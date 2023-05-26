@@ -5,7 +5,15 @@ var locations = [
   {lat: 45.1441365, lng: -93.0031786, name: "Marker 4"},
   //inside the Capitol
   {lat: 44.955674, lng: -93.1069443, name: "Rathskeller"},
-    {lat: 44.9565977, lng: -93.1028148, name: "MN Senate Building"}
+    {lat: 44.9565977, lng: -93.1028148, name: "MN Senate Building"},
   //Capitol Tour
-  
+  //Hamm's Tour
+   {lat: 44.96298, lng: -93.07270, name: "Andrew F. Keller"},
+  {lat: 144.96298, lng: -93.07270, name: "Andrew F. Keller"},
+  {lat: 144.96298, lng: -93.07270, name: "Andrew F. Keller"},
+  {lat: 144.96298, lng: -93.07270, name: "Andrew F. Keller"},
+  {lat: 144.96298, lng: -93.07270, name: "Andrew F. Keller"},
+  {lat: 144.96298, lng: -93.07270, name: "Andrew F. Keller"},
+  {lat: 144.96298, lng: -93.07270, name: "Andrew F. Keller"},
+  {lat: 144.96298, lng: -93.07270, name: "Andrew F. Keller"},
 ];
