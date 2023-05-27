@@ -10,7 +10,7 @@ var locations = [
   //Hamm's Tour
    {lat: 44.96298, lng: -93.07270, name: "Andrew F. Keller"},
   {lat: 44.96161716168361, lng: -93.07357235985117, name: "Swede Hollow"},
-  {lat: 144.96298, lng: -93.07270, name: "Andrew F. Keller"},
+  {lat: 44.96237525092297, lng: -93.0707501008638, name: "'Minnesota 13' Whiskey"},
   {lat: 144.96298, lng: -93.07270, name: "Andrew F. Keller"},
   {lat: 144.96298, lng: -93.07270, name: "Andrew F. Keller"},
   {lat: 144.96298, lng: -93.07270, name: "Andrew F. Keller"},
