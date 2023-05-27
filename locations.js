@@ -9,7 +9,7 @@ var locations = [
   //Capitol Tour
   //Hamm's Tour
    {lat: 44.96298, lng: -93.07270, name: "Andrew F. Keller"},
-  {lat: 144.96298, lng: -93.07270, name: "Andrew F. Keller"},
+  {lat: 44.96161716168361, lng: -93.07357235985117, name: "Swede Hollow"},
   {lat: 144.96298, lng: -93.07270, name: "Andrew F. Keller"},
   {lat: 144.96298, lng: -93.07270, name: "Andrew F. Keller"},
   {lat: 144.96298, lng: -93.07270, name: "Andrew F. Keller"},
