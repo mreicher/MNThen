@@ -7,11 +7,11 @@ var locations = [
     htmlFile: "example/logic_test.html"
   },
   {
-    lat: 44.961922,
-    lng: -93.070196,
-    name: "Location 2",
+    lat: 44.962440539863806,
+    lng: -93.07089205405951,
+    name: "Minnesota 13 Whiskey",
     popupContent: "Location 2 Popup Content",
-    htmlFile: "location2.html"
+    htmlFile: "tour/hamm/hamm_mn13.html"
   },
   {
     lat: 44.962043,
