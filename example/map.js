@@ -21,7 +21,7 @@ document.addEventListener("DOMContentLoaded", function () {
     radius: 10,
   }).addTo(map);
 
-  var thresholdFeet = 8; // Threshold distance in feet
+  var thresholdFeet = 7; // Threshold distance in feet
 
   function updateUserLocation(e) {
     var userLatLng = e.latlng;
