@@ -88,7 +88,7 @@ document.addEventListener("DOMContentLoaded", function () {
     }, 8000); // Adjust the duration as needed (in milliseconds)
 
     map.locate({
-      watch: true, // Set watch to false
+      watch: false, // Set watch to false
       enableHighAccuracy: true,
       maximumAge: 0,
     });
