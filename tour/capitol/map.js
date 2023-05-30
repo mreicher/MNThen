@@ -21,12 +21,14 @@ document.addEventListener("DOMContentLoaded", function () {
     radius: 10,
   }).addTo(map);
 
-  var thresholdFeet = 10; // Threshold distance in feet -- change as needed.
+  var thresholdFeet = 10; // Threshold distance in feet
+  var tourSwitchDelay = 2000; // Delay in milliseconds
 
   var statusMessageContainer = document.getElementById("status-message-container");
   var statusMessage = document.getElementById("status-message");
 
   var locatingTimeout;
+  var isTracking = false;
 
   function updateUserLocation(e) {
     clearTimeout(locatingTimeout); // Clear the locating timeout
@@ -62,7 +64,9 @@ document.addEventListener("DOMContentLoaded", function () {
 
       // Check if the user is within the threshold distance
       if (distanceFeet <= thresholdFeet) {
-        window.location.href = location.htmlFile;
+        setTimeout(function () {
+          window.location.href = location.htmlFile;
+        }, tourSwitchDelay);
         return; // Exit the function if location is found
       }
     }
@@ -88,7 +92,7 @@ document.addEventListener("DOMContentLoaded", function () {
     }, 9000); // Adjust the duration as needed (in milliseconds)
 
     map.locate({
-      watch: false, // Set watch to false
+      watch: false, // Set watch to false initially
       enableHighAccuracy: true,
       maximumAge: 0,
     });
@@ -96,7 +100,16 @@ document.addEventListener("DOMContentLoaded", function () {
     map.on("locationfound", function (e) {
       updateUserLocation(e); // Call updateUserLocation when location is found
 
-      statusMessage.innerHTML = "Device location discovered";
+      if (!isTracking) {
+        isTracking = true;
+        map.locate({
+          watch: true, // Set watch to true to continuously track the user's location
+          enableHighAccuracy: true,
+          maximumAge: 0,
+        });
+      }
+
+      statusMessage.innerHTML = "Device location found";
       setTimeout(function () {
         statusMessageContainer.style.display = "none";
       }, 3000); // Adjust the duration as needed (in milliseconds)
