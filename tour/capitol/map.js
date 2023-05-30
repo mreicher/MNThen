@@ -85,7 +85,7 @@ document.addEventListener("DOMContentLoaded", function () {
 
     locatingTimeout = setTimeout(function () {
       onLocationError();
-    }, 8000); // Adjust the duration as needed (in milliseconds)
+    }, 9000); // Adjust the duration as needed (in milliseconds)
 
     map.locate({
       watch: false, // Set watch to false
