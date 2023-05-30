@@ -1,7 +1,7 @@
 document.addEventListener("DOMContentLoaded", function () {
   var map = L.map("map", {
     attributionControl: false,
-  }).setView([44.962365525580054, -93.0712786465091], 18);
+  }).setView([44.95476299989211, -93.10224462080151], 18);
 
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
     maxZoom: 20,
