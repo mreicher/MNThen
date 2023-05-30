@@ -1,120 +1,136 @@
-document.addEventListener("DOMContentLoaded", function () {
-  var map = L.map("map", {
-    attributionControl: false,
-  }).setView([44.96262861772549, -93.0713965108224], 18);
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Minnesota Then History Tours</title>
+  <link rel="shortcut icon" type="image/jpg" href="/images/mnthenfav.ico" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.7.1/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@4.6.0/dist/css/bootstrap.min.css">
+ 
+  <style>
+    .map-container {
+      height: 450px;
+      margin-bottom: 10px;
+    }
 
-  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-    maxZoom: 20,
-    id: "mapbox/streets-v11",
-    tileSize: 512,
-    zoomOffset: -1,
-  }).addTo(map);
+    #map {
+      width: 100%;
+      height: 450px;
+    }
 
-  L.control.attribution({
-    prefix: false,
-  }).addTo(map);
+    .message-box {
+      padding: 10px;
+      margin-bottom: 20px;
+    }
 
-  var userLocationMarker = L.circleMarker([0, 0], {
-    color: "red",
-    fillColor: "#f03",
-    fillOpacity: 0.5,
-    radius: 10,
-  }).addTo(map);
+    .safety-message-box {
+      padding: 16px;
+    }
 
-  var thresholdFeet = 10; // Threshold distance in feet
-  var tourSwitchDelay = 2000; // Delay in milliseconds
+    body {
+      font-size: 18px;
+    }
 
-  var statusMessageContainer = document.getElementById("status-message-container");
-  var statusMessage = document.getElementById("status-message");
-
-  var locatingTimeout;
-  var isTracking = false;
-
-  function updateUserLocation(e) {
-    clearTimeout(locatingTimeout); // Clear the locating timeout
-
-    var userLatLng = e.latlng;
-    userLocationMarker.setLatLng(userLatLng);
-    map.setView(userLatLng);
-
-    for (var i = 0; i < locations.length; i++) {
-      var location = locations[i];
-      var locationLatLng = L.latLng(location.lat, location.lng);
-      var distance = userLatLng.distanceTo(locationLatLng);
-      var distanceFeet = Math.floor(distance * 3.28084); // Convert to feet and round down
-      var distanceFeetInt = parseInt(distanceFeet); // Convert to integer
-
-      var popupContent =
-        "<b>" +
-        location.name +
-        "</b><br>Distance: " +
-        distanceFeetInt +
-        " feet";
-
-      var popupOptions = {
-        autoClose: false,
-      };
-
-      var marker = L.marker(locationLatLng).bindPopup(
-        popupContent,
-        popupOptions
-      );
-
-      marker.addTo(map);
-
-      // Check if the user is within the threshold distance
-      if (distanceFeet <= thresholdFeet) {
-        setTimeout(function () {
-          window.location.href = location.htmlFile;
-        }, tourSwitchDelay);
-        return; // Exit the function if location is found
+    @media (max-width: 768px) {
+      body {
+        font-size: 16px;
       }
     }
-  }
 
-  function onLocationError(e) {
-    clearTimeout(locatingTimeout); // Clear the locating timeout
+    .leaflet-popup-content-wrapper:before {
+      content: attr(data-number);
+      background-color: #0089e0;
+      color: #fff;
+      font-weight: bold;
+      padding: 4px 8px;
+      border-radius: 50%;
+      display: inline-block;
+      margin-right: 4px;
+    }
 
-    statusMessage.innerHTML = "Device location not found. Please try again.";
-    statusMessageContainer.style.display = "block"; // Show the status message container
+    .leaflet-popup-content {
+      font-size: 18px;
+    }
 
-    setTimeout(function () {
-      statusMessageContainer.style.display = "none";
-    }, 3000); // Adjust the duration as needed (in milliseconds)
-  }
+    .leaflet-popup-tip-container {
+      display: none;
+    }
+    
+#status-message-container {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 9999;
+  opacity: 1;
+  transition: opacity 3s;
+}
 
-  function startLocating() {
-    statusMessage.innerHTML = "Searching for your location...";
-    statusMessageContainer.style.display = "block"; // Show the status message container
+#status-message {
+  background-color: #f8f8f8;
+  border: 1px solid #ccc;
+  border-radius: 5px;
+  padding: 15px;
+  text-align: center;
+  font-weight: bold;
+  max-width: 90%;
+  font-size: 16px;
+  margin: 0 auto;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
 
-    locatingTimeout = setTimeout(function () {
-      onLocationError();
-    }, 9000); // Adjust the duration as needed (in milliseconds)
+.hide-message {
+  opacity: 0;
+  transition: opacity 1s;
+}
 
-    map.locate({
-      watch: false, // Set watch to false initially
-      enableHighAccuracy: true,
-      maximumAge: 0,
+.hide-message-container {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 1s;
+}
+
+  </style>
+</head>
+<body style="margin: 0; padding: 0;">
+    <div id="status-message-container">
+      <div id="status-message">Searching for your location...</div>
+    </div>
+  <div id="map" class="map-container"></div>
+
+  <div class="container-fluid">
+    <div class="row">
+      <div class="col-12 text-center">
+        <button id="returnButton" class="btn btn-lg btn-secondary">Exit the Tour</button>
+        <p></p>
+      </div>
+    </div>
+    <div class="row">
+      <div class="col-12">
+        <div class="message-box bg-primary text-white p-3 rounded mb-3" style="font-size: 1.2rem;">
+          <p><strong>Navigation Tip:</strong> Discover historical locations by moving toward the map's blue markers. Your mobile device will automatically update with information when you're in range.</p>
+        </div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="col-12">
+        <div class="safety-message-box bg-danger text-white p-3 rounded" style="font-size: 1.2rem;">
+          <p><strong>Safety Reminder:</strong> We want you to have a safe and enjoyable experience while exploring local history. Please keep an eye on your surroundings and be mindful of potential hazards.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+  
+  <script>
+    document.getElementById("returnButton").addEventListener("click", function () {
+      window.location.href = "/index.html";
     });
+  </script>
 
-    map.on("locationfound", function (e) {
-      updateUserLocation(e); // Call updateUserLocation when location is found
-
-      if (!isTracking) {
-        isTracking = true;
-        map.locate({
-          watch: true, // Set watch to true to continuously track the user's location
-          enableHighAccuracy: true,
-          maximumAge: 0,
-        });
-      }
-
-      statusMessage.innerHTML = "Device location found";
-      setTimeout(function () {
-        statusMessageContainer.style.display = "none";
-      }, 3000); // Adjust the duration as needed (in milliseconds)
-    });
-  }
-
-  setTimeout(startLocating, 1000); // Delay starting the locating process by 1 second
-});
+  <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+  <script src="/locations_1.js"></script>
+  <script src="hamm_map.js"></script>
+  
+</body>
+</html>
