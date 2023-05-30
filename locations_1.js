@@ -11,7 +11,7 @@ var locations = [
     lng: -93.07089205405951,
     name: "Minnesota 13 Whiskey",
     popupContent: "Location 2 Popup Content",
-    htmlFile: "tour/hamm/hamm_mn13.html"
+    htmlFile: "/tour/hamm/hamm_mn13.html"
   },
   {
     lat: 44.962043,
