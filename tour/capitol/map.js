@@ -21,7 +21,7 @@ document.addEventListener("DOMContentLoaded", function () {
     radius: 10,
   }).addTo(map);
 
-  var thresholdFeet = 100; // Threshold distance in feet -- change as needed.
+  var thresholdFeet = 10; // Threshold distance in feet -- change as needed.
 
   var statusMessageContainer = document.getElementById("status-message-container");
   var statusMessage = document.getElementById("status-message");
