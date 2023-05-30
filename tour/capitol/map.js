@@ -96,7 +96,7 @@ document.addEventListener("DOMContentLoaded", function () {
     map.on("locationfound", function (e) {
       updateUserLocation(e); // Call updateUserLocation when location is found
 
-      statusMessage.innerHTML = "Device location found";
+      statusMessage.innerHTML = "Device location discovered";
       setTimeout(function () {
         statusMessageContainer.style.display = "none";
       }, 3000); // Adjust the duration as needed (in milliseconds)
