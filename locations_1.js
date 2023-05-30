@@ -1,7 +1,7 @@
 var locations = [
   {
-    lat: 45.14444048074899,
-    lng: -93.00450137251777,
+    lat: 45.144334537396375,
+    lng: -93.00439140908348,
     name: "The Logic Test",
     popupContent: "Logic Tester",
     htmlFile: "/example/logic_test.html"
