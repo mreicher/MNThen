@@ -1,7 +1,7 @@
 document.addEventListener("DOMContentLoaded", function () {
   var map = L.map("map", {
     attributionControl: false,
-  }).setView([45.09384047720653, -92.99761868394353], 18);
+  }).setView([45.09396938812941, -92.99743282865592], 18);
 
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
     maxZoom: 20,
@@ -21,9 +21,18 @@ document.addEventListener("DOMContentLoaded", function () {
     radius: 10,
   }).addTo(map);
 
-  var thresholdFeet = 50; // Threshold distance in feet
+  var thresholdFeet = 10; // Threshold distance in feet
+  var tourSwitchDelay = 2000; // Delay in milliseconds
+
+  var statusMessageContainer = document.getElementById("status-message-container");
+  var statusMessage = document.getElementById("status-message");
+
+  var locatingTimeout;
+  var isTracking = false;
 
   function updateUserLocation(e) {
+    clearTimeout(locatingTimeout); // Clear the locating timeout
+
     var userLatLng = e.latlng;
     userLocationMarker.setLatLng(userLatLng);
     map.setView(userLatLng);
@@ -55,21 +64,57 @@ document.addEventListener("DOMContentLoaded", function () {
 
       // Check if the user is within the threshold distance
       if (distanceFeet <= thresholdFeet) {
-        window.location.href = location.htmlFile;
+        setTimeout(function () {
+          window.location.href = location.htmlFile;
+        }, tourSwitchDelay);
+        return; // Exit the function if location is found
       }
     }
   }
 
   function onLocationError(e) {
-    alert("Failed to access your location. Please make sure location services are enabled and try again.");
+    clearTimeout(locatingTimeout); // Clear the locating timeout
+
+    statusMessage.innerHTML = "Device location not found. Please try again.";
+    statusMessageContainer.style.display = "block"; // Show the status message container
+
+    setTimeout(function () {
+      statusMessageContainer.style.display = "none";
+    }, 3000); // Adjust the duration as needed (in milliseconds)
   }
 
-  map.on("locationfound", updateUserLocation);
-  map.on("locationerror", onLocationError);
+  function startLocating() {
+    statusMessage.innerHTML = "Searching for your location...";
+    statusMessageContainer.style.display = "block"; // Show the status message container
 
-  map.locate({
-    watch: true,
-    enableHighAccuracy: true,
-    maximumAge: 0,
-  });
+    locatingTimeout = setTimeout(function () {
+      onLocationError();
+    }, 9000); // Adjust the duration as needed (in milliseconds)
+
+    map.locate({
+      watch: false, // Set watch to false initially
+      enableHighAccuracy: true,
+      maximumAge: 0,
+    });
+
+    map.on("locationfound", function (e) {
+      updateUserLocation(e); // Call updateUserLocation when location is found
+
+      if (!isTracking) {
+        isTracking = true;
+        map.locate({
+          watch: true, // Set watch to true to continuously track the user's location
+          enableHighAccuracy: true,
+          maximumAge: 0,
+        });
+      }
+
+      statusMessage.innerHTML = "Device location found";
+      setTimeout(function () {
+        statusMessageContainer.style.display = "none";
+      }, 3000); // Adjust the duration as needed (in milliseconds)
+    });
+  }
+
+  setTimeout(startLocating, 1000); // Delay starting the locating process by 1 second
 });
