@@ -35,8 +35,8 @@ var locations = [
     htmlFile: "/tour/hamm/hamm_closing.html"
   },
     {
-    lat: #,
-    lng: #,
+    lat: 35.21071776507992,
+    lng:  -97.4440679244086,
     name: "Location Template",
     popupContent: "Location 3 Popup Content",
     htmlFile: "location3.html"
