@@ -20,10 +20,17 @@ var locations = [
     popupContent: "Above Swede Hollow",
     htmlFile: "/tour/hamm/hamm_hollow.html"
   },
+   {
+    lat: 44.9620906324505,
+    lng: -93.0710358080048,
+    name: "Hamm Jr. Kidnapping",
+    popupContent: "Hamm Jr. Kidnapping",
+    htmlFile: "/tour/hamm/hamm_kidnap.html"
+  },
     {
-    lat: 44.962043,
-    lng: -93.072014,
-    name: "Location 3",
+    lat: #,
+    lng: #,
+    name: "Location Template",
     popupContent: "Location 3 Popup Content",
     htmlFile: "location3.html"
   }
