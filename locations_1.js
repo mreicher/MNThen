@@ -7,8 +7,8 @@ var locations = [
     htmlFile: "/example/logic_test.html"
   },
   {
-    lat: 44.962440539863806,
-    lng: -93.07089205405951,
+    lat: 44.96244516,
+    lng: -93.07088783,
     name: "Minnesota 13 Whiskey",
     popupContent: "Location 2 Popup Content",
     htmlFile: "/tour/hamm/hamm_mn13.html"
