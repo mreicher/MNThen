@@ -27,6 +27,13 @@ var locations = [
     popupContent: "Hamm Jr. Kidnapping",
     htmlFile: "/tour/hamm/hamm_kidnap.html"
   },
+      {
+    lat: 44.9626001898243,
+    lng:  -93.07036032373,
+    name: "Location Template",
+    popupContent: "Closing of Stroh Brewery",
+    htmlFile: "/tour/hamm/hamm_closing.html"
+  },
     {
     lat: #,
     lng: #,
