@@ -42,10 +42,10 @@ var locations = [
     htmlFile: "/tour/hamm/hamm_bear.html"
   },
       {
-    lat: 35.21071776507992,
-    lng:  -97.4440679244086,
-    name: "Location Template",
-    popupContent: "Location 3 Popup Content",
-    htmlFile: "location3.html"
+    lat: 44.928296016597855,
+    lng:   -93.12476627530773,
+    name: "Stahlmann Brewery (1855 - 1897)",
+    popupContent: "Stahlmann Brewery",
+    htmlFile: "/tour/ftrd/ftrd_stahl.html"
   }
 ];
