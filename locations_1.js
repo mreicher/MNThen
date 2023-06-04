@@ -30,14 +30,14 @@ var locations = [
       {
     lat: 44.9626001898243,
     lng:  -93.07036032373,
-    name: "Closing of Stroh Brewery",
+    name: "Closing of Stroh Brewery (1997)",
     popupContent: "Closing of Stroh Brewery",
     htmlFile: "/tour/hamm/hamm_closing.html"
   },
     {
     lat: 44.9623493204131,
-    lng:  -44.9623493204131,
-    name: "The Iconic Hamm's Bear",
+    lng:  -93.071697028134,
+    name: "The Iconic Hamm's Bear (1953 - 99)",
     popupContent: "Hamm's Bear",
     htmlFile: "/tour/hamm/hamm_bear.html"
   },
