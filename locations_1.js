@@ -35,8 +35,8 @@ var locations = [
     htmlFile: "/tour/hamm/hamm_closing.html"
   },
     {
-    lat: 35.21071776507992,
-    lng:  -97.4440679244086,
+    lat: 44.9623493204131,
+    lng:  -44.9623493204131,
     name: "The Iconic Hamm's Bear",
     popupContent: "Hamm's Bear",
     htmlFile: "/tour/hamm/hamm_bear.html"
