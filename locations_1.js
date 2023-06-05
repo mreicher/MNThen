@@ -23,7 +23,7 @@ var locations = [
    {
     lat: 44.9620906324505,
     lng: -93.0710358080048,
-    name: "Hamm Jr. Kidnapping",
+    name: "Hamm Jr. Kidnapping (1933)",
     popupContent: "Hamm Jr. Kidnapping",
     htmlFile: "/tour/hamm/hamm_kidnap.html"
   },
@@ -44,8 +44,15 @@ var locations = [
       {
     lat: 44.928296016597855,
     lng:   -93.12476627530773,
-    name: "Stahlmann Brewery (1855 - 1897)",
+    name: "Stahlmann Brewery (1855 - 97)",
     popupContent: "Stahlmann Brewery",
     htmlFile: "/tour/ftrd/ftrd_stahl.html"
+  },
+  {
+    lat: 45.013359183182786,
+    lng:   -93.27190590645603,
+    name: "Scandal at John's Bar (1952 - 56)",
+    popupContent: "Tony Jaros River Garden",
+    htmlFile: "/tour/NE/NE_johnsbar.html"
   }
 ];
