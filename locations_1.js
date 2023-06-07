@@ -40,6 +40,13 @@ var locations = [
     name: "The Iconic Hamm's Bear (1953 - 99)",
     popupContent: "Hamm's Bear",
     htmlFile: "/tour/hamm/hamm_bear.html"
+  },          
+  {
+    lat: 44.96231983329402,
+    lng:  -93.07176137488261,
+    name: "Theodore Hamm Mansion (1886 - 1954)",
+    popupContent: "Theodore Hamm Mansion",
+    htmlFile: "/tour/hamm/hamm_mansion.html"
   },
       {
     lat: 44.928296016597855,
