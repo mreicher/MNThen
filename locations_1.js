@@ -42,8 +42,8 @@ var locations = [
     htmlFile: "/tour/hamm/hamm_bear.html"
   },          
   {
-    lat: 44.96231983329402,
-    lng:  -93.07176137488261,
+    lat: 44.961337319371076,
+    lng:   -93.07148153924896,
     name: "Theodore Hamm Mansion (1886 - 1954)",
     popupContent: "Theodore Hamm Mansion",
     htmlFile: "/tour/hamm/hamm_mansion.html"
