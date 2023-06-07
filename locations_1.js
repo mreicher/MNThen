@@ -54,5 +54,12 @@ var locations = [
     name: "Scandal at John's Bar (1952 - 56)",
     popupContent: "Tony Jaros River Garden",
     htmlFile: "/tour/NE/NE_johnsbar.html"
+  },
+    {
+    lat: 44.95270480002584,
+    lng:   -93.07440808976824,
+    name: "Bruce Vento (1940 - 2000)",
+    popupContent: "Bruce Vento",
+    htmlFile: "/tour/STP/STP_Vento.html"
   }
 ];
