@@ -42,6 +42,13 @@ var locations = [
     htmlFile: "/tour/hamm/hamm_bear.html"
   },          
   {
+    lat: 44.96292536959989,
+    lng:   -93.07205849805618,
+    name: "'New' Hamm's Brewery Public Tour (1894)",
+    popupContent: "Hamm's Brewery Tour",
+    htmlFile: "/tour/hamm/hamm_tour.html"
+  },
+    {
     lat: 44.961337319371076,
     lng:   -93.07148153924896,
     name: "Theodore Hamm Mansion (1886 - 1954)",
