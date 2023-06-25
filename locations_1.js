@@ -75,5 +75,12 @@ var locations = [
     name: "Bruce Vento (1940 - 2000)",
     popupContent: "Bruce Vento",
     htmlFile: "/tour/STP/STP_Vento.html"
+  },
+  {
+    lat: 45.073692373690626,
+    lng:   -93.01483408611226,
+    name: "Plantation Night Club (1930 - 1933)",
+    popupContent: "Plantation Night Club",
+    htmlFile: "/tour/wbl/wbl_plant.html"
   }
 ];
