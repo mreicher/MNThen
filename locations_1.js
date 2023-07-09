@@ -6,6 +6,13 @@ var locations = [
     popupContent: "Logic Tester",
     htmlFile: "/example/test_sponsor.html"
   },
+    {
+    lat: 45.11470303675785,
+    lng: -93.00297067944051,
+    name: "The Demo Page",
+    popupContent: "The Demo Page",
+    htmlFile: "/example/demo.html"
+  },
   {
     lat: 44.96244516,
     lng: -93.07088783,
