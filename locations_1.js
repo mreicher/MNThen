@@ -89,5 +89,12 @@ var locations = [
     name: "Plantation Night Club (1930 - 1933)",
     popupContent: "Plantation Night Club",
     htmlFile: "/tour/wbl/wbl_plant.html"
+  },
+    {
+    lat: 45.08631531351397,
+    lng:   -92.99990683456114,
+    name: "Geist Gazebo",
+    popupContent: "Geist Gazebo",
+    htmlFile: "/tour/wbl/wbl_geist.html"
   }
 ];
