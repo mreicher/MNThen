@@ -100,6 +100,15 @@ var locations = [
     title: "Plantation Night Club",
     creator: "Matt Reicher",
     link: "https://original.newsbreak.com/@ron-dansley-1587459/3078633820088-lion-s-park-a-remembrance-of-white-bear-lake-s-legendary-plantation-night-club"
+  },
+    {
+    name: "The Geist Gazebo",
+    lat: 45.08631531351397,
+    lon:  -92.99990683456114,
+    image: "https://www.mnthen.com/tour/wbl/gallery/geis/wbl_geist2.jpg",
+    title: "The Geist Gazebo",
+    creator: "Matt Reicher",
+    link: "https://original.newsbreak.com/@ron-dansley-1587459/3077047712038-matoska-park-s-living-history-the-geist-gazebo-and-its-storied-past"
   }
   // Add more locations here
 ];
