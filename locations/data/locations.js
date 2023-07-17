@@ -118,7 +118,16 @@ var locations = [
     title: "Hubert H. Humphrey (1911 - 1978)",
     creator: "Matt Reicher",
     link: "https://mnthen.com/blog/people/humphrey.html"
-  }
+  },
+        {
+    name: "Floyd B. Olson (1891 - 1936)",
+    lat: 44.954510008008796,
+    lon:  -93.10355723897186,
+    image: "https://www.mnthen.com/tour/capitol/gallery/olson/olson_2.jpg",
+    title: "Floyd B. Olson (1891 - 1936)",
+    creator: "Matt Reicher",
+    link: "https://mnthen.com/blog/people/olson.html"
+  },
   // Add more locations here
 ];
 
