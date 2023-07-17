@@ -109,6 +109,15 @@ var locations = [
     title: "The Geist Gazebo",
     creator: "Matt Reicher",
     link: "https://original.newsbreak.com/@ron-dansley-1587459/3077047712038-matoska-park-s-living-history-the-geist-gazebo-and-its-storied-past"
+  },
+      {
+    name: "Hubert H. Humphrey (1911 - 1978)",
+    lat: 44.95392488222734,
+    lon:  -93.1032724056789,
+    image: "https://www.mnthen.com/tour/capitol/gallery/humphrey/humphrey_3.jpg",
+    title: "Hubert H. Humphrey (1911 - 1978)",
+    creator: "Matt Reicher",
+    link: "https://mnthen.com/blog/people/humphrey.html"
   }
   // Add more locations here
 ];
