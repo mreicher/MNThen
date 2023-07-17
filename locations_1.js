@@ -96,5 +96,19 @@ var locations = [
     name: "Geist Gazebo",
     popupContent: "Geist Gazebo",
     htmlFile: "/tour/wbl/wbl_geist.html"
+  },
+      {
+    lat: 44.95392488222734,
+    lng:   -93.1032724056789,
+    name: "Hubert H. Humphrey (1911 - 1978)",
+    popupContent: "Hubert H. Humphrey",
+    htmlFile: "/tour/capitol/capitol_humphrey.html"
+  },
+      {
+    lat: 44.954510008008796,
+    lng:   -93.10355723897186,
+    name: "Floyd B. Olson",
+    popupContent: "Floyd B. Olson (1891 - 1936)",
+    htmlFile: "/tour/capitol/capitol_olson.html"
   }
 ];
