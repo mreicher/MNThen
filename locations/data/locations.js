@@ -128,6 +128,15 @@ var locations = [
     creator: "Matt Reicher",
     link: "https://mnthen.com/blog/people/olson.html"
   },
+    {
+    name: "WBL Burial Mounds",
+    lat: 45.07970650298757,
+    lon:  -93.01208914876786,
+    image: "https://www.mnthen.com/tour/wbl/gallery/mound/wbl_mound1.jpg",
+    title: "WBL Burial Mounds",
+    creator: "Matt Reicher",
+    link: "https://mnthen.com/blog/place/wbl_mounds.html"
+  },
   // Add more locations here
 ];
 
