@@ -110,5 +110,12 @@ var locations = [
     name: "Floyd B. Olson",
     popupContent: "Floyd B. Olson (1891 - 1936)",
     htmlFile: "/tour/capitol/capitol_olson.html"
+  },
+        {
+    lat: 45.07970650298757,
+    lng:   -93.01208914876786,
+    name: "WBL Burial Mounds",
+    popupContent: "WBL Burial Mounds",
+    htmlFile: "/tour/wbl/wbl_mounds.html"
   }
 ];
