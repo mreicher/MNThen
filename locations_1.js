@@ -105,8 +105,8 @@ var locations = [
     htmlFile: "/tour/capitol/capitol_humphrey.html"
   },
       {
-    lat: 44.95449626398087,
-    lng:   -93.10350642666506,
+    lat: 44.95439155818203,
+    lng:   -93.10349447696363,
     name: "Floyd B. Olson",
     popupContent: "Floyd B. Olson (1891 - 1936)",
     htmlFile: "/tour/capitol/capitol_olson.html"
