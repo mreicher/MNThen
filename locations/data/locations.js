@@ -112,8 +112,8 @@ var locations = [
   },
       {
     name: "Hubert H. Humphrey (1911 - 1978)",
-    lat: 44.95392488222734,
-    lon:  -93.1032724056789,
+    lat: 44.95325804566806,
+    lon:  -93.1032296122576,
     image: "https://www.mnthen.com/tour/capitol/gallery/humphrey/humphrey_3.jpg",
     title: "Hubert H. Humphrey (1911 - 1978)",
     creator: "Matt Reicher",
@@ -121,8 +121,8 @@ var locations = [
   },
         {
     name: "Floyd B. Olson (1891 - 1936)",
-    lat: 44.954510008008796,
-    lon:  -93.10355723897186,
+    lat: 44.95449626398087,
+    lon:  -93.10350642666506,
     image: "https://www.mnthen.com/tour/capitol/gallery/olson/olson_2.jpg",
     title: "Floyd B. Olson (1891 - 1936)",
     creator: "Matt Reicher",
