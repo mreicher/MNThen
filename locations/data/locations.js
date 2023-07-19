@@ -121,8 +121,8 @@ var locations = [
   },
         {
     name: "Floyd B. Olson (1891 - 1936)",
-    lat: 44.95449626398087,
-    lon:  -93.10350642666506,
+    lat: 44.95439155818203,
+    lon:  -93.10349447696363,
     image: "https://www.mnthen.com/tour/capitol/gallery/olson/olson_2.jpg",
     title: "Floyd B. Olson (1891 - 1936)",
     creator: "Matt Reicher",
