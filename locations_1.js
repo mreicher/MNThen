@@ -98,15 +98,15 @@ var locations = [
     htmlFile: "/tour/wbl/wbl_geist.html"
   },
       {
-    lat: 44.95392488222734,
-    lng:   -93.1032724056789,
+    lat: 44.95325804566806,
+    lng:   -93.1032296122576,
     name: "Hubert H. Humphrey (1911 - 1978)",
     popupContent: "Hubert H. Humphrey",
     htmlFile: "/tour/capitol/capitol_humphrey.html"
   },
       {
-    lat: 44.954510008008796,
-    lng:   -93.10355723897186,
+    lat: 44.95449626398087,
+    lng:   -93.10350642666506,
     name: "Floyd B. Olson",
     popupContent: "Floyd B. Olson (1891 - 1936)",
     htmlFile: "/tour/capitol/capitol_olson.html"
