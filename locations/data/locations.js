@@ -137,6 +137,15 @@ var locations = [
     creator: "Matt Reicher",
     link: "https://mnthen.com/blog/place/wbl_mounds.html"
   },
+        {
+    name: "Wildwood Amusement Park",
+    lat: 45.05723176782259,
+    lon:   -92.95907468980563,
+    image: "https://www.mnthen.com/locations/gallery/mahtomedi/wildwood/wildwood_1.jpg",
+    title: "Wildwood Amusement Park",
+    creator: "Matt Reicher",
+    link: "https://mnthen.com/blog/places/wildwood.html"
+  }
   // Add more locations here
 ];
 
