@@ -123,6 +123,6 @@ var locations = [
     lng:   -92.95891026289415,
     name: "Wildwood Amusement Park",
     popupContent: "Wildwood Amusement Park",
-    htmlFile: "/locations/markers/mahtomedi/mah_wildwood.html"
+    htmlFile: "/markers/mahtomedi/mah_wildwood.html"
   }
 ];
