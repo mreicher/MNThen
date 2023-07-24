@@ -155,6 +155,15 @@ var locations = [
     creator: "Matt Reicher",
     link: "https://mnthen.com/blog/places/mpls_grain_belt.html"
   },
+    {
+    name: "Father Hennepin Suspension Bridge",
+    lat: 44.98463074655949,
+    lon: -93.26445659478223,
+    image: "https://www.mnthen.com/locations/gallery/mpls/henn_bridge/mpls_henn_bridge_1.jpg",
+    title: "Father Hennepin Suspension Bridge",
+    creator: "Matt Reicher",
+    link: "https://www.mnopedia.org/structure/father-louis-hennepin-suspension-bridge"
+  },
   // Add more locations here
 ];
 
