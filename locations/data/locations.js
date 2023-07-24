@@ -177,7 +177,7 @@ var locations = [
     name: "Charlotte Ouisconsin Clark Van Cleve",
     lat: 44.986612630415564,
     lon: -93.23121494980424,
-    image: "https://www.mnthen.com/locations/gallery/mpls/van_cleve/mpls_van_cleve_1.jpg",
+    image: "https://www.mnthen.com/locations/gallery/mpls/mpls_van_cleve/mpls_van_cleve_1.jpg",
     title: "Charlotte Ouisconsin Clark Van Cleve (1819–1907)",
     creator: "Matt Reicher",
     link: "https://www.mnopedia.org/person/van-cleve-charlotte-ouisconsin-clark-1819-1907"
