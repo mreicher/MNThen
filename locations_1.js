@@ -124,5 +124,12 @@ var locations = [
     name: "Grain Belt Beer Sign",
     popupContent: "Grain Belt Beer Sign",
     htmlFile: "/markers/mpls/mpls_grain_belt.html"
+  },
+  {
+    lat: 44.98463074655949,
+    lng: -93.26445659478223,
+    name: "Father Hennepin Suspension Beidge",
+    popupContent: "Father Hennepin Suspension Beidge",
+    htmlFile: "/markers/mpls/mpls_henn_bridge.html"
   }
 ];
