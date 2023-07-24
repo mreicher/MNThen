@@ -128,8 +128,8 @@ var locations = [
   {
     lat: 44.98463074655949,
     lng: -93.26445659478223,
-    name: "Father Hennepin Suspension Beidge",
-    popupContent: "Father Hennepin Suspension Beidge",
+    name: "Father Hennepin Suspension Bridge",
+    popupContent: "Father Hennepin Suspension Bridge",
     htmlFile: "/markers/mpls/mpls_henn_bridge.html"
   }
 ];
