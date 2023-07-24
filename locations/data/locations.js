@@ -164,6 +164,16 @@ var locations = [
     creator: "Matt Reicher",
     link: "https://www.mnopedia.org/structure/father-louis-hennepin-suspension-bridge"
   },
+  {
+    name: "Gramma B’s (1979 - 1984)",
+    lat: 45.00748720292698,
+    lon: -93.27185181388745,
+    image: "https://www.mnthen.com/locations/gallery/mpls/gramma_b/mpls_gramma_b_1.jpg",
+    title: "Gramma B’s (1979 - 1984)",
+    creator: "Matt Reicher",
+    link: "https://www.mnthen.com/blog/place/mpls_gramma_b.html"
+  },
+
   // Add more locations here
 ];
 
