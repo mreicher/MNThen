@@ -138,5 +138,12 @@ var locations = [
     name: "Gramma B’s",
     popupContent: "Gramma B’s (1979 - 1984)",
     htmlFile: "/markers/mpls/mpls_gramma_b.html"
+  },
+  {
+    lat: 44.986612630415564,
+    lng: -93.23121494980424,
+    name: "Charlotte Ouisconsin Clark Van Cleve",    
+    popupContent: "Charlotte Ouisconsin Clark Van Cleve (1819–1907)",
+    htmlFile: "/markers/mpls/mpls_van_cleve.html"
   }
 ];
