@@ -150,7 +150,7 @@ var locations = [
     name: "Grain Belt Beer Sign",
     lat: 44.985500012634446,
     lon: -93.26562138020033,
-    image: "https://www.mnthen.com/locations/gallery/mpls/premium/mpls_grain_belt_2.jpg",
+    image: "https://www.mnthen.com/locations/gallery/mpls/premium/mpls_grain_belt_3.jpg",
     title: "Grain Belt Beer Sign",
     creator: "Matt Reicher",
     link: "https://mnthen.com/blog/places/mpls_grain_belt.html"
