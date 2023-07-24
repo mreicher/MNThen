@@ -131,5 +131,11 @@ var locations = [
     name: "Father Hennepin Suspension Bridge",
     popupContent: "Father Hennepin Suspension Bridge",
     htmlFile: "/markers/mpls/mpls_henn_bridge.html"
+  },
+    lat: 45.00748720292698,
+    lng: -93.27185181388745,
+    name: "Gramma B’s",
+    popupContent: "Gramma B’s (1979 - 1984)",
+    htmlFile: "/markers/mpls/mpls_gramma_b.html"
   }
 ];
