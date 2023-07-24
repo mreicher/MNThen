@@ -6,13 +6,6 @@ var locations = [
     popupContent: "Logic Tester",
     htmlFile: "/example/test_sponsor.html"
   },
-    {
-    lat: 45.11470303675785,
-    lng: -93.00297067944051,
-    name: "The Demo Page",
-    popupContent: "The Demo Page",
-    htmlFile: "/example/demo.html"
-  },
   {
     lat: 44.96244516,
     lng: -93.07088783,
@@ -124,5 +117,12 @@ var locations = [
     name: "Wildwood Amusement Park",
     popupContent: "Wildwood Amusement Park",
     htmlFile: "/markers/mahtomedi/mah_wildwood.html"
+  },
+    {
+    lat: 44.985500012634446,
+    lng:   -93.26562138020033,
+    name: "Grain Belt Beer Sign",
+    popupContent: "Grain Belt Beer Sign",
+    htmlFile: "/markers/mpls/mpls_grain_belt.html"
   }
 ];
