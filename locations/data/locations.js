@@ -139,8 +139,8 @@ var locations = [
   },
         {
     name: "Wildwood Amusement Park",
-    lat: 45.05721674642659,
-    lon: -92.95891026289415,
+    lat: 45.05648381562563,
+    lon: -92.96040208835049,
     image: "https://www.mnthen.com/locations/gallery/mahtomedi/wildwood/wildwood_1.jpg",
     title: "Wildwood Amusement Park",
     creator: "Matt Reicher",
