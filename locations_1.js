@@ -112,8 +112,8 @@ var locations = [
     htmlFile: "/tour/wbl/wbl_mounds.html"
   },
   {
-    lat: 45.05721674642659,
-    lng:   -92.95891026289415,
+    lat: 45.05648381562563,
+    lng:   -92.96040208835049,
     name: "Wildwood Amusement Park",
     popupContent: "Wildwood Amusement Park",
     htmlFile: "/markers/mahtomedi/mah_wildwood.html"
