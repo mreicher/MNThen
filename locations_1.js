@@ -1,0 +1,207 @@
+// locations.js
+const locations = [
+  {
+    name: "Minnesota 13 Whiskey",
+    lat: 44.96244516,
+    lng: -93.07088783,
+    image: "https://www.mnthen.com/tour/hamm/gallery/mn13/hamm_ms13_1.jpg",
+    title: "Minnesota 13",
+    creator: "Matt Reicher",
+    htmlFile: "/tour/hamm/hamm_mn13.html",
+    link: "https://original.newsbreak.com/@ron-dansley-1587459/3039852975572-moonshine-legacy-the-story-of-minnesota-13-and-stearns-county-s-bootlegging-era" // Replace with the actual URL of the article
+  },
+   {
+    name: "Swede Hollow",
+    lat: 44.96147364579489,
+    lng: -93.07331340101548,
+    image: "https://www.mnthen.com/tour/hamm/gallery/hollow/hamm_hollow1.jpg",
+    title: "Swede Hollow",
+    creator: "Matt Reicher",
+        htmlFile: "/tour/hamm/hamm_hollow.html",
+    link: "https://original.newsbreak.com/@ron-dansley-1587459/2905067413178-swede-hollow"
+  },
+  //fix these
+   {
+    name: "Hamm Jr. Kidnapping (1933)",
+    lat: 44.9620906324505,
+    lng: -93.0710358080048,
+     image: "https://www.mnthen.com/tour/hamm/gallery/kidnap/hamm_kidnap1.jpg",
+    title: "Hamm Jr. Kidnapping",
+    creator: "Matt Reicher",
+        htmlFile: "/tour/hamm/hamm_kidnap.html",
+    link: "https://vocal.media/criminal/kidnapping-of-hamm-s-brewery-president-william-hamm-jr-june-15-19-1933"
+  },
+      {
+    name: "Closing of Stroh Brewery (1997)",
+    lat: 44.9626001898243,
+     lng: -93.07036032373,
+      image: "https://www.mnthen.com/tour/hamm/gallery/closing/hamm_closing1.jpg",
+    title: "Closing of the Stroh Brewery",
+    creator: "Matt Reicher",
+        htmlFile: "/tour/hamm/hamm_closing.html",
+    link: "https://original.newsbreak.com/@ron-dansley-1587459/2922345876111-closing-of-east-st-paul-s-stroh-hamm-s-brewery-november-21-1997"
+  },
+    {
+    name: "The Iconic Hamm's Bear (1953 - 99)",
+    lat: 44.96231983329402,
+     lng: -93.07176137488261,
+      image: "https://www.mnthen.com/tour/hamm/gallery/bear/hamm_bear1.jpg",
+    title: "Hamm's Bear",
+    creator: "Matt Reicher",
+      htmlFile: "/tour/hamm/hamm_bear.html",
+    link: "https://original.newsbreak.com/@ron-dansley-1587459/2918808919766-the-story-of-the-iconic-hamm-s-bear-1953-1999"
+  },          
+  {
+    name: "'New' Hamm's Brewery Public Tour (1894)",
+    lat: 44.96292536959989,
+     lng:  -93.07205849805618,
+      image: "https://www.mnthen.com/tour/hamm/gallery/public/hamm_public1.jpg",
+     title: "Hamm's Brewery Tour",
+     creator: "Matt Reicher",
+       htmlFile: "/tour/hamm/hamm_tour.html",
+    link: "https://original.newsbreak.com/@ron-dansley-1587459/2928741186662-public-tour-of-the-new-hamm-s-brewery-september-27-1894"
+  },
+    {
+    name: "Theodore Hamm Mansion (1886 - 1954)",
+    lat: 44.961337319371076,
+    lng:  -93.07148153924896,
+     image: "https://www.mnthen.com/tour/hamm/gallery/mansion/hamm_mansion1.jpg",
+     title: "Theodore Hamm Mansion",
+     creator: "Matt Reicher",
+         htmlFile: "/tour/hamm/hamm_mansion.html",
+    link: "https://original.newsbreak.com/@ron-dansley-1587459/2899577700997-theodore-hamm-mansion-c-1886-1954"
+  },
+      {
+    name: "Stahlmann Brewery (1855 - 97)",
+    lat: 44.928296016597855,
+     lng:   -93.12476627530773,
+      image: "https://img.particlenews.com/image.php?type=thumbnail_580x000&url=1VFflC_0mkCicPj00",
+     title: "Stahlmann Brewery",
+     creator: "Matt Reicher",
+         htmlFile: "/tour/ftrd/ftrd_stahl.html",
+    link: "https://original.newsbreak.com/@ron-dansley-1587459/3046980377052-the-legacy-lives-on-uncovering-the-little-known-story-of-christopher-stahlmann-s-brewing-empire"
+  },
+  {
+    name: "Scandal at John's Bar (1952 - 56)",
+    lat: 45.013359183182786,
+     lng:  -93.27190590645603,
+      image: "https://img.particlenews.com/image.php?type=thumbnail_580x000&url=2hntzQ_0mivQGBS00",
+     title: "Scandal at John's Bar (1952 - 56)",
+     creator: "Matt Reicher",
+         htmlFile: "/tour/NE/NE_johnsbar.html",
+    link: "https://original.newsbreak.com/@ron-dansley-1587459/3045699798148-unveiling-the-secrets-of-john-s-bar-and-funhouse-a-scandalous-tale-of-corruption-in-1950s-minneapolis"
+  },
+    {
+    name: "Bruce Vento (1940 - 2000)",
+    lat: 44.95270480002584,
+     lng:   -93.07440808976824,
+      image: "https://img.particlenews.com/image.php?type=thumbnail_580x000&url=4Mv2y5_0mmgW4bE00",
+     title: "Bruce Vento (1940 - 2000)",
+     creator: "Matt Reicher",
+         htmlFile: "/tour/STP/STP_Vento.html",
+    link: "https://original.newsbreak.com/@ron-dansley-1587459/3049434704183-prominent-politician-and-advocate-bruce-f-vento-s-enduring-legacy-of-social-justice-and-environmental-conservation"
+  },
+  {
+    name: "Plantation Night Club (1930 - 1933)",
+    lat: 45.073692373690626,
+    lng:  -93.01483408611226,
+    image: "https://www.mnthen.com/tour/wbl/gallery/plant/wbl_plant1.jpg",
+    title: "Plantation Night Club",
+    creator: "Matt Reicher",
+        htmlFile: "/tour/wbl/wbl_plant.html",
+    link: "https://original.newsbreak.com/@ron-dansley-1587459/3078633820088-lion-s-park-a-remembrance-of-white-bear-lake-s-legendary-plantation-night-club"
+  },
+    {
+    name: "The Geist Gazebo",
+    lat: 45.08605100639051,
+    lng:  -92.9996527864558,
+    image: "https://www.mnthen.com/tour/wbl/gallery/geist/geist_2.jpg",
+    title: "The Geist Gazebo",
+    creator: "Matt Reicher",
+        htmlFile: "/tour/wbl/wbl_geist.html",
+    link: "https://original.newsbreak.com/@ron-dansley-1587459/3077047712038-matoska-park-s-living-history-the-geist-gazebo-and-its-storied-past"
+  },
+      {
+    name: "Hubert H. Humphrey (1911 - 1978)",
+    lat: 44.95325804566806,
+    lng:  -93.1032296122576,
+    image: "https://www.mnthen.com/tour/capitol/gallery/humphrey/humphrey_3.jpg",
+    title: "Hubert H. Humphrey (1911 - 1978)",
+    creator: "Matt Reicher",
+       htmlFile: "/tour/capitol/capitol_humphrey.html",
+    link: "https://mnthen.com/blog/people/humphrey.html"
+  },
+        {
+    name: "Floyd B. Olson (1891 - 1936)",
+    lat: 44.95439155818203,
+    lng:  -93.10349447696363,
+    image: "https://www.mnthen.com/tour/capitol/gallery/olson/olson_2.jpg",
+    title: "Floyd B. Olson (1891 - 1936)",
+    creator: "Matt Reicher",
+      htmlFile: "/tour/capitol/capitol_olson.html",
+    link: "https://mnthen.com/blog/people/olson.html"
+  },
+    {
+    name: "WBL Burial Mounds",
+    lat: 45.07970650298757,
+    lng:  -93.01208914876786,
+    image: "https://www.mnthen.com/tour/wbl/gallery/mound/wbl_mound1.jpg",
+    title: "WBL Burial Mounds",
+    creator: "Matt Reicher",
+        htmlFile: "/tour/wbl/wbl_mounds.html",
+    link: "https://mnthen.com/blog/place/wbl_mounds.html"
+  },
+        {
+    name: "Wildwood Amusement Park",
+    lat: 45.05648381562563,
+    lng: -92.96040208835049,
+    image: "https://www.mnthen.com/locations/gallery/mahtomedi/wildwood/wildwood_1.jpg",
+    title: "Wildwood Amusement Park",
+    creator: "Matt Reicher",
+     htmlFile: "/markers/mahtomedi/mah_wildwood.html",
+    link: "https://mnthen.com/blog/places/wildwood.html"
+  },
+  {
+    name: "Grain Belt Beer Sign",
+    lat: 44.985500012634446,
+    lng: -93.26562138020033,
+    image: "https://www.mnthen.com/locations/gallery/mpls/premium/mpls_grain_belt_3.jpg",
+    title: "Grain Belt Beer Sign",
+    creator: "Matt Reicher",
+      htmlFile: "/markers/mpls/mpls_grain_belt.html",
+    link: "https://mnthen.com/blog/places/mpls_grain_belt.html"
+  },
+    {
+    name: "Father Hennepin Suspension Bridge",
+    lat: 44.98463074655949,
+    lng: -93.26445659478223,
+    image: "https://www.mnthen.com/locations/gallery/mpls/henn_bridge/henn_bridge_1.jpg",
+    title: "Father Hennepin Suspension Bridge",
+    creator: "Matt Reicher",
+        htmlFile: "/markers/mpls/mpls_henn_bridge.html",
+    link: "https://www.mnopedia.org/structure/father-louis-hennepin-suspension-bridge"
+  },
+  {
+    name: "Gramma B’s (1979 - 1984)",
+    lat: 45.00748720292698,
+    lng: -93.27185181388745,
+    image: "https://www.mnthen.com/locations/gallery/mpls/gramma_b/mpls_gramma_b_1.jpg",
+    title: "Gramma B’s (1979 - 1984)",
+    creator: "Matt Reicher",
+        htmlFile: "/markers/mpls/mpls_gramma_b.html",
+    link: "https://www.mnthen.com/blog/place/mpls_gramma_b.html"
+  },
+  {
+    name: "Charlotte Ouisconsin Clark Van Cleve",
+    lat: 44.986612630415564,
+    lng: -93.23121494980424,
+    image: "https://www.mnthen.com/locations/gallery/mpls/mpls_van_cleve/mpls_van_cleve_1.jpg",
+    title: "Charlotte Ouisconsin Clark Van Cleve (1819–1907)",
+    creator: "Matt Reicher",
+      htmlFile: "/markers/mpls/mpls_van_cleve.html",
+    link: "https://www.mnopedia.org/person/van-cleve-charlotte-ouisconsin-clark-1819-1907"
+  },
+
+  // Add more locations here
+];
+
