@@ -187,7 +187,7 @@ var locations = [
     lat: 44.955601674534925,
     lon: -93.10899976598101,
     image: "https://www.mnthen.com/images/van_meter_header.jpg",
-    title: "The Death of Gangster Homer Van Meter (Aug 23, 1934)",
+    title: "The Demise of Homer Van Meter (Aug 23, 1934)",
     creator: "Matt Reicher",
     link: "https://mnthen.com/blog/people/van_meter.html"
   },
