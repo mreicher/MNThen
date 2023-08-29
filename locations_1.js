@@ -201,6 +201,16 @@ const locations = [
       htmlFile: "/markers/mpls/mpls_van_cleve.html",
     link: "https://www.mnopedia.org/person/van-cleve-charlotte-ouisconsin-clark-1819-1907"
   },
+  {
+    name: "The Last Moments of Homer Van Meter",
+    lat: 44.955601674534925,
+    lng: -93.10899976598101,
+    image: "https://www.mnthen.com/images/van_meter_header.jpg",
+    title: "The Death of Gangster Homer Van Meter (Aug 23, 1934)",
+    creator: "Matt Reicher",
+      htmlFile: "/tour/gangster/gangster_van_meter.html",
+    link: "https://mnthen.com/blog/people/van_meter.html"
+  },
 
   // Add more locations here
 ];
