@@ -211,6 +211,16 @@ const locations = [
       htmlFile: "/tour/gangster/gangster_van_meter.html",
     link: "https://mnthen.com/blog/people/van_meter.html"
   },
+      {
+    name: "The Kidnapping of Edward Bremer (Jan 17 - Feb 7, 1934)",
+    lat: 44.93780553154248,
+    lng: -93.14673954572167,
+    image: "https://www.mnthen.com/images/gangster_bremer_kidnap1.jpg",
+    title: "The Kidnapping of Edward Bremer (Jan 17 - Feb 7, 1934)",
+    creator: "Matt Reicher",
+    htmlFile: "/tour/gangster/gangster_bremer_kidnap.html",
+    link: "https://mnthen.com/blog/event/bremer_kidnap.html"
+  },
 
   // Add more locations here
 ];
