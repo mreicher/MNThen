@@ -2,8 +2,8 @@
 const locations = [
   {
     name: "Minnesota 13 Whiskey",
-    lat: 44.96244516,
-    lng: -93.07088783,
+    lat: 44.962424618820044,
+    lng: -93.07096147711366,
     image: "https://www.mnthen.com/tour/hamm/gallery/mn13/hamm_ms13_1.jpg",
     title: "Minnesota 13",
     creator: "Matt Reicher",
