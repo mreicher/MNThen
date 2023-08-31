@@ -130,8 +130,8 @@ var locations = [
   },
     {
     name: "WBL Burial Mounds",
-    lat: 45.07970650298757,
-    lon:  -93.01208914876786,
+    lat:  45.079743218622916,
+    lon:  -93.01197856934648,
     image: "https://www.mnthen.com/tour/wbl/gallery/mound/wbl_mound1.jpg",
     title: "WBL Burial Mounds",
     creator: "Matt Reicher",
