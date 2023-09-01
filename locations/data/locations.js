@@ -31,8 +31,8 @@ var locations = [
   },
       {
     name: "Closing of Stroh Brewery (1997)",
-    lat: 44.9626001898243,
-     lon: -93.07036032373,
+    lat: 44.96294524306296,
+     lon: -93.07009994914725,
       image: "https://www.mnthen.com/tour/hamm/gallery/closing/hamm_closing1.jpg",
     title: "Closing of the Stroh Brewery",
     creator: "Matt Reicher",
