@@ -25,7 +25,7 @@ const locations = [
     lat: 44.9620906324505,
     lng: -93.0710358080048,
      image: "https://www.mnthen.com/tour/hamm/gallery/kidnap/hamm_kidnap1.jpg",
-    title: "Hamm Jr. Kidnapping",
+    title: "Hamm Jr. Kidnapping (June 15-19, 1933)",
     creator: "Matt Reicher",
         htmlFile: "/tour/hamm/hamm_kidnap.html",
     link: "https://vocal.media/criminal/kidnapping-of-hamm-s-brewery-president-william-hamm-jr-june-15-19-1933"
@@ -201,24 +201,34 @@ const locations = [
     link: "https://www.mnopedia.org/person/van-cleve-charlotte-ouisconsin-clark-1819-1907"
   },
   {
-    name: "The Last Moments of Homer Van Meter",
+    name: "Last Moments of Homer Van Meter",
     lat: 44.955601674534925,
     lng: -93.10899976598101,
     image: "https://www.mnthen.com/images/van_meter_header.jpg",
-    title: "The Death of Gangster Homer Van Meter (Aug 23, 1934)",
+    title: "Death of Gangster Homer Van Meter (Aug 23, 1934)",
     creator: "Matt Reicher",
       htmlFile: "/tour/gangster/gangster_van_meter.html",
     link: "https://mnthen.com/blog/people/van_meter.html"
   },
       {
-    name: "The Kidnapping of Edward Bremer (Jan 17 - Feb 7, 1934)",
+    name: "Kidnapping of Edward Bremer (Jan 17 - Feb 7, 1934)",
     lat: 44.93780553154248,
     lng: -93.14673954572167,
     image: "https://www.mnthen.com/images/gangster_bremer_kidnap1.jpg",
-    title: "The Kidnapping of Edward Bremer (Jan 17 - Feb 7, 1934)",
+    title: "Kidnapping of Edward Bremer (Jan 17 - Feb 7, 1934)",
     creator: "Matt Reicher",
     htmlFile: "/tour/gangster/gangster_bremer_kidnap.html",
     link: "https://mnthen.com/blog/event/bremer_kidnap.html"
+  },
+    {
+    name: "Shootout at Lincoln Court Apartments (March 31, 1934)",
+    lat: 44.93780553154248,
+    lng: -93.14673954572167,
+    image: "https://www.mnthen.com/images/gangster/gangster_lincoln_ct.jpg",
+    title: "Shootout at Lincoln Court Apartments (March 31, 1934)",
+    creator: "Matt Reicher",
+    htmlFile: "/tour/gangster/gangster_lincoln_ct.html",
+    link: "https://mnthen.com/blog/event/shootout_lincoln_ct.html"
   },
 
   // Add more locations here
