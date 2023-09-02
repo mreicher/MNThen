@@ -31,24 +31,34 @@ const locations = [
     link: "https://original.newsbreak.com/@ron-dansley-1587459/3078633820088-lion-s-park-a-remembrance-of-white-bear-lake-s-legendary-plantation-night-club"
   },
   {
-    name: "The Last Moments of Homer Van Meter",
+    name: "Last Moments of Homer Van Meter",
     lat: 44.955601674534925,
     lng: -93.10899976598101,
     image: "https://www.mnthen.com/images/van_meter_header.jpg",
-    title: "The Death of Gangster Homer Van Meter (Aug 23, 1934)",
+    title: "Death of Gangster Homer Van Meter (Aug 23, 1934)",
     creator: "Matt Reicher",
     htmlFile: "/tour/gangster/gangster_van_meter.html",
     link: "https://mnthen.com/blog/people/van_meter.html"
   },
       {
-    name: "The Kidnapping of Edward Bremer (Jan 17 - Feb 7, 1934)",
+    name: "Kidnapping of Edward Bremer (Jan 17 - Feb 7, 1934)",
     lat: 44.93780553154248,
     lng: -93.14673954572167,
     image: "https://www.mnthen.com/images/gangster_bremer_kidnap1.jpg",
-    title: "The Kidnapping of Edward Bremer (Jan 17 - Feb 7, 1934)",
+    title: "Kidnapping of Edward Bremer (Jan 17 - Feb 7, 1934)",
     creator: "Matt Reicher",
     htmlFile: "/tour/gangster/gangster_bremer_kidnap.html",
     link: "https://mnthen.com/blog/event/bremer_kidnap.html"
+  },
+  {
+    name: "Shootout at Lincoln Court Apartments (March 31, 1934)",
+    lat: 44.93780553154248,
+    lng: -93.14673954572167,
+    image: "https://www.mnthen.com/images/gangster/gangster_lincoln_ct.jpg",
+    title: "Shootout at Lincoln Court Apartments (March 31, 1934)",
+    creator: "Matt Reicher",
+    htmlFile: "/tour/gangster/gangster_lincoln_ct.html",
+    link: "https://mnthen.com/blog/event/shootout_lincoln_ct.html"
   },
 
   // Add more locations here
