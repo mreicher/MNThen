@@ -222,8 +222,8 @@ const locations = [
   },
     {
     name: "Shootout at Lincoln Court Apartments (March 31, 1934)",
-    lat: 44.93780553154248,
-    lng: -93.14673954572167,
+    lat: 44.93862937714858,
+    lng: -93.14674392038688,
     image: "https://www.mnthen.com/images/gangster/gangster_lincoln_ct.jpg",
     title: "Shootout at Lincoln Court Apartments (March 31, 1934)",
     creator: "Matt Reicher",
