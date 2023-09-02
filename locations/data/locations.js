@@ -199,6 +199,15 @@ var locations = [
     creator: "Matt Reicher",
     link: "https://mnthen.com/blog/event/bremer_kidnap.html"
   },
+   {
+    name: "Shootout at Lincoln Court Apartments (March 31, 1934)",
+    lat: 44.93780553154248,
+    lon: -93.14673954572167,
+    image: "https://www.mnthen.com/images/gangster/gangster_lincoln_ct.jpg",
+    title: "Shootout at Lincoln Court Apartments (March 31, 1934)",
+    creator: "Matt Reicher",
+    link: "https://mnthen.com/blog/event/shootout_lincoln_ct.html"
+  },
 
   // Add more locations here
 ];
