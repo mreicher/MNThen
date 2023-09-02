@@ -20,9 +20,8 @@ const locations = [
         htmlFile: "/tour/hamm/hamm_hollow.html",
     link: "https://original.newsbreak.com/@ron-dansley-1587459/2905067413178-swede-hollow"
   },
-  //fix these
    {
-    name: "Hamm Jr. Kidnapping (1933)",
+    name: "Hamm Jr. Kidnapping (June 15-19, 1933)",
     lat: 44.9620906324505,
     lng: -93.0710358080048,
      image: "https://www.mnthen.com/tour/hamm/gallery/kidnap/hamm_kidnap1.jpg",
