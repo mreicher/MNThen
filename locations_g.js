@@ -11,7 +11,7 @@ const locations = [
     link: "https://original.newsbreak.com/@ron-dansley-1587459/3039852975572-moonshine-legacy-the-story-of-minnesota-13-and-stearns-county-s-bootlegging-era" // Replace with the actual URL of the article
   },
    {
-    name: "Hamm Jr. Kidnapping (1933)",
+    name: "Hamm Jr. Kidnapping (June 15-19, 1933)",
     lat: 44.9620906324505,
     lng: -93.0710358080048,
     image: "https://www.mnthen.com/tour/hamm/gallery/kidnap/hamm_kidnap1.jpg",
