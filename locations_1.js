@@ -230,6 +230,16 @@ const locations = [
     htmlFile: "/tour/gangster/gangster_lincoln_ct.html",
     link: "https://mnthen.com/blog/event/shootout_lincoln_ct.html"
   },
+        {
+    name: "Michael 'Eyedea' Larsen (1981 - 2010)",
+    lat: 44.922167523742054,
+    lng: -93.10991227113067,
+    image: "https://www.mnthen.com/images/eyedea.jpg",
+    title: "Michael 'Eyedea' Larsen (1981 - 2010)",
+    creator: "Matt Reicher",
+      htmlFile: "/markers/wsp/wsp_eyedea.html",
+    link: "https://mnthen.com/blog/people/eyedea_larsen.html"
+  },
 
   // Add more locations here
 ];
