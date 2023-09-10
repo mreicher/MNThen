@@ -234,7 +234,7 @@ const locations = [
     name: "Michael 'Eyedea' Larsen (1981 - 2010)",
     lat: 44.922167523742054,
     lng: -93.10991227113067,
-    image: "https://www.mnthen.com/images/eyedea.jpg",
+    image: "https://www.mnthen.com/images/wsp_eyedea.jpg",
     title: "Michael 'Eyedea' Larsen (1981 - 2010)",
     creator: "Matt Reicher",
       htmlFile: "/markers/wsp/wsp_eyedea.html",
