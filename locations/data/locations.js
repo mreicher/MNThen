@@ -208,6 +208,15 @@ var locations = [
     creator: "Matt Reicher",
     link: "https://mnthen.com/blog/event/shootout_lincoln_ct.html"
   },
+            {
+    name: "Michael 'Eyedea' Larsen (1981 - 2010)",
+    lat: 44.922167523742054,
+    lon: -93.10991227113067,
+    image: "https://www.mnthen.com/images/eyedea.jpg",
+    title: "Michael 'Eyedea' Larsen (1981 - 2010)",
+    creator: "Matt Reicher",
+    link: "https://mnthen.com/blog/people/eyedea_larsen.html"
+  },
 
   // Add more locations here
 ];
