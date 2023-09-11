@@ -68,9 +68,9 @@ var locations = [
     name: "Stahlmann Brewery (1855 - 97)",
     lat: 44.92834574749703,
     lon: -93.12531650959622,
-      image: "https://img.particlenews.com/image.php?type=thumbnail_580x000&url=1VFflC_0mkCicPj00",
-     title: "Stahlmann Brewery",
-     creator: "Matt Reicher",
+    image: "https://www.mnthen.com/tour/ftrd/gallery/ftrd_stahl1.jpg",
+    title: "Stahlmann Brewery",
+    creator: "Matt Reicher",
     link: "https://original.newsbreak.com/@ron-dansley-1587459/3046980377052-the-legacy-lives-on-uncovering-the-little-known-story-of-christopher-stahlmann-s-brewing-empire"
   },
   {
