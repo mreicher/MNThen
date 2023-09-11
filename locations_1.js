@@ -72,8 +72,8 @@ const locations = [
   },
       {
     name: "Stahlmann Brewery (1855 - 97)",
-    lat: 44.928296016597855,
-     lng:   -93.12476627530773,
+    lat: 44.92834574749703,
+    lng: -93.12531650959622,
       image: "https://img.particlenews.com/image.php?type=thumbnail_580x000&url=1VFflC_0mkCicPj00",
      title: "Stahlmann Brewery",
      creator: "Matt Reicher",
