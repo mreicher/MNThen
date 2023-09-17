@@ -158,7 +158,7 @@ const locations = [
     title: "Wildwood Amusement Park",
     creator: "Matt Reicher",
      htmlFile: "/markers/mahtomedi/mah_wildwood.html",
-    link: "https://mnthen.com/blog/places/wildwood.html"
+    link: "https://mnthen.com/blog/place/wildwood.html"
   },
   {
     name: "Grain Belt Beer Sign",
@@ -168,7 +168,7 @@ const locations = [
     title: "Grain Belt Beer Sign",
     creator: "Matt Reicher",
       htmlFile: "/markers/mpls/mpls_grain_belt.html",
-    link: "https://mnthen.com/blog/places/mpls_grain_belt.html"
+    link: "https://mnthen.com/blog/place/mpls_grain_belt.html"
   },
     {
     name: "Father Hennepin Suspension Bridge",
