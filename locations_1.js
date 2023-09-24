@@ -30,7 +30,7 @@ const locations = [
     title: "Hamm Jr. Kidnapping (June 15-19, 1933)",
     creator: "Matt Reicher",
     htmlFile: "/tour/hamm/hamm_kidnap.html",
-    tour: "hamm",
+    tour: "split",
     link: "https://vocal.media/criminal/kidnapping-of-hamm-s-brewery-president-william-hamm-jr-june-15-19-1933"
   },
       {
