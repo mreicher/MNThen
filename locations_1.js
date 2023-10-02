@@ -118,7 +118,7 @@ const locations = [
     title: "Plantation Night Club",
     creator: "Matt Reicher",
     htmlFile: "/tour/wbl/wbl_plant.html",
-    tour: "gangster",
+    tour: "wbl_split",
     link: "https://original.newsbreak.com/@ron-dansley-1587459/3078633820088-lion-s-park-a-remembrance-of-white-bear-lake-s-legendary-plantation-night-club"
   },
     {
