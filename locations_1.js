@@ -271,9 +271,9 @@ const locations = [
     image: "https://www.mnthen.com/markers/mankato/images/mankato_38.jpg",
     title: "Hanging of the Dakota 38 (Dec. 26, 1862)",
     creator: "Matt Reicher",
-    htmlFile: "/markers/mankato/man_dakota_36.html",
+    htmlFile: "https://www.mnthen.com/markers/mankato/man_dakota_36.html",
     tour: "history",
-    link: "https://original.newsbreak.com/@ron-dansley-1587459/3091006771631-the-tragic-end-of-the-us-dakota-war-remembering-the-largest-mass-hanging-in-american-history" // Replace with the actual URL of the article
+    link: "https://www.mnthen.com/blog/event/dakota_war.html" // Replace with the actual URL of the article
   },
 
   // Add more locations here
