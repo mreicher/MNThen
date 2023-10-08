@@ -275,6 +275,17 @@ const locations = [
     tour: "history",
     link: "https://www.mnthen.com/blog/event/dakota_war.html" // Replace with the actual URL of the article
   },
+    {
+    name: "Summit Brewing Company (1986 - )",
+    lat: 44.91347102967256,
+    lng: -93.13990153531473,
+    image: "https://www.mnthen.com/markers/stp/summit/images/stp_summit_1.jpg",
+    title: "Summit Brewing Company (1986 - )",
+    creator: "Matt Reicher",
+    htmlFile: "https://mnthen.com/markers/stp/summit/stp_summit_brewing.html",
+    tour: "history",
+    link: "https://www.mnthen.com/blog/place/stp_summit_brewing.html" // Replace with the actual URL of the article
+  },
 
   // Add more locations here
 ];
