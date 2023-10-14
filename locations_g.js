@@ -8,6 +8,7 @@ const locations = [
     title: "Minnesota 13",
     creator: "Matt Reicher",
     htmlFile: "/tour/hamm/hamm_mn13.html",
+    order: 1,
     link: "https://original.newsbreak.com/@ron-dansley-1587459/3039852975572-moonshine-legacy-the-story-of-minnesota-13-and-stearns-county-s-bootlegging-era" // Replace with the actual URL of the article
   },
    {
@@ -18,6 +19,7 @@ const locations = [
     title: "Hamm Jr. Kidnapping",
     creator: "Matt Reicher",
     htmlFile: "/tour/hamm/hamm_kidnap.html",
+    order: 2,
     link: "https://vocal.media/criminal/kidnapping-of-hamm-s-brewery-president-william-hamm-jr-june-15-19-1933"
   },
   {
@@ -28,6 +30,7 @@ const locations = [
     title: "Plantation Night Club",
     creator: "Matt Reicher",
     htmlFile: "/tour/wbl/wbl_plant.html",
+    order: 3,
     link: "https://original.newsbreak.com/@ron-dansley-1587459/3078633820088-lion-s-park-a-remembrance-of-white-bear-lake-s-legendary-plantation-night-club"
   },
   {
@@ -38,6 +41,7 @@ const locations = [
     title: "Death of Gangster Homer Van Meter (Aug 23, 1934)",
     creator: "Matt Reicher",
     htmlFile: "/tour/gangster/gangster_van_meter.html",
+    order: 4,
     link: "https://mnthen.com/blog/people/van_meter.html"
   },
       {
@@ -48,6 +52,7 @@ const locations = [
     title: "Kidnapping of Edward Bremer (Jan 17 - Feb 7, 1934)",
     creator: "Matt Reicher",
     htmlFile: "/tour/gangster/gangster_bremer_kidnap.html",
+    order: 5,
     link: "https://mnthen.com/blog/event/bremer_kidnap.html"
   },
   {
@@ -58,6 +63,7 @@ const locations = [
     title: "Shootout at Lincoln Court Apartments (March 31, 1934)",
     creator: "Matt Reicher",
     htmlFile: "/tour/gangster/gangster_lincoln_ct.html",
+    order: 6,
     link: "https://mnthen.com/blog/event/shootout_lincoln_ct.html"
   },
 
