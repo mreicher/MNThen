@@ -28,8 +28,8 @@ function getTourCards() {
             categories: ["History", "Architecture"],
     },
     {
-      title: "Shooting of Christmas Wreath Salesman Oscar Erickson (Dec. 16, 1932)",
-      summary: "Innocent wreath salesman Oscar Erickson was killed by the Barker-Karpis gang during a robbery getaway, fueling calls to end the era of brazen criminals terrorizing citizens.",
+      title: "Shooting of Wreath Salesman Oscar Erickson (Dec. 16, 1932)",
+      summary: "Oscar Erickson was killed by the Barker-Karpis gang during a robbery getaway, fueling calls to end the era of brazen criminals terrorizing citizens.",
             creator: "Matt Reicher",
       image: "https://mnthen.com/images/erickson.jpg",
       link: "https://mnthen.com/blog/people/erickson.html",
