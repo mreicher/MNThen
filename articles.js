@@ -18,9 +18,9 @@ function getTourCards() {
       keywords: ["dakota", "war", "mankato", "sibley"],
             categories: ["History", "Architecture"],
     },
-        {
+    {
       title: "Shootout at the Lincoln Court Apartments (March 31, 1934)",
-      summary: "Dillinger and Van Meter engaged in a gun battle with police at St. Paul's Lincoln Court Apartments, galvanizing the public against gangster violence plaguing the city.",
+      summary: "John Dillinger and Homer Van Meter engaged in a gun battle with police at St. Paul's Lincoln Court Apartments, galvanizing the public against gangster violence plaguing the city.",
             creator: "Matt Reicher",
       image: "https://mnthen.com/images/gangster/gangster_lincoln_ct.jpg",
       link: "https://mnthen.com/blog/event/shootout_lincoln_ct.html",
@@ -36,7 +36,7 @@ function getTourCards() {
       keywords: ["gangster", "barker", "karpis", "shooting"],
             categories: ["History", "Architecture"],
     },
-        {
+    {
       title: "Larsen, Michael 'Eyedea' (Nov 9, 1981 - Oct 16, 2010)",
       summary: "Gifted battle rapper and versatile hip-hop artist Eyedea left a profound musical impact despite a tragic accidental overdose death at 28.",
             creator: "Matt Reicher",
@@ -54,7 +54,7 @@ function getTourCards() {
       keywords: ["humphrey", "Humphrey", "politics", "minneapolis", "Minneapolis"],
             categories: ["History", "Architecture"],
     },
-        {
+    {
       title: "Olson, Floyd B. (1891 - 1936)",
       summary: "Floyd B. Olson, Minnesota's 22nd Governor, left a profound legacy with his unwavering commitment to social justice, labor rights, and economic reforms during the Great Depression. ",
             creator: "Matt Reicher",
@@ -63,7 +63,7 @@ function getTourCards() {
       keywords: ["politics", "govenor", "olson", "Olson"],
             categories: ["History", "Architecture"],
     },
-        {
+    {
       title: "Van Meter, Homer V. (1905 - 1934)",
       summary: "Van Meter, an infamous Depression-era gangster, met his violent end in a disputed encounter with St. Paul police on August 23, 1934, near University Ave. and Marion St.",
             creator: "Matt Reicher",
@@ -81,17 +81,17 @@ function getTourCards() {
       keywords: ["premium", "grain belt", "sign", "minneapolis", "Minneapolis", "beer"],
             categories: ["History", "Architecture"],
     },
-            {
+    {
       title: "Gramma B's",
-      summary: "Floyd B. Olson, Minnesota's 22nd Governor, left a profound legacy with his unwavering commitment to social justice, labor rights, and economic reforms during the Great Depression. ",
+      summary: "Gramma B's, a raucous Northeast Minneapolis bar from 1979-1984, attracted bikers and employed bouncers who became famous wrestlers before neighbor complaints eventually helped force its closure.",
             creator: "Matt Reicher",
       image: "https://mnthen.com/locations/gallery/mpls/gramma_b/mpls_gramma_b_1.jpg",
       link: "https://mnthen.com/blog/place/mpls_gramma_b.html",
       keywords: ["northeast", "Northeast", "Minneapolis", "saloon", "bar"],
             categories: ["History", "Architecture"],
     },
-        {
-      title: "Summit Brewing Company (1986 - )",
+    {
+      title: "Summit Brewing (1986 - )",
       summary: "Founded by Mark Stutrud, Summit grew from a small brewery focusing on underrepresented beer styles to one of Minnesota's largest breweries.",
             creator: "Matt Reicher",
       image: "https://mnthen.com/markers/stp/summit/images/stp_summit_1.jpg",
@@ -101,14 +101,14 @@ function getTourCards() {
     },
     {
       title: "Native American Burial Mounds (White Bear Lake)",
-      summary: "In 1941, the iconic Grain Belt Beer sign, a giant bottle cap, was erected in Minneapolis. It went dark in 1996 but was relit in 2017 after restoration efforts.",
+      summary: "Centuries of Native American history in White Bear Lake area erased in 1889 as sacred burial mounds were demolished to accommodate expanding European settlement.",
             creator: "Matt Reicher",
       image: "https://mnthen.com/tour/wbl/gallery/mound/wbl_mound1.jpg",
       link: "https://mnthen.com/blog/place/wbl_mounds.html",
       keywords: ["burial", "mounds", "bear", "Bear", "lake"],
             categories: ["History", "Architecture"],
     },
-        {
+    {
       title: "Wildwood Amusement Park",
       summary: "Wildwood Amusement Park on White Bear Lake, the 'Coney Island of Saint Paul,' entertained generations until financial woes forced its closure in the 1930s",
             creator: "Matt Reicher",
@@ -117,6 +117,7 @@ function getTourCards() {
       keywords: ["amusement", "park", "mahtomedi", "wildwood", "streetcar"],
             categories: ["History", "Architecture"],
     },
+    // Add more articles here
   ];
 }
 
@@ -160,7 +161,6 @@ function generateArticleCards() {
     const summary = document.createElement('p');
     summary.className = 'card-text recent-article-summary';
     summary.textContent = article.summary;
-
 
     const creator = document.createElement('p');
     creator.className = 'card-text';
