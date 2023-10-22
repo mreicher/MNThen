@@ -20,7 +20,7 @@ function getTourCards() {
     },
         {
       title: "Shootout at the Lincoln Court Apartments (March 31, 1934)",
-      summary: "Dillinger and Van Meter engaged in epic gun battle with police at Lincoln Court Apartments in St. Paul, galvanizing public sentiment against gangster violence plaguing the city.",
+      summary: "Dillinger and Van Meter engaged in a gun battle with police at St. Paul's Lincoln Court Apartments, galvanizing the public against gangster violence plaguing the city.",
             creator: "Matt Reicher",
       image: "https://mnthen.com/images/gangster/gangster_lincoln_ct.jpg",
       link: "https://mnthen.com/blog/event/shootout_lincoln_ct.html",
