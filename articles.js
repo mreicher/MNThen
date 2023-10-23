@@ -1,5 +1,14 @@
 function getTourCards() {
   return [
+        {
+      title: "Shooting of Roy McCord (Jan 13, 1934)",
+      summary: "Northwest Airways radio operator Roy McCord's near deadly run-in with the Barker-Karpis Gang in St. Paul was a turning point in the fight against gangsters.",
+      creator: "Matt Reicher",
+      image: "https://mnthen.com/images/gangster/mccord/stp_mccord_holly.jpg",
+      link: "https://mnthen.com/blog/event/stp_mccord_shooting.html",
+      keywords: ["bremer", "mccord", "shooting", "gangster"],
+            categories: ["History", "Architecture"],
+    },
     {
       title: "Kidnapping of Edward Bremer (Jan 17 - Feb 7, 1934)",
       summary: "Ed Bremer was kidnapped and held for ransom by the Barker-Karpis gang in 1934. His eventual release helped bring about the end of the gangster era.",
