@@ -9,6 +9,15 @@ function getTourCards() {
       keywords: ["bremer", "mccord", "shooting", "gangster"],
             categories: ["History", "Architecture"],
     },
+        {
+      title: "Death of 'Dapper' Dan Hogan (Dec 4, 1928)",
+      summary: "Dapper Dan Hogan, St. Paul's underworld ambassador, was killed by a car bomb after breakfast at home. His murderers were never identified.",
+      creator: "Matt Reicher",
+      image: "https://mnthen.com/images/gangster/hogan/stp_hogan.jpg",
+      link: "https://mnthen.com/blog/event/stp_hogan",
+      keywords: ["gangster", "layover", "bomb", "st paul"],
+            categories: ["History", "Architecture"],
+    },
     {
       title: "Kidnapping of Edward Bremer (Jan 17 - Feb 7, 1934)",
       summary: "Ed Bremer was kidnapped and held for ransom by the Barker-Karpis gang in 1934. His eventual release helped bring about the end of the gangster era.",
