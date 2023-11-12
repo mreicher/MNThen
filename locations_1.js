@@ -75,7 +75,7 @@ const locations = [
      creator: "Matt Reicher",
     htmlFile: "/tour/hamm/hamm_mansion.html",
     tour: "hamm",
-    link: "https://original.newsbreak.com/@ron-dansley-1587459/2899577700997-theodore-hamm-mansion-c-1886-1954"
+    link: "https://mnthen.com/blog/place/stp_hamm_mansion.html"
   },
       {
     name: "Stahlmann Brewery (1855 - 97)",
