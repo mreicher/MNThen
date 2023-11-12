@@ -1,5 +1,14 @@
 function getTourCards() {
   return [
+            {
+      title: "Theodore Hamm Mansion (c. 1886 - 1954)",
+      summary: "The Theodore Hamm mansion, perched above Swede Hollow, once a beacon of elegance, fell victim to fire in 1954, leaving a legacy preserved in Upper Swede Hollow Park.",
+      creator: "Matt Reicher",
+      image: "https://mnthen.com/tour/hamm/gallery/mansion/hamm_mansion5.jpg",
+      link: "https://mnthen.com/blog/event/stp_hamm_mansion.html",
+      keywords: ["hamm", "mansion", "Saint Paul", "gangster"],
+            categories: ["History", "Architecture"],
+    },
         {
       title: "Shooting of Roy McCord (Jan 13, 1934)",
       summary: "Northwest Airways radio operator Roy McCord's near deadly run-in with the Barker-Karpis Gang in St. Paul was a turning point in the fight against gangsters.",
