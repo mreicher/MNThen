@@ -5,7 +5,7 @@ function getTourCards() {
       summary: "The Theodore Hamm mansion, perched above Swede Hollow, once a beacon of elegance, fell victim to fire in 1954, leaving a legacy preserved in Upper Swede Hollow Park.",
       creator: "Matt Reicher",
       image: "https://mnthen.com/tour/hamm/gallery/mansion/hamm_mansion5.jpg",
-      link: "https://mnthen.com/blog/event/stp_hamm_mansion.html",
+      link: "https://mnthen.com/blog/place/stp_hamm_mansion.html",
       keywords: ["hamm", "mansion", "Saint Paul", "gangster"],
             categories: ["History", "Architecture"],
     },
