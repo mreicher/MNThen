@@ -18,9 +18,9 @@ const locations = [
     image: "https://www.mnthen.com/tour/hamm/gallery/hollow/hamm_hollow1.jpg",
     title: "Swede Hollow",
     creator: "Matt Reicher",
-    htmlFile: "/tour/hamm/hamm_hollow.html",
+    htmlFile: "https://mnthen.com/exhibit/locations/stp/swede_hollow.html",
     tour: "hamm",
-    link: "https://original.newsbreak.com/@ron-dansley-1587459/2905067413178-swede-hollow"
+    link: "https://www.mnopedia.org/place/swede-hollow"
   },
    {
     name: "Hamm Jr. Kidnapping (June 15-19, 1933)",
