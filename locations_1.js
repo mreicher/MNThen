@@ -1,16 +1,5 @@
 // locations.js
 const locations = [
-  {
-    name: "Minnesota 13 Whiskey",
-    lat: 44.962424618820044,
-    lng: -93.07096147711366,
-    image: "https://www.mnthen.com/tour/hamm/gallery/mn13/hamm_ms13_1.jpg",
-    title: "Minnesota 13",
-    creator: "Matt Reicher",
-    htmlFile: "/tour/hamm/hamm_mn13.html",
-    tour: "history",
-    link: "https://original.newsbreak.com/@ron-dansley-1587459/3039852975572-moonshine-legacy-the-story-of-minnesota-13-and-stearns-county-s-bootlegging-era" // Replace with the actual URL of the article
-  },
    {
     name: "Swede Hollow",
     lat: 44.96147364579489,
@@ -187,17 +176,6 @@ const locations = [
     tour: "northeast",
     link: "https://mnthen.com/blog/place/mpls_grain_belt.html"
   },
-    {
-    name: "Father Hennepin Suspension Bridge",
-    lat: 44.98463074655949,
-    lng: -93.26445659478223,
-    image: "https://www.mnthen.com/locations/gallery/mpls/henn_bridge/henn_bridge_1.jpg",
-    title: "Father Hennepin Suspension Bridge",
-    creator: "Matt Reicher",
-    htmlFile: "/markers/mpls/mpls_henn_bridge.html",
-    tour: "history",
-    link: "https://www.mnopedia.org/structure/father-louis-hennepin-suspension-bridge"
-  },
   {
     name: "Gramma B’s (1979 - 1984)",
     lat: 45.00748720292698,
@@ -208,17 +186,6 @@ const locations = [
     htmlFile: "/markers/mpls/mpls_gramma_b.html",
     tour: "northeast",
     link: "https://www.mnthen.com/blog/place/mpls_gramma_b.html"
-  },
-  {
-    name: "Charlotte Ouisconsin Clark Van Cleve",
-    lat: 44.986612630415564,
-    lng: -93.23121494980424,
-    image: "https://www.mnthen.com/locations/gallery/mpls/mpls_van_cleve/mpls_van_cleve_1.jpg",
-    title: "Charlotte Ouisconsin Clark Van Cleve (1819–1907)",
-    creator: "Matt Reicher",
-    htmlFile: "/markers/mpls/mpls_van_cleve.html",
-    tour: "history",
-    link: "https://www.mnopedia.org/person/van-cleve-charlotte-ouisconsin-clark-1819-1907"
   },
   {
     name: "Last Moments of Homer Van Meter",
@@ -275,18 +242,6 @@ const locations = [
     tour: "history",
     link: "https://www.mnthen.com/blog/event/dakota_war.html" // Replace with the actual URL of the article
   },
-    {
-    name: "Summit Brewing Company (1986 - )",
-    lat: 44.91347102967256,
-    lng: -93.13990153531473,
-    image: "https://www.mnthen.com/markers/stp/summit/images/stp_summit_1.jpg",
-    title: "Summit Brewing Company (1986 - )",
-    creator: "Matt Reicher",
-    htmlFile: "https://mnthen.com/markers/stp/summit/stp_summit_brewing.html",
-    tour: "history",
-    link: "https://www.mnthen.com/blog/place/stp_summit_brewing.html" // Replace with the actual URL of the article
-  },
-
   // Add more locations here
 ];
 
