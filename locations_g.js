@@ -1,15 +1,15 @@
 // locations.js
 const locations = [
-  {
-    name: "Minnesota 13 Whiskey",
-    lat: 44.962424618820044,
-    lng: -93.07096147711366,
-    image: "https://www.mnthen.com/tour/hamm/gallery/mn13/hamm_ms13_1.jpg",
-    title: "Minnesota 13",
+    {
+    name: "O'Connor Layover Agreement",
+    lat: 44.94345476309088,
+    lng:  -93.09704684183636,
+    image: "https://www.mnthen.com/images/gangster/layover/stp_oconnor_1.jpg",
+    title: "O’Connor Layover Agreement",
     creator: "Matt Reicher",
-    htmlFile: "/tour/hamm/hamm_mn13.html",
-    order: 2,
-    link: "https://original.newsbreak.com/@ron-dansley-1587459/3039852975572-moonshine-legacy-the-story-of-minnesota-13-and-stearns-county-s-bootlegging-era" // Replace with the actual URL of the article
+    htmlFile: "/tour/gangster/gangster_layover.html",
+    order: 1,
+    link: "https://www.mnopedia.org/multimedia/john-oconnor-chief-st-paul-police"
   },
    {
     name: "Hamm Jr. Kidnapping (June 15-19, 1933)",
@@ -19,19 +19,8 @@ const locations = [
     title: "Hamm Jr. Kidnapping",
     creator: "Matt Reicher",
     htmlFile: "/tour/hamm/hamm_kidnap.html",
-    order: 3,
+    order: 7,
     link: "https://vocal.media/criminal/kidnapping-of-hamm-s-brewery-president-william-hamm-jr-june-15-19-1933"
-  },
-  {
-    name: "Plantation Night Club (1930 - 1933)",
-    lat: 45.073692373690626,
-    lng:  -93.01483408611226,
-    image: "https://www.mnthen.com/tour/wbl/gallery/plant/wbl_plant1.jpg",
-    title: "Plantation Night Club",
-    creator: "Matt Reicher",
-    htmlFile: "/tour/wbl/wbl_plant.html",
-    order: 1,
-    link: "https://original.newsbreak.com/@ron-dansley-1587459/3078633820088-lion-s-park-a-remembrance-of-white-bear-lake-s-legendary-plantation-night-club"
   },
   {
     name: "Last Moments of Homer Van Meter",
@@ -41,7 +30,7 @@ const locations = [
     title: "Death of Gangster Homer Van Meter (Aug 23, 1934)",
     creator: "Matt Reicher",
     htmlFile: "/tour/gangster/gangster_van_meter.html",
-    order: 4,
+    order: 5,
     link: "https://mnthen.com/blog/people/van_meter.html"
   },
       {
@@ -52,7 +41,7 @@ const locations = [
     title: "Kidnapping of Edward Bremer (Jan 17 - Feb 7, 1934)",
     creator: "Matt Reicher",
     htmlFile: "/tour/gangster/gangster_bremer_kidnap.html",
-    order: 5,
+    order: 3,
     link: "https://mnthen.com/blog/event/bremer_kidnap.html"
   },
   {
@@ -63,7 +52,7 @@ const locations = [
     title: "Shootout at Lincoln Court Apartments (March 31, 1934)",
     creator: "Matt Reicher",
     htmlFile: "/tour/gangster/gangster_lincoln_ct.html",
-    order: 6,
+    order: 4,
     link: "https://mnthen.com/blog/event/shootout_lincoln_ct.html"
   },
 
