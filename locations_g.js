@@ -9,8 +9,8 @@ const locations = [
     creator: "Matt Reicher",
     htmlFile: "/tour/gangster/gangster_layover.html",
     order: 1,
-    link: "https://www.mnopedia.org/multimedia/john-oconnor-chief-st-paul-police"
-  },
+    link: "https://www.mnopedia.org/thing/oconnor-layover-agreement"},
+    
    {
     name: "Hamm Jr. Kidnapping (June 15-19, 1933)",
     lat: 44.9620906324505,
