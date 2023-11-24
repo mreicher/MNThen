@@ -31,7 +31,7 @@ const locations = [
     title: "Hamm Jr. Kidnapping",
     creator: "Matt Reicher",
     htmlFile: "/tour/hamm/hamm_kidnap.html",
-    order: 7,
+    order: 8,
     link: "https://vocal.media/criminal/kidnapping-of-hamm-s-brewery-president-william-hamm-jr-june-15-19-1933"
   },
   {
@@ -42,8 +42,8 @@ const locations = [
     title: "Death of Gangster Homer Van Meter (Aug 23, 1934)",
     creator: "Matt Reicher",
     htmlFile: "/tour/gangster/gangster_van_meter.html",
-    order: 5,
-    link: "https://mnthen.com/blog/people/van_meter.html"
+    order: 7,
+    link: "https://mnthen.com/blog/people/van_meter.html
   },
       {
     name: "Kidnapping of Edward Bremer (Jan 17 - Feb 7, 1934)",
@@ -53,7 +53,7 @@ const locations = [
     title: "Kidnapping of Edward Bremer (Jan 17 - Feb 7, 1934)",
     creator: "Matt Reicher",
     htmlFile: "/tour/gangster/gangster_bremer_kidnap.html",
-    order: 3,
+    order: 4,
     link: "https://mnthen.com/blog/event/bremer_kidnap.html"
   },
   {
@@ -64,7 +64,7 @@ const locations = [
     title: "Shootout at Lincoln Court Apartments (March 31, 1934)",
     creator: "Matt Reicher",
     htmlFile: "/tour/gangster/gangster_lincoln_ct.html",
-    order: 4,
+    order: 5,
     link: "https://mnthen.com/blog/event/shootout_lincoln_ct.html"
   },
 
