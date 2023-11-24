@@ -20,7 +20,7 @@ const locations = [
     creator: "Matt Reicher",
     htmlFile: "/tour/gangster/gangster_hogan.html",
     order: 2,
-    link: "https://vocal.media/criminal/the-death-of-dapper-dan-hogan"
+    link: "https://mnthen.com/blog/event/stp_hogan.html"
   },
     
    {
