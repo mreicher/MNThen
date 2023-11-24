@@ -10,6 +10,18 @@ const locations = [
     htmlFile: "/tour/gangster/gangster_layover.html",
     order: 1,
     link: "https://www.mnopedia.org/thing/oconnor-layover-agreement"},
+
+      {
+    name: "Death of Dan Hogan",
+    lat: 44.91687188613347,
+    lng:  -93.14300726595808,
+    image: "https://www.mnthen.com/images/gangster/hogan/stp_hogan_2.jpg",
+    title: "Death of Dan Hogan",
+    creator: "Matt Reicher",
+    htmlFile: "/tour/gangster/gangster_hogan.html",
+    order: 2,
+    link: "https://vocal.media/criminal/the-death-of-dapper-dan-hogan"
+  },
     
    {
     name: "Hamm Jr. Kidnapping (June 15-19, 1933)",
