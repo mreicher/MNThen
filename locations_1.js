@@ -11,6 +11,17 @@ const locations = [
     tour: "hamm",
     link: "https://www.mnopedia.org/place/swede-hollow"
   },
+       {
+    name: "O'Connor Layover Agreement",
+    lat: 44.94345476309088,
+    lng:  -93.09704684183636,
+    image: "https://www.mnthen.com/images/gangster/layover/stp_oconnor_1.jpg",
+    title: "O’Connor Layover Agreement",
+    creator: "Matt Reicher",
+    htmlFile: "/tour/gangster/gangster_layover.html",
+    tour: "gangster",
+    link: "https://www.mnopedia.org/thing/oconnor-layover-agreement"
+    },
    {
     name: "Hamm Jr. Kidnapping (June 15-19, 1933)",
     lat: 44.9620906324505,
@@ -87,17 +98,6 @@ const locations = [
          htmlFile: "/tour/NE/NE_johnsbar.html",
         tour: "northeast",
     link: "https://original.newsbreak.com/@ron-dansley-1587459/3045699798148-unveiling-the-secrets-of-john-s-bar-and-funhouse-a-scandalous-tale-of-corruption-in-1950s-minneapolis"
-  },
-    {
-    name: "Bruce Vento (1940 - 2000)",
-    lat: 44.95270480002584,
-     lng:   -93.07440808976824,
-      image: "https://img.particlenews.com/image.php?type=thumbnail_580x000&url=4Mv2y5_0mmgW4bE00",
-     title: "Bruce Vento (1940 - 2000)",
-     creator: "Matt Reicher",
-    htmlFile: "/tour/STP/STP_Vento.html",
-    tour: "history",
-    link: "https://original.newsbreak.com/@ron-dansley-1587459/3049434704183-prominent-politician-and-advocate-bruce-f-vento-s-enduring-legacy-of-social-justice-and-environmental-conservation"
   },
   {
     name: "Plantation Night Club (1930 - 1933)",
