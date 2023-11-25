@@ -9,7 +9,8 @@ const locations = [
     creator: "Matt Reicher",
     htmlFile: "/tour/gangster/gangster_layover.html",
     order: 1,
-    link: "https://www.mnopedia.org/thing/oconnor-layover-agreement"},
+    link: "https://www.mnopedia.org/thing/oconnor-layover-agreement"
+    },
 
       {
     name: "Death of Dan Hogan",
@@ -43,7 +44,7 @@ const locations = [
     creator: "Matt Reicher",
     htmlFile: "/tour/gangster/gangster_van_meter.html",
     order: 7,
-    link: "https://mnthen.com/blog/people/van_meter.html
+    link: "https://mnthen.com/blog/people/van_meter.html"
   },
       {
     name: "Kidnapping of Edward Bremer (Jan 17 - Feb 7, 1934)",
