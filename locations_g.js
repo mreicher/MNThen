@@ -13,15 +13,27 @@ const locations = [
     },
 
       {
-    name: "Death of Dan Hogan",
+    name: "Death of Dan Hogan (Dec 4, 1928)",
     lat: 44.91687188613347,
     lng:  -93.14300726595808,
     image: "https://www.mnthen.com/images/gangster/hogan/stp_hogan_2.jpg",
-    title: "Death of Dan Hogan",
+    title: "Death of Dan Hogan (Dec 4, 1928)",
     creator: "Matt Reicher",
     htmlFile: "/tour/gangster/gangster_hogan.html",
     order: 2,
     link: "https://mnthen.com/blog/event/stp_hogan.html"
+  },
+
+{
+    name: "Shooting of Roy McCord (Jan 13, 1934)",
+    lat: 44.94331607407829,
+    lng:  -93.12381819681936,
+    image: "https://www.mnthen.com/images/gangster/mccord/stp_mccord_holly.jpg",
+    title: "Shooting of Roy McCord (Jan 13, 1934)",
+    creator: "Matt Reicher",
+    htmlFile: "/tour/gangster/gangster_mccord.html",
+    order: 3,
+    link: "https://mnthen.com/blog/event/stp_mccord_shooting.html"
   },
     
    {
