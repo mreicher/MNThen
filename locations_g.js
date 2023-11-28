@@ -35,29 +35,6 @@ const locations = [
     order: 3,
     link: "https://mnthen.com/blog/event/stp_mccord_shooting.html"
   },
-    
-   {
-    name: "Hamm Jr. Kidnapping (June 15-19, 1933)",
-    lat: 44.9620906324505,
-    lng: -93.0710358080048,
-    image: "https://www.mnthen.com/tour/hamm/gallery/kidnap/hamm_kidnap1.jpg",
-    title: "Hamm Jr. Kidnapping",
-    creator: "Matt Reicher",
-    htmlFile: "/tour/hamm/hamm_kidnap.html",
-    order: 8,
-    link: "https://vocal.media/criminal/kidnapping-of-hamm-s-brewery-president-william-hamm-jr-june-15-19-1933"
-  },
-  {
-    name: "Last Moments of Homer Van Meter",
-    lat: 44.955601674534925,
-    lng: -93.10899976598101,
-    image: "https://www.mnthen.com/images/van_meter_header.jpg",
-    title: "Death of Gangster Homer Van Meter (Aug 23, 1934)",
-    creator: "Matt Reicher",
-    htmlFile: "/tour/gangster/gangster_van_meter.html",
-    order: 7,
-    link: "https://mnthen.com/blog/people/van_meter.html"
-  },
       {
     name: "Kidnapping of Edward Bremer (Jan 17 - Feb 7, 1934)",
     lat: 44.93780553154248,
@@ -79,6 +56,42 @@ const locations = [
     htmlFile: "/tour/gangster/gangster_lincoln_ct.html",
     order: 5,
     link: "https://mnthen.com/blog/event/shootout_lincoln_ct.html"
+  },
+
+        {
+    name: "Shooting of Oscar Erickson (Dec 16, 1932)",
+    lat: 44.982103412630785,
+    lng:  -93.15490322958249,
+    image: "https://www.mnthen.com/images/gangster/erickson/gangster_erickson.jpg",
+    title: "Shooting of Oscar Erickson (Dec 16, 1932)",
+    creator: "Matt Reicher",
+    htmlFile: "/tour/gangster/gangster_erickson.html",
+    order: 6,
+    link: "https://original.newsbreak.com/@ron-dansley-1587459/2331506947458-the-shooting-of-christmas-wreath-salesman-oscar-erickson"
+    },
+
+      {
+    name: "Last Moments of Homer Van Meter",
+    lat: 44.955601674534925,
+    lng: -93.10899976598101,
+    image: "https://www.mnthen.com/images/van_meter_header.jpg",
+    title: "Death of Gangster Homer Van Meter (Aug 23, 1934)",
+    creator: "Matt Reicher",
+    htmlFile: "/tour/gangster/gangster_van_meter.html",
+    order: 7,
+    link: "https://mnthen.com/blog/people/van_meter.html"
+  },
+
+       {
+    name: "Hamm Jr. Kidnapping (June 15-19, 1933)",
+    lat: 44.9620906324505,
+    lng: -93.0710358080048,
+    image: "https://www.mnthen.com/tour/hamm/gallery/kidnap/hamm_kidnap1.jpg",
+    title: "Hamm Jr. Kidnapping",
+    creator: "Matt Reicher",
+    htmlFile: "/tour/hamm/hamm_kidnap.html",
+    order: 8,
+    link: "https://vocal.media/criminal/kidnapping-of-hamm-s-brewery-president-william-hamm-jr-june-15-19-1933"
   },
 
   // Add more locations here
