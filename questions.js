@@ -1,5 +1,3 @@
-// questions.js
-
 const questions = [
   {
     question: "First keeper of John O'Connor's layover agreement system?",
@@ -12,7 +10,7 @@ const questions = [
     answers: [
       "Leadership skills",
       "Stylish dress",
-      "Role as underworld ambassador",
+      "Ambassador role",
       "Political acumen"
     ],
     correctAnswer: "Stylish dress",
@@ -21,25 +19,25 @@ const questions = [
   {
     question: "Prompt for Roy McCord's search on January 13, 1934?",
     answers: [
-      "Concerned call from his wife",
-      "Request from his co-worker",
-      "Assignment from the airport",
+      "Call from his wife",
+      "Co-worker request",
+      "Work assignment",
       "Anonymous tip"
     ],
-    correctAnswer: "Concerned call from his wife",
+    correctAnswer: "Call from his wife",
     tidbit: "McCord's wife called, concerned about strange activity. He enlisted co-worker Robert Luening and met up with Cowin at his 562 Holly Ave. apartment."
   },
-{
-  question: "Why did the Barker-Karpis Gang turn to kidnapping post-21st Amendment?",
-  answers: ["Hamm Jr. success", "Replace alcohol income", "Anonymous tip", "Harry Sawyer's recommendation"],
-  correctAnswer: "Replace alcohol income",
-  tidbit: "The 21st Amendment ended illegal alcohol trade, leading the Barker-Karpis Gang to resort to kidnapping for income."
-}
+  {
+    question: "Why did the Barker-Karpis Gang turn to kidnapping post-21st Amendment?",
+    answers: ["Hamm Jr. success", "Replace alcohol income", "Anonymous tip", "Harry Sawyer's recommendation"],
+    correctAnswer: "Replace alcohol income",
+    tidbit: "The 21st Amendment ended illegal alcohol trade, leading the Barker-Karpis Gang to resort to kidnapping for income."
+  },
   {
     question: "Which river runs through the Twin Cities of Minneapolis and St. Paul?",
     answers: ["Mississippi River", "Missouri River", "Red River", "Ohio River"],
     correctAnswer: "Mississippi River",
-          tidbit: "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat."
+    tidbit: "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat."
   },
   // Add more questions here following the same format
 ];
