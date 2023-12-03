@@ -17,28 +17,62 @@ const questions = [
     tidbit: "Dan Hogan, known as 'Dapper' due to his stylish dress, was a key liaison between local law enforcement and criminal elements in St. Paul."
   },
   {
-    question: "What was the reason for Roy McCord's search on January 13, 1934?",
+    question: "What was the reason behind Roy McCord's search on January 13, 1934?",
     answers: [
-      "His wife called",
-      "Co-worker request",
-      "Work assignment",
+      "A phone call from his wife",
+      "Request from his co-worker",
+      "Assignment from the airport",
       "Anonymous tip"
     ],
-    correctAnswer: "His wife called",
+    correctAnswer: "A phone call from his wife",
     tidbit: "McCord's wife called, concerned about strange activity. He enlisted co-worker Robert Luening and met up with Cowin at his 562 Holly Ave. apartment."
   },
   {
     question: "Why did the Barker-Karpis Gang turn to kidnapping post-21st Amendment?",
-    answers: ["Hamm Jr. success", "Replace alcohol income", "Anonymous tip", "Harry Sawyer's idea"],
-    correctAnswer: "Replace alcohol income",
+    answers: ["Hamm Jr. kidnapping success", "Replace illegal alcohol income", "An anonymous tip", "Harry Sawyer's recommendation"],
+    correctAnswer: "Replace illegal alcohol income",
     tidbit: "The 21st Amendment ended illegal alcohol trade, leading the Barker-Karpis Gang to resort to kidnapping for income."
   },
+  {
+  question: "What controversial aspect surrounded Homer Van Meter's death?",
+  answers: [
+    "Excessive police force",
+    "Lack of eyewitnesses",
+    "Escape before shooting",
+    "Involvement of a rival gang"
+  ],
+  correctAnswer: "Excessive police force",
+  tidbit: "Homer Van Meter's death was marked by controversy due to the excessive force used by the police, with reports suggesting he was shot multiple times even after falling to the ground."
+},
+{
+  question: "What led to the gunfight at Lincoln Court Apartments involving John Dillinger?",
+  answers: [
+    "A bank robbery",
+    "A turf dispute",
+    "A routine check by law enforcement",
+    "An anonymous tip"
+  ],
+  correctAnswer: "A routine check by law enforcement",
+  tidbit: "The gunfight at Lincoln Court Apartments, involving John Dillinger, escalated from a routine check by law enforcement, sparked by the suspicions of the building's owner about the residents of apartment 303."
+},
     {
     question: "Who was Oscar Erickson, and what was his job on December 16, 1932?",
-    answers: ["Cook", "Wreath salesman", "Florist", "Banker"],
-    correctAnswer: "Wreath salesman",
+    answers: ["Cook", "Christmas wreath salesman", "Florist", "Banker"],
+    correctAnswer: "Christmas wreath salesman",
     tidbit: "Oscar Erickson was a Christmas wreath salesman on December 16, 1932."
   },
+{
+  question: "What significant action did William Hamm Jr. have to perform while being held by the kidnappers?",
+  answers: [
+    "Signing the ransom notes",
+    "Identifying his abductors",
+    "Recording a plea for help",
+    "Planning his own escape"
+  ],
+  correctAnswer: "Signing the ransom notes",
+  tidbit: "While kidnapped, William Hamm Jr. was forced by the Barker-Karpis Gang to sign four notes authorizing a large ransom payment, a critical part of their abduction strategy."
+}
+
   // Add more questions here following the same format
 ];
 
