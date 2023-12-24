@@ -5,7 +5,8 @@ const blogArticles = [
       icon: "fa-calendar",
       image: "https://mnthen.com/images/gangster_bremer_kidnap1.jpg",
       url: "https://mnthen.com/blog/event/bremer_kidnap.html",
-      keywords: ["bremer", "kidnap", "kidnapping", "gangster", "all"],
+      keywords: ["saint paul", "st. paul", "bremer", "kidnap", "kidnapping", "gangster", "all"],
+
     },
     {
       headline: "Hanging of the Dakota 38 (Dec. 26, 1862)",
@@ -14,6 +15,7 @@ const blogArticles = [
       image: "https://mnthen.com/markers/mankato/images/mankato_38.jpg",
       url: "https://mnthen.com/blog/event/dakota_war.html",
       keywords: ["dakota", "war", "mankato", "sibley", "all"],
+
     },
         {
       headline: "Shootout at the Lincoln Court Apartments (March 31, 1934)",
@@ -21,7 +23,8 @@ const blogArticles = [
         icon: "fa-calendar",
       image: "https://mnthen.com/images/gangster/gangster_lincoln_ct.jpg",
       url: "https://mnthen.com/blog/event/shootout_lincoln_ct.html",
-      keywords: ["gangster", "lincoln", "Lincoln", "Dillinger", "dillinger", "all"],
+      keywords: ["saint paul", "st. paul", "gangster", "lincoln", "Lincoln", "Dillinger", "dillinger", "all"],
+
     },
     {
       headline: "Shooting of Wreath Salesman Oscar Erickson (Dec. 16, 1932)",
@@ -29,7 +32,8 @@ const blogArticles = [
             icon: "fa-calendar",
       image: "https://mnthen.com/images/erickson.jpg",
       url: "https://mnthen.com/blog/people/erickson.html",
-      keywords: ["gangster", "barker", "karpis", "shooting", "all"],
+      keywords: ["saint paul", "st. paul", "gangster", "barker", "karpis", "shooting", "all"],
+
     },
         {
       headline: "Larsen, Michael 'Eyedea' (Nov 9, 1981 - Oct 16, 2010)",
@@ -37,7 +41,8 @@ const blogArticles = [
            icon: "fa-user",
       image: "https://mnthen.com/images/wsp_eyedea.jpg",
       url: "https://mnthen.com/blog/people/eyedea_larsen.html",
-      keywords: ["eyedea", "smile", "rap", "music", "Eyedea", "all"],
+      keywords: ["saint paul", "st. paul", "eyedea", "smile", "rap", "music", "Eyedea", "all"],
+
     },
     {
       headline: "Humphrey, Hubert H. (1911 - 1978)",
@@ -45,7 +50,8 @@ const blogArticles = [
             icon: "fa-user",
       image: "https://mnthen.com/images/humphrey_header.jpg",
       url: "https://mnthen.com/blog/people/humphrey.html",
-      keywords: ["humphrey", "Humphrey", "politics", "minneapolis", "Minneapolis", "all"],
+      keywords: ["saint paul", "st. paul", "humphrey", "Humphrey", "politics", "minneapolis", "Minneapolis", "all"],
+
     },
         {
       headline: "Olson, Floyd B. (1891 - 1936)",
@@ -53,7 +59,8 @@ const blogArticles = [
             icon: "fa-user",
       image: "https://mnthen.com/tour/capitol/gallery/olson/olson_1.jpg",
       url: "https://mnthen.com/blog/people/olson.html",
-      keywords: ["politics", "govenor", "olson", "Olson", "all"],
+      keywords: ["saint paul", "st. paul", "politics", "govenor", "olson", "Olson", "all"],
+
     },
         {
       headline: "Van Meter, Homer V. (1905 - 1934)",
@@ -61,7 +68,8 @@ const blogArticles = [
             icon: "fa-calendar",
       image: "https://mnthen.com/images/van_meter_header.jpg",
       url: "https://mnthen.com/blog/people/van_meter.html",
-      keywords: ["gangster", "dillinger", "Dillinger", "shooting", "van meter", "Van Meter", "all"],
+      keywords: ["saint paul", "st. paul", "gangster", "dillinger", "Dillinger", "shooting", "van meter", "Van Meter", "all"],
+
     },
     {
       headline: "Grain Belt Beer Sign",
@@ -70,6 +78,7 @@ const blogArticles = [
       image: "https://mnthen.com/locations/gallery/mpls/premium/mpls_grain_belt_1.jpg",
       url: "https://mnthen.com/blog/place/mpls_grain_belt.html",
       keywords: ["premium", "grain belt", "sign", "minneapolis", "Minneapolis", "beer", "all"],
+
     },
             {
       headline: "Gramma B's",
@@ -78,6 +87,7 @@ const blogArticles = [
       image: "https://mnthen.com/locations/gallery/mpls/gramma_b/mpls_gramma_b_1.jpg",
       url: "https://mnthen.com/blog/place/mpls_gramma_b.html",
       keywords: ["northeast", "Northeast", "Minneapolis", "saloon", "bar", "all"],
+
     },
         {
       headline: "Summit Brewing (1986 - )",
@@ -85,7 +95,8 @@ const blogArticles = [
             icon: "fa-building",
       image: "https://mnthen.com/markers/stp/summit/images/stp_summit_1.jpg",
       url: "https://mnthen.com/blog/place/stp_summit_brewing.html",
-      keywords: ["saint paul", "st paul", "Summit", "summit", "beer", "stutrud", "Stutrud", "all"],
+      keywords: ["saint paul", "st. paul", "Summit", "summit", "beer", "stutrud", "Stutrud", "all"],
+
     },
     {
       headline: "Native American Burial Mounds (White Bear Lake)",
@@ -94,6 +105,7 @@ const blogArticles = [
       image: "https://mnthen.com/tour/wbl/gallery/mound/wbl_mound1.jpg",
       url: "https://mnthen.com/blog/place/wbl_mounds.html",
       keywords: ["burial", "mounds", "bear", "Bear", "lake", "all"],
+
     },
         {
       headline: "Wildwood Amusement Park",
@@ -102,6 +114,7 @@ const blogArticles = [
       image: "https://mnthen.com/locations/gallery/mahtomedi/wildwood/wildwood_2.jpg",
       url: "https://mnthen.com/blog/place/wildwood.html",
       keywords: ["amusement", "park", "mahtomedi", "wildwood", "streetcar", "all"],
+
     },
     // Add more articles as needed
 ];
