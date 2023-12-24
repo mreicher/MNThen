@@ -116,14 +116,14 @@ const blogArticles = [
       keywords: ["amusement", "park", "mahtomedi", "wildwood", "streetcar", "all"],
 
     },
-            {
-      headline: "Shooting of Roy McCord (Jan. 13, 1934)",
-      blurb: "After work, Roy McCord joined friends to search for "peeping toms," inadvertently encountering the Barker-Karpis Gang, leading to his near-fatal shooting.",
-            icon: "fa-calendar",
-      image: "https://mnthen.com/images/gangster/mccord/stp_mccord_holly.jpg",
-      url: "https://mnthen.com/blog/event/stp_mccord_shooting.html",
-      keywords: ["saint paul", "st. paul", "mccord", "gangster", "barker", "karpis", "shooting", "all"],
-
-    },
+   {
+  headline: "Shooting of Roy McCord (Jan. 13, 1934)",
+  blurb: "After work, Roy McCord joined friends to search for 'peeping toms,' inadvertently encountering the Barker-Karpis Gang, leading to his near-fatal shooting.",
+  icon: "fa-calendar",
+  image: "https://mnthen.com/images/gangster/mccord/stp_mccord_holly.jpg",
+  url: "https://mnthen.com/blog/event/stp_mccord_shooting.html",
+  keywords: ["saint paul", "st. paul", "mccord", "gangster", "barker", "karpis", "shooting", "all"],
+},
+    
     // Add more articles as needed
 ];
