@@ -124,6 +124,14 @@ const blogArticles = [
   url: "https://mnthen.com/blog/event/stp_mccord_shooting.html",
   keywords: ["saint paul", "st. paul", "mccord", "gangster", "barker", "karpis", "shooting", "all"],
 },
+       {
+  headline: "Theodore Hamm Mansion (c. 1886 - 1954)",
+  blurb: "The Theodore Hamm mansion once stood majestically over Swede Hollow, embodying St. Paul's brewing heritage and the Hamm family legacy.",
+  icon: "fa-building",
+  image: "https://mnthen.com/tour/hamm/gallery/mansion/hamm_mansion5.jpg",
+  url: "https://mnthen.com/blog/place/stp_hamm_mansion.html",
+  keywords: ["saint paul", "st. paul", "hamm", "mansion", "east side", "all"],
+},
     
     // Add more articles as needed
 ];
