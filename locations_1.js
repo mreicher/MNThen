@@ -121,5 +121,17 @@ const locations = [
     tour: "northeast",
     link: "https://www.mnthen.com/blog/place/mpls_gramma_b.html"
   },
+      {
+    name: "Hanging of the Dakota 38",
+    lat: 44.1680805962643,
+    lng: -94.00311590799822,
+    image: "https://mnthen.com/markers/mankato/images/mankato_38.jpg",
+    title: "Hanging of the Dakota 38",
+    creator: "Matt Reicher",
+    htmlFile: "https://mnthen.com/markers/mankato/man_dakota_38.html ",
+
+    tour: "history",
+    link: "https://mnthen.com/blog/event/dakota_war.html"
+  },
   // Add more locations here
 ];
