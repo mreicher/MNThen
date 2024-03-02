@@ -140,8 +140,19 @@ const locations = [
     title: "Wildwood Amusement Park",
     creator: "Matt Reicher",
      htmlFile: "/markers/mahtomedi/mah_wildwood.html",
-    tour: "history",
+    tour: "lake",
     link: "https://mnthen.com/blog/place/wildwood.html"
+  },
+         {
+    name: "The Geist Gazebo",
+    lat: 45.08605286688677,
+    lng:  -92.99990965105705,
+    image: "https://www.mnthen.com/tour/wbl/gallery/geist/geist_2.jpg",
+    title: "The Geist Gazebo",
+    creator: "Matt Reicher",
+    htmlFile: "/tour/wbl/wbl_geist.html",
+    tour: "lake",
+    link: "https://original.newsbreak.com/@ron-dansley-1587459/3077047712038-matoska-park-s-living-history-the-geist-gazebo-and-its-storied-past"
   },
         {
     name: "Michael 'Eyedea' Larsen (1981 - 2010)",
