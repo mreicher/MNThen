@@ -129,9 +129,30 @@ const locations = [
     title: "Hanging of the Dakota 38",
     creator: "Matt Reicher",
     htmlFile: "https://mnthen.com/markers/mankato/man_dakota_38.html ",
-
     tour: "history",
     link: "https://mnthen.com/blog/event/dakota_war.html"
   },
-  // Add more locations here
+           {
+    name: "Wildwood Amusement Park",
+    lat: 45.05648381562563,
+    lng: -92.96040208835049,
+    image: "https://www.mnthen.com/locations/gallery/mahtomedi/wildwood/wildwood_1.jpg",
+    title: "Wildwood Amusement Park",
+    creator: "Matt Reicher",
+     htmlFile: "/markers/mahtomedi/mah_wildwood.html",
+    tour: "history",
+    link: "https://mnthen.com/blog/place/wildwood.html"
+  },
+        {
+    name: "Michael 'Eyedea' Larsen (1981 - 2010)",
+    lat: 44.922167523742054,
+    lng: -93.10991227113067,
+    image: "https://www.mnthen.com/images/wsp_eyedea.jpg",
+    title: "Michael 'Eyedea' Larsen (1981 - 2010)",
+    creator: "Matt Reicher",
+    htmlFile: "/markers/wsp/wsp_eyedea.html",
+    tour: "history",
+    link: "https://mnthen.com/blog/people/eyedea_larsen.html"
+  },
+   // Add more locations here
 ];
