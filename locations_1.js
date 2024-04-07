@@ -121,49 +121,6 @@ const locations = [
     tour: "northeast",
     link: "https://www.mnthen.com/blog/place/mpls_gramma_b.html"
   },
-      {
-    name: "Hanging of the Dakota 38",
-    lat: 44.1680805962643,
-    lng: -94.00311590799822,
-    image: "https://mnthen.com/markers/mankato/images/mankato_38.jpg",
-    title: "Hanging of the Dakota 38",
-    creator: "Matt Reicher",
-    htmlFile: "https://mnthen.com/markers/mankato/man_dakota_38.html ",
-    tour: "history",
-    link: "https://mnthen.com/blog/event/dakota_war.html"
-  },
-           {
-    name: "Wildwood Amusement Park",
-    lat: 45.05648381562563,
-    lng: -92.96040208835049,
-    image: "https://www.mnthen.com/locations/gallery/mahtomedi/wildwood/wildwood_1.jpg",
-    title: "Wildwood Amusement Park",
-    creator: "Matt Reicher",
-     htmlFile: "/markers/mahtomedi/mah_wildwood.html",
-    tour: "lake",
-    link: "https://mnthen.com/blog/place/wildwood.html"
-  },
-         {
-    name: "The Geist Gazebo",
-    lat: 45.08605286688677,
-    lng:  -92.99990965105705,
-    image: "https://www.mnthen.com/tour/wbl/gallery/geist/geist_2.jpg",
-    title: "The Geist Gazebo",
-    creator: "Matt Reicher",
-    htmlFile: "/tour/wbl/wbl_geist.html",
-    tour: "lake",
-    link: "https://original.newsbreak.com/@ron-dansley-1587459/3077047712038-matoska-park-s-living-history-the-geist-gazebo-and-its-storied-past"
-  },
-        {
-    name: "Michael 'Eyedea' Larsen (1981 - 2010)",
-    lat: 44.922167523742054,
-    lng: -93.10991227113067,
-    image: "https://www.mnthen.com/images/wsp_eyedea.jpg",
-    title: "Michael 'Eyedea' Larsen (1981 - 2010)",
-    creator: "Matt Reicher",
-    htmlFile: "/markers/wsp/wsp_eyedea.html",
-    tour: "history",
-    link: "https://mnthen.com/blog/people/eyedea_larsen.html"
-  },
+
    // Add more locations here
 ];
