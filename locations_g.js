@@ -11,6 +11,18 @@ const locations = [
     order: 1,
     link: "https://www.mnopedia.org/thing/oconnor-layover-agreement"
     },
+    
+        {
+    name: "Madam Nina Clifford (1851 - 1929)",
+    lat: 44.94193315146205,
+    lng:  -93.1000893047694,
+    image: "https://www.mnthen.com/images/gangster/clifford/clifford1.jpg",
+    title: "Madam Nina Clifford (1851 - 1929)",
+    creator: "Matt Reicher",
+    htmlFile: "/tour/gangster/gangster_clifford.html",
+    order: 2,
+    link: "https://original.newsbreak.com/@ron-dansley-1587459/2331506947458-the-shooting-of-christmas-wreath-salesman-oscar-erickson"
+    },
 
       {
     name: "Death of Dan Hogan (Dec 4, 1928)",
@@ -20,7 +32,7 @@ const locations = [
     title: "Death of Dan Hogan (Dec 4, 1928)",
     creator: "Matt Reicher",
     htmlFile: "/tour/gangster/gangster_hogan.html",
-    order: 2,
+    order: 3,
     link: "https://mnthen.com/blog/event/stp_hogan.html"
   },
 
@@ -32,7 +44,7 @@ const locations = [
     title: "Shooting of Roy McCord (Jan 13, 1934)",
     creator: "Matt Reicher",
     htmlFile: "/tour/gangster/gangster_mccord.html",
-    order: 3,
+    order: 4,
     link: "https://mnthen.com/blog/event/stp_mccord_shooting.html"
   },
       {
@@ -43,7 +55,7 @@ const locations = [
     title: "Kidnapping of Edward Bremer (Jan 17 - Feb 7, 1934)",
     creator: "Matt Reicher",
     htmlFile: "/tour/gangster/gangster_bremer_kidnap.html",
-    order: 4,
+    order: 5,
     link: "https://mnthen.com/blog/event/bremer_kidnap.html"
   },
   {
@@ -54,21 +66,9 @@ const locations = [
     title: "Shootout at Lincoln Court Apartments (March 31, 1934)",
     creator: "Matt Reicher",
     htmlFile: "/tour/gangster/gangster_lincoln_ct.html",
-    order: 5,
+    order: 6,
     link: "https://mnthen.com/blog/event/shootout_lincoln_ct.html"
   },
-
-        {
-    name: "Shooting of Oscar Erickson (Dec 16, 1932)",
-    lat: 44.982103412630785,
-    lng:  -93.15490322958249,
-    image: "https://www.mnthen.com/images/gangster/erickson/gangster_erickson.jpg",
-    title: "Shooting of Oscar Erickson (Dec 16, 1932)",
-    creator: "Matt Reicher",
-    htmlFile: "/tour/gangster/gangster_erickson.html",
-    order: 6,
-    link: "https://original.newsbreak.com/@ron-dansley-1587459/2331506947458-the-shooting-of-christmas-wreath-salesman-oscar-erickson"
-    },
 
       {
     name: "Last Moments of Homer Van Meter",
