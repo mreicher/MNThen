@@ -21,7 +21,7 @@ const locations = [
     creator: "Matt Reicher",
     htmlFile: "/tour/gangster/gangster_clifford.html",
     order: 2,
-    link: "https://original.newsbreak.com/@ron-dansley-1587459/2331506947458-the-shooting-of-christmas-wreath-salesman-oscar-erickson"
+    link: "https://www.mnthen.com/blog/people/clifford.html"
     },
 
       {
