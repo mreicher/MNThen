@@ -91,7 +91,7 @@ const locations = [
     creator: "Matt Reicher",
     htmlFile: "/tour/hamm/hamm_kidnap.html",
     order: 8,
-    link: "https://vocal.media/criminal/kidnapping-of-hamm-s-brewery-president-william-hamm-jr-june-15-19-1933"
+    link: "https://mnthen.com/blog/event/hamm_kidnap.html"
   },
 
   // Add more locations here
