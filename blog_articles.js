@@ -132,6 +132,21 @@ const blogArticles = [
   url: "https://mnthen.com/blog/place/stp_hamm_mansion.html",
   keywords: ["saint paul", "st. paul", "hamm", "mansion", "east side", "all"],
 },
-    
+    {
+      headline: "Clifford, Nina (1851 - 1929)",
+      blurb: "Nina Clifford, a prominent St. Paul madam, operated a high-class brothel and became a wealthy, influential figure, defying societal norms.",
+      icon: "fa-user",
+      image: "https://mnthen.com/images/gangster/clifford/clifford1.jpg",
+      url: "https://mnthen.com/blog/people/clifford.html",
+      keywords: ["brothel", "st. paul", "saint paul", "gangster", "Nina"],
+    },
+    {
+      headline: "William Hamm Jr. Kidnapping (June 15 - 19, 1933)",
+      blurb: "William Hamm Jr., President of Hamm's Brewing Co., was kidnapped for ransom by the Barker-Karpis Gang in 1933, sparking public outrage and leading to the gang's eventual capture.",
+      icon: "fa-calendar",
+      image: "https://mnthen.com/tour/hamm/gallery/kidnap/hamm_kidnap1.jpg",
+      url: "https://mnthen.com/blog/event/hamm_kidnap.html",
+       keywords: ["kidnapping", "st. paul", "saint paul", "gangster", "Barker", "Karpis"],
+    },
     // Add more articles as needed
 ];
