@@ -9,12 +9,12 @@ const blogArticles = [
 
     },
     {
-      headline: "Hanging of the Dakota 38 (Dec. 26, 1862)",
-      blurb: "On December 26, 1862, the largest mass hanging in American history marked the end of the US-Dakota War, with 38 condemned individuals executed.",
-       icon: "fa-calendar",
-      image: "https://mnthen.com/markers/mankato/images/mankato_38.jpg",
-      url: "https://mnthen.com/blog/event/dakota_war.html",
-      keywords: ["dakota", "war", "mankato", "sibley", "all"],
+      headline: "Bucket of Blood Saloon",
+      blurb: "The Bucket of Blood Saloon in St. Paul’s red-light district gained a reputation fro violence, mirroring the neighborhood’s rough atmosphere.",
+       icon: "fa-building",
+      image: "https://mnthen.com/images/bucketo.jpg",
+      url: "https://mnthen.com/blog/place/bucket_of_blood.html",
+      keywords: ["saint paul", "st. paul", "saloon", "bucket", "all"],
 
     },
         {
@@ -65,7 +65,7 @@ const blogArticles = [
         {
       headline: "Van Meter, Homer V. (1905 - 1934)",
       blurb: "Van Meter, an infamous Depression-era gangster, met his violent end in a disputed encounter with St. Paul police on August 23, 1934, near University Ave. and Marion St.",
-            icon: "fa-calendar",
+            icon: "fa-user",
       image: "https://mnthen.com/images/van_meter_header.jpg",
       url: "https://mnthen.com/blog/people/van_meter.html",
       keywords: ["saint paul", "st. paul", "gangster", "dillinger", "Dillinger", "shooting", "van meter", "Van Meter", "all"],
@@ -132,18 +132,18 @@ const blogArticles = [
   url: "https://mnthen.com/blog/place/stp_hamm_mansion.html",
   keywords: ["saint paul", "st. paul", "hamm", "mansion", "east side", "all"],
 },
-    {
+             {
       headline: "Clifford, Nina (1851 - 1929)",
       blurb: "Nina Clifford, a prominent St. Paul madam, operated a high-class brothel and became a wealthy, influential figure, defying societal norms.",
-      icon: "fa-user",
+  icon: "fa-user",
       image: "https://mnthen.com/images/gangster/clifford/clifford1.jpg",
       url: "https://mnthen.com/blog/people/clifford.html",
-      keywords: ["brothel", "st. paul", "saint paul", "gangster", "Nina"],
+      keywords: ["brothel", "St. Paul", "Saint Paul", "gangster", "Nina"],
     },
-    {
+                 {
       headline: "William Hamm Jr. Kidnapping (June 15 - 19, 1933)",
       blurb: "William Hamm Jr., President of Hamm's Brewing Co., was kidnapped for ransom by the Barker-Karpis Gang in 1933, sparking public outrage and leading to the gang's eventual capture.",
-      icon: "fa-calendar",
+  icon: "fa-calendar",
       image: "https://mnthen.com/tour/hamm/gallery/kidnap/hamm_kidnap1.jpg",
       url: "https://mnthen.com/blog/event/hamm_kidnap.html",
        keywords: ["kidnapping", "st. paul", "saint paul", "gangster", "Barker", "Karpis"],
