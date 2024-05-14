@@ -36,12 +36,12 @@ const blogArticles = [
 
     },
         {
-      headline: "Larsen, Michael 'Eyedea' (Nov 9, 1981 - Oct 16, 2010)",
-     blurb: "Gifted battle rapper and versatile hip-hop artist Eyedea left a profound musical impact despite a tragic accidental overdose death at 28.",
-           icon: "fa-user",
-      image: "https://mnthen.com/images/wsp_eyedea.jpg",
-      url: "https://mnthen.com/blog/people/eyedea_larsen.html",
-      keywords: ["saint paul", "st. paul", "eyedea", "smile", "rap", "music", "Eyedea", "all"],
+      headline: "Original Red's Savoy (1965 - 2017)",
+     blurb: "Iconic local pizza joint Red's Savoy closed in 2017 after 52 years of serving its signature Minnesota-style pizza.",
+           icon: "fa-building",
+      image: "https://mnthen.com/images/reds_savoy.jpg",
+      url: "https://mnthen.com/blog/place/reds_savoy.html",
+      keywords: ["saint paul", "st. paul", "pizza", "Savoy", "savoy", "bar", "all"],
 
     },
     {
