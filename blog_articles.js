@@ -132,7 +132,7 @@ const blogArticles = [
   url: "https://mnthen.com/blog/place/stp_hamm_mansion.html",
   keywords: ["saint paul", "st. paul", "hamm", "mansion", "east side", "all"],
 },
-             {
+    {
       headline: "Clifford, Nina (1851 - 1929)",
       blurb: "Nina Clifford, a prominent St. Paul madam, operated a high-class brothel and became a wealthy, influential figure, defying societal norms.",
   icon: "fa-user",
@@ -140,13 +140,21 @@ const blogArticles = [
       url: "https://mnthen.com/blog/people/clifford.html",
       keywords: ["brothel", "St. Paul", "Saint Paul", "gangster", "Nina"],
     },
-                 {
+    {
       headline: "William Hamm Jr. Kidnapping (June 15 - 19, 1933)",
       blurb: "William Hamm Jr., President of Hamm's Brewing Co., was kidnapped for ransom by the Barker-Karpis Gang in 1933, sparking public outrage and leading to the gang's eventual capture.",
   icon: "fa-calendar",
       image: "https://mnthen.com/tour/hamm/gallery/kidnap/hamm_kidnap1.jpg",
       url: "https://mnthen.com/blog/event/hamm_kidnap.html",
        keywords: ["kidnapping", "st. paul", "saint paul", "gangster", "Barker", "Karpis"],
+    },
+    {
+      headline: "Death of \"Dapper\" Dan Hogan (Dec 4, 1928)",
+      blurb: "Gangster \"Dapper\" Dan Hogan, a pivotal link between St. Paul's criminal underworld and law enforcement, was killed in a bombing. His murderers remain unidentified.",
+      icon: "fa-calendar",
+      image: "https://mnthen.com/images/gangster/hogan/stp_hogan.jpg",
+      url: "https://mnthen.com/blog/event/stp_hogan.html",
+      keywords: ["saint paul", "st. paul", "hogan", "bomb", "layover", "gangster", "all"],
     },
     // Add more articles as needed
 ];
