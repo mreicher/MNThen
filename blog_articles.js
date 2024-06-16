@@ -10,7 +10,7 @@ const blogArticles = [
     },
     {
       headline: "Bucket of Blood Saloon",
-      blurb: "The Bucket of Blood Saloon in St. Paul’s red-light district gained a reputation fro violence, mirroring the neighborhood’s rough atmosphere.",
+      blurb: "The Bucket of Blood Saloon in St. Paul’s red-light district gained a reputation for violence, mirroring the neighborhood’s rough atmosphere.",
        icon: "fa-building",
       image: "https://mnthen.com/images/bucketo.jpg",
       url: "https://mnthen.com/blog/place/bucket_of_blood.html",
