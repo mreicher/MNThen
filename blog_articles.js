@@ -125,7 +125,7 @@ const blogArticles = [
     icon: "fa-user",
     image: "https://mnthen.com/images/gangster/clifford/clifford1.jpg",
     url: "https://mnthen.com/blog/peole/clifford.html",
-    keywords: ["brothel", "St. Paul", "Saint Paul", "gangster", "Nina", "person"]
+    keywords: ["brothel", "St. Paul", "Saint Paul", "gangster", "Nina", “all”, “person"]
   },
   {
     headline: "William Hamm Jr. Kidnapping (June 15 - 19, 1933)",
@@ -133,7 +133,7 @@ const blogArticles = [
     icon: "fa-calendar",
     image: "https://mnthen.com/tour/hamm/gallery/kidnap/hamm_kidnap1.jpg",
     url: "https://mnthen.com/blog/event/hamm_kidnap.html",
-    keywords: ["kidnapping", "st. paul", "saint paul", "gangster", "Barker", "Karpis", "event"]
+    keywords: ["kidnapping", "st. paul", "saint paul", "gangster", "Barker", "Karpis", , ”all“, "event"]
   },
   {
     headline: "Death of \"Dapper\" Dan Hogan (Dec 4, 1928)",
