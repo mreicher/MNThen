@@ -1,16 +1,5 @@
 // locations.js
 const locations = [
-      {
-    name: "Wildwood Amusement Park",
-    lat: 45.05648381562563,
-    lon: -92.96040208835049,
-    image: "https://www.mnthen.com/locations/gallery/mahtomedi/wildwood/wildwood_1.jpg",
-    title: "Wildwood Amusement Park",
-    creator: "Matt Reicher",
-   htmlFile: "https://mnthen.com/markers/mahtomedi/mah_wildwood.html",
-    tour: "history",
-    link: "https://mnthen.com/blog/places/wildwood.html"
-  },
   {
     name: "Michael 'Eyedea' Larsen (1981 - 2010)",
     lat: 44.922167523742054,
