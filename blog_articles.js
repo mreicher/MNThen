@@ -1,4 +1,12 @@
 const blogArticles = [
+            {
+      headline: "Hanging of the Dakota 38 (Dec. 26, 1862)",
+      blurb: "Broken promises sparked deadly confrontation in 1862. On December 26, 38 Dakota men were hanged, marking the conflict's tragic end.",
+      icon: "fa-calendar",
+      image: "https://mnthen.com/markers/mankato/images/mankato_38.jpg",
+      url: "https://mnthen.com/blog/event/dakota_coflict.html",
+      keywords: ["Dakota", "dakota", "Mankato", "1982", "war", "conflict", "event", "all"],
+    },
     {
       headline: "Kidnapping of Edward Bremer (Jan 17 - Feb 7, 1934)",
       blurb: "Ed Bremer was kidnapped and held for ransom by the Barker-Karpis gang in 1934. His eventual release helped bring about the end of the gangster era.",
