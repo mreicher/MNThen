@@ -5,7 +5,7 @@ const blogArticles = [
       icon: "fa-calendar",
       image: "https://mnthen.com/images/gangster_bremer_kidnap1.jpg",
       url: "https://mnthen.com/blog/event/bremer_kidnap.html",
-      keywords: ["saint paul", "st. paul", "bremer", "kidnap", "kidnapping", "gangster", "all"],
+      keywords: ["saint paul", "st. paul", "bremer", "kidnap", "kidnapping", "gangster", "event", "all"],
 
     },
     {
@@ -14,7 +14,7 @@ const blogArticles = [
        icon: "fa-building",
       image: "https://mnthen.com/images/bucketo.jpg",
       url: "https://mnthen.com/blog/place/bucket_of_blood.html",
-      keywords: ["saint paul", "st. paul", "saloon", "bucket", "all"],
+      keywords: ["saint paul", "st. paul", "saloon", "bucket", "place", "all"],
 
     },
         {
@@ -23,7 +23,7 @@ const blogArticles = [
         icon: "fa-calendar",
       image: "https://mnthen.com/images/gangster/gangster_lincoln_ct.jpg",
       url: "https://mnthen.com/blog/event/shootout_lincoln_ct.html",
-      keywords: ["saint paul", "st. paul", "gangster", "lincoln", "Lincoln", "Dillinger", "dillinger", "all"],
+      keywords: ["saint paul", "st. paul", "gangster", "lincoln", "Lincoln", "Dillinger", "dillinger", "event", "all"],
 
     },
     {
@@ -32,7 +32,7 @@ const blogArticles = [
             icon: "fa-calendar",
       image: "https://mnthen.com/images/erickson.jpg",
       url: "https://mnthen.com/blog/people/erickson.html",
-      keywords: ["saint paul", "st. paul", "gangster", "barker", "karpis", "shooting", "all"],
+      keywords: ["saint paul", "st. paul", "gangster", "barker", "karpis", "shooting", "event", "all"],
 
     },
         {
@@ -41,7 +41,7 @@ const blogArticles = [
            icon: "fa-building",
       image: "https://mnthen.com/images/reds_savoy.jpg",
       url: "https://mnthen.com/blog/place/reds_savoy.html",
-      keywords: ["saint paul", "st. paul", "pizza", "Savoy", "savoy", "bar", "all"],
+      keywords: ["saint paul", "st. paul", "pizza", "Savoy", "savoy", "bar", "place", "all"],
 
     },
     {
@@ -50,7 +50,7 @@ const blogArticles = [
             icon: "fa-user",
       image: "https://mnthen.com/images/humphrey_header.jpg",
       url: "https://mnthen.com/blog/people/humphrey.html",
-      keywords: ["saint paul", "st. paul", "humphrey", "Humphrey", "politics", "minneapolis", "Minneapolis", "all"],
+      keywords: ["saint paul", "st. paul", "humphrey", "Humphrey", "politics", "minneapolis", "Minneapolis", "person", "all"],
 
     },
         {
@@ -59,7 +59,7 @@ const blogArticles = [
             icon: "fa-user",
       image: "https://mnthen.com/tour/capitol/gallery/olson/olson_1.jpg",
       url: "https://mnthen.com/blog/people/olson.html",
-      keywords: ["saint paul", "st. paul", "politics", "govenor", "olson", "Olson", "all"],
+      keywords: ["saint paul", "st. paul", "politics", "govenor", "olson", "Olson", "person", "all"],
 
     },
         {
@@ -68,7 +68,7 @@ const blogArticles = [
             icon: "fa-user",
       image: "https://mnthen.com/images/van_meter_header.jpg",
       url: "https://mnthen.com/blog/people/van_meter.html",
-      keywords: ["saint paul", "st. paul", "gangster", "dillinger", "Dillinger", "shooting", "van meter", "Van Meter", "all"],
+      keywords: ["saint paul", "st. paul", "gangster", "dillinger", "Dillinger", "shooting", "van meter", "Van Meter", "person", "all"],
 
     },
     {
@@ -77,7 +77,7 @@ const blogArticles = [
             icon: "fa-building",
       image: "https://mnthen.com/locations/gallery/mpls/premium/mpls_grain_belt_1.jpg",
       url: "https://mnthen.com/blog/place/mpls_grain_belt.html",
-      keywords: ["premium", "grain belt", "sign", "minneapolis", "Minneapolis", "beer", "all"],
+      keywords: ["premium", "grain belt", "sign", "minneapolis", "Minneapolis", "beer", "place", "all"],
 
     },
             {
@@ -86,7 +86,7 @@ const blogArticles = [
            icon: "fa-building",
       image: "https://mnthen.com/locations/gallery/mpls/gramma_b/mpls_gramma_b_1.jpg",
       url: "https://mnthen.com/blog/place/mpls_gramma_b.html",
-      keywords: ["northeast", "Northeast", "Minneapolis", "saloon", "bar", "all"],
+      keywords: ["northeast", "Northeast", "Minneapolis", "saloon", "bar", "place", "all"],
 
     },
         {
@@ -95,7 +95,7 @@ const blogArticles = [
             icon: "fa-building",
       image: "https://mnthen.com/markers/stp/summit/images/stp_summit_1.jpg",
       url: "https://mnthen.com/blog/place/stp_summit_brewing.html",
-      keywords: ["saint paul", "st. paul", "Summit", "summit", "beer", "stutrud", "Stutrud", "all"],
+      keywords: ["saint paul", "st. paul", "Summit", "summit", "beer", "stutrud", "Stutrud", "place", "all"],
 
     },
     {
@@ -104,7 +104,7 @@ const blogArticles = [
                  icon: "fa-building",
       image: "https://mnthen.com/tour/wbl/gallery/mound/wbl_mound1.jpg",
       url: "https://mnthen.com/blog/place/wbl_mounds.html",
-      keywords: ["burial", "mounds", "bear", "Bear", "lake", "all"],
+      keywords: ["burial", "mounds", "bear", "Bear", "lake", "place", "all"],
 
     },
         {
@@ -113,7 +113,7 @@ const blogArticles = [
             icon: "fa-building",
       image: "https://mnthen.com/locations/gallery/mahtomedi/wildwood/wildwood_2.jpg",
       url: "https://mnthen.com/blog/place/wildwood.html",
-      keywords: ["amusement", "park", "mahtomedi", "wildwood", "streetcar", "all"],
+      keywords: ["amusement", "park", "mahtomedi", "wildwood", "streetcar", "place", "all"],
 
     },
    {
@@ -122,7 +122,7 @@ const blogArticles = [
   icon: "fa-calendar",
   image: "https://mnthen.com/images/gangster/mccord/stp_mccord_holly.jpg",
   url: "https://mnthen.com/blog/event/stp_mccord_shooting.html",
-  keywords: ["saint paul", "st. paul", "mccord", "gangster", "barker", "karpis", "shooting", "all"],
+  keywords: ["saint paul", "st. paul", "mccord", "gangster", "barker", "karpis", "shooting", "event", "all"],
 },
        {
   headline: "Theodore Hamm Mansion (c. 1886 - 1954)",
@@ -130,7 +130,7 @@ const blogArticles = [
   icon: "fa-building",
   image: "https://mnthen.com/tour/hamm/gallery/mansion/hamm_mansion5.jpg",
   url: "https://mnthen.com/blog/place/stp_hamm_mansion.html",
-  keywords: ["saint paul", "st. paul", "hamm", "mansion", "east side", "all"],
+  keywords: ["saint paul", "st. paul", "hamm", "mansion", "east side", "place", "all"],
 },
              {
       headline: "Clifford, Nina (1851 - 1929)",
@@ -138,7 +138,7 @@ const blogArticles = [
   icon: "fa-user",
       image: "https://mnthen.com/images/gangster/clifford/clifford1.jpg",
       url: "https://mnthen.com/blog/people/clifford.html",
-      keywords: ["brothel", "St. Paul", "Saint Paul", "gangster", "Nina"],
+      keywords: ["brothel", "St. Paul", "Saint Paul", "gangster", "person", "Nina"],
     },
                  {
       headline: "William Hamm Jr. Kidnapping (June 15 - 19, 1933)",
@@ -146,7 +146,7 @@ const blogArticles = [
   icon: "fa-calendar",
       image: "https://mnthen.com/tour/hamm/gallery/kidnap/hamm_kidnap1.jpg",
       url: "https://mnthen.com/blog/event/hamm_kidnap.html",
-       keywords: ["kidnapping", "st. paul", "saint paul", "gangster", "Barker", "Karpis"],
+       keywords: ["kidnapping", "st. paul", "saint paul", "gangster", "event", "Barker", "event", "Karpis"],
     },
          {
       headline: "Death of \"Dapper\" Dan Hogan (Dec 4, 1928)",
@@ -154,7 +154,7 @@ const blogArticles = [
       icon: "fa-calendar",
       image: "https://mnthen.com/images/gangster/hogan/stp_hogan.jpg",
       url: "https://mnthen.com/blog/event/stp_hogan.html",
-      keywords: ["saint paul", "st. paul", "hogan", "bomb", "layover", "gangster", "all"],
+      keywords: ["saint paul", "st. paul", "hogan", "bomb", "layover", "gangster", "event", "all"],
     },
 
 
