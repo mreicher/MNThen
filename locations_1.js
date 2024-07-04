@@ -1,5 +1,16 @@
 // locations.js
 const locations = [
+                {
+    name: "Michael 'Eyedea' Larsen (1981 - 2010)",
+    lat: 44.922167523742054,
+    lng: -93.10991227113067,
+    image: "https://www.mnthen.com/images/wsp_eyedea.jpg",
+    title: "Michael 'Eyedea' Larsen (1981 - 2010)",
+    creator: "Matt Reicher",
+           tour: "history", 
+      htmlFile: "/markers/wsp/wsp_eyedea.html",
+    link: "https://mnthen.com/blog/people/eyedea_larsen.html"
+  },
         {
     name: "Hanging of the Dakota 38",
     lat: 44.1680805962643,
