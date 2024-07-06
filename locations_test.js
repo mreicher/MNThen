@@ -6,6 +6,7 @@ const locations = [
         image: "https://www.mnthen.com/tour/wbl/gallery/plant/wbl_plant1.jpg",
         creator: "Matt Reicher",
         city: "White Bear Lake",
+        audioURL: "path/to/your/audio/file.mp3" 
     },
 
    // Add more locations here
