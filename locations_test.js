@@ -13,7 +13,7 @@ const locations = [
         audioURL: "/audio/wbl/wbl_plant.mp3", 
         tour: "wbl_split",
         link: "https://original.newsbreak.com/@ron-dansley-1587459/3078633820088-lion-s-park-a-remembrance-of-white-bear-lake-s-legendary-plantation-night-club",
-        imageSource: "Image of the Plantation Nighclub used xourtesy of MNHS"
+        imageSource: "Image of the Plantation Nighclub via the White Bear Press"
     },
 
 
