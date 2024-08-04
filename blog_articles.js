@@ -172,6 +172,14 @@ const blogArticles = [
       url: "https://mnthen.com/blog/event/stp_hogan.html",
       keywords: ["saint paul", "st. paul", "hogan", "bomb", "layover", "gangster", "event", "all"],
     },
+             {
+      headline: "St. Paul's Downtown Ball Park (aka the \'Pillbox') 1903 - 1909",
+      blurb: "St. Paul's Downtown Ballpark, known as 'The Pillbox,' served as the St. Paul Saints' home from 1903-1909. This compact field, built to keep the team downtown, featured unique dimensions and close-quarters play.",
+      icon: "fa-building",
+      image: "https://mnthen.com/images/pillbox.jpg",
+      url: "https://mnthen.com/blog/place/pillbox.html",
+      keywords: ["saint paul", "st. paul", "baseball", "Saints", "sports", "ballpark", "place", "all"],
+    },
 
 
     // Add more articles as needed
