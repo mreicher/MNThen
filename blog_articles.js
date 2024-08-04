@@ -180,6 +180,14 @@ const blogArticles = [
       url: "https://mnthen.com/blog/place/pillbox.html",
       keywords: ["saint paul", "st. paul", "baseball", "Saints", "sports", "ballpark", "place", "all"],
     },
+                 {
+      headline: "Leona \"Dottie\" Farnsworth (c. 1873 - 1902)",
+      blurb: "Dottie Farnsworth, a pioneering female cyclist in 1890s Minnesota, broke records and sparked riots. Her career exemplified the era's \"new woman\" and the social impact of women's bicycle racing.",
+      icon: "fa-user",
+      image: "https://mnthen.com/images/dottie.jpg",
+      url: "https://mnthen.com/blog/people/dottie.html",
+      keywords: ["minneapolis", "mpls", "bicycle", "bike", "race", "dottie", "person", "all"],
+    },
 
 
     // Add more articles as needed
