@@ -105,6 +105,14 @@ const blogArticles = [
       keywords: ["northeast", "Northeast", "Minneapolis", "saloon", "bar", "place", "all"],
 
     },
+               {
+  headline: "Michael Allen 'Bones' Hartzell (1947 - 2018)",
+  blurb: "Michael \"Bones\" Hartzell, a beloved figure in St. Paul's North End, spent over 40 years living on Rice Street, maintaining sidewalks and becoming an integral part of the community until his death in 2018.",
+  icon: "fa-user",
+  image: "https://mnthen.com/images/bones.jpg",
+  url: "https://mnthen.com/blog/person/bones.html",
+  keywords: ["saint paul", "st paul", "bones", "rice", "north end", "person", "all"],
+},
         {
       headline: "Summit Brewing (1986 - )",
       blurb: "Founded by Mark Stutrud, Summit grew from a small brewery focusing on underrepresented beer styles to one of Minnesota's largest breweries.",
