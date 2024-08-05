@@ -110,7 +110,7 @@ const blogArticles = [
   blurb: "Michael \"Bones\" Hartzell, a beloved figure in St. Paul's North End, spent over 40 years living on Rice Street, maintaining sidewalks and becoming an integral part of the community until his death in 2018.",
   icon: "fa-user",
   image: "https://mnthen.com/images/bones.jpg",
-  url: "https://mnthen.com/blog/person/bones.html",
+  url: "https://mnthen.com/blog/people/bones.html",
   keywords: ["saint paul", "st paul", "bones", "rice", "north end", "person", "all"],
 },
         {
