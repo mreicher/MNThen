@@ -196,6 +196,14 @@ const blogArticles = [
       url: "https://mnthen.com/blog/people/dottie.html",
       keywords: ["minneapolis", "mpls", "bicycle", "bike", "race", "dottie", "person", "all"],
     },
+               {
+  headline: "Great Northeast Minneapolis Fire (August 13, 1893)",
+  blurb: "The Great Fire of 1893 devastated Northeast Minneapolis, destroying 23 city blocks and countless buildings. It spread rapidly before being halted by the Minneapolis Brewing Company's fireproof structure.",
+  icon: "fa-calendar",
+  image: "https://mnthen.com/images/fire_1893.jpg,
+  url: "https://mnthen.com/blog/event/NE_fire_1893.html",
+  keywords: ["northeast", "mpls", "minneapolis", "fire", "grain belt", "event", "all"],
+},
 
 
     // Add more articles as needed
