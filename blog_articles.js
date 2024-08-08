@@ -22,6 +22,7 @@ const blogArticles = [
       image: "https://mnthen.com/images/gangster_bremer_kidnap1.jpg",
       url: "https://mnthen.com/blog/event/bremer_kidnap.html",
       keywords: ["saint paul", "st. paul", "bremer", "kidnap", "kidnapping", "gangster", "event", "all"],
+
     },
     {
       headline: "Bucket of Blood Saloon",
@@ -30,6 +31,7 @@ const blogArticles = [
       image: "https://mnthen.com/images/bucketo.jpg",
       url: "https://mnthen.com/blog/place/bucket_of_blood.html",
       keywords: ["saint paul", "st. paul", "saloon", "bucket", "place", "all"],
+
     },
         {
       headline: "Shootout at the Lincoln Court Apartments (March 31, 1934)",
@@ -38,6 +40,7 @@ const blogArticles = [
       image: "https://mnthen.com/images/gangster/gangster_lincoln_ct.jpg",
       url: "https://mnthen.com/blog/event/shootout_lincoln_ct.html",
       keywords: ["saint paul", "st. paul", "gangster", "lincoln", "Lincoln", "Dillinger", "dillinger", "event", "all"],
+
     },
     {
       headline: "Shooting of Wreath Salesman Oscar Erickson (Dec. 16, 1932)",
@@ -46,6 +49,7 @@ const blogArticles = [
       image: "https://mnthen.com/images/erickson.jpg",
       url: "https://mnthen.com/blog/people/erickson.html",
       keywords: ["saint paul", "st. paul", "gangster", "barker", "karpis", "shooting", "event", "all"],
+
     },
         {
       headline: "Original Red's Savoy (1965 - 2017)",
@@ -54,15 +58,8 @@ const blogArticles = [
       image: "https://mnthen.com/images/reds_savoy.jpg",
       url: "https://mnthen.com/blog/place/reds_savoy.html",
       keywords: ["saint paul", "st. paul", "pizza", "Savoy", "savoy", "bar", "place", "all"],
+
     },
-               {
-  headline: "Nye's Polonaise (1950 - 2016)",
-  blurb: "Nye's Polonaise, a beloved Northeast Minneapolis institution, served its community for nearly 66 years. Known for Polish cuisine, polka music, and unforgettable characters, it remained a timeless haven until closing in 2016.",
-  icon: "fa-building",
-  image: "https://mnthen.com/images/nyes.jpg",
-  url: "https://mnthen.com/blog/place/nyes.html",
-  keywords: ["northeast", "mpls", "minneapolis", "nyes", "polish", "dance", "place", "all"],
-},
     {
       headline: "Humphrey, Hubert H. (1911 - 1978)",
       blurb: "Progressive champion Hubert Humphrey left an enduring legacy fighting tirelessly for civil rights and social justice as mayor, senator, vice president.",
@@ -70,6 +67,7 @@ const blogArticles = [
       image: "https://mnthen.com/images/humphrey_header.jpg",
       url: "https://mnthen.com/blog/people/humphrey.html",
       keywords: ["saint paul", "st. paul", "humphrey", "Humphrey", "politics", "minneapolis", "Minneapolis", "person", "all"],
+
     },
         {
       headline: "Olson, Floyd B. (1891 - 1936)",
@@ -78,6 +76,7 @@ const blogArticles = [
       image: "https://mnthen.com/tour/capitol/gallery/olson/olson_1.jpg",
       url: "https://mnthen.com/blog/people/olson.html",
       keywords: ["saint paul", "st. paul", "politics", "govenor", "olson", "Olson", "person", "all"],
+
     },
         {
       headline: "Van Meter, Homer V. (1905 - 1934)",
@@ -86,6 +85,7 @@ const blogArticles = [
       image: "https://mnthen.com/images/van_meter_header.jpg",
       url: "https://mnthen.com/blog/people/van_meter.html",
       keywords: ["saint paul", "st. paul", "gangster", "dillinger", "Dillinger", "shooting", "van meter", "Van Meter", "person", "all"],
+
     },
     {
       headline: "Grain Belt Beer Sign",
@@ -94,6 +94,7 @@ const blogArticles = [
       image: "https://mnthen.com/locations/gallery/mpls/premium/mpls_grain_belt_1.jpg",
       url: "https://mnthen.com/blog/place/mpls_grain_belt.html",
       keywords: ["premium", "grain belt", "sign", "minneapolis", "Minneapolis", "beer", "place", "all"],
+
     },
             {
       headline: "Gramma B's",
@@ -102,9 +103,10 @@ const blogArticles = [
       image: "https://mnthen.com/locations/gallery/mpls/gramma_b/mpls_gramma_b_1.jpg",
       url: "https://mnthen.com/blog/place/mpls_gramma_b.html",
       keywords: ["northeast", "Northeast", "Minneapolis", "saloon", "bar", "place", "all"],
+
     },
                {
-  headline: "Michael Allen 'Bones' Hartzell (1947 - 2018)",
+  headline: "Hartzell, Michael Allen 'Bones' (1947 - 2018)",
   blurb: "Michael \"Bones\" Hartzell, a beloved figure in St. Paul's North End, spent over 40 years living on Rice Street, maintaining sidewalks and becoming an integral part of the community until his death in 2018.",
   icon: "fa-user",
   image: "https://mnthen.com/images/bones.jpg",
@@ -118,6 +120,7 @@ const blogArticles = [
       image: "https://mnthen.com/markers/stp/summit/images/stp_summit_1.jpg",
       url: "https://mnthen.com/blog/place/stp_summit_brewing.html",
       keywords: ["saint paul", "st. paul", "Summit", "summit", "beer", "stutrud", "Stutrud", "place", "all"],
+
     },
     {
       headline: "Native American Burial Mounds (White Bear Lake)",
@@ -126,6 +129,7 @@ const blogArticles = [
       image: "https://mnthen.com/tour/wbl/gallery/mound/wbl_mound1.jpg",
       url: "https://mnthen.com/blog/place/wbl_mounds.html",
       keywords: ["burial", "mounds", "bear", "Bear", "lake", "place", "all"],
+
     },
         {
       headline: "Wildwood Amusement Park",
@@ -134,6 +138,7 @@ const blogArticles = [
       image: "https://mnthen.com/locations/gallery/mahtomedi/wildwood/wildwood_2.jpg",
       url: "https://mnthen.com/blog/place/wildwood.html",
       keywords: ["amusement", "park", "mahtomedi", "wildwood", "streetcar", "place", "all"],
+
     },
    {
   headline: "Shooting of Roy McCord (Jan. 13, 1934)",
@@ -184,7 +189,7 @@ const blogArticles = [
       keywords: ["saint paul", "st. paul", "baseball", "Saints", "sports", "ballpark", "place", "all"],
     },
                  {
-      headline: "Leona \"Dottie\" Farnsworth (c. 1873 - 1902)",
+      headline: "Farnsworth, Leona \"Dottie\" (c. 1873 - 1902)",
       blurb: "Dottie Farnsworth, a pioneering female cyclist in 1890s Minnesota, broke records and sparked riots. Her career exemplified the era's \"new woman\" and the social impact of women's bicycle racing.",
       icon: "fa-user",
       image: "https://mnthen.com/images/dottie.jpg",
@@ -199,6 +204,23 @@ const blogArticles = [
   url: "https://mnthen.com/blog/event/NE_fire_1893.html",
   keywords: ["northeast", "mpls", "minneapolis", "fire", "grain belt", "event", "all"],
 },
+           {
+  headline: "Nye's Polonaise (1950 - 2016)",
+  blurb: "Nye's Polonaise, a beloved Northeast Minneapolis institution, served its community for nearly 66 years. Known for Polish cuisine, polka music, and unforgettable characters, it remained a timeless haven until closing in 2016.",
+  icon: "fa-building",
+  image: "https://mnthen.com/images/nyes.jpg",
+  url: "https://mnthen.com/blog/place/nyes.html",
+  keywords: ["northeast", "mpls", "minneapolis", "nyes", "polish", "dance", "place", "all"],
+},
+             {
+      headline: "Weckman, George \"The Hot Dog Man\" (1951 - 2009)",
+      blurb: "George Weckman was the celebrated \"Hot Dog Man\" of St. Paul. His hard work, dedication, and commitment to his customers made him a local icon.",
+  icon: "fa-user",
+      image: "https://mnthen.com/images/weckman.jpg",
+      url: "https://mnthen.com/blog/people/weckman.html",
+      keywords: ["hot dog", "St. Paul", "Saint Paul", "vendor", "person", "george", "weckman", "all"],
+    },
+
 
     // Add more articles as needed
 ];
