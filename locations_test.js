@@ -28,23 +28,23 @@ const locations = [
         audioURL: "/audio/mahtomedi/wildwood.mp3", 
         tours: "history",
         link: "https://mnthen.com/blog/place/wildwood.html",
-        imageSource: "Image of the slide at Wildwood Park c. 1905 via MPRNews",
+        imageSource: "Image of the slide at Wildwood Park c. 1905 via MPRNews"
     },
-        {
-        id: "1014",
-        lat:  44.922167523742054,
-        lng:  -93.10991227113067,
-        name: “Michael 'Eyedea' Larsen (1981 - 2010)",
-        title: "Michael 'Eyedea' Larsen",
-        image: "https://www.mnthen.com/images/wsp_eyedea.jpg",
-        creator: "Matt Reicher",
-        city: "St. Paul",
-        htmlFile: "/markers/wsp/wsp_eyedea.html",
-        audioURL: "/audio/wsp/wsp_eyedea.mp3", 
-        tours: "history",
-        link: "https://mnthen.com/blog/people/eyedea_larsen.html",
-        imageSource: "Image of 'Eyedea' Larsen via Heavy Blog is Heavy",
-    },
+{
+    id: "1014",
+    lat: 44.922167523742054,
+    lng: -93.10991227113067,
+    name: "Michael 'Eyedea' Larsen (1981 - 2010)",
+    title: "Michael 'Eyedea' Larsen",
+    image: "https://www.mnthen.com/images/wsp_eyedea.jpg",
+    creator: "Matt Reicher",
+    city: "St. Paul",
+    htmlFile: "/markers/wsp/wsp_eyedea.html",
+    audioURL: "/audio/wsp/wsp_eyedea.mp3", 
+    tours: "history",
+    link: "https://mnthen.com/blog/people/eyedea_larsen.html",
+    imageSource: "Image of 'Eyedea' Larsen via Heavy Blog is Heavy"
+}
 
 
 
