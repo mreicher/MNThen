@@ -60,9 +60,21 @@ const locations = [
     link: "https://mnthen.com/blog/event/dakota_conflict.html",
     imageSource: "Dakota 38 Memorial via Library of Congress"
 },
-
-
-
+{
+    id: "1014",
+    lat: 44.961337319371076,
+    lng: -93.07148153924896,
+    name: "Theodore Hamm Mansion (c. 1886 - 1954)",
+    title: "Theodore Hamm Mansion",
+    image: "https://mnthen.com/tour/hamm/gallery/mansion/hamm_mansion5.jpg",
+    creator: "Matt Reicher",
+    city: "St. Paul",
+    htmlFile: "/tour/hamm/hamm_mansion.html",
+    audioURL: "/exhibit/audio/stp/stp_hamm_mansion.mp3", 
+    tours: "hamm",
+    link: "https://mnthen.com/blog/place/stp_hamm_mansion.html",
+    imageSource: "Photo of the Hamm Mansion via 1889 Victorian House Restoration"
+},
 
 
    // Add more locations here
