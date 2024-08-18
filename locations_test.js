@@ -75,6 +75,22 @@ const locations = [
     link: "https://mnthen.com/blog/place/stp_hamm_mansion.html",
     imageSource: "Photo of the Hamm Mansion via 1889 Victorian House Restoration"
 },
+    {
+    id: "1015",
+    lat: 44.98463074655949,
+    lng: -93.26445659478223,
+    name: "Father Louis Hennepin Suspension Bridge",
+    title: "Father Louis Hennepin Suspension Bridge",
+    image: "/locations/gallery/mpls/henn_bridge/henn_bridge_1.jpg",
+    creator: "Matt Reicher",
+    city: "Minneapolis",
+    htmlFile: "/markers/mpls/mpls_henn_bridge.html",
+    audioURL: "/audio/mpls/mpls_henn_bridge.mp3", 
+    tours: "history",
+    link: "https://www.mnopedia.org/structure/father-louis-hennepin-suspension-bridge",
+    imageSource: "First suspension bridge in Minneapolis, (c. 1858) via MNopedia"
+},
+
 
 
    // Add more locations here
