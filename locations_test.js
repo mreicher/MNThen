@@ -92,9 +92,9 @@ const locations = [
 },
     {
     id: "1016",
-    lat: 44.98463074655949,
-    lng: -93.26445659478223,
-    name: "Swede Hollow (MNHS Test)",
+    lat: 44.94971776087015,
+    lng: -93.10614669576397,
+    name: "Swede Hollow (MNHS Example Site)",
     title: "Swede Hollow",
     image: "https://mnthen.com/tour/hamm/gallery/hollow/hamm_hollow1.jpg",
     creator: "Matt Reicher",
