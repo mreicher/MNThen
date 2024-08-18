@@ -100,7 +100,7 @@ const locations = [
     creator: "Matt Reicher",
     city: "St. Paul",
     htmlFile: "https://mnthen.com/tour/hamm/hamm_hollow.html",
-    audioURL: "/exhibit/audio/stp/stp_swede_hollow.mp3", 
+    audioURL: "/audio/exhibit/swede_hollow.mp3", 
     tours: "history",
     link: "https://www.mnopedia.org/place/swede-hollow",
     imageSource: "Swede Hollow looking north, (c.1910). via MNopedia"
