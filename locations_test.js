@@ -13,7 +13,7 @@ const locations = [
         audioURL: "/audio/wbl/wbl_plant.mp3", 
         tours: "wbl_split",
         link: "https://original.newsbreak.com/@ron-dansley-1587459/3078633820088-lion-s-park-a-remembrance-of-white-bear-lake-s-legendary-plantation-night-club",
-        imageSource: "Image of the Plantation Nighclub via the White Bear Press"
+        imageSource: "The Plantation Nighclub via the White Bear Press"
     },
         {
         id: "1011",
@@ -58,7 +58,7 @@ const locations = [
     audioURL: "/audio/mankato/man_dakota_38.mp3", 
     tours: "history",
     link: "https://mnthen.com/blog/event/dakota_conflict.html",
-    imageSource: "Dakota 38 Memorial via Library of Congress"
+    imageSource: "The Dakota 38 Memorial via Library of Congress"
 },
 {
     id: "1014",
@@ -73,7 +73,7 @@ const locations = [
     audioURL: "/exhibit/audio/stp/stp_hamm_mansion.mp3", 
     tours: "hamm",
     link: "https://mnthen.com/blog/place/stp_hamm_mansion.html",
-    imageSource: "Photo of the Hamm Mansion via 1889 Victorian House Restoration"
+    imageSource: "The Hamm Mansion via 1889 Victorian House Restoration"
 },
     {
     id: "1015",
@@ -90,6 +90,22 @@ const locations = [
     link: "https://www.mnopedia.org/structure/father-louis-hennepin-suspension-bridge",
     imageSource: "First suspension bridge in Minneapolis, (c. 1858) via MNopedia"
 },
+    {
+    id: "1016",
+    lat: 44.98463074655949,
+    lng: -93.26445659478223,
+    name: "Swede Hollow (MNHS Test)",
+    title: "Swede Hollow",
+    image: "https://mnthen.com/tour/hamm/gallery/hollow/hamm_hollow1.jpg",
+    creator: "Matt Reicher",
+    city: "St. Paul",
+    htmlFile: "https://mnthen.com/tour/hamm/hamm_hollow.html",
+    audioURL: "/exhibit/audio/stp/stp_swede_hollow.mp3", 
+    tours: "history",
+    link: "https://www.mnopedia.org/place/swede-hollow",
+    imageSource: "Swede Hollow looking north, (c.1910). via MNopedia"
+},
+
 
 
 
