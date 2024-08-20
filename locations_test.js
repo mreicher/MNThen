@@ -105,6 +105,21 @@ const locations = [
     link: "https://www.mnopedia.org/place/swede-hollow",
     imageSource: "Swede Hollow looking north, (c.1910). via MNopedia"
 },
+    {
+    id: "1017",
+    lat: 44.954610002713714,
+    lng: -93.1022388820506,
+    name: "Minnesota’s Third State Capitol",
+    title: "Minnesota’s Third State Capitol",
+    image: "https://mnthen.com/exhibit/images/capitol3.jpg",
+    creator: "Brian Pease",
+    city: "St. Paul",
+    htmlFile: "https://mnthen.com/tour/hamm/hamm_hollow.html",
+    audioURL: "/audio/exhibit/capitol3.mp3", 
+    tours: "history",
+    link: "https://www.mnopedia.org/structure/minnesota-s-third-state-capitol",
+    imageSource: "Minnesota State Capitol Building (2022)"
+},
 
 
 
