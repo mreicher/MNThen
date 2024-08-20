@@ -112,11 +112,11 @@ const locations = [
     name: "Minnesota’s Third State Capitol",
     title: "Minnesota’s Third State Capitol",
     image: "https://mnthen.com/exhibit/images/capitol3.jpg",
-    creator: "Brian Pease",
+    creator: "Brian C. Pease",
     city: "St. Paul",
     htmlFile: "https://mnthen.com/tour/hamm/hamm_hollow.html",
     audioURL: "/audio/exhibit/capitol3.mp3", 
-    tours: "history",
+    tours: "capitol",
     link: "https://www.mnopedia.org/structure/minnesota-s-third-state-capitol",
     imageSource: "Minnesota State Capitol Building (2022)"
 },
