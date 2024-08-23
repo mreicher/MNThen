@@ -2,8 +2,8 @@
 const locations = [
     {
     id: "1010",
-    lat: 45.14440004252878,
-    lng: -93.00431103417095,
+    lat: 45.073692373690626,
+    lng: -93.01483408611226,
     name: "Plantation Night Club (1930 - 1933)",
     title: "Plantation Night Club",
     image: "https://www.mnthen.com/tour/wbl/gallery/plant/wbl_plant1.jpg",
