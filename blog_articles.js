@@ -188,6 +188,14 @@ const blogArticles = [
       url: "https://mnthen.com/blog/place/pillbox.html",
       keywords: ["saint paul", "st. paul", "baseball", "Saints", "sports", "ballpark", "place", "all"],
     },
+    {
+  "headline": "Whiskey the Horse (c. 1911 - 1943)",
+  "blurb": "Whiskey, an exceptional Army horse at Fort Snelling, gained fame for his jumping prowess and enduring bond with Lt. William Hazelrigg.",
+  "icon": "fa-user",
+  "image": "https://mnthen.com/images/whiskey.jpg",
+  "url": "https://mnthen.com/blog/people/whiskey.html",
+  "keywords": ["saint paul", "st. paul", "fort snelling", "army", "horse", "grave", "person", "all"]
+},
                  {
       headline: "Farnsworth, Leona \"Dottie\" (c. 1873 - 1902)",
       blurb: "Dottie Farnsworth, a pioneering female cyclist in 1890s Minnesota, broke records and sparked riots. Her career exemplified the era's \"new woman\" and the social impact of women's bicycle racing.",
