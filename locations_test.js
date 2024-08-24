@@ -121,10 +121,10 @@ const locations = [
     link: "https://www.mnopedia.org/structure/minnesota-s-third-state-capitol",
     imageSource: "Minnesota State Capitol Building (2022)"
 },
-    {
+{
   "id": "1018",
-  "lat": 44.954610002713714,
-  "lng": -93.1022388820506,
+  "lat": 44.893943004662326,
+  "lng": -93.18772007741772,
   "name": "Whiskey the Horse (c. 1911 - 1943)",
   "title": "Whiskey the Horse (c. 1911 - 1943)",
   "image": "https://mnthen.com/images/whiskey.jpg",
