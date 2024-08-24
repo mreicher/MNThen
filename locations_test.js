@@ -121,9 +121,20 @@ const locations = [
     link: "https://www.mnopedia.org/structure/minnesota-s-third-state-capitol",
     imageSource: "Minnesota State Capitol Building (2022)"
 },
-
-
-
+    {
+  "id": "1018",
+  "lat": 44.954610002713714,
+  "lng": -93.1022388820506,
+  "name": "Whiskey the Horse (c. 1911 - 1943)",
+  "title": "Whiskey the Horse (c. 1911 - 1943)",
+  "image": "https://mnthen.com/images/whiskey.jpg",
+  "creator": "Matt Reicher",
+  "city": "St. Paul",
+  "audioURL": "/audio/exhibit/whiskey.mp3",
+  "tours": "history",
+  "link": "https://mnthen.com/blog/people/whiskey.html",
+  "imageSource": "Whiskey with Captain W.R. Hazelrigg (1943)"
+}
 
    // Add more locations here
 ];
