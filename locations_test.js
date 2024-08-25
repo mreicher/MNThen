@@ -2,6 +2,20 @@
 const locations = [
 
     {
+    "id": "1001",
+    "lat": 45.144373628204576,
+    "lng": -93.00425125866178,
+    "name": "Test Location",
+    "title": "Test Location",
+    "image": "https://www.mnthen.com/tour/wbl/gallery/plant/wbl_plant1.jpg",
+    "creator": "Matt Reicher",
+    "city": "Secret Place",
+    "audioURL": "/audio/wbl/wbl_plant.mp3",
+    "tours": "wbl_split",
+    "link": "https://original.newsbreak.com/@ron-dansley-1587459/3078633820088-lion-s-park-a-remembrance-of-white-bear-lake-s-legendary-plantation-night-club",
+    "imageSource": "The Plantation Nightclub via the White Bear Press"
+},
+    {
     id: "1010",
     lat: 45.073692373690626,
     lng: -93.01483408611226,
