@@ -1,20 +1,20 @@
 // locations_test.js
 const locations = [
 
-{
-    id: "1017",
-    lat: 44.95475874410186,
-    lng: -93.10223010864519,
-    name: "Minnesota’s Third State Capitol",
-    title: "Minnesota’s Third State Capitol",
-    image: "https://mnthen.com/exhibit/images/capitol3.jpg",
-    creator: "Brian C. Pease",
-    city: "St. Paul",
-    audioURL: "/audio/exhibit/capitol3.mp3",
-    tours: "capitol",
-    link: "https://www.mnopedia.org/structure/minnesota-s-third-state-capitol",
-    imageSource: "Minnesota State Capitol Building (2022)"
-},
+    {
+    id: "1010",
+    lat: 45.073692373690626,
+    lng: -93.01483408611226,
+    name: "Plantation Night Club (1930 - 1933)",
+    title: "Plantation Night Club",
+    image: "https://www.mnthen.com/tour/wbl/gallery/plant/wbl_plant1.jpg",
+    creator: "Matt Reicher",
+    city: "White Bear Lake",
+    audioURL: "/audio/wbl/wbl_plant.mp3", 
+    tours: "wbl_split",
+    link: "https://original.newsbreak.com/@ron-dansley-1587459/3078633820088-lion-s-park-a-remembrance-of-white-bear-lake-s-legendary-plantation-night-club",
+    imageSource: "The Plantation Nightclub via the White Bear Press"
+    },
     
         {
         id: "1011",
@@ -30,6 +30,7 @@ const locations = [
         link: "https://mnthen.com/blog/place/wildwood.html",
         imageSource: "Image of the slide at Wildwood Park c. 1905 via MPRNews"
     },
+    
 {
     id: "1012",
     lat: 44.922167523742054,
@@ -44,6 +45,7 @@ const locations = [
     link: "https://mnthen.com/blog/people/eyedea_larsen.html",
     imageSource: "Image of 'Eyedea' Larsen via Heavy Blog is Heavy"
 },
+    
     {
     id: "1013",
     lat: 44.1680805962643,
@@ -58,6 +60,7 @@ const locations = [
     link: "https://mnthen.com/blog/event/dakota_conflict.html",
     imageSource: "The Dakota 38 Memorial via Library of Congress"
 },
+    
 {
     id: "1014",
     lat: 44.961337319371076,
@@ -72,6 +75,7 @@ const locations = [
     link: "https://mnthen.com/blog/place/stp_hamm_mansion.html",
     imageSource: "The Hamm Mansion via 1889 Victorian House Restoration"
 },
+    
     {
     id: "1015",
     lat: 44.98463074655949,
@@ -86,6 +90,7 @@ const locations = [
     link: "https://www.mnopedia.org/structure/father-louis-hennepin-suspension-bridge",
     imageSource: "First suspension bridge in Minneapolis, (c. 1858) via MNopedia"
 },
+    
     {
     id: "1016",
     lat: 44.949271218176925,
@@ -100,20 +105,22 @@ const locations = [
     link: "https://www.mnopedia.org/place/swede-hollow",
     imageSource: "Swede Hollow looking north, (c.1910). via MNopedia"
 },
-    {
+    
+{
     id: "1017",
-    lat: 44.954610002713714,
-    lng: -93.1022388820506,
+    lat: 44.95475874410186,
+    lng: -93.10223010864519,
     name: "Minnesota’s Third State Capitol",
     title: "Minnesota’s Third State Capitol",
     image: "https://mnthen.com/exhibit/images/capitol3.jpg",
     creator: "Brian C. Pease",
     city: "St. Paul",
-    audioURL: "/audio/exhibit/capitol3.mp3", 
+    audioURL: "/audio/exhibit/capitol3.mp3",
     tours: "capitol",
     link: "https://www.mnopedia.org/structure/minnesota-s-third-state-capitol",
     imageSource: "Minnesota State Capitol Building (2022)"
 },
+    
 {
   "id": "1018",
   "lat": 44.893943004662326,
