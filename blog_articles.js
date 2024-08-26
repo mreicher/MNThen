@@ -220,7 +220,7 @@ const blogArticles = [
   url: "https://mnthen.com/blog/place/nyes.html",
   keywords: ["northeast", "mpls", "minneapolis", "nyes", "polish", "dance", "place", "all"],
 },
-             {
+    {
       headline: "Weckman, George \"The Hot Dog Man\" (1951 - 2009)",
       blurb: "George Weckman was the celebrated \"Hot Dog Man\" of St. Paul. His hard work, dedication, and commitment to his customers made him a local icon.",
   icon: "fa-user",
@@ -228,6 +228,14 @@ const blogArticles = [
       url: "https://mnthen.com/blog/people/weckman.html",
       keywords: ["hot dog", "St. Paul", "Saint Paul", "vendor", "person", "george", "weckman", "all"],
     },
+    {
+  "headline": "Murder of Alice Matthews (March 23, 1912)",
+  "blurb": "A young woman, Alice Matthews, was brutally murdered in Minneapolis in 1912. Despite a massive investigation and public outcry, her attacker was never identified.",
+  "icon": "fa-calendar",
+  "image": "https://mnthen.com/images/matthews.jpg",
+  "url": "https://mnthen.com/blog/event/matthews.html",
+  "keywords": ["minneapolis", "mpls", "unsolved", "true crime", "crime", "event", "all"],
+},
 
 
     // Add more articles as needed
