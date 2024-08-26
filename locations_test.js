@@ -1,20 +1,21 @@
 // locations_test.js
 const locations = [
 
-    {
-    id: "1010",
-    lat: 45.073692373690626,
-    lng: -93.01483408611226,
-    name: "Plantation Night Club (1930 - 1933)",
-    title: "Plantation Night Club",
-    image: "https://www.mnthen.com/tour/wbl/gallery/plant/wbl_plant1.jpg",
-    creator: "Matt Reicher",
-    city: "White Bear Lake",
-    audioURL: "/audio/wbl/wbl_plant.mp3", 
-    tours: "wbl_split",
-    link: "https://original.newsbreak.com/@ron-dansley-1587459/3078633820088-lion-s-park-a-remembrance-of-white-bear-lake-s-legendary-plantation-night-club",
-    imageSource: "The Plantation Nightclub via the White Bear Press"
-    },
+{
+    id: "1017",
+    lat: 44.95475874410186,
+    lng: -93.10223010864519,
+    name: "Minnesota’s Third State Capitol",
+    title: "Minnesota’s Third State Capitol",
+    image: "https://mnthen.com/exhibit/images/capitol3.jpg",
+    creator: "Brian C. Pease",
+    city: "St. Paul",
+    audioURL: "/audio/exhibit/capitol3.mp3",
+    tours: "capitol",
+    link: "https://www.mnopedia.org/structure/minnesota-s-third-state-capitol",
+    imageSource: "Minnesota State Capitol Building (2022)"
+},
+    
         {
         id: "1011",
         lat:  45.05648381562563,
