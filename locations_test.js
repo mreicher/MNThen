@@ -95,7 +95,7 @@ const locations = [
     id: "1016",
     lat: 44.949271218176925,
     lng: -93.10455573104193,
-    name: "Swede Hollow (MNHS Example Site)",
+    name: "(MNHS Example Site)",
     title: "Swede Hollow",
     image: "https://mnthen.com/tour/hamm/gallery/hollow/hamm_hollow1.jpg",
     creator: "Matt Reicher",
@@ -134,7 +134,22 @@ const locations = [
   "tours": "history",
   "link": "https://mnthen.com/blog/people/whiskey.html",
   "imageSource": "Whiskey with Captain W.R. Hazelrigg (1943)"
-}
+},
+
+    {
+    "id": "1019",
+    "lat": 44.96153652405189,
+    "lng": -93.07320192008716,
+    "name": "Swede Hollow",
+    "title": "Swede Hollow",
+    "image": "https://mnthen.com/tour/hamm/gallery/hollow/hamm_hollow1.jpg",
+    "creator": "Matt Reicher",
+    "city": "St. Paul",
+    "audioURL": "/audio/exhibit/swede_hollow.mp3",
+    "tours": "history",
+    "link": "https://www.mnopedia.org/place/swede-hollow",
+    "imageSource": "Swede Hollow looking north, (c.1910). via MNopedia"
+},
 
    // Add more locations here
 ];
