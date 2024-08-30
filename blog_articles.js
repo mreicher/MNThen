@@ -236,6 +236,14 @@ const blogArticles = [
   "url": "https://mnthen.com/blog/event/matthews.html",
   "keywords": ["minneapolis", "mpls", "unsolved", "true crime", "crime", "event", "all"],
 },
+    {
+  "headline": "Keller, Andrew F. (A.F.) (1819 - 1873)",
+  "blurb": "Pioneer brewer who founded the Pittsburg Brewery (later becoming the Hamm's Brewery) in St. Paul in 1857. His contributions remain a mystery.",
+  "icon": "fa-user",
+  "image": "https://mnthen.com/images/hamms_1880.jpg",
+  "url": "https://mnthen.com/blog/people/keller.html",
+  "keywords": ["saint paul", "st. paul", "beer", "brewer", "pioneer", "keller", "person", "all"],
+},
 
 
     // Add more articles as needed
