@@ -244,6 +244,14 @@ const blogArticles = [
   "url": "https://mnthen.com/blog/people/keller.html",
   "keywords": ["saint paul", "st. paul", "beer", "brewer", "pioneer", "keller", "person", "all"],
 },
+    {
+  "headline": "William R. Merriam Mansion (1882 - 1896)",
+  "blurb": "The Merriam Mansion, a grand Queen Anne-style home overlooking St. Paul built in 1882, burned down in 1896.",
+  "icon": "fa-building",
+  "image": "https://mnthen.com/images/merriam_house.jpg",
+  "url": "https://mnthen.com/blog/place/merriam_mansion.html",
+  "keywords": ["saint paul", "st. paul", "merriam", "mansion", "capitol", "park", "cass", "place", "all"]
+}.
 
 
     // Add more articles as needed
