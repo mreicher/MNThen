@@ -151,5 +151,20 @@ const locations = [
     "imageSource": "Swede Hollow looking north, (c.1910). via MNopedia"
 },
 
+    {
+    "id": "1020",
+    "lat": 44.95677827995171,
+    "lng": -93.10067483187163,
+    "name": "William R. Merriam Mansion (1882 - 1896)",
+    "title": "William R. Merriam Mansion",
+    "image": "https://mnthen.com/images/merriam_house.jpg",
+    "creator": "Matt Reicher",
+    "city": "St. Paul",
+    "audioURL": "/audio/exhibit/merriam_mansion.mp3",
+    "tours": "history",
+    "link": "https://mnthen.com/blog/place/merriam_mansion.html",
+    "imageSource": "William R. Merriam residence, (c.1890). via St Paul Historical"
+},
+
    // Add more locations here
 ];
