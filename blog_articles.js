@@ -250,8 +250,8 @@ const blogArticles = [
   "icon": "fa-building",
   "image": "https://mnthen.com/images/merriam_house.jpg",
   "url": "https://mnthen.com/blog/place/merriam_mansion.html",
-  "keywords": ["saint paul", "st. paul", "merriam", "mansion", "capitol", "park", "cass", "place", "all"]
-}.
+  "keywords": ["saint paul", "st. paul", "merriam", "mansion", "capitol", "park", "cass", "place", "all"],
+},
 
 
     // Add more articles as needed
