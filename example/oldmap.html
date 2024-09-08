@@ -305,8 +305,8 @@ var newMarkers = {};
 
 // Define alpha-beta filter constants and variables
 
-const alpha = 0.25;
-const beta = 0.025;
+const alpha = 0.2;
+const beta = 0.01;
 
 var lastEstimatedPos = null;
 var lastEstimatedVel = { lat: 0, lng: 0 };
@@ -393,7 +393,7 @@ L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
 
     L.control.attribution({ prefix: false }).addTo(map);
 
-    var userLocationMarker = L.circleMarker([0, 0], {
+var userLocationMarker = L.circleMarker([0, 0], {
 
         color: "red",
         fillColor: "#f03",
@@ -402,10 +402,8 @@ L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
 
     }).addTo(map);
 
-
     var userInteracted = false;
-
-
+    
     map.on("dragstart zoomstart", function() {
 
         userInteracted = true;
@@ -585,6 +583,10 @@ function movingAverageFilter(newMeasurement) {
     return L.latLng(avgLat, avgLng);
 }
 
+let lastAppliedLatLng = null;
+let isStationary = true;
+const STATIONARY_THRESHOLD = 0.5; // feet per second
+
 function combinedFilter(newMeasurement) {
     const smoothedPos = alphaBetaFilter(newMeasurement);
     return movingAverageFilter(smoothedPos);
@@ -600,61 +602,179 @@ function fastDistanceApprox(latlng1, latlng2) {
     return 111319.9 * Math.sqrt(dx * dx + dy * dy);
 }
 
+function applyDynamicDeadband(latLng, lastLatLng, isStationary) {
+    const deadbandThresholdFeet = isStationary ? 3 : 0.5; // Adjust threshold based on motion
+    const distanceFeet = fastDistanceApprox(latLng, lastLatLng) * 3.28084;
+    if (distanceFeet < deadbandThresholdFeet) {
+        return lastLatLng; // Ignore small hops
+    }
+    return latLng; // Apply the actual new position
+}
+
+let lastEstimatedVel = { lat: 0, lng: 0 };
 let resetInteractionTimeout;
 let lastUpdateTime = null;
 const SMOOTHING_FACTOR = 0.5;
+const PREDICTION_TIME = 0.5; // Predict 0.5 seconds ahead
+const CENTER_THRESHOLD = 0.0001; // Example value
+const UPDATE_INTERVAL = 1000; // 1 second between updates
 
 function updateUserLocation(e = null) {
+    const now = Date.now();
     console.log('updateUserLocation called with', e);
+    // Get current location
     currentLatLng = e ? e.latlng : lastKnownLatLng;
     console.log('Set currentLatLng to:', currentLatLng);
     
     if (!currentLatLng) {
+        console.warn('No current location available');
         return null;
     }
     
-    const smoothedLatLng = combinedFilter(currentLatLng);
+    // Calculate speed and check if stationary
+    if (lastUpdateTime && lastAppliedLatLng) {
+        const timeDiff = (now - lastUpdateTime) / 1000; // Convert to seconds
+        const distanceFeet = fastDistanceApprox(currentLatLng, lastAppliedLatLng) * 3.28084;
+        const speed = distanceFeet / timeDiff;
+        isStationary = speed < STATIONARY_THRESHOLD;
+    }
+    
+    // Apply filters
+    const deadbandFilteredLatLng = applyDynamicDeadband(currentLatLng, lastAppliedLatLng || currentLatLng, isStationary);
+    const smoothedLatLng = combinedFilter(deadbandFilteredLatLng);
     console.log('Smoothed currentLatLng:', smoothedLatLng);
     
+    // Update last known positions
+    lastAppliedLatLng = smoothedLatLng;
+    lastUpdateTime = now;
     lastKnownLatLng = smoothedLatLng;
+    
+    // Update marker position
     userLocationMarker.setLatLng(smoothedLatLng);
     
     // Predict future position
-    const predictedLat = smoothedLatLng.lat + lastEstimatedVel.lat * 0.5; // Predict 0.5 seconds ahead
-    const predictedLng = smoothedLatLng.lng + lastEstimatedVel.lng * 0.5;
+    const predictedLat = smoothedLatLng.lat + lastEstimatedVel.lat * PREDICTION_TIME;
+    const predictedLng = smoothedLatLng.lng + lastEstimatedVel.lng * PREDICTION_TIME;
     const predictedLatLng = L.latLng(predictedLat, predictedLng);
     
+    // Find closest location
+    const { closestLocation, closestDistance } = findClosestLocation(smoothedLatLng);
+    
+    // Update distance box
+    updateDistanceBox(closestDistance);
+    
+    // Check for location transition
+    checkLocationTransition(closestLocation, closestDistance);
+    
+    // Update accuracy mode
+    updateAccuracyMode(closestDistance);
+    
+    return smoothedLatLng;
+}
+
+function centerMapOnUser() {
+    if (map && userLocationMarker && !userInteracted) {
+        var userPosition = userLocationMarker.getLatLng();
+        var mapCenter = map.getCenter();
+        
+        // Check if the user's position is significantly different from the map center
+        if (Math.abs(userPosition.lat - mapCenter.lat) > CENTER_THRESHOLD || 
+            Math.abs(userPosition.lng - mapCenter.lng) > CENTER_THRESHOLD) {
+            map.panTo(userPosition, { animate: true, duration: PREDICTION_TIME });
+            userLocationMarker.getElement().classList.add('centered-icon');
+        }
+    }
+}
+
+let consolidatedInterval = setInterval(function() {
+    var currentTime = Date.now();
+    updateUserLocation();
+    
+    if (!userInteracted) {
+        const predictedLat = lastKnownLatLng.lat + lastEstimatedVel.lat * PREDICTION_TIME;
+        const predictedLng = lastKnownLatLng.lng + lastEstimatedVel.lng * PREDICTION_TIME;
+        const predictedLatLng = L.latLng(predictedLat, predictedLng);
+        map.panTo(predictedLatLng, { animate: true, duration: PREDICTION_TIME });
+    }
+    
+    // Call the centerMapOnUser function here
+    centerMapOnUser();
+}, UPDATE_INTERVAL);
+
+// Assuming you have a spatial index library imported, e.g., RBush
+
+let locationIndex;
+let lastCheckedPosition;
+const RECALCULATION_THRESHOLD = 10; // meters
+
+function initializeLocationIndex(locations) {
+    locationIndex = new RBush();
+    const items = locations.map(loc => ({
+        minX: loc.lng, minY: loc.lat, maxX: loc.lng, maxY: loc.lat, location: loc
+    }));
+    locationIndex.load(items);
+}
+
+function findClosestLocation(currentLatLng) {
+    if (lastCheckedPosition && fastDistanceApprox(currentLatLng, lastCheckedPosition) < RECALCULATION_THRESHOLD) {
+        return lastResult;
+    }
+
+    const searchBbox = getBoundingBox(currentLatLng, 1000); // 1km radius
+    const nearbyLocations = locationIndex.search(searchBbox);
+
     let closestLocation = null;
     let closestDistance = Infinity;
-    
-    for (let i = 0; i < locations.length; i++) {
-        const location = locations[i];
+
+    for (const item of nearbyLocations) {
+        const location = item.location;
         const locationLatLng = L.latLng(location.lat, location.lng);
-        const distance = fastDistanceApprox(smoothedLatLng, locationLatLng);
+        const distance = fastDistanceApprox(currentLatLng, locationLatLng);
         const distanceFeet = Math.round(distance * 3.28084);
-        
+
         if (distanceFeet < closestDistance) {
             closestDistance = distanceFeet;
             closestLocation = location;
         }
     }
-    
+
+    lastCheckedPosition = currentLatLng;
+    lastResult = { closestLocation, closestDistance };
+    return lastResult;
+}
+
+function getBoundingBox(latLng, radiusInMeters) {
+    const lat = latLng.lat;
+    const lng = latLng.lng;
+    const latChange = radiusInMeters / 111320; // Roughly 111,320 meters per degree of latitude
+    const lngChange = radiusInMeters / (111320 * Math.cos(lat * (Math.PI / 180)));
+
+    return {
+        minX: lng - lngChange,
+        minY: lat - latChange,
+        maxX: lng + lngChange,
+        maxY: lat + latChange
+    };
+}
+
+function updateDistanceBox(distanceFeet) {
     const distanceBox = document.getElementById("distanceBox");
-    if (closestDistance < 5280) {
-        distanceBox.innerHTML = `Closest Marker: ${closestDistance} feet`;
-    } else if (closestDistance === 5280) {
-        distanceBox.innerHTML = `Closest Marker: 1.00 mile`;
+    if (distanceFeet < 5280) {
+        distanceBox.innerHTML = `Closest Marker: ${distanceFeet} feet`;
     } else {
-        const distanceMiles = (closestDistance / 5280).toFixed(2);
+        const distanceMiles = (distanceFeet / 5280).toFixed(2);
         distanceBox.innerHTML = `Closest Marker: ${distanceMiles} miles`;
     }
-    
-    const latLngId = closestLocation.lat + "," + closestLocation.lng;
-    const lastTransitionTime = sessionStorage.getItem('lastTransitionTime');
+}
+
+function checkLocationTransition(closestLocation, distanceFeet) {
+    const distanceBox = document.getElementById("distanceBox");
+    const latLngId = `${closestLocation.lat},${closestLocation.lng}`;
+    const lastTransitionTime = parseInt(sessionStorage.getItem('lastTransitionTime') || '0');
     const lastVisitedLocation = sessionStorage.getItem('lastVisitedLocation');
     const cooldownActiveForLastLocation = lastVisitedLocation === latLngId && (Date.now() - lastTransitionTime) < COOLDOWN;
     
-    if (closestDistance <= thresholdFeet) {
+    if (distanceFeet <= thresholdFeet) {
         if (cooldownActiveForLastLocation) {
             distanceBox.classList.add("within-cooldown");
             distanceBox.classList.remove("within-threshold");
@@ -665,24 +785,23 @@ function updateUserLocation(e = null) {
             console.log("Transition conditions met. Redirecting...");
             sessionStorage.setItem("lastTransitionTime", Date.now().toString());
             sessionStorage.setItem("lastVisitedLocation", latLngId);
-            setTimeout(function() {
+            setTimeout(() => {
                 window.location.href = `location.html?id=${closestLocation.id}`;
             }, INITIAL_DELAY);
         }
     } else {
-        distanceBox.classList.remove("within-threshold");
-        distanceBox.classList.remove("within-cooldown");
+        distanceBox.classList.remove("within-threshold", "within-cooldown");
     }
-    
-    if (closestDistance <= HIGH_ACCURACY_THRESHOLD && !useHighAccuracy) {
+}
+
+function updateAccuracyMode(distanceFeet) {
+    if (distanceFeet <= HIGH_ACCURACY_THRESHOLD && !useHighAccuracy) {
         useHighAccuracy = true;
         restartLocationTracking();
-    } else if (closestDistance > HIGH_ACCURACY_THRESHOLD && useHighAccuracy) {
+    } else if (distanceFeet > HIGH_ACCURACY_THRESHOLD && useHighAccuracy) {
         useHighAccuracy = false;
         restartLocationTracking();
     }
-    
-    return smoothedLatLng;
 }
 
 function restartLocationTracking() {
@@ -720,11 +839,45 @@ function resetUserInteraction() {
             }
             
             // Recenter the map
-            map.setView(currentLatLng, map.getZoom(), { animate: true, duration: 0.5 });
+            map.setView(currentLatLng, 20, { animate: true, duration: 0.5 });
             userLocationMarker.getElement().classList.add('centered-icon');
         }
+        
+        // Ensure user icon is on screen and centered
+        ensureUserIconOnScreen();
     }, 25000); // Reset after 25 seconds of no interaction
 }
+
+function centerMapOnUser() {
+    if (map && userLocationMarker && !userInteracted) {
+        var userPosition = userLocationMarker.getLatLng();
+        var mapCenter = map.getCenter();
+        
+        // Reduced threshold for more sensitive recentering
+        if (Math.abs(userPosition.lat - mapCenter.lat) > 0.00005 || 
+            Math.abs(userPosition.lng - mapCenter.lng) > 0.00005) {
+            map.panTo(userPosition, { animate: true, duration: 0.5 });
+        }
+        
+        // Always add the centered-icon class
+        userLocationMarker.getElement().classList.add('centered-icon');
+    }
+}
+
+function ensureUserIconOnScreen() {
+    if (map && userLocationMarker) {
+        var userPosition = userLocationMarker.getLatLng();
+        var bounds = map.getBounds();
+        
+        if (!bounds.contains(userPosition)) {
+            // If user icon is off-screen, center the map on the user
+            map.setView(userPosition, map.getZoom(), { animate: true, duration: 0.5 });
+        }
+    }
+}
+
+// Call resetUserInteraction whenever there's user interaction
+map.on('drag zoomstart touchstart', resetUserInteraction);
 
 map.on('locationfound', function(e) {
     updateUserLocation(e);
@@ -844,31 +997,6 @@ var marker = L.marker(locationLatLng, { icon: newMarkerIcon });
 
     currentMarkers = newMarkers;
 
-let consolidatedInterval = setInterval(function() {
-  var currentTime = Date.now();
-  updateUserLocation();
-  if (!userInteracted) {
-    const predictedLat = lastKnownLatLng.lat + lastEstimatedVel.lat * 0.5;
-    const predictedLng = lastKnownLatLng.lng + lastEstimatedVel.lng * 0.5;
-    const predictedLatLng = L.latLng(predictedLat, predictedLng);
-    map.panTo(predictedLatLng, { animate: true, duration: 0.5 });
-  }
-}, 2000);
-
-function centerMapOnUser() {
-  if (map && userLocationMarker && !userInteracted) {
-    var userPosition = userLocationMarker.getLatLng();
-    var mapCenter = map.getCenter();
-    
-    // Check if the user's position is significantly different from the map center
-    if (Math.abs(userPosition.lat - mapCenter.lat) > 0.0001 || 
-        Math.abs(userPosition.lng - mapCenter.lng) > 0.0001) {
-      map.panTo(userPosition, { animate: true, duration: 0.5 });
-      userLocationMarker.getElement().classList.add('centered-icon');
-    }
-  }
-}
-    
     function recenterAndClosePopup() {
     if (userLocationMarker.getLatLng()) {
         map.setView(userLocationMarker.getLatLng(), map.getZoom());
