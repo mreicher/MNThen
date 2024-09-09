@@ -95,7 +95,7 @@ const locations = [
     id: "1016",
     lat: 44.949271218176925,
     lng: -93.10455573104193,
-    name: "(MNHS Example Site)",
+    name: "This is a (MNHS Example Site)",
     title: "Swede Hollow",
     image: "https://mnthen.com/tour/hamm/gallery/hollow/hamm_hollow1.jpg",
     creator: "Matt Reicher",
