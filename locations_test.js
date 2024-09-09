@@ -140,7 +140,7 @@ const locations = [
     "id": "1019",
     "lat": 44.96153652405189,
     "lng": -93.07320192008716,
-    "name": "Swede Hollow",
+    "name": "Swede Hollow (unknown - 1956)",
     "title": "Swede Hollow",
     "image": "https://mnthen.com/tour/hamm/gallery/hollow/hamm_hollow1.jpg",
     "creator": "Matt Reicher",
