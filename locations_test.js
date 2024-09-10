@@ -107,19 +107,19 @@ const locations = [
 },
     
 {
-    id: "1017",
-    lat: 44.95475874410186,
-    lng: -93.10223010864519,
-    name: "Minnesota’s Third State Capitol",
-    title: "Minnesota’s Third State Capitol",
-    image: "https://mnthen.com/exhibit/images/capitol3.jpg",
-    creator: "Brian C. Pease",
-    city: "St. Paul",
-    audioURL: "/audio/exhibit/capitol3.mp3",
-    tours: "capitol",
-    link: "https://www.mnopedia.org/structure/minnesota-s-third-state-capitol",
-    imageSource: "Minnesota State Capitol Building (2022)"
-},
+    "id": "1017",
+    "lat": 44.95463990008291,
+    "lng": -93.10223181529494,
+    "name": "Minnesota’s Third State Capitol",
+    "title": "Minnesota’s Third State Capitol",
+    "image": "https://mnthen.com/exhibit/images/capitol3.jpg",
+    "creator": "Brian C. Pease",
+    "city": "St. Paul",
+    "audioURL": "/audio/exhibit/capitol3.mp3",
+    "tours": "capitol",
+    "link": "https://www.mnopedia.org/structure/minnesota-s-third-state-capitol",
+    "imageSource": "Minnesota State Capitol Building (2022)"
+}
     
 {
   "id": "1018",
@@ -151,10 +151,10 @@ const locations = [
     "imageSource": "Swede Hollow looking north, (c.1910). via MNopedia"
 },
 
-    {
+{
     "id": "1020",
-    "lat": 44.95677827995171,
-    "lng": -93.10067483187163,
+    "lat": 44.956571587648774,
+    "lng": -93.10028134083977,
     "name": "William R. Merriam Mansion (1882 - 1896)",
     "title": "William R. Merriam Mansion",
     "image": "https://mnthen.com/images/merriam_house.jpg",
@@ -164,7 +164,7 @@ const locations = [
     "tours": "history",
     "link": "https://mnthen.com/blog/place/merriam_mansion.html",
     "imageSource": "William R. Merriam residence, (c.1890). via St Paul Historical"
-},
+}
 
    // Add more locations here
 ];
