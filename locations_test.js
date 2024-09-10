@@ -119,7 +119,7 @@ const locations = [
     "tours": "capitol",
     "link": "https://www.mnopedia.org/structure/minnesota-s-third-state-capitol",
     "imageSource": "Minnesota State Capitol Building (2022)"
-}
+},
     
 {
   "id": "1018",
@@ -164,7 +164,7 @@ const locations = [
     "tours": "history",
     "link": "https://mnthen.com/blog/place/merriam_mansion.html",
     "imageSource": "William R. Merriam residence, (c.1890). via St Paul Historical"
-}
+},
 
    // Add more locations here
 ];
