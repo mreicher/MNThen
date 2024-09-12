@@ -301,10 +301,6 @@
 var closestDistance = Infinity;
 var newMarkers = {};
 
-// Define alpha-beta filter constants and variables
-const alpha = 0.2;
-const beta = 0.01;
-
 var lastEstimatedPos = null;
 var lastEstimatedVel = { lat: 0, lng: 0 };
 
@@ -533,42 +529,21 @@ loadScriptWithCacheBust();
     });
 
 var currentMarkers = {};
-var UPDATE_INTERVAL = 20000;
 var lastKnownLatLng = null;
 var currentLatLng = null;
 var closestLocation = null;
 let useHighAccuracy = false;
 
-// Kalman Filter implementation
-class KalmanFilter {
-    constructor(q = 0.1, r = 1) {
-        this.q = q; // process noise covariance
-        this.r = r; // measurement noise covariance
-        this.p = 1; // estimation error covariance
-        this.x = 0; // estimated value
-        this.k = 0; // kalman gain
+function vectorSubtract(a, b) {
+    if (a.length !== b.length) {
+        throw new Error('Incompatible vector dimensions');
     }
-
-    filter(measurement) {
-        // prediction
-        this.p = this.p + this.q;
-
-        // correction
-        this.k = this.p / (this.p + this.r);
-        this.x = this.x + this.k * (measurement - this.x);
-        this.p = (1 - this.k) * this.p;
-
-        return this.x;
+    
+    let result = [];
+    for (let i = 0; i < a.length; i++) {
+        result[i] = a[i] - b[i];
     }
-}
-
-const latitudeKF = new KalmanFilter(0.01, 4);
-const longitudeKF = new KalmanFilter(0.01, 4);
-
-function kalmanFilter(newMeasurement) {
-    const filteredLat = latitudeKF.filter(newMeasurement.lat);
-    const filteredLng = longitudeKF.filter(newMeasurement.lng);
-    return L.latLng(filteredLat, filteredLng);
+    return result;
 }
 
 const movingAverageWindow = 8; // Number of samples to average
@@ -590,12 +565,45 @@ let lastAppliedLatLng = null;
 let isStationary = true;
 const STATIONARY_THRESHOLD = 0.5; // feet per second
 
-function combinedFilter(newMeasurement) {
-    const kalmanFiltered = kalmanFilter(newMeasurement);
-    return movingAverageFilter(kalmanFiltered);
+function fastDistanceApprox(latlng1, latlng2) {
+    const { lat: lat1, lng: lng1 } = latlng1;
+    const { lat: lat2, lng: lng2 } = latlng2;
+
+    const dx = (lng2 - lng1) * Math.cos((lat1 + lat2) * Math.PI / 180 / 2);
+    const dy = lat2 - lat1;
+
+    return 111319.9 * Math.sqrt(dx * dx + dy * dy);
 }
 
-// ... [rest of the code remains unchanged]
+function applyDynamicDeadband(latLng, lastLatLng, isStationary) {
+    const deadbandThresholdFeet = isStationary ? 4 : 1.5; // Adjust threshold based on motion
+    const distanceFeet = fastDistanceApprox(latLng, lastLatLng) * 3.28084;
+    if (distanceFeet < deadbandThresholdFeet) {
+        return lastLatLng; // Ignore small hops
+    }
+    return latLng; // Apply the actual new position
+}
+
+const smoothingFactor = 0.2; // Start with a moderate value
+
+function lowPassFilter(newMeasurement) {
+    if (!lastAppliedLatLng) return newMeasurement;
+    return {
+        lat: lastAppliedLatLng.lat + smoothingFactor * (newMeasurement.lat - lastAppliedLatLng.lat),
+        lng: lastAppliedLatLng.lng + smoothingFactor * (newMeasurement.lng - lastAppliedLatLng.lng)
+    };
+}
+
+let lastEstimatedVel = { lat: 0, lng: 0 };
+let resetInteractionTimeout;
+let lastUpdateTime = null;
+const SMOOTHING_FACTOR = 0.5;
+const PREDICTION_TIME = 0.5; // Predict 0.5 seconds ahead
+const CENTER_THRESHOLD = 0.0001; // Example value
+const UPDATE_INTERVAL = 1000; // 1 second between updates
+
+// Kalman filter initialization
+const kalmanFilter = new KalmanFilter();
 
 function updateUserLocation(e = null) {
     const now = Date.now();
@@ -619,20 +627,25 @@ function updateUserLocation(e = null) {
     
     // Apply filters
     const deadbandFilteredLatLng = applyDynamicDeadband(currentLatLng, lastAppliedLatLng || currentLatLng, isStationary);
-    const smoothedLatLng = combinedFilter(deadbandFilteredLatLng);
+    const kalmanFilteredLatLng = kalmanFilter.filter(deadbandFilteredLatLng);
     const lowPassFiltered = lowPassFilter(currentLatLng);
-    console.log('Smoothed currentLatLng:', smoothedLatLng);
+    console.log('Kalman filtered currentLatLng:', kalmanFilteredLatLng);
     
     // Update last known positions
-    lastAppliedLatLng = smoothedLatLng;
+    lastAppliedLatLng = kalmanFilteredLatLng;
     lastUpdateTime = now;
-    lastKnownLatLng = smoothedLatLng;
+    lastKnownLatLng = kalmanFilteredLatLng;
     
     // Update marker position
-    userLocationMarker.setLatLng(smoothedLatLng);
+    userLocationMarker.setLatLng(kalmanFilteredLatLng);
+    
+    // Predict future position
+    const predictedLat = kalmanFilteredLatLng.lat + kalmanFilter.state[2] * PREDICTION_TIME;
+    const predictedLng = kalmanFilteredLatLng.lng + kalmanFilter.state[3] * PREDICTION_TIME;
+    const predictedLatLng = L.latLng(predictedLat, predictedLng);
     
     // Find closest location
-    const { closestLocation, closestDistance } = findClosestLocation(smoothedLatLng);
+    const { closestLocation, closestDistance } = findClosestLocation(kalmanFilteredLatLng);
     
     // Update distance box
     updateDistanceBox(closestDistance);
@@ -643,7 +656,153 @@ function updateUserLocation(e = null) {
     // Update accuracy mode
     updateAccuracyMode(closestDistance);
     
-    return smoothedLatLng;
+    return kalmanFilteredLatLng;
+}
+
+class KalmanFilter {
+    constructor() {
+        this.state = null;
+        this.P = null;
+        this.Q = [[0.1, 0, 0, 0],
+                  [0, 0.1, 0, 0],
+                  [0, 0, 0.01, 0],
+                  [0, 0, 0, 0.01]];  // Process noise covariance
+        this.R = [[1, 0],
+                  [0, 1]];  // Measurement noise covariance
+    }
+
+    filter(newMeasurement) {
+        if (!this.state) {
+            this.state = [newMeasurement.lat, newMeasurement.lng, 0, 0];
+            this.P = [[1, 0, 0, 0],
+                      [0, 1, 0, 0],
+                      [0, 0, 1, 0],
+                      [0, 0, 0, 1]];
+            return {lat: this.state[0], lng: this.state[1]};
+        }
+
+        const dt = 1; // Time step (adjust as needed)
+        const F = [[1, 0, dt, 0],
+                   [0, 1, 0, dt],
+                   [0, 0, 1, 0],
+                   [0, 0, 0, 1]];
+        
+        this.state = matrixMultiply(F, this.state);
+        this.P = matrixAdd(matrixMultiply(matrixMultiply(F, this.P), transpose(F)), this.Q);
+
+        const H = [[1, 0, 0, 0],
+                   [0, 1, 0, 0]];
+        const z = [newMeasurement.lat, newMeasurement.lng];
+        const y = vectorSubtract(z, matrixMultiply(H, this.state));
+        const S = matrixAdd(matrixMultiply(matrixMultiply(H, this.P), transpose(H)), this.R);
+        const K = matrixMultiply(matrixMultiply(this.P, transpose(H)), inverse(S));
+        
+        this.state = vectorAdd(this.state, matrixMultiply(K, y));
+        this.P = matrixSubtract(this.P, matrixMultiply(matrixMultiply(K, H), this.P));
+
+        return {lat: this.state[0], lng: this.state[1]};
+    }
+}
+
+// Helper functions for matrix operations
+function matrixMultiply(a, b) {
+    if (a[0].length !== b.length) {
+        throw new Error('Incompatible matrix dimensions');
+    }
+    
+    let result = [];
+    for (let i = 0; i < a.length; i++) {
+        result[i] = [];
+        for (let j = 0; j < b[0].length; j++) {
+            let sum = 0;
+            for (let k = 0; k < a[0].length; k++) {
+                sum += a[i][k] * b[k][j];
+            }
+            result[i][j] = sum;
+        }
+    }
+    return result;
+}
+
+function matrixAdd(a, b) {
+    if (a.length !== b.length || a[0].length !== b[0].length) {
+        throw new Error('Incompatible matrix dimensions');
+    }
+    
+    let result = [];
+    for (let i = 0; i < a.length; i++) {
+        result[i] = [];
+        for (let j = 0; j < a[0].length; j++) {
+            result[i][j] = a[i][j] + b[i][j];
+        }
+    }
+    return result;
+}
+
+function matrixSubtract(a, b) {
+    if (a.length !== b.length || a[0].length !== b[0].length) {
+        throw new Error('Incompatible matrix dimensions');
+    }
+    
+    let result = [];
+    for (let i = 0; i < a.length; i++) {
+        result[i] = [];
+        for (let j = 0; j < a[0].length; j++) {
+            result[i][j] = a[i][j] - b[i][j];
+        }
+    }
+    return result;
+}
+
+function transpose(a) {
+    let result = [];
+    for (let i = 0; i < a[0].length; i++) {
+        result[i] = [];
+        for (let j = 0; j < a.length; j++) {
+            result[i][j] = a[j][i];
+        }
+    }
+    return result;
+}
+
+function inverse(a) {
+    if (a.length !== 2 || a[0].length !== 2) {
+        throw new Error('This implementation only supports 2x2 matrices');
+    }
+    
+    let det = a[0][0] * a[1][1] - a[0][1] * a[1][0];
+    if (det === 0) {
+        throw new Error('Matrix is not invertible');
+    }
+    
+    return [
+        [a[1][1] / det, -a[0][1] / det],
+        [-a[1][0] / det, a[0][0] / det]
+    ];
+}
+
+function vectorAdd(a, b) {
+    if (a.length !== b.length) {
+        throw new Error('Incompatible vector dimensions');
+    }
+    
+    let result = [];
+    for (let i = 0; i < a.length; i++) {
+        result[i] = a[i] + b[i];
+    }
+    return result;
+}
+
+function vectorSubtract(a, b) {
+    if (a.length !== b.length) {
+        throw new Error('Incompatible vector dimensions');
+    }
+    
+    let result = [];
+    for (let i = 0; i < a.length; i++) {
+        result[i] = a[i] - b[i];
+    }
+    return result;
 }
 
 let consolidatedInterval = setInterval(function() {
