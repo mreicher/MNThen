@@ -462,13 +462,32 @@ loadScriptWithCacheBust();
         }
     });
 
-var currentMarkers = {};
-var lastKnownLatLng = null;
-var currentLatLng = null;
-var closestLocation = null;
+const currentMarkers = {};
+let lastKnownLatLng = null;
+let currentLatLng = null;
+let closestLocation = null;
 let useHighAccuracy = false;
 
-function alphaBetaFilter(newMeasurement) {
+const STATIONARY_THRESHOLD = 0.75; // feet per second
+const SMOOTHING_FACTOR = 0.5;
+const PREDICTION_TIME = 0.5; // Predict 0.5 seconds ahead
+const UPDATE_INTERVAL = 1000; // 1 second between updates
+const ANIMATION_DURATION = 500; // ms
+const FEET_PER_METER = 3.28084;
+
+let lastEstimatedPos = null;
+let lastEstimatedVel = { lat: 0, lng: 0 };
+let lastExpSmoothedValue = null;
+const expSmoothingFactor = 0.2;
+const movingAverageWindow = 8;
+let positionBuffer = [];
+let lastAppliedLatLng = null;
+let isStationary = true;
+let lastUpdateTime = null;
+let resetInteractionTimeout;
+let consolidatedInterval;
+
+function alphaBetaFilter(newMeasurement, alpha = 0.5, beta = 0.1) {
     if (!lastEstimatedPos) {
         lastEstimatedPos = { ...newMeasurement };
         return lastEstimatedPos;
@@ -487,81 +506,75 @@ function alphaBetaFilter(newMeasurement) {
         lng: newMeasurement.lng - predictedPos.lng
     };
 
-    lastEstimatedPos.lat += alpha * residual.lat;
-    lastEstimatedPos.lng += alpha * residual.lng;
-    lastEstimatedVel.lat += beta * residual.lat;
-    lastEstimatedVel.lng += beta * residual.lng;
+    lastEstimatedPos = {
+        lat: lastLat + alpha * residual.lat,
+        lng: lastLng + alpha * residual.lng
+    };
+    lastEstimatedVel = {
+        lat: velLat + (beta / alpha) * residual.lat,
+        lng: velLng + (beta / alpha) * residual.lng
+    };
 
     return lastEstimatedPos;
 }
 
-let lastExpSmoothedValue = null;
-const expSmoothingFactor = 0.2; // Adjust as
-
-function newExponentialSmoothing(newMeasurement) {
+function exponentialSmoothing(newMeasurement) {
     if (!lastExpSmoothedValue) {
         lastExpSmoothedValue = { ...newMeasurement };
         return lastExpSmoothedValue;
     }
-    lastExpSmoothedValue.lat = lastExpSmoothedValue.lat + expSmoothingFactor * (newMeasurement.lat - lastExpSmoothedValue.lat);
-    lastExpSmoothedValue.lng = lastExpSmoothedValue.lng + expSmoothingFactor * (newMeasurement.lng - lastExpSmoothedValue.lng);
+    lastExpSmoothedValue = {
+        lat: lastExpSmoothedValue.lat + expSmoothingFactor * (newMeasurement.lat - lastExpSmoothedValue.lat),
+        lng: lastExpSmoothedValue.lng + expSmoothingFactor * (newMeasurement.lng - lastExpSmoothedValue.lng)
+    };
     return lastExpSmoothedValue;
 }
-
-const movingAverageWindow = 8; // Number of samples to average
-let positionBuffer = [];
 
 function movingAverageFilter(newMeasurement) {
     positionBuffer.push(newMeasurement);
     if (positionBuffer.length > movingAverageWindow) {
-        positionBuffer.shift(); // Remove the oldest sample
+        positionBuffer.shift();
     }
 
     const avgLat = positionBuffer.reduce((sum, pos) => sum + pos.lat, 0) / positionBuffer.length;
     const avgLng = positionBuffer.reduce((sum, pos) => sum + pos.lng, 0) / positionBuffer.length;
 
-    return L.latLng(avgLat, avgLng);
+    return { lat: avgLat, lng: avgLng };
 }
 
-let lastAppliedLatLng = null;
-let isStationary = true;
-const STATIONARY_THRESHOLD = 0.75; // feet per second
-
 function combinedFilter(newMeasurement) {
-    const alphaBetaPos = alphaBetaFilter(newMeasurement);   // First apply Alpha-Beta filter
-    const movingAvgPos = movingAverageFilter(alphaBetaPos); // Then apply Moving Average filter
-    return newExponentialSmoothing(movingAvgPos);              // Finally apply Exponential Smoothing
+    const alphaBetaPos = alphaBetaFilter(newMeasurement);
+    const movingAvgPos = movingAverageFilter(alphaBetaPos);
+    return exponentialSmoothing(movingAvgPos);
 }
 
 function fastDistanceApprox(latlng1, latlng2) {
     const { lat: lat1, lng: lng1 } = latlng1;
     const { lat: lat2, lng: lng2 } = latlng2;
 
-    const dx = (lng2 - lng1) * Math.cos((lat1 + lat2) * Math.PI / 180 / 2);
+    const dx = (lng2 - lng1) * Math.cos((lat1 + lat2) * Math.PI / 360);
     const dy = lat2 - lat1;
 
     return 111319.9 * Math.sqrt(dx * dx + dy * dy);
 }
 
 function applyDynamicDeadband(latLng, lastLatLng, isStationary) {
-if (!latLng || !lastLatLng || typeof latLng.lat !== 'number' || typeof latLng.lng !== 'number' ||
-typeof lastLatLng.lat !== 'number' || typeof lastLatLng.lng !== 'number') {
-throw new Error('Invalid latLng or lastLatLng: Must have numeric lat and lng properties');
+    if (!latLng || !lastLatLng || typeof latLng.lat !== 'number' || typeof latLng.lng !== 'number' ||
+        typeof lastLatLng.lat !== 'number' || typeof lastLatLng.lng !== 'number') {
+        throw new Error('Invalid latLng or lastLatLng: Must have numeric lat and lng properties');
+    }
+
+    if (typeof isStationary !== 'boolean') {
+        throw new Error('isStationary must be a boolean');
+    }
+
+    const deadbandThresholdFeet = isStationary ? 4 : 1.5;
+    const distanceFeet = fastDistanceApprox(latLng, lastLatLng) * FEET_PER_METER;
+
+    return distanceFeet < deadbandThresholdFeet ? lastLatLng : latLng;
 }
 
-if (typeof isStationary !== 'boolean') {
-    throw new Error('isStationary must be a boolean');
-}
-
-const deadbandThresholdFeet = isStationary ? 4 : 1.5;
-const distanceFeet = fastDistanceApprox(latLng, lastLatLng) * 3.28084;
-
-return distanceFeet < deadbandThresholdFeet ? lastLatLng : latLng;
-}
-
-const smoothingFactor = 0.15; // Start with a moderate value -- go up if there is too much lag.
-
-function lowPassFilter(newMeasurement) {
+function lowPassFilter(newMeasurement, smoothingFactor = 0.15) {
     if (!lastAppliedLatLng) return newMeasurement;
     return {
         lat: lastAppliedLatLng.lat + smoothingFactor * (newMeasurement.lat - lastAppliedLatLng.lat),
@@ -569,17 +582,10 @@ function lowPassFilter(newMeasurement) {
     };
 }
 
-let lastEstimatedVel = { lat: 0, lng: 0 };
-let resetInteractionTimeout;
-let lastUpdateTime = null;
-const SMOOTHING_FACTOR = 0.5;
-const PREDICTION_TIME = 0.5; // Predict 0.5 seconds ahead
-const UPDATE_INTERVAL = 1000; // 1 second between updates
-
 function updateUserLocation(e = null) {
     const now = Date.now();
     console.log('updateUserLocation called with', e);
-    // Get current location
+    
     currentLatLng = e ? e.latlng : lastKnownLatLng;
     console.log('Set currentLatLng to:', currentLatLng);
     
@@ -588,54 +594,39 @@ function updateUserLocation(e = null) {
         return null;
     }
     
-    // Calculate speed and check if stationary
     if (lastUpdateTime && lastAppliedLatLng) {
-        const timeDiff = (now - lastUpdateTime) / 1000; // Convert to seconds
-        const distanceFeet = fastDistanceApprox(currentLatLng, lastAppliedLatLng) * 3.28084;
+        const timeDiff = (now - lastUpdateTime) / 1000;
+        const distanceFeet = fastDistanceApprox(currentLatLng, lastAppliedLatLng) * FEET_PER_METER;
         const speed = distanceFeet / timeDiff;
         isStationary = speed < STATIONARY_THRESHOLD;
     }
     
-    // Apply filters
     const deadbandFilteredLatLng = applyDynamicDeadband(currentLatLng, lastAppliedLatLng || currentLatLng, isStationary);
     const smoothedLatLng = combinedFilter(deadbandFilteredLatLng);
     const lowPassFiltered = lowPassFilter(currentLatLng);
     console.log('Smoothed currentLatLng:', smoothedLatLng);
     
-    // Update last known positions
     lastAppliedLatLng = smoothedLatLng;
     lastUpdateTime = now;
     lastKnownLatLng = smoothedLatLng;
     
-    // Update marker position
     userLocationMarker.setLatLng(smoothedLatLng);
     
-    // Predict future position
     const predictedLat = smoothedLatLng.lat + lastEstimatedVel.lat * PREDICTION_TIME;
     const predictedLng = smoothedLatLng.lng + lastEstimatedVel.lng * PREDICTION_TIME;
-    const predictedLatLng = L.latLng(predictedLat, predictedLng);
+    const predictedLatLng = { lat: predictedLat, lng: predictedLng };
     
-    // Find closest location
     const { closestLocation, closestDistance } = findClosestLocation(smoothedLatLng);
     
-    // Update distance box
     updateDistanceBox(closestDistance);
-    
-    // Check for location transition
     checkLocationTransition(closestLocation, closestDistance);
-    
-    // Update accuracy mode
     updateAccuracyMode(closestDistance);
     
     return smoothedLatLng;
 }
 
-let consolidatedInterval;
-const ANIMATION_DURATION = 500; // ms
-
 function startConsolidatedInterval() {
     consolidatedInterval = setInterval(() => {
-        const currentTime = performance.now(); // More precise than Date.now()
         const updatedLocation = updateUserLocation();
         
         if (updatedLocation && !userInteracted) {
