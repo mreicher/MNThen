@@ -166,20 +166,6 @@ const locations = [
     "imageSource": "William R. Merriam residence, (c.1890). via St Paul Historical"
 },
 
-{
-    "id": "1111",
-    "lat": 45.144356857708345,
-    "lng": -93.00440227118557,
-    "name": "Plantation Night Club – test location",
-    "title": "Plantation Night Club",
-    "image": "https://www.mnthen.com/tour/wbl/gallery/plant/wbl_plant1.jpg",
-    "creator": "Matt Reicher",
-    "city": "White Bear Lake",
-    "audioURL": "/audio/wbl/wbl_plant.mp3",
-    "tours": "wbl_split",
-    "link": "https://original.newsbreak.com/@ron-dansley-1587459/3078633820088-lion-s-park-a-remembrance-of-white-bear-lake-s-legendary-plantation-night-club",
-    "imageSource": "The Plantation Nightclub via the White Bear Press"
-},
 
    // Add more locations here
 ];
