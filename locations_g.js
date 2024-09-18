@@ -7,6 +7,7 @@ const locations = [
     image: "https://www.mnthen.com/images/gangster/layover/stp_oconnor_1.jpg",
     title: "O’Connor Layover Agreement",
     creator: "Matt Reicher",
+    tour: "gangster",
     htmlFile: "/tour/gangster/gangster_layover.html",
     order: 1,
     link: "https://www.mnopedia.org/thing/oconnor-layover-agreement"
@@ -19,6 +20,7 @@ const locations = [
     image: "https://www.mnthen.com/images/gangster/clifford/clifford1.jpg",
     title: "Madam Nina Clifford (1851 - 1929)",
     creator: "Matt Reicher",
+    tour: "gangster",
     htmlFile: "/tour/gangster/gangster_clifford.html",
     order: 2,
     link: "https://www.mnthen.com/blog/people/clifford.html"
@@ -31,6 +33,7 @@ const locations = [
     image: "https://www.mnthen.com/images/gangster/hogan/stp_hogan_2.jpg",
     title: "Death of Dan Hogan (Dec 4, 1928)",
     creator: "Matt Reicher",
+    tour: "gangster",
     htmlFile: "/tour/gangster/gangster_hogan.html",
     order: 3,
     link: "https://mnthen.com/blog/event/stp_hogan.html"
@@ -43,6 +46,7 @@ const locations = [
     image: "https://www.mnthen.com/images/gangster/mccord/stp_mccord_holly.jpg",
     title: "Shooting of Roy McCord (Jan 13, 1934)",
     creator: "Matt Reicher",
+    tour: "gangster",
     htmlFile: "/tour/gangster/gangster_mccord.html",
     order: 4,
     link: "https://mnthen.com/blog/event/stp_mccord_shooting.html"
@@ -54,6 +58,7 @@ const locations = [
     image: "https://www.mnthen.com/images/gangster_bremer_kidnap1.jpg",
     title: "Kidnapping of Edward Bremer (Jan 17 - Feb 7, 1934)",
     creator: "Matt Reicher",
+    tour: "gangster",
     htmlFile: "/tour/gangster/gangster_bremer_kidnap.html",
     order: 5,
     link: "https://mnthen.com/blog/event/bremer_kidnap.html"
@@ -65,6 +70,7 @@ const locations = [
     image: "https://www.mnthen.com/images/gangster/gangster_lincoln_ct.jpg",
     title: "Shootout at Lincoln Court Apartments (March 31, 1934)",
     creator: "Matt Reicher",
+    tour: "gangster",
     htmlFile: "/tour/gangster/gangster_lincoln_ct.html",
     order: 6,
     link: "https://mnthen.com/blog/event/shootout_lincoln_ct.html"
@@ -77,6 +83,7 @@ const locations = [
     image: "https://www.mnthen.com/images/van_meter_header.jpg",
     title: "Death of Gangster Homer Van Meter (Aug 23, 1934)",
     creator: "Matt Reicher",
+    tour: "gangster",
     htmlFile: "/tour/gangster/gangster_van_meter.html",
     order: 7,
     link: "https://mnthen.com/blog/people/van_meter.html"
@@ -89,6 +96,7 @@ const locations = [
     image: "https://www.mnthen.com/tour/hamm/gallery/kidnap/hamm_kidnap1.jpg",
     title: "Hamm Jr. Kidnapping",
     creator: "Matt Reicher",
+    tour: "gangster",
     htmlFile: "/tour/hamm/hamm_kidnap.html",
     order: 8,
     link: "https://mnthen.com/blog/event/hamm_kidnap.html"
