@@ -5,7 +5,7 @@ const locations_h = [
         lat: 45.14434783374931,
         lng: -93.00441148466629,
         image: "https://example.com/image1.jpg",
-        audio: "https://example.com/audio1.mp3",
+        audio: "https://www.mnthen.com/audio/rath.mp3",
         city: "Minneapolis",
         creator: "John Doe",
         trivia: {
@@ -20,7 +20,7 @@ const locations_h = [
         lat:  45.144664056565475,
         lng: -93.0030220919916,
         image: "https://example.com/image2.jpg",
-        audio: "https://example.com/audio2.mp3",
+        audio: "https://www.mnthen.com/audio/rath.mp3",
         city: "St. Paul",
         creator: "Jane Smith",
         trivia: {
