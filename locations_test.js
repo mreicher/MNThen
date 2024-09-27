@@ -91,23 +91,8 @@ const locations = [
     imageSource: "First suspension bridge in Minneapolis, (c. 1858) via MNopedia"
 },
     
-    {
-    id: "1016",
-    lat: 44.949271218176925,
-    lng: -93.10455573104193,
-    name: "This is a (MNHS Example Site)",
-    title: "Swede Hollow",
-    image: "https://mnthen.com/tour/hamm/gallery/hollow/hamm_hollow1.jpg",
-    creator: "Matt Reicher",
-    city: "St. Paul",
-    audioURL: "/audio/exhibit/swede_hollow.mp3", 
-    tours: "history",
-    link: "https://www.mnopedia.org/place/swede-hollow",
-    imageSource: "Swede Hollow looking north, (c.1910). via MNopedia"
-},
-    
 {
-    "id": "1017",
+    "id": "1016",
     "lat": 44.95463990008291,
     "lng": -93.10223181529494,
     "name": "Minnesota’s Third State Capitol",
@@ -122,7 +107,7 @@ const locations = [
 },
     
 {
-  "id": "1018",
+  "id": "1017",
   "lat": 44.893943004662326,
   "lng": -93.18772007741772,
   "name": "Whiskey the Horse (c. 1911 - 1943)",
@@ -137,7 +122,7 @@ const locations = [
 },
 
     {
-    "id": "1019",
+    "id": "1018",
     "lat": 44.96153652405189,
     "lng": -93.07320192008716,
     "name": "Swede Hollow (Pre-1839: Unknown - 1956)",
@@ -152,7 +137,7 @@ const locations = [
 },
 
 {
-    "id": "1020",
+    "id": "1019",
     "lat": 44.956571587648774,
     "lng": -93.10028134083977,
     "name": "William R. Merriam Mansion (1882 - 1896)",
