@@ -6,7 +6,8 @@ const locations_h = [
         lng: -93.00441148466629, 
         image: "https://mnthen.com/images/nyes.jpg",
         audio: "https://example.com/audio1.mp3",
-        city: "Minneapolis"
+        city: "Minneapolis",
+        creator: "Matt Reicher"
     },
     {
         id: 2,
@@ -15,6 +16,7 @@ const locations_h = [
         lng: -93.0030220919916,  
         image: "https://example.com/image2.jpg",
         audio: "https://example.com/audio2.mp3",
-        city: "St. Paul"
+        city: "St. Paul",
+        creator: "Matt Reicher"
     }
 ];
