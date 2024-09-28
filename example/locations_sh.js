@@ -1,7 +1,7 @@
-const locations_h = [
+const locations = [
 
     {
-    id: "1010",
+    id: "1",
     lat: 45.14433707181925,
     lng: -93.00436999674588,
     name: "Plantation Night Club (1930 - 1933)",
@@ -16,7 +16,7 @@ const locations_h = [
     },
 
         {
-        id: "1011",
+        id: "2",
         lat:  45.1445975379045,
         lng:  -93.0030998635396,
         name: "Wildwood Amusement Park (1889 - 1932)",
