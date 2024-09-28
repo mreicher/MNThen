@@ -1,4 +1,4 @@
-const locations = [
+const locations_h = [
     {
         id: 1,
         name: "Location 1",
