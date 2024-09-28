@@ -1,9 +1,9 @@
-const locations_h = [
+const locations = [
 
     {
     id: "1010",
-    lat: 45.073692373690626,
-    lng: -93.01483408611226,
+    lat: 45.14433707181925,
+    lng: -93.00436999674588,
     name: "Plantation Night Club (1930 - 1933)",
     title: "Plantation Night Club",
     image: "https://www.mnthen.com/tour/wbl/gallery/plant/wbl_plant1.jpg",
@@ -14,11 +14,11 @@ const locations_h = [
     link: "https://original.newsbreak.com/@ron-dansley-1587459/3078633820088-lion-s-park-a-remembrance-of-white-bear-lake-s-legendary-plantation-night-club",
     imageSource: "The Plantation Nightclub via the White Bear Press"
     },
-    
+
         {
         id: "1011",
-        lat:  45.05648381562563,
-        lng:  -92.96040208835049,
+        lat:  45.1445975379045,
+        lng:  -93.0030998635396,
         name: "Wildwood Amusement Park (1889 - 1932)",
         title: "Wildwood Amusement Park",
         image: "https://www.mnthen.com/locations/gallery/mahtomedi/wildwood/wildwood_2.jpg",
@@ -29,7 +29,7 @@ const locations_h = [
         link: "https://mnthen.com/blog/place/wildwood.html",
         imageSource: "Image of the slide at Wildwood Park c. 1905 via MPRNews"
     },
-    
+    /*
 {
     id: "1012",
     lat: 44.922167523742054,
@@ -149,7 +149,7 @@ const locations_h = [
     "link": "https://mnthen.com/blog/place/merriam_mansion.html",
     "imageSource": "William R. Merriam residence, (c.1890). via St Paul Historical"
 },
-
+*/
 
    // Add more locations here
 ];
