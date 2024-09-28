@@ -1,13 +1,13 @@
 const locations_h = [
     {
         id: 1,
-        name: "Location 1",
+        name: "Michael 'Eyedea' Larsen (1981 - 2010)",
         lat: 45.14434783374931,  
         lng: -93.00441148466629, 
         image: "https://mnthen.com/images/wsp_eyedea.jpg",
         audio: "https://mnthen.com/audio/mpls/mpls_grain_belt.mp3",
         city: "Minneapolis",
-        creator: "John Doe",
+        creator: "Matt Reicher",
         trivia: {
             question: "What year was Minneapolis founded?",
             options: ["1850", "1867", "1872", "1890"],
