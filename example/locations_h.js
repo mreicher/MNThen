@@ -4,7 +4,7 @@ const locations_h = [
         name: "Location 1",
         lat: 45.14434783374931,  
         lng: -93.00441148466629, 
-        image: "https://example.com/image1.jpg",
+        image: "https://mnthen.com/images/nyes.jpg",
         audio: "https://example.com/audio1.mp3",
         city: "Minneapolis"
     },
