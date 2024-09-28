@@ -1,7 +1,7 @@
 const locations_h = [
     {
         id: 1,
-        name: "Michael 'Eyedea' Larsen (1981 - 2010)",
+        name: "Father Louis Hennepin Suspension Bridge",
         lat: 45.14434783374931,  
         lng: -93.00441148466629, 
         image: "https://mnthen.com/images/wsp_eyedea.jpg",
