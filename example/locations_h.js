@@ -8,6 +8,7 @@ const locations_h = [
         audio: "https://mnthen.com/audio/mpls/mpls_grain_belt.mp3",
         city: "Minneapolis",
         creator: "Matt Reicher",
+        link: "https://mnthen.com/blog/place/wildwood.html",
         imageSource: "The Plantation Nightclub via the White Bear Press",
         trivia: {
             question: "What year was Minneapolis founded?",
@@ -25,6 +26,7 @@ const locations_h = [
         city: "St. Paul",
         creator: "Jane Smith",
         imageSource: "The Plantation Nightclub via the White Bear Press",
+        link: "https://mnthen.com/blog/place/wildwood.html",
         trivia: {
             question: "What is the nickname of St. Paul?",
             options: ["The Capital City", "The Twin City", "The Saintly City", "The River City"],
