@@ -1,4 +1,4 @@
-const locations_h = [
+const locations = [
     {
         id: 1,
         name: "Father Louis Hennepin Suspension Bridge",
