@@ -1,6 +1,6 @@
 const locations_h = [
     {
-         id: "1010",
+         id: 1,
         name: "Father Louis Hennepin Suspension Bridge",
         lat: 45.14434783374931,  
         lng: -93.00441148466629, 
@@ -17,7 +17,7 @@ const locations_h = [
         }
     },
     {
-        id: "2",
+        id: 2,
         name: "Location 2",
         lat: 45.144664056565475, 
         lng: -93.0030220919916, 
