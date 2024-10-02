@@ -1,6 +1,6 @@
-const locations = [
+const locations_h = [
     {
-        id: "1",
+         id: "1010",
         name: "Father Louis Hennepin Suspension Bridge",
         lat: 45.14434783374931,  
         lng: -93.00441148466629, 
