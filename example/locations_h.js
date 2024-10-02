@@ -1,9 +1,9 @@
 const locations_h = [
     {
-         id: 1,
+        id: 1,
         name: "Father Louis Hennepin Suspension Bridge",
-        lat: 45.14434783374931,  
-        lng: -93.00441148466629, 
+        lat: 45.14434783374931,
+        lng: -93.00441148466629,
         image: "https://mnthen.com/images/wsp_eyedea.jpg",
         audio: "https://mnthen.com/audio/mpls/mpls_grain_belt.mp3",
         city: "Minneapolis",
@@ -19,14 +19,14 @@ const locations_h = [
     {
         id: 2,
         name: "Location 2",
-        lat: 45.144664056565475, 
-        lng: -93.0030220919916, 
+        lat: 45.144664056565475,
+        lng: -93.0030220919916,
         image: "https://mnthen.com/images/wsp_eyedea.jpg",
         audio: "https://mnthen.com/audio/mpls/mpls_grain_belt.mp3",
         city: "St. Paul",
         creator: "Jane Smith",
-        imageSource: "The Plantation Nightclub via the White Bear Press",
         link: "https://mnthen.com/blog/place/wildwood.html",
+        imageSource: "The Plantation Nightclub via the White Bear Press",
         trivia: {
             question: "What is the nickname of St. Paul?",
             options: ["The Capital City", "The Twin City", "The Saintly City", "The River City"],
