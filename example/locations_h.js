@@ -1,6 +1,23 @@
 const locations_h = [
-    {
+        {
         id: 1,
+        name: "Barker-Karpis Gang West Saint Paul Hideout",
+        lat: 44.915278600994434,
+        lng: -93.08081040735343,
+        image: "https://mnthen.com/tour/gangster/images/wsp_house.jpg",
+        audio: "https://mnthen.com/audio/mpls/mpls_grain_belt.mp3",
+        city: "West Saint Paul",
+        creator: "Matt Reicher",
+        link: "http://www.historictwincities.com/2021/07/12/barker-karpis-gang-hideout-house-1031-south-robert-street/",
+        imageSource: "Former Barker-Karpis WSP Hideout via <a href='https://www.atlasobscura.com/places/barker-karpis-hideout-house' target=_blank'>Atlas Obscura</a>.",
+        trivia: {
+            question: "What was the name of Nick Hannegraf's Tavern?",
+            options: ["Drover's", "Nick's", "Grover's", "Cheers"],
+            answer: 0
+        }
+    },
+    {
+        id: 2,
         name: "Father Louis Hennepin Suspension Bridge",
         lat: 45.14434783374931,
         lng: -93.00441148466629,
@@ -17,7 +34,7 @@ const locations_h = [
         }
     },
     {
-        id: 2,
+        id: 3,
         name: "Location 2",
         lat: 45.144664056565475,
         lng: -93.0030220919916,
