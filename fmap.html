@@ -303,6 +303,11 @@ const DEAD_ZONE_THRESHOLD = 1; // in meters
 let lastMapUpdateTime = 0;
 const MIN_UPDATE_INTERVAL = 100; // milliseconds
 
+let warmupPeriod = 5000; // 5 seconds warm-up
+let warmupStartTime = null;
+const initialSmoothingFactor = 0.55; // More aggressive smoothing during warm-up
+const normalSmoothingFactor = 0.35; // Your current smoothing factor
+
 let lastEstimatedVel = { lat: 0, lng: 0 };
 let resetInteractionTimeout;
 let lastUpdateTime = null;
@@ -539,6 +544,7 @@ var currentLatLng = null;
 var closestLocation = null;
 let useHighAccuracy = false;
 
+
 function alphaBetaFilter(newMeasurement) {
     if (!lastEstimatedPos) {
         lastEstimatedPos = { ...newMeasurement };
@@ -567,20 +573,29 @@ function alphaBetaFilter(newMeasurement) {
 }
 
 // Kalman Filter implementation
-class KalmanFilter {
-    constructor(R, Q) {
+class AdaptiveKalmanFilter {
+    constructor(R, Q, adaptiveFactorR = 0.01, adaptiveFactorQ = 0.01) {
         this.R = R; // Measurement noise
         this.Q = Q; // Process noise
         this.P = 1; // Estimation error covariance
         this.X = null; // Estimated value
         this.K = 0; // Kalman gain
+        this.adaptiveFactorR = adaptiveFactorR;
+        this.adaptiveFactorQ = adaptiveFactorQ;
     }
 
-    filter(measurement) {
+    filter(measurement, velocity) {
         if (this.X === null) {
             this.X = measurement;
             return this.X;
         }
+
+        // Adapt R based on velocity
+        this.R = Math.max(this.R * (1 - this.adaptiveFactorR * velocity), 0.01);
+        
+        // Adapt Q based on the difference between prediction and measurement
+        const innovation = measurement - this.X;
+        this.Q = Math.max(this.Q + this.adaptiveFactorQ * Math.abs(innovation), 0.01);
 
         // Prediction
         this.P = this.P + this.Q;
@@ -594,15 +609,16 @@ class KalmanFilter {
     }
 }
 
-const latFilter = new KalmanFilter(0.01, 0.1);
-const lngFilter = new KalmanFilter(0.01, 0.1);
+const latFilter = new AdaptiveKalmanFilter(0.01, 0.1);
+const lngFilter = new AdaptiveKalmanFilter(0.01, 0.1);
 
-function kalmanFilterPosition(position) {
+function kalmanFilterPosition(position, velocity) {
     return {
-        lat: latFilter.filter(position.lat),
-        lng: lngFilter.filter(position.lng)
+        lat: latFilter.filter(position.lat, velocity),
+        lng: lngFilter.filter(position.lng, velocity)
     };
 }
+
 
 let lastExpSmoothedValue = null;
 const expSmoothingFactor = 0.2; // Adjust as
@@ -679,6 +695,29 @@ function lowPassFilter(newMeasurement) {
     };
 }
 
+const recentPositions = [];
+const MAX_RECENT_POSITIONS = 5;
+
+function calculateConfidence(newPosition) {
+    if (recentPositions.length < 2) {
+        recentPositions.push(newPosition);
+        return 1;
+    }
+
+    const lastPosition = recentPositions[recentPositions.length - 1];
+    const distance = fastDistanceApprox(newPosition, lastPosition);
+    
+    // If the new position is very far from the last one, lower confidence
+    const confidence = Math.max(0, 1 - distance / 10); // Adjust the divisor as needed
+
+    recentPositions.push(newPosition);
+    if (recentPositions.length > MAX_RECENT_POSITIONS) {
+        recentPositions.shift();
+    }
+
+    return confidence;
+}
+/*
 function updateUserLocation(e = null) {
     const now = Date.now();
     console.log('updateUserLocation called with', e);
@@ -781,7 +820,131 @@ function updateUserLocation(e = null) {
     
     return velocitySmoothedLatLng;
 }
+*/
 
+function updateUserLocation(e = null) {
+    const now = Date.now();
+    console.log('updateUserLocation called with', e);
+    
+    // Get current location
+    currentLatLng = e ? e.latlng : lastKnownLatLng;
+    console.log('Set currentLatLng to:', currentLatLng);
+    
+    if (!currentLatLng) {
+        console.warn('No current location available');
+        return null;
+    }
+    
+    // Initialize lastAppliedLatLng if it's null
+    if (!lastAppliedLatLng) {
+        lastAppliedLatLng = currentLatLng;
+        warmupStartTime = now;
+    }
+    
+    // Calculate speed and check if stationary
+    let speed = 0;
+    if (lastUpdateTime && lastAppliedLatLng) {
+        const timeDiff = (now - lastUpdateTime) / 1000; // Convert to seconds
+        const distanceFeet = fastDistanceApprox(currentLatLng, lastAppliedLatLng) * 3.28084;
+        speed = distanceFeet / timeDiff;
+        isStationary = speed < STATIONARY_THRESHOLD;
+        
+        // Update velocity buffer
+        velocityBuffer.push(speed);
+        if (velocityBuffer.length > VELOCITY_BUFFER_SIZE) {
+            velocityBuffer.shift();
+        }
+    }
+    
+    // Adaptive filtering
+    const avgVelocity = velocityBuffer.reduce((sum, v) => sum + v, 0) / velocityBuffer.length || 0;
+    const adaptiveAlpha = Math.min(ADAPTIVE_ALPHA * avgVelocity, 0.9);
+    const adaptiveBeta = Math.min(ADAPTIVE_BETA * avgVelocity, 0.4);
+    
+    // Apply warm-up smoothing
+    const timeSinceWarmupStart = now - warmupStartTime;
+    let currentSmoothingFactor;
+    
+    if (timeSinceWarmupStart < warmupPeriod) {
+        const warmupProgress = timeSinceWarmupStart / warmupPeriod;
+        currentSmoothingFactor = initialSmoothingFactor + (normalSmoothingFactor - initialSmoothingFactor) * warmupProgress;
+    } else {
+        currentSmoothingFactor = normalSmoothingFactor;
+    }
+    
+    // Apply filters
+    const deadbandFilteredLatLng = applyDynamicDeadband(currentLatLng, lastAppliedLatLng, isStationary);
+    const smoothedLatLng = adaptiveAlphaBetaFilter(deadbandFilteredLatLng, adaptiveAlpha, adaptiveBeta);
+    
+    // Apply Kalman filter
+    const kalmanFilteredLatLng = kalmanFilterPosition(smoothedLatLng, avgVelocity);
+    
+    // Calculate confidence
+    const confidence = calculateConfidence(kalmanFilteredLatLng);
+    
+    // Apply confidence-based smoothing
+    const confidenceAdjustedSmoothingFactor = currentSmoothingFactor * confidence;
+    
+    let finalSmoothedLatLng;
+    if (lastFilteredLocation) {
+        finalSmoothedLatLng = {
+            lat: lastFilteredLocation.lat + confidenceAdjustedSmoothingFactor * (kalmanFilteredLatLng.lat - lastFilteredLocation.lat),
+            lng: lastFilteredLocation.lng + confidenceAdjustedSmoothingFactor * (kalmanFilteredLatLng.lng - lastFilteredLocation.lng)
+        };
+    } else {
+        finalSmoothedLatLng = kalmanFilteredLatLng;
+    }
+    
+    // Velocity-based smoothing
+    const velocitySmoothedLatLng = velocityBasedSmoothing(finalSmoothedLatLng, avgVelocity);
+    
+    console.log('Velocity-smoothed LatLng:', velocitySmoothedLatLng);
+    
+    // Check if the movement is within the dead zone
+    const distance = lastFilteredLocation ? 
+        fastDistanceApprox(velocitySmoothedLatLng, lastFilteredLocation) : 
+        Number.MAX_VALUE;
+    
+    if (distance > DEAD_ZONE_THRESHOLD) {
+        lastFilteredLocation = velocitySmoothedLatLng;
+        
+        // Update last known positions
+        lastAppliedLatLng = velocitySmoothedLatLng;
+        lastUpdateTime = now;
+        lastKnownLatLng = velocitySmoothedLatLng;
+        
+        // Update marker position
+        userLocationMarker.setLatLng(velocitySmoothedLatLng);
+        
+        // Predict future position
+        const predictedLatLng = predictFuturePosition(velocitySmoothedLatLng, avgVelocity);
+        
+        // Only update the map view if enough time has passed since the last update
+        if (now - lastMapUpdateTime > MIN_UPDATE_INTERVAL) {
+            requestAnimationFrame(() => {
+                if (!userInteracted) {
+                    map.panTo(predictedLatLng, { animate: true, duration: 0.5, noMoveStart: true });
+                }
+                lastMapUpdateTime = now;
+            });
+        }
+        
+        // Find closest location
+        const { closestLocation, closestDistance } = findClosestLocation(velocitySmoothedLatLng);
+        
+        // Update distance box
+        updateDistanceBox(closestDistance);
+        
+        // Check for location transition
+        checkLocationTransition(closestLocation, closestDistance);
+        
+        // Update accuracy mode
+        updateAccuracyMode(closestDistance);
+    }
+    
+    return velocitySmoothedLatLng;
+}
+    
 function adaptiveAlphaBetaFilter(measurement, alpha, beta) {
     if (!lastEstimatedPos) {
         lastEstimatedPos = { ...measurement };
