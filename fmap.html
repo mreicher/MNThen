@@ -297,6 +297,26 @@
 let closestDistance = Infinity;
 let newMarkers = {};
 
+// Add these variables at the top of your script
+let lastFilteredLocation = null;
+const SMOOTHING_FACTOR = 0.2;
+const DEAD_ZONE_THRESHOLD = 1; // in meters
+let lastMapUpdateTime = 0;
+const MIN_UPDATE_INTERVAL = 100; // milliseconds
+
+let lastEstimatedVel = { lat: 0, lng: 0 };
+let resetInteractionTimeout;
+let lastUpdateTime = null;
+const SMOOTHING_FACTOR = 0.5;
+const PREDICTION_TIME = 0.5; // Predict 0.5 seconds ahead
+const UPDATE_INTERVAL = 1000; // 1 second between updates
+
+// Add these variables at the top of your script
+let velocityBuffer = [];
+const VELOCITY_BUFFER_SIZE = 5;
+const ADAPTIVE_ALPHA = 0.1;
+const ADAPTIVE_BETA = 0.05;
+
 // Define alpha-beta filter constants and variables
 const alpha = 0.1;
 const beta = 0.005;
@@ -660,16 +680,10 @@ function lowPassFilter(newMeasurement) {
     };
 }
 
-let lastEstimatedVel = { lat: 0, lng: 0 };
-let resetInteractionTimeout;
-let lastUpdateTime = null;
-const SMOOTHING_FACTOR = 0.5;
-const PREDICTION_TIME = 0.5; // Predict 0.5 seconds ahead
-const UPDATE_INTERVAL = 1000; // 1 second between updates
-
 function updateUserLocation(e = null) {
     const now = Date.now();
     console.log('updateUserLocation called with', e);
+    
     // Get current location
     currentLatLng = e ? e.latlng : lastKnownLatLng;
     console.log('Set currentLatLng to:', currentLatLng);
@@ -680,45 +694,174 @@ function updateUserLocation(e = null) {
     }
     
     // Calculate speed and check if stationary
+    let speed = 0;
     if (lastUpdateTime && lastAppliedLatLng) {
         const timeDiff = (now - lastUpdateTime) / 1000; // Convert to seconds
         const distanceFeet = fastDistanceApprox(currentLatLng, lastAppliedLatLng) * 3.28084;
-        const speed = distanceFeet / timeDiff;
+        speed = distanceFeet / timeDiff;
         isStationary = speed < STATIONARY_THRESHOLD;
+        
+        // Update velocity buffer
+        velocityBuffer.push(speed);
+        if (velocityBuffer.length > VELOCITY_BUFFER_SIZE) {
+            velocityBuffer.shift();
+        }
     }
+    
+    // Adaptive filtering
+    const avgVelocity = velocityBuffer.reduce((sum, v) => sum + v, 0) / velocityBuffer.length || 0;
+    const adaptiveAlpha = Math.min(ADAPTIVE_ALPHA * avgVelocity, 0.9);
+    const adaptiveBeta = Math.min(ADAPTIVE_BETA * avgVelocity, 0.4);
     
     // Apply filters
     const deadbandFilteredLatLng = applyDynamicDeadband(currentLatLng, lastAppliedLatLng || currentLatLng, isStationary);
-    const smoothedLatLng = combinedFilter(deadbandFilteredLatLng);
-    const lowPassFiltered = lowPassFilter(currentLatLng);
-    console.log('Smoothed currentLatLng:', smoothedLatLng);
+    const smoothedLatLng = adaptiveAlphaBetaFilter(deadbandFilteredLatLng, adaptiveAlpha, adaptiveBeta);
     
-    // Update last known positions
-    lastAppliedLatLng = smoothedLatLng;
-    lastUpdateTime = now;
-    lastKnownLatLng = smoothedLatLng;
+    // Apply additional low-pass filter to reduce jitter
+    let finalSmoothedLatLng;
+    if (lastFilteredLocation) {
+        finalSmoothedLatLng = {
+            lat: lastFilteredLocation.lat + SMOOTHING_FACTOR * (smoothedLatLng.lat - lastFilteredLocation.lat),
+            lng: lastFilteredLocation.lng + SMOOTHING_FACTOR * (smoothedLatLng.lng - lastFilteredLocation.lng)
+        };
+    } else {
+        finalSmoothedLatLng = smoothedLatLng;
+    }
     
-    // Update marker position
-    userLocationMarker.setLatLng(smoothedLatLng);
+    // Velocity-based smoothing
+    const velocitySmoothedLatLng = velocityBasedSmoothing(finalSmoothedLatLng, avgVelocity);
     
-    // Predict future position
-    const predictedLat = smoothedLatLng.lat + lastEstimatedVel.lat * PREDICTION_TIME;
-    const predictedLng = smoothedLatLng.lng + lastEstimatedVel.lng * PREDICTION_TIME;
-    const predictedLatLng = L.latLng(predictedLat, predictedLng);
+    console.log('Velocity-smoothed LatLng:', velocitySmoothedLatLng);
     
-    // Find closest location
-    const { closestLocation, closestDistance } = findClosestLocation(smoothedLatLng);
+    // Check if the movement is within the dead zone
+    const distance = lastFilteredLocation ? 
+        fastDistanceApprox(velocitySmoothedLatLng, lastFilteredLocation) : 
+        Number.MAX_VALUE;
     
-    // Update distance box
-    updateDistanceBox(closestDistance);
+    if (distance > DEAD_ZONE_THRESHOLD) {
+        lastFilteredLocation = velocitySmoothedLatLng;
+        
+        // Update last known positions
+        lastAppliedLatLng = velocitySmoothedLatLng;
+        lastUpdateTime = now;
+        lastKnownLatLng = velocitySmoothedLatLng;
+        
+        // Update marker position
+        userLocationMarker.setLatLng(velocitySmoothedLatLng);
+        
+        // Predict future position
+        const predictedLatLng = predictFuturePosition(velocitySmoothedLatLng, avgVelocity);
+        
+        // Only update the map view if enough time has passed since the last update
+        if (now - lastMapUpdateTime > MIN_UPDATE_INTERVAL) {
+            requestAnimationFrame(() => {
+                if (!userInteracted) {
+                    map.panTo(predictedLatLng, { animate: true, duration: 0.5, noMoveStart: true });
+                }
+                lastMapUpdateTime = now;
+            });
+        }
+        
+        // Find closest location
+        const { closestLocation, closestDistance } = findClosestLocation(velocitySmoothedLatLng);
+        
+        // Update distance box
+        updateDistanceBox(closestDistance);
+        
+        // Check for location transition
+        checkLocationTransition(closestLocation, closestDistance);
+        
+        // Update accuracy mode
+        updateAccuracyMode(closestDistance);
+    }
     
-    // Check for location transition
-    checkLocationTransition(closestLocation, closestDistance);
-    
-    // Update accuracy mode
-    updateAccuracyMode(closestDistance);
-    
-    return smoothedLatLng;
+    return velocitySmoothedLatLng;
+}
+
+function adaptiveAlphaBetaFilter(measurement, alpha, beta) {
+    if (!lastEstimatedPos) {
+        lastEstimatedPos = { ...measurement };
+        lastEstimatedVel = { lat: 0, lng: 0 };
+        return lastEstimatedPos;
+    }
+
+    const predictedPos = {
+        lat: lastEstimatedPos.lat + lastEstimatedVel.lat,
+        lng: lastEstimatedPos.lng + lastEstimatedVel.lng
+    };
+
+    const residual = {
+        lat: measurement.lat - predictedPos.lat,
+        lng: measurement.lng - predictedPos.lng
+    };
+
+    lastEstimatedPos = {
+        lat: predictedPos.lat + alpha * residual.lat,
+        lng: predictedPos.lng + alpha * residual.lng
+    };
+
+    lastEstimatedVel = {
+        lat: lastEstimatedVel.lat + (beta / alpha) * residual.lat,
+        lng: lastEstimatedVel.lng + (beta / alpha) * residual.lng
+    };
+
+    return lastEstimatedPos;
+}
+
+function velocityBasedSmoothing(position, velocity) {
+    const smoothingFactor = Math.min(0.1 * velocity, 0.9);
+    return {
+        lat: lastAppliedLatLng.lat + smoothingFactor * (position.lat - lastAppliedLatLng.lat),
+        lng: lastAppliedLatLng.lng + smoothingFactor * (position.lng - lastAppliedLatLng.lng)
+    };
+}
+
+function predictFuturePosition(currentLatLng, velocity) {
+    const predictionTime = 0.5; // Predict 0.5 seconds into the future
+    const predictedDistance = velocity * predictionTime;
+    const bearing = calculateBearing(lastAppliedLatLng, currentLatLng);
+    return destinationPoint(currentLatLng, bearing, predictedDistance);
+}
+
+function calculateBearing(start, end) {
+    const startLat = toRadians(start.lat);
+    const startLng = toRadians(start.lng);
+    const endLat = toRadians(end.lat);
+    const endLng = toRadians(end.lng);
+
+    const y = Math.sin(endLng - startLng) * Math.cos(endLat);
+    const x = Math.cos(startLat) * Math.sin(endLat) -
+              Math.sin(startLat) * Math.cos(endLat) * Math.cos(endLng - startLng);
+    const bearing = (toDegrees(Math.atan2(y, x)) + 360) % 360;
+    return bearing;
+}
+
+function destinationPoint(start, bearing, distance) {
+    const R = 6371e3; // Earth's radius in meters
+    const δ = distance / R; // angular distance in radians
+    const θ = toRadians(bearing);
+
+    const φ1 = toRadians(start.lat);
+    const λ1 = toRadians(start.lng);
+
+    const sinφ2 = Math.sin(φ1) * Math.cos(δ) + Math.cos(φ1) * Math.sin(δ) * Math.cos(θ);
+    const φ2 = Math.asin(sinφ2);
+    const y = Math.sin(θ) * Math.sin(δ) * Math.cos(φ1);
+    const x = Math.cos(δ) - Math.sin(φ1) * sinφ2;
+    const λ2 = λ1 + Math.atan2(y, x);
+
+    return {
+        lat: toDegrees(φ2),
+        lng: (toDegrees(λ2) + 540) % 360 - 180 // normalize to -180..+180
+    };
+}
+
+function toRadians(degrees) {
+    return degrees * Math.PI / 180;
+}
+
+function toDegrees(radians) {
+    return radians * 180 / Math.PI;
 }
 
 let consolidatedInterval;
@@ -925,24 +1068,6 @@ function resetUserInteraction() {
 let lastCenterTime = 0;
 const CENTER_THRESHOLD = 0.0001; // Example value
     
-/*    
-function centerMapOnUser() {
-    if (map && userLocationMarker && !userInteracted) {
-        var userPosition = userLocationMarker.getLatLng();
-        var mapCenter = map.getCenter();
-        
-        // Use CENTER_THRESHOLD or 0.00005, whichever you prefer
-        if (Math.abs(userPosition.lat - mapCenter.lat) > CENTER_THRESHOLD || 
-            Math.abs(userPosition.lng - mapCenter.lng) > CENTER_THRESHOLD) {
-            map.panTo(userPosition, { animate: true, duration: 0.5 });
-        }
-        
-        // Always add the centered-icon class
-        userLocationMarker.getElement().classList.add('centered-icon');
-    }
-}
-*/
-
 function centerMapOnUser() {
     if (map && userLocationMarker && !userInteracted) {
         const userPosition = userLocationMarker.getLatLng();
@@ -963,23 +1088,23 @@ function centerMapOnUser() {
     }
 }
 
-const PADDING_PERCENTAGE = 0.1; // 10% padding from edges
-
+const PADDING_PERCENTAGE = 0.15; // 15% padding from edges
+const CENTER_COOLDOWN = 30000; // 30 second cooldown between centering
 function ensureUserIconOnScreen() {
     if (!map || !userLocationMarker) return;
-
+    const now = Date.now();
+    if (now - lastCenterTime < CENTER_COOLDOWN) return;
     const userPosition = userLocationMarker.getLatLng();
     const bounds = map.getBounds();
     const visibleBounds = bounds.pad(-PADDING_PERCENTAGE);
-
     if (!visibleBounds.contains(userPosition)) {
         const currentZoom = map.getZoom();
-        const newCenter = calculateNewCenter(userPosition, bounds);
-        map.flyTo(newCenter, currentZoom, {
+        const newCenter = calculateNewCenter(userPosition, bounds);flyTo(newCenter, currentZoom, {
             animate: true,
             duration: 0.75,
             easeLinearity: 0.5
         });
+        lastCenterTime = now;
     }
 }
 
