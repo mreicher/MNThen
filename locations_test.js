@@ -1,4 +1,4 @@
-const gameLocations = [
+const locations = [
 
     {
         id: "1010",
