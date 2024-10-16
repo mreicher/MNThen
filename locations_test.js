@@ -11,6 +11,7 @@ const locations = [
         city: "White Bear Lake",
         audioURL: "/audio/wbl/wbl_plant.mp3", 
         tours: "wbl_split",
+        summary: "This is a placeholder.",
         link: "https://original.newsbreak.com/@ron-dansley-1587459/3078633820088-lion-s-park-a-remembrance-of-white-bear-lake-s-legendary-plantation-night-club",
         imageSource: "The Plantation Nightclub via the White Bear Press",
         additionalInfo: "This is a place to add more info. This is a placeholder for now."
@@ -27,6 +28,7 @@ const locations = [
         city: "Mahtomedi",
         audioURL: "/audio/mahtomedi/wildwood.mp3", 
         tours: "history",
+                summary: "This is a placeholder.",
         link: "https://mnthen.com/blog/place/wildwood.html",
         imageSource: "Image of the slide at Wildwood Park c. 1905 via MPRNews",
         additionalInfo: "This is a place to add more info. This is a placeholder for now."
@@ -43,6 +45,7 @@ const locations = [
         city: "St. Paul",
         audioURL: "/audio/wsp/wsp_eyedea.mp3", 
         tours: "history",
+                summary: "This is a placeholder.",
         link: "https://mnthen.com/blog/people/eyedea_larsen.html",
         imageSource: "Image of 'Eyedea' Larsen via Heavy Blog is Heavy",
         additionalInfo: "This is a place to add more info. This is a placeholder for now."
@@ -59,6 +62,7 @@ const locations = [
         city: "Mankato",
         audioURL: "/audio/mankato/man_dakota_38.mp3", 
         tours: "history",
+                summary: "This is a placeholder.",
         link: "https://mnthen.com/blog/event/dakota_conflict.html",
         imageSource: "The Dakota 38 Memorial via Library of Congress",
         additionalInfo: "This is a place to add more info. This is a placeholder for now."
@@ -75,6 +79,7 @@ const locations = [
         city: "St. Paul",
         audioURL: "/exhibit/audio/stp/stp_hamm_mansion.mp3", 
         tours: "hamm",
+                summary: "This is a placeholder.",
         link: "https://mnthen.com/blog/place/stp_hamm_mansion.html",
         imageSource: "The Hamm Mansion via 1889 Victorian House Restoration",
         additionalInfo: "This is a place to add more info. This is a placeholder for now."
@@ -91,6 +96,7 @@ const locations = [
         city: "Minneapolis",
         audioURL: "/audio/mpls/mpls_henn_bridge.mp3", 
         tours: "history",
+                summary: "This is a placeholder.",
         link: "https://www.mnopedia.org/structure/father-louis-hennepin-suspension-bridge",
         imageSource: "First suspension bridge in Minneapolis, (c. 1858) via MNopedia",
         additionalInfo: "This is a place to add more info. This is a placeholder for now."
@@ -107,6 +113,7 @@ const locations = [
         city: "St. Paul",
         audio: "/audio/exhibit/capitol3.mp3",
         tours: "capitol",
+                summary: "This is a placeholder.",
         link: "https://www.mnopedia.org/structure/minnesota-s-third-state-capitol",
         imageSource: "Minnesota State Capitol Building (2022)",
         additionalInfo: "This is a place to add more info. This is a placeholder for now."
@@ -123,6 +130,7 @@ const locations = [
         city: "St. Paul",
         audioURL: "/audio/exhibit/whiskey.mp3",
         tours: "history",
+                summary: "This is a placeholder.",
         link: "https://mnthen.com/blog/people/whiskey.html",
         imageSource: "Whiskey with Captain W.R. Hazelrigg (1943)",
         additionalInfo: "This is a place to add more info. This is a placeholder for now."
@@ -139,6 +147,7 @@ const locations = [
         city: "St. Paul",
         audioURL: "/audio/exhibit/swede_hollow.mp3",
         tours: "history",
+                summary: "This is a placeholder.",
         link: "https://www.mnopedia.org/place/swede-hollow",
         imageSource: "Swede Hollow looking north, (c.1910). via MNopedia",
         additionalInfo: "This is a place to add more info. This is a placeholder for now."
@@ -155,6 +164,7 @@ const locations = [
         city: "St. Paul",
         audio: "/audio/exhibit/merriam_mansion.mp3",
         tours: "history",
+                summary: "This is a placeholder.",
         link: "https://mnthen.com/blog/place/merriam_mansion.html",
         imageSource: "William R. Merriam residence, (c.1890). via St Paul Historical",
         additionalInfo: "This is a place to add more info. This is a placeholder for now."
