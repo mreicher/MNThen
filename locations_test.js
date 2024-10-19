@@ -28,7 +28,7 @@ const locations = [
         city: "Mahtomedi",
         audioURL: "/audio/mahtomedi/wildwood.mp3", 
         tours: "history",
-        summary: "Wildwood Amusement Park entertained Twin Cities families with rides, shows, and lakeside activities from the 1890s until 1932, when it closed due to financial troubles. Today, the park is no more, but its memory lives on.",
+        summary: "The park entertained Twin Cities families with rides, shows, and lakeside activities from the 1890s until 1932, when it closed due to financial troubles. Today, the park is no more, but its memory lives on.",
         link: "https://mnthen.com/blog/place/wildwood.html",
         imageSource: "Image of the slide at Wildwood Park c. 1905 via MPRNews",
         additionalInfo: "Wildwood featured the popular 'Scenic Railway,' a wooden roller coaster designed by Fred W. Pearce. It was later moved to his Excelsior Amusement Park."
