@@ -1,0 +1,1114 @@
+let map, userMarker, markerClusterGroup;
+let currentLocationIndex = 0;
+let visitedLocations = [];
+let gameLocations = [];
+let isLocationHuntVisible = false;
+let lastPosition = null;
+let positionBuffer = [];
+const bufferSize = 15;
+const smoothingFactor = 0.2;
+let filteredPosition = null;
+const DISTANCE_THRESHOLD = 20; // 20 feet
+let lastUpdateTime = 0;
+let velocity = { lat: 0, lng: 0 };
+let isMapInteracting = false;
+let followUser = true;
+let locationCooldowns = {};
+
+const speedThreshold = 0.5; // m/s
+const distanceThreshold = 5; // meters
+const accuracyThreshold = 30; // meters
+
+let lastHiddenTime = 0;
+const BACKGROUND_THRESHOLD = 25000; // 25 seconds in milliseconds
+
+let lastKnownPosition = null;
+let isTransitioning = false;
+let lastVisitedLocationId = null;
+
+const MOVEMENT_THRESHOLD = 1; // meters
+const INACTIVITY_TIMEOUT = 60000; // 1 minute in milliseconds
+let lastInteractionTime = Date.now();
+
+function initMap() {
+    map = L.map('map', {
+        zoomControl: false,
+        attributionControl: false,
+        zoomSnap: 0.1,
+        zoomDelta: 0.5,
+        wheelDebounceTime: 100,
+        tapTolerance: 15,
+        bounceAtZoomLimits: false
+    }).fitWorld();
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '© OpenStreetMap contributors',
+        updateWhenIdle: true,
+        updateWhenZooming: false
+    }).addTo(map);
+
+    markerClusterGroup = L.markerClusterGroup({
+        showCoverageOnHover: false,
+        zoomToBoundsOnClick: true,
+        spiderfyOnMaxZoom: true,
+        animate: true,
+        animateAddingMarkers: true,
+        iconCreateFunction: cluster => L.divIcon({
+            html: `<div><span>${cluster.getChildCount()}</span></div>`,
+            className: 'marker-cluster-custom',
+            iconSize: L.point(40, 40)
+        })
+    });
+    map.addLayer(markerClusterGroup);
+
+    userMarker = L.marker([0, 0], {
+        icon: L.divIcon({
+            className: 'user-marker',
+            html: '<div class="user-marker-icon"></div>',
+            iconSize: [20, 20],
+            iconAnchor: [10, 10]
+        })
+    }).addTo(map);
+
+    const loadingMessage = createLoadingMessage();
+    document.body.appendChild(loadingMessage);
+            
+    if ("geolocation" in navigator) {
+        navigator.geolocation.getCurrentPosition(initializeUserLocation, handleLocationError, {
+            enableHighAccuracy: true,
+            timeout: 30000,
+            maximumAge: 0
+        });
+    } else {
+        showPopup("Geolocation is not supported by your browser");
+        map.setView([44.9778, -93.2650], 19);
+        document.body.removeChild(loadingMessage);
+    }
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    addMapEventListeners();
+
+    map.touchZoom.enable();
+    map.doubleClickZoom.enable();
+}
+
+function createLoadingMessage() {
+    const loadingMessage = document.createElement('div');
+    loadingMessage.id = 'loadingMessage';
+    loadingMessage.style.cssText = `
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        background-color: rgba(255, 255, 255, 0.8);
+        padding: 20px;
+        border-radius: 10px;
+        z-index: 1000;
+    `;
+    loadingMessage.innerHTML = '<p>Searching for your location...</p>';
+    return loadingMessage;
+}
+
+function initializeUserLocation(position) {
+    const { latitude: userLat, longitude: userLng } = position.coords;
+
+    userMarker.setLatLng([userLat, userLng]);
+    map.setView([userLat, userLng], 19);
+
+    const loadingMessage = document.getElementById('loadingMessage');
+    if (loadingMessage) {
+        document.body.removeChild(loadingMessage);
+    }
+
+    startPositionUpdates();
+    startHunt();
+}
+
+function startPositionUpdates() {
+    navigator.geolocation.watchPosition(
+        handlePositionUpdate,
+        handleLocationError,
+        {
+            enableHighAccuracy: true,
+            maximumAge: 0,
+            timeout: 30000
+        }
+    );
+}
+
+function handlePositionUpdate(position) {
+    const currentTime = Date.now();
+    if (currentTime - lastUpdateTime >= 100 && !isPopupOpen()) {
+        updateUserLocation(position);
+        lastUpdateTime = currentTime;
+    }
+}
+
+function isPopupOpen() {
+    return document.querySelector('.popup') !== null || 
+        (document.querySelector('.custom-popup') !== null && document.querySelector('.custom-popup').classList.contains('leaflet-popup-content-wrapper')) ||
+        document.querySelector('.leaflet-popup') !== null;
+}
+
+function handleVisibilityChange() {
+    if (document.hidden) {
+        lastHiddenTime = Date.now();
+        lastKnownPosition = userMarker.getLatLng();
+    } else {
+        const hiddenDuration = Date.now() - lastHiddenTime;
+        if (hiddenDuration > BACKGROUND_THRESHOLD) {
+            updateLocationAfterBackground();
+        }
+    }
+}
+
+function updateLocationAfterBackground() {
+    if ("geolocation" in navigator) {
+        navigator.geolocation.getCurrentPosition(
+            position => {
+                const newPosition = {
+                    lat: position.coords.latitude,
+                    lng: position.coords.longitude
+                };
+                
+                updateUserLocation(position, true);
+                centerMapOnUser(newPosition, true);
+                
+                lastPosition = null;
+                positionBuffer = [];
+                filteredPosition = null;
+                velocity = { lat: 0, lng: 0 };
+                
+                updateDistanceBox();
+                
+                followUser = true;
+                
+                map.invalidateSize();
+            },
+            error => console.warn("Error getting location after background:", error),
+            {
+                enableHighAccuracy: true,
+                timeout: 10000,
+                maximumAge: 0
+            }
+        );
+    }
+}
+
+function updateUserLocation(position, forceUpdate = false) {
+    if (isMapInteracting && !forceUpdate) return;
+
+    const newPosition = {
+        lat: position.coords.latitude,
+        lng: position.coords.longitude,
+        accuracy: position.coords.accuracy
+    };
+
+    if (isNaN(newPosition.lat) || isNaN(newPosition.lng)) {
+        console.warn("Invalid position received:", newPosition);
+        return;
+    }
+
+    if (newPosition.accuracy > accuracyThreshold && !forceUpdate) {
+        console.warn("Low accuracy position, skipping update");
+        return;
+    }
+
+    const filteredPosition = kalmanFilter.update(newPosition);
+
+    positionBuffer.push(filteredPosition);
+    if (positionBuffer.length > bufferSize) {
+        positionBuffer.shift();
+    }
+
+    const smoothedPosition = calculateWeightedAveragePosition(positionBuffer);
+
+    if (lastPosition) {
+        const distance = calculateDistance(lastPosition, smoothedPosition);
+        const timeDiff = (Date.now() - lastUpdateTime) / 1000;
+        const speed = distance / timeDiff;
+        
+        if (speed > speedThreshold && distance > distanceThreshold) {
+            const angle = calculateAngle(lastPosition, smoothedPosition);
+            updateUserMarkerHeading(angle);
+        }
+
+        if (distance > MOVEMENT_THRESHOLD || forceUpdate) {
+            centerMapOnUser(smoothedPosition, forceUpdate);
+        }
+    } else {
+        centerMapOnUser(smoothedPosition, forceUpdate);
+    }
+
+    updateUserMarkerPosition(smoothedPosition);
+    updateDistanceBox();
+
+    lastPosition = smoothedPosition;
+    lastUpdateTime = Date.now();
+    lastInteractionTime = Date.now(); // Reset inactivity timer
+}
+
+function updateUserMarkerPosition(position) {
+    if (!userMarker || !map) return;
+
+    userMarker.setLatLng([position.lat, position.lng]);
+    
+    const markerElement = userMarker.getElement();
+    if (markerElement) {
+        const point = map.latLngToLayerPoint([position.lat, position.lng]);
+        markerElement.style.transform = `translate3d(${point.x}px, ${point.y}px, 0)`;
+        markerElement.style.transition = 'transform 0.3s cubic-bezier(0.25, 0.1, 0.25, 1)';
+    }
+
+    lastKnownPosition = position;
+    updateDistanceBox();
+}
+
+const kalmanFilter = {
+    x: { estimate: 0, errorEstimate: 1, gain: 0 },
+    y: { estimate: 0, errorEstimate: 1, gain: 0 },
+    measurementError: 1,
+    processError: 0.01,
+
+    update(measurement) {
+        if (this.x.estimate === 0 && this.y.estimate === 0) {
+            this.x.estimate = measurement.lng;
+            this.y.estimate = measurement.lat;
+            return measurement;
+        }
+
+        let predictedX = this.x.estimate;
+        let predictedY = this.y.estimate;
+        let predictedErrorX = this.x.errorEstimate + this.processError;
+        let predictedErrorY = this.y.errorEstimate + this.processError;
+
+        this.x.gain = predictedErrorX / (predictedErrorX + this.measurementError);
+        this.y.gain = predictedErrorY / (predictedErrorY + this.measurementError);
+
+        this.x.estimate = predictedX + this.x.gain * (measurement.lng - predictedX);
+        this.y.estimate = predictedY + this.y.gain * (measurement.lat - predictedY);
+
+        this.x.errorEstimate = (1 - this.x.gain) * predictedErrorX;
+        this.y.errorEstimate = (1 - this.y.gain) * predictedErrorY;
+
+        return {
+            lat: this.y.estimate,
+            lng: this.x.estimate,
+            accuracy: measurement.accuracy
+        };
+    }
+};
+              
+function calculateWeightedAveragePosition(positions) {
+    let sumLat = 0, sumLng = 0, totalWeight = 0;
+
+    for (let i = 0; i < positions.length; i++) {
+        const weight = Math.pow(smoothingFactor, positions.length - i - 1);
+        sumLat += positions[i].lat * weight;
+        sumLng += positions[i].lng * weight;
+        totalWeight += weight;
+    }
+
+    return {
+        lat: sumLat / totalWeight,
+        lng: sumLng / totalWeight
+    };
+}
+
+function calculateDistance(pos1, pos2) {
+    const R = 6371e3; // Earth's radius in meters
+    const φ1 = pos1.lat * Math.PI / 180;
+    const φ2 = pos2.lat * Math.PI / 180;
+    const Δφ = (pos2.lat - pos1.lat) * Math.PI / 180;
+    const Δλ = (pos2.lng - pos1.lng) * Math.PI / 180;
+
+    const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
+            Math.cos(φ1) * Math.cos(φ2) *
+            Math.sin(Δλ/2) * Math.sin(Δλ/2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+
+    return R * c; // Distance in meters
+}
+
+function calculateAngle(pos1, pos2) {
+    return Math.atan2(pos2.lng - pos1.lng, pos2.lat - pos1.lat) * 180 / Math.PI;
+}
+
+function updateUserMarkerHeading(angle) {
+    const markerIcon = userMarker.getElement().querySelector('.user-marker-icon');
+    if (markerIcon) {
+        markerIcon.style.transform = `rotate(${angle}deg)`;
+    }
+}
+
+function centerMapOnUser(position, immediate = false) {
+    if (!followUser && !immediate) return;
+
+    const padding = { top: 50, bottom: 50, left: 50, right: 50 };
+    const bounds = L.latLngBounds(position, position);
+    
+    map.fitBounds(bounds, {
+        paddingTopLeft: [padding.left, padding.top],
+        paddingBottomRight: [padding.right, padding.bottom],
+        animate: !immediate,
+        duration: 0.5,
+        easeLinearity: 0.25
+    });
+}
+
+function addMapEventListeners() {
+    map.on('dragstart zoomstart', () => {
+        followUser = false;
+        isMapInteracting = true;
+        lastInteractionTime = Date.now();
+    });
+
+    map.on('dragend zoomend', () => {
+        isMapInteracting = false;
+    });
+
+    setInterval(checkInactivity, 1000); // Check inactivity every second
+}
+
+function checkInactivity() {
+    if (Date.now() - lastInteractionTime > INACTIVITY_TIMEOUT) {
+        followUser = true;
+        if (lastKnownPosition) {
+            centerMapOnUser(lastKnownPosition, true);
+        }
+    }
+}
+
+function recenterMap() {
+    if (lastKnownPosition) {
+        centerMapOnUser(lastKnownPosition, true);
+        followUser = true;
+        lastInteractionTime = Date.now();
+    }
+}
+
+function handleLocationError(error) {
+    console.warn("Error getting user location:", error);
+    
+    const loadingMessage = document.getElementById('loadingMessage');
+    if (loadingMessage) {
+        document.body.removeChild(loadingMessage);
+    }
+    
+    let errorMessage;
+    switch(error.code) {
+        case error.PERMISSION_DENIED:
+            errorMessage = "User denied the request for geolocation.";
+            break;
+        case error.POSITION_UNAVAILABLE:
+            errorMessage = "Location information is unavailable.";
+            break;
+        case error.TIMEOUT:
+            errorMessage = "The request to get user location timed out.";
+            break;
+        case error.UNKNOWN_ERROR:
+            errorMessage = "An unknown error occurred.";
+            break;
+    }
+    
+    showPopup("Location Error: " + errorMessage);
+}
+
+function returnToIndex() {
+    showPopup("Are you ready to leave?", 'info', () => {
+        window.location.href = "index.html";
+    });
+    
+    document.getElementById('returnButton').classList.remove('active');
+}
+
+function toggleNavigationTips() {
+    const tipsElement = document.querySelector('.navigation-tips');
+    const computedStyle = window.getComputedStyle(tipsElement);
+    
+    if (computedStyle.display === 'none') {
+        tipsElement.style.display = 'block';
+    } else {
+        tipsElement.style.display = 'none';
+    }
+    
+    document.getElementById('tipsButton').classList.toggle('active');
+}
+
+function closeNavigationTips() {
+    document.querySelector('.navigation-tips').style.display  = 'none';
+    document.getElementById('tipsButton').classList.remove('active');
+}
+
+function addUIEventListeners() {
+    document.getElementById('recenterButton').addEventListener('click', recenterMap);
+    document.getElementById('returnButton').addEventListener('click', returnToIndex);
+    document.getElementById('tipsButton').addEventListener('click', toggleNavigationTips);
+    document.querySelector('.navigation-tips .close-button').addEventListener('click', closeNavigationTips);
+}
+
+function updateDistanceBox() {
+    if (userMarker) {
+        let userLat = userMarker.getLatLng().lat;
+        let userLng = userMarker.getLatLng().lng;
+        
+        if (userLat === 0 && userLng === 0) {
+            const center = map.getCenter();
+            userLat = center.lat;
+            userLng = center.lng;
+        }
+
+        let closestDistance = Infinity;
+        let closestLocation = null;
+
+        gameLocations.forEach(location => {
+            const distance = L.latLng(userLat, userLng).distanceTo([location.lat, location.lng]);
+            if (distance < closestDistance) {
+                closestDistance = distance;
+                closestLocation = location;
+            }
+        });
+
+        const distanceFeet = Math.round(closestDistance * 3.28084);
+        
+        const now = Date.now();
+        const cooldownPeriod = 3 * 60 * 1000;
+        let remainingCooldown = 0;
+
+        if (lastVisitedLocationId !== null) {
+            const lastVisitTime = locationCooldowns[lastVisitedLocationId] || 0;
+            remainingCooldown = Math.max(0, cooldownPeriod - (now - lastVisitTime));
+        }
+
+        let distanceText = distanceFeet < 5280 ? `${distanceFeet} feet` : `${(distanceFeet / 5280).toFixed(2)} miles`;
+        
+        if (remainingCooldown > 0) {
+            const remainingSeconds = Math.ceil(remainingCooldown / 1000);
+        }
+
+        document.getElementById('distanceBox').innerText = `Closest Stop: ${distanceText}`;
+        
+        if (distanceFeet <= DISTANCE_THRESHOLD && !isLocationHuntVisible) {
+            showLocationHunt(closestLocation);
+        }
+    }
+}
+
+setInterval(updateDistanceBox, 1000);
+
+function startHunt() {
+    gameLocations = locations.sort((a, b) => a.id - b.id);
+    currentLocationIndex = 0;
+    locationCooldowns = {};
+    lastVisitedLocationId = null;
+    loadAllLocations();
+}
+
+function getMarkerColor(tours) {
+    switch (tours.toLowerCase()) {
+        case 'hamm':
+            return '#FFA500';
+        case 'gangster':
+            return '#3f9b0b';
+        case 'capitol':
+            return '#8B0000';
+        case 'history':
+            return '#0f2bab';
+        default:
+            return '#0f2bab';
+    }
+}
+
+function loadAllLocations() {
+    gameLocations.forEach((location, index) => {
+        const markerColor = getMarkerColor(location.tours);
+        
+        const locationMarker = L.marker([location.lat, location.lng], {
+            icon: L.divIcon({
+                className: 'custom-pin-icon',
+                html: `<div class="pin-head" style="background-color: ${markerColor};"></div>`,
+                iconSize: [30, 30],
+                iconAnchor: [15, 30],
+            })
+        });
+                
+        const popupContent = `
+            <div class="popup-content">
+                <img src="${location.image}" alt="${location.name}" class="location-image">
+                <h4 class="location-name">
+                    <a href="${location.link}" target="_blank" rel="noopener noreferrer" style="text-decoration: none; color: inherit;">${location.name}</a>
+                </h4>
+                <div class="popup-buttons">
+                    <button class="button route-button" data-lat="${location.lat}" data-lng="${location.lng}">Directions</button>
+                    <button class="button summary-button" data-location-id="${location.id}">Summary</button>
+                </div>
+            </div>
+        `;
+
+        locationMarker.bindPopup(popupContent, {
+            offset: L.point(0, -25),
+            className: 'custom-popup'
+        });
+
+        locationMarker.on('popupopen', function(e) {
+            const popup = e.popup._contentNode;
+            const routeButton = popup.querySelector('.route-button');
+            const summaryButton = popup.querySelector('.summary-button');
+
+            if (routeButton) {
+                routeButton.addEventListener('click', function(event) {
+                    event.preventDefault();
+                    const lat = this.getAttribute('data-lat');
+                    const lng = this.getAttribute('data-lng');
+                    showDirectionsModal(lat, lng);
+                });
+            }
+
+            if (summaryButton) {
+                summaryButton.addEventListener('click', function(event) {
+                    event.preventDefault();
+                    const locationId = this.getAttribute('data-location-id');
+                    showLocationSummary(locationId);
+                });
+            }
+        });
+
+        markerClusterGroup.addLayer(locationMarker);
+    });
+
+    map.addLayer(markerClusterGroup);
+    updateDistanceBox();
+}
+
+function showLocationHunt(location) {
+    const now = Date.now();
+    const cooldownPeriod = 3 * 60 * 1000;
+
+    if (location.id === lastVisitedLocationId) {
+        const lastVisitTime = locationCooldowns[location.id] || 0;
+        if (now - lastVisitTime < cooldownPeriod) {
+            console.log(`Location ${location.id} is on cooldown. Skipping.`);
+            return;
+        }
+    }
+
+    locationCooldowns[location.id] = now;
+    lastVisitedLocationId = location.id;
+
+    isLocationHuntVisible = true;
+    const lochuntContainer = document.querySelector('.lochunt-container');
+    lochuntContainer.innerHTML = '';
+    lochuntContainer.style.cssText = `
+        display: flex;
+        flex-direction: column;
+        height: 100%;
+        overflow: hidden;
+    `;
+    const scrollableContent = document.createElement('div');
+    scrollableContent.style.cssText = `
+        flex: 1;
+        overflow-y: auto;
+        -webkit-overflow-scrolling: touch;
+    `;
+    const locationImage = document.createElement('img');
+    locationImage.src = location.image;
+    locationImage.alt = location.name;
+    locationImage.style.cssText = `
+        width: 100%;
+        height: 45vh;
+        object-fit: cover;
+        object-position: center;
+    `;
+    scrollableContent.appendChild(locationImage);
+    const contentContainer = document.createElement('div');
+    contentContainer.classList.add('lochunt-content');
+    contentContainer.style.cssText = `
+        padding: 20px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+    `;
+    const locationInfo = document.createElement('div');
+    locationInfo.classList.add('lochunt-info');
+    locationInfo.style.cssText = `
+        text-align: center;
+        margin-bottom: 15px;
+    `;
+    const locationName = document.createElement('h1');
+    locationName.textContent = location.name;
+    locationName.style.cssText = `
+        font-size: calc(1.5rem + 1.5vw);
+        font-weight: bold;
+        color: #333;
+    `;
+    const locationCity = document.createElement('p');
+    locationCity.textContent = `${location.city}`;
+    locationCity.style.cssText = `
+        font-size: calc(1rem + 0.5vw);
+        color: #00008B;
+        font-weight: bold;
+        margin-bottom: 0px;
+    `;
+    const locationCreator = document.createElement('p');
+    locationCreator.textContent = `Created by: ${location.creator}`;
+    locationCreator.style.cssText = `
+        font-size: calc(0.9rem + 0.4vw);
+        color: #666;
+    `;
+    locationInfo.appendChild(locationName);
+    locationInfo.appendChild(locationCity);
+    locationInfo.appendChild(locationCreator);
+    contentContainer.appendChild(locationInfo);
+    const audioPlayerContainer = createAudioPlayer(location.audio);
+    console.log("Audio URL:", location.audio);
+    contentContainer.appendChild(audioPlayerContainer);
+    scrollableContent.appendChild(contentContainer);
+    lochuntContainer.appendChild(scrollableContent);
+    const blueBar = createBlueBar(location);
+    blueBar.style.cssText += `
+        position: sticky;
+        bottom: 0;
+        width: 100%;
+    `;
+    lochuntContainer.appendChild(blueBar);
+    initAudioPlayer();
+}
+
+function createAudioPlayer(audioSrc) {
+    const audioPlayerContainer = document.createElement('div');
+    audioPlayerContainer.classList.add('audio-player');
+    audioPlayerContainer.style.cssText = `
+        width: 100%;
+        max-width: 400px;
+        margin-bottom: 15px;
+    `;
+
+    const audio = document.createElement('audio');
+    audio.id = 'locationAudio';
+    audio.src = audioSrc;
+
+    const audioProgress = document.createElement('div');
+    audioProgress.classList.add('audio-progress');
+    audioProgress.style.cssText = `
+        width: 100%;
+        margin-bottom: 15px;
+    `;
+
+    const progressContainer = document.createElement('div');
+    progressContainer.classList.add('progress');
+    progressContainer.style.cssText = `
+        height: 6px;
+        background-color: #d1d1d1;
+        cursor: pointer;
+    `;
+
+    const progressBar = document.createElement('div');
+    progressBar.id = 'progressBar';
+    progressBar.classList.add('progress-bar');
+    progressBar.style.cssText = `
+        background-color: var(--primary-color);
+        width: 0%;
+    `;
+
+    progressContainer.appendChild(progressBar);
+    audioProgress.appendChild(progressContainer);
+
+    const timeInfo = document.createElement('div');
+    timeInfo.classList.add('audio-time');
+    timeInfo.style.cssText = `
+        display: flex;
+        justify-content: space-between;
+        font-size: 16px;
+        color: #666;
+        margin-bottom: 10px;
+    `;
+    
+    const currentTimeSpan = document.createElement('span');
+    currentTimeSpan.id = 'currentTime';
+    currentTimeSpan.textContent = '0:00';
+    
+    const durationSpan = document.createElement('span');
+    durationSpan.id = 'duration';
+    durationSpan.textContent = '0:00';
+
+    timeInfo.appendChild(currentTimeSpan);
+    timeInfo.appendChild(durationSpan);
+
+    const audioControls = document.createElement('div');
+    audioControls.classList.add('audio-controls');
+    audioControls.style.cssText = `
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        font-size: 24px;
+    `;
+
+    const rewindBtn = createAudioButton('skip-backward', 'rewindBtn');
+    const playPauseBtn = createAudioButton('play', 'playPauseBtn');
+    const forwardBtn = createAudioButton('skip-forward', 'forwardBtn');
+
+    audioControls.appendChild(rewindBtn);
+    audioControls.appendChild(playPauseBtn);
+    audioControls.appendChild(forwardBtn);
+
+    audioPlayerContainer.appendChild(audio);
+    audioPlayerContainer.appendChild(audioProgress);
+    audioPlayerContainer.appendChild(timeInfo);
+    audioPlayerContainer.appendChild(audioControls);
+
+    return audioPlayerContainer;
+}
+
+function createAudioButton(iconName, id) {
+    const button = document.createElement('button');
+    button.id = id;
+    button.classList.add('audio-button');
+    button.innerHTML = `<i class="bi bi-${iconName}"></i>`;
+    button.style.cssText = `
+        background-color: white;
+        color: var(--primary-color);
+        border: 2px solid var(--primary-color);
+        border-radius: 50%;
+        width: 55px;
+        height: 55px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        transition: all 0.3s ease;
+    `;
+    
+    button.addEventListener('mouseover', () => {
+        button.style.backgroundColor = 'var(--hover-color)';
+    });
+    
+    button.addEventListener('mouseout', () => {
+        button.style.backgroundColor = 'white';
+    });
+    
+    button.addEventListener('click', () => {
+        button.style.backgroundColor = 'var(--primary-color)';
+        button.style.color = 'white';
+        button.style.transform = 'scale(0.95)';
+        
+        setTimeout(() => {
+            button.style.backgroundColor = 'white';
+            button.style.color = 'var(--primary-color)';
+            button.style.transform = 'scale(1)';
+        }, 200);
+    });
+    
+    return button;
+}
+
+function createBlueBar(location) {
+    const blueBar = document.createElement('div');
+    blueBar.style.cssText = `
+        width: 100%;
+        height: 55px;
+        background-color: #005f9e;
+        margin-top: auto;
+        box-shadow: 0 -2px 5px rgba(0,0,0,0.025);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 0 10px;
+    `;
+
+    const infoButton = document.createElement('button');
+    infoButton.innerHTML = '<i class="bi bi-info-circle-fill text-white" style="font-size: 1.5rem;"></i>';
+    infoButton.classList.add('btn', 'btn-sm', 'me-2');
+    infoButton.onclick = () => {
+        if (location && location.imageSource) {
+            showPopup('Image source: ' + location.imageSource);
+        } else {
+            showPopup('Image source information is not available');
+        }
+    };
+    
+    const feedbackButton = document.createElement('a');
+    feedbackButton.href = 'mailto:mattreicher@protonmail.com?subject=Feedback';
+    feedbackButton.target= '_blank';
+    feedbackButton.rel = 'noopener noreferrer';
+    feedbackButton.innerHTML = '<i class="bi bi-envelope-fill text-white" style="font-size: 1.5rem;"></i>';
+    feedbackButton.classList.add('btn', 'btn-sm');
+
+    blueBar.appendChild(infoButton);
+    blueBar.appendChild(feedbackButton);
+
+    return blueBar;
+}
+
+function initAudioPlayer() {
+    const audio = document.getElementById('locationAudio');
+    const playPauseBtn = document.getElementById('playPauseBtn');
+    const rewindBtn = document.getElementById('rewindBtn');
+    const forwardBtn = document.getElementById('forwardBtn');
+    const progressBar = document.getElementById('progressBar');
+    const progressContainer = document.querySelector('.progress');
+    const currentTimeSpan = document.getElementById('currentTime');
+    const durationSpan = document.getElementById('duration');
+
+    if (!audio || !playPauseBtn || !rewindBtn || !forwardBtn || !progressBar || !progressContainer || !currentTimeSpan || !durationSpan) {
+        console.error('One or more audio player elements not found');
+        return;
+    }
+
+    playPauseBtn.addEventListener('click', togglePlayPause);
+    rewindBtn.addEventListener('click', () => seek(-10));
+    forwardBtn.addEventListener('click', () => seek(10));
+    progressContainer.addEventListener('click', setProgress);
+
+    audio.addEventListener('timeupdate', updateProgress);
+    audio.addEventListener('loadedmetadata', () => {
+        durationSpan.textContent = formatTime(audio.duration);
+    });
+
+    function togglePlayPause() {
+        if (audio.paused) {
+            audio.play();
+            playPauseBtn.innerHTML = '<i class="bi bi-pause-fill"></i>';
+        } else {
+            audio.pause();
+            playPauseBtn.innerHTML = '<i class="bi bi-play-fill"></i>';
+        }
+    }
+
+    function seek(seconds) {
+        audio.currentTime += seconds;
+    }
+
+    function setProgress(e) {
+        const width = this.clientWidth;
+        const clickX = e.offsetX;
+        const duration = audio.duration;
+        audio.currentTime = (clickX / width) * duration;
+    }
+
+    function updateProgress() {
+        const progress = (audio.currentTime / audio.duration) * 100;
+        progressBar.style.width = `${progress}%`;
+        currentTimeSpan.textContent = formatTime(audio.currentTime);
+    }
+
+    function formatTime(time) {
+        const minutes = Math.floor(time / 60);
+        const seconds = Math.floor(time % 60);
+        return `${minutes}:${seconds < 10 ? '0' : ''}${seconds}`;
+    }
+}
+
+function showPopup(message, type = 'info', callback = null) {
+    const popup = document.createElement('div');
+    popup.className = 'popup';
+    popup.style.cssText = `
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        background-color: white;
+        padding: 20px;
+        border-radius: 10px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        z-index: 1000;
+        text-align: center;
+        max-width: 80%;
+    `;
+
+    const messageElement = document.createElement('p');
+    messageElement.textContent = message;
+    messageElement.style.marginBottom = '20px';
+    popup.appendChild(messageElement);
+
+    if (type === 'info') {
+        const okButton = document.createElement('button');
+        okButton.textContent = 'OK';
+        okButton.style.cssText = `
+            background-color: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+        `;
+        okButton.onclick = () => {
+            document.body.removeChild(popup);
+            if (callback) callback();
+        };
+        popup.appendChild(okButton);
+    } else if (type === 'confirm') {
+        const confirmButton = document.createElement('button');
+        confirmButton.textContent = 'Yes';
+        confirmButton.style.cssText = `
+            background-color: #28a745;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            margin-right: 10px;
+        `;
+        confirmButton.onclick = () => {
+            document.body.removeChild(popup);
+            if (callback) callback(true);
+        };
+        popup.appendChild(confirmButton);
+
+        const cancelButton = document.createElement('button');
+        cancelButton.textContent = 'No';
+        cancelButton.style.cssText = `
+            background-color: #dc3545;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+        `;
+        cancelButton.onclick = () => {
+            document.body.removeChild(popup);
+            if (callback) callback(false);
+        };
+        popup.appendChild(cancelButton);
+    }
+
+    document.body.appendChild(popup);
+}
+
+function showDirectionsModal(lat, lng) {
+    const modal = document.createElement('div');
+    modal.className = 'directions-modal';
+    modal.style.cssText = `
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        background-color: white;
+        padding: 20px;
+        border-radius: 10px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        z-index: 1000;
+        text-align: center;
+        max-width: 80%;
+    `;
+
+    const title = document.createElement('h2');
+    title.textContent = 'Get Directions';
+    title.style.marginBottom = '20px';
+    modal.appendChild(title);
+
+    const googleMapsLink = document.createElement('a');
+    googleMapsLink.href = `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`;
+    googleMapsLink.target = '_blank';
+    googleMapsLink.rel = 'noopener noreferrer';
+    googleMapsLink.textContent = 'Open in Google Maps';
+    googleMapsLink.style.cssText = `
+        display: block;
+        background-color: #4285F4;
+        color: white;
+        text-decoration: none;
+        padding: 10px 20px;
+        border-radius: 5px;
+        margin-bottom: 10px;
+    `;
+    modal.appendChild(googleMapsLink);
+
+    const appleMapsLink = document.createElement('a');
+    appleMapsLink.href = `http://maps.apple.com/?daddr=${lat},${lng}`;
+    appleMapsLink.target = '_blank';
+    appleMapsLink.rel = 'noopener noreferrer';
+    appleMapsLink.textContent = 'Open in Apple Maps';
+    appleMapsLink.style.cssText = `
+        display: block;
+        background-color: #000000;
+        color: white;
+        text-decoration: none;
+        padding: 10px 20px;
+        border-radius: 5px;
+        margin-bottom: 10px;
+    `;
+    modal.appendChild(appleMapsLink);
+
+    const closeButton = document.createElement('button');
+    closeButton.textContent = 'Close';
+    closeButton.style.cssText = `
+        background-color: #dc3545;
+        color: white;
+        border: none;
+        padding: 10px 20px;
+        border-radius: 5px;
+        cursor: pointer;
+    `;
+    closeButton.onclick = () => {
+        document.body.removeChild(modal);
+    };
+    modal.appendChild(closeButton);
+
+    document.body.appendChild(modal);
+}
+
+function showLocationSummary(locationId) {
+    const location = gameLocations.find(loc => loc.id === parseInt(locationId));
+    if (!location) {
+        console.error('Location not found');
+        return;
+    }
+
+    const modal = document.createElement('div');
+    modal.className = 'location-summary-modal';
+    modal.style.cssText = `
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        background-color: white;
+        padding: 20px;
+        border-radius: 10px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        z-index: 1000;
+        max-width: 80%;
+        max-height: 80%;
+        overflow-y: auto;
+    `;
+
+    const content = `
+        <h2 style="margin-bottom: 15px;">${location.name}</h2>
+        <p><strong>City:</strong> ${location.city}</p>
+        <p><strong>Creator:</strong> ${location.creator}</p>
+        <p><strong>Summary:</strong> ${location.summary}</p>
+    `;
+
+    modal.innerHTML = content;
+
+    const closeButton = document.createElement('button');
+    closeButton.textContent = 'Close';
+    closeButton.style.cssText = `
+        background-color: #dc3545;
+        color: white;
+        border: none;
+        padding: 10px 20px;
+        border-radius: 5px;
+        cursor: pointer;
+        margin-top: 15px;
+    `;
+    closeButton.onclick = () => {
+        document.body.removeChild(modal);
+    };
+    modal.appendChild(closeButton);
+
+    document.body.appendChild(modal);
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    initMap();
+    addUIEventListeners();
+});
+
+// Simulating location updates for testing purposes
+// Remove this in production and use real geolocation
+setInterval(() => {
+    const lat = 44.9778 + (Math.random() - 0.5) * 0.01;
+    const lng = -93.2650 + (Math.random() - 0.5) * 0.01;
+    handlePositionUpdate({ coords: { latitude: lat, longitude: lng } });
+}, 2000);
