@@ -15,6 +15,7 @@ const locations = [
         summary: "This is a placeholder.",
         link: "https://original.newsbreak.com/@ron-dansley-1587459/3078633820088-lion-s-park-a-remembrance-of-white-bear-lake-s-legendary-plantation-night-club",
         imageSource: "The Plantation Nightclub via the White Bear Press",
+        imageSource2: "This is the second image source.",
         additionalInfo: "This is a place to add more info. This is a placeholder for now."
     },
 
