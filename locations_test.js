@@ -7,15 +7,15 @@ const locations = [
         name: "Plantation Night Club (1930 - 1933)",
         title: "Plantation Night Club",
         image: "https://www.mnthen.com/tour/wbl/gallery/plant/wbl_plant1.jpg",
-        image2: "https://bloximages.chicago2.vip.townnews.com/presspubs.com/content/tncms/assets/v3/editorial/9/c7/9c74c82e-c8ea-11ed-9d67-ff9d39ac5ad2/641b5bb51c54f.image.jpg",
+        image2: "https://www.mnthen.com/tour/wbl/gallery/plant/wbl_plant2.jpg",
         creator: "Matt Reicher",
         city: "White Bear Lake",
         audio: "/audio/wbl/wbl_plant.mp3", 
         tours: "wbl_split",
         summary: "This is a placeholder.",
         link: "https://original.newsbreak.com/@ron-dansley-1587459/3078633820088-lion-s-park-a-remembrance-of-white-bear-lake-s-legendary-plantation-night-club",
-        imageSource: "The Plantation Nightclub via the White Bear Press",
-        imageSource2: "This is the second image source.",
+        imageSource: "Plantation Nightclub via the White Bear Press",
+        imageSource2: "Plantation Nightclub admission ticket via the White Bear Press",
         additionalInfo: "This is a place to add more info. This is a placeholder for now."
     },
 
