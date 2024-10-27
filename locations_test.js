@@ -1,7 +1,7 @@
 const locations = [
 
     {
-        id: "1011",
+        id: "1010",
         lat: 45.05648381562563,
         lng: -92.96040208835049,
         name: "Wildwood Amusement Park (1889 - 1932)",
@@ -10,7 +10,7 @@ const locations = [
         creator: "Matt Reicher",
         city: "Mahtomedi",
         audio: "/audio/mahtomedi/wildwood.mp3", 
-        tours: "history",
+        tours: "place",
         summary: "Wildwood entertained Twin Cities families with rides, shows, and lakeside activities from the 1890s until 1932, when it closed due to financial troubles. Today, the park is long since gone, but its memory lives on.",
         link: "https://mnthen.com/blog/place/wildwood.html",
         imageSource: "Image of the slide at Wildwood Park c. 1905 via MPRNews",
@@ -18,7 +18,7 @@ const locations = [
     },
 
     {
-        id: "1012",
+        id: "1011",
         lat: 44.922167523742054,
         lng: -93.10991227113067,
         name: "Michael 'Eyedea' Larsen (1981 - 2010)",
@@ -27,7 +27,7 @@ const locations = [
         creator: "Matt Reicher",
         city: "St. Paul",
         audio: "/audio/wsp/wsp_eyedea.mp3", 
-        tours: "history",
+        tours: "person",
         summary: "Michael 'Eyedea' Larsen was a talented battle rapper and hip-hop artist from St. Paul. He passed away at 28, but his memory lives on through his music.",
         link: "https://mnthen.com/blog/people/eyedea_larsen.html",
         imageSource: "Image of 'Eyedea' Larsen via Heavy Blog is Heavy",
@@ -35,7 +35,7 @@ const locations = [
     },
 
     {
-        id: "1013",
+        id: "1012",
         lat: 44.1680805962643,
         lng: -94.00311590799822,
         name: "Hanging of the Dakota 38 (Dec 26, 1862)",
@@ -44,7 +44,7 @@ const locations = [
         creator: "Matt Reicher",
         city: "Mankato",
         audio: "/audio/mankato/man_dakota_38.mp3", 
-        tours: "history",
+        tours: "event",
         summary: "The 1862 Dakota War culminated in the largest mass hanging in US history, with 38 Dakota warriors executed, marking the end of Native American resistance in the region.",
         link: "https://mnthen.com/blog/event/dakota_conflict.html",
         imageSource: "The Dakota 38 Memorial via Library of Congress",
@@ -52,7 +52,7 @@ const locations = [
     },
 
     {
-        id: "1014",
+        id: "1013",
         lat: 44.961337319371076,
         lng: -93.07148153924896,
         name: "Theodore Hamm Mansion (c. 1886 - 1954)",
@@ -61,7 +61,7 @@ const locations = [
         creator: "Matt Reicher",
         city: "St. Paul",
         audio: "/exhibit/audio/stp/stp_hamm_mansion.mp3", 
-        tours: "hamm",
+        tours: "place",
         summary: "The Theodore Hamm mansion, a grand St. Paul landmark, was a symbol of the Hamm family's wealth. Built in the late 1800s, it was destroyed by fire in 1954.",
         link: "https://mnthen.com/blog/place/stp_hamm_mansion.html",
         imageSource: "The Hamm Mansion via 1889 Victorian House Restoration",
@@ -69,7 +69,7 @@ const locations = [
     },
 
     {
-        id: "1015",
+        id: "1014",
         lat: 44.98463074655949,
         lng: -93.26445659478223,
         name: "Father Louis Hennepin Suspension Bridge",
@@ -78,7 +78,7 @@ const locations = [
         creator: "Matt Reicher",
         city: "Minneapolis",
         audio: "/audio/mpls/mpls_henn_bridge.mp3", 
-        tours: "history",
+        tours: "place",
         summary: "The Father Louis Hennepin Bridge, built in 1855, was the first to span the Mississippi River above St. Anthony Falls. It connected Minneapolis to the east bank, spurring incredible growth.",
         link: "https://www.mnopedia.org/structure/father-louis-hennepin-suspension-bridge",
         imageSource: "First suspension bridge in Minneapolis, (c. 1858) via MNopedia",
@@ -86,7 +86,7 @@ const locations = [
     },
 
     {
-        id: "1016",
+        id: "1015",
         lat: 44.95463990008291,
         lng: -93.10223181529494,
         name: "Minnesota’s Third State Capitol",
@@ -95,7 +95,7 @@ const locations = [
         creator: "Brian C. Pease",
         city: "St. Paul",
         audio: "/audio/exhibit/capitol3.mp3",
-        tours: "capitol",
+        tours: "place",
         summary: "Minnesota’s third state capitol, built between 1896 and 1905 by architect Cass Gilbert, is a stunning mix of artistry and innovation. Recent restorations preserved its historical beauty while adding modern updates.",
         link: "https://www.mnopedia.org/structure/minnesota-s-third-state-capitol",
         imageSource: "Minnesota State Capitol Building (2022)",
@@ -103,7 +103,7 @@ const locations = [
     },
 
     {
-        id: "1017",
+        id: "1016",
         lat: 44.893943004662326,
         lng: -93.18772007741772,
         name: "Whiskey the Horse (c. 1911 - 1943)",
@@ -112,7 +112,7 @@ const locations = [
         creator: "Matt Reicher",
         city: "St. Paul",
         audio: "/audio/exhibit/whiskey.mp3",
-        tours: "history",
+        tours: "person",
         summary: "Whiskey, a rebellious Army horse, became a legendary performer and jumper under Lt. Hazelrigg's training at Fort Snelling, maintaining their bond until his death at 32 in 1943.",
         link: "https://mnthen.com/blog/people/whiskey.html",
         imageSource: "Whiskey with Captain W.R. Hazelrigg (1943)",
@@ -120,7 +120,7 @@ const locations = [
     },
 
     {
-        id: "1018",
+        id: "1017",
         lat: 44.96153652405189,
         lng: -93.07320192008716,
         name: "Swede Hollow (Pre-1839: Unknown - 1956)",
@@ -129,7 +129,7 @@ const locations = [
         creator: "Matt Reicher",
         city: "St. Paul",
         audio: "/audio/exhibit/swede_hollow.mp3",
-        tours: "history",
+        tours: "place",
         summary: "Swede Hollow was a hidden immigrant neighborhood in St. Paul from the 1850s to 1956. Despite no plumbing or electricity, it became a tight-knit, hardworking community.",
         link: "https://www.mnopedia.org/place/swede-hollow",
         imageSource: "Swede Hollow looking north, (c.1910). via MNopedia",
@@ -137,7 +137,7 @@ const locations = [
     },
 
     {
-        id: "1019",
+        id: "1018",
         lat: 44.956571587648774,
         lng: -93.10028134083977,
         name: "William R. Merriam Mansion (1882 - 1896)",
@@ -146,7 +146,7 @@ const locations = [
         creator: "Matt Reicher",
         city: "St. Paul",
         audio: "/audio/exhibit/merriam_mansion.mp3",
-        tours: "history",
+        tours: "place",
         summary: "In 1880, William R. Merriam built an impressive Queen Anne-style mansion in St. Paul, designed by Clarence Johnston. The mansion, a social hub, was tragically destroyed by fire in 1896.",
         link: "https://mnthen.com/blog/place/merriam_mansion.html",
         imageSource: "William R. Merriam residence, (c.1890). via St Paul Historical",
