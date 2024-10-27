@@ -7,7 +7,7 @@ const locations = [
         name: "Plantation Night Club (1930 - 1933)",
         title: "Plantation Night Club",
         image: "https://www.mnthen.com/tour/wbl/gallery/plant/wbl_plant1.jpg",
-        image2: "https://www.mnthen.com/tour/wbl/gallery/plant/wbl_plant2.jpg",
+        image2: "https://www.mnthen.com/tour/wbl/gallery/plant/wbl_plant3.jpg",
         creator: "Matt Reicher",
         city: "White Bear Lake",
         audio: "/audio/wbl/wbl_plant.mp3", 
@@ -15,7 +15,7 @@ const locations = [
         summary: "This is a placeholder.",
         link: "https://original.newsbreak.com/@ron-dansley-1587459/3078633820088-lion-s-park-a-remembrance-of-white-bear-lake-s-legendary-plantation-night-club",
         imageSource: "Plantation Nightclub via the White Bear Press",
-        imageSource2: "Plantation Nightclub admission ticket via the White Bear Press",
+        imageSource2: "Plantation Nightclub 1952 aerial view via the White Bear Press",
         additionalInfo: "This is a place to add more info. This is a placeholder for now."
     },
 
