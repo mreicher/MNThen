@@ -28,7 +28,7 @@ const locations = [
         city: "St. Paul",
         audio: "/audio/wsp/wsp_eyedea.mp3", 
         tours: "history",
-        summary: "Michael "Eyedea" Larsen was a talented battle rapper and hip-hop artist from St. Paul. He passed away at 28, but his memory lives on through his music.",
+        summary: "Michael 'Eyedea' Larsen was a talented battle rapper and hip-hop artist from St. Paul. He passed away at 28, but his memory lives on through his music.",
         link: "https://mnthen.com/blog/people/eyedea_larsen.html",
         imageSource: "Image of 'Eyedea' Larsen via Heavy Blog is Heavy",
         additionalInfo: "Eyedea's music often delved into philosophy, psychology, and social issues, reflecting his thoughtful and introspective nature."
