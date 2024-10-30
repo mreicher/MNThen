@@ -160,7 +160,25 @@ const locations = [
         link: "https://mnthen.com/blog/place/merriam_mansion.html",
         imageSource: "William R. Merriam residence, (c.1890). via St Paul Historical",
         additionalInfo: "After serving as Minnesota's governor, Merriam was appointed by President McKinley to direct the U.S. Census Bureau in 1899."
-    }
+    },
+    {
+    "id": "1019",
+    "lat": 45.08507176751576,
+    "lng": -92.78547482838577,
+    "name": "St. Croix Boom Site (1856 - 1914)",
+    "title": "St. Croix Boom Site",
+    "image": "https://www.mnthen.com/locations/gallery/mahtomedi/wildwood/wildwood_2.jpg",
+    "creator": "Matt Reicher",
+    "city": "Stillwater",
+    "audio": "/audio/exhibit/boomsite.mp3",
+    "tours": "place",
+    "summary": "The St. Croix Boom Site marked Minnesota's lumbering peak, processing 15 billion feet of logs over six decades. Deforestation, shifting industry, and infrastructure changes led to its 1914 closure.",
+    "today": "Along HWY 95, three miles north of downtown Stillwater",
+    "link": "https://mnthen.com/blog/place/boomsite.html",
+    "imageSource": "Image of the slide at Wildwood Park c. 1905 via MPRNews",
+    "additionalInfo": "Recent efforts to clean up and preserve the St. Croix Boom Site have helped highlight its natural beauty and historical significance."
+}
+
 
     // Add more locations here
 ];
