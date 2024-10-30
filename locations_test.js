@@ -167,7 +167,7 @@ const locations = [
     "lng": -92.78547482838577,
     "name": "St. Croix Boom Site (1856 - 1914)",
     "title": "St. Croix Boom Site",
-    "image": "https://www.mnthen.com/locations/gallery/mahtomedi/wildwood/wildwood_2.jpg",
+    "image": "https://mnthen.com/images/boom1.jpg",
     "creator": "Matt Reicher",
     "city": "Stillwater",
     "audio": "/audio/exhibit/boomsite.mp3",
