@@ -228,6 +228,14 @@ const blogArticles = [
       url: "https://mnthen.com/blog/people/weckman.html",
       keywords: ["hot dog", "St. Paul", "Saint Paul", "vendor", "person", "george", "weckman", "all"],
     },
+        {
+      headline: "St. Croix Boom Site" (1856 - 1914)",
+      blurb: "In 1914, the last log passed through St. Croix Boom Site, ending a remarkable era of lumber history that shaped Minnesota's development.",
+  icon: "fa-user",
+      image: "https://mnthen.com/images/boom1.jpg",
+      url: "https://mnthen.com/blog/place/boomsite.html",
+      keywords: ["Stillwater", "logging", "nature", "river", "place", "St. Croix", "all"],
+    },
     {
   "headline": "Murder of Alice Matthews (March 23, 1912)",
   "blurb": "A young woman, Alice Matthews, was brutally murdered in Minneapolis in 1912. Despite a massive investigation and public outcry, her attacker was never identified.",
