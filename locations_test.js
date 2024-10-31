@@ -196,24 +196,6 @@ const locations = [
         link: "https://www.mnopedia.org/person/morgan-samuel-huntington-1911-2000",
         imageSource: "Image of Samuel H. Morgan, ca 1990s. via MNOpedia",
         additionalInfo: "The Samuel H. Morgan Land Fund supports Minnesota land conservation by funding acquisitions to expand state parks, public trails, and green spaces."
-},
-
-{
-    id: "1021",
-    lat: 44.9555782791406,
-    lng: -93.10223239680457,
-    name: "State Capitol Rathskeller",
-    title: "State Capitol Rathskeller",
-    image: "https://mnthen.com/images/exhibit/caprath.jpg",
-    creator: "Matt Reicher",
-    city: "Saint Paul",
-    audio: "/audio/exhibit/rath.mp3",
-    tours: "place",
-    summary: "The State Capitol's German-style rathskeller, opened in 1905, underwent multiple transformations due to anti-German sentiment and Prohibition before being fully restored to its original glory in 2000.",
-    today: "North wing of the capitol, basement level",
-    link: "https://mnthen.com/blog/place/caprath.html",
-    imageSource: "Image of the Rathskeller c. 1905 via Atlas Obscura",
-    additionalInfo: "The rathskeller was originally intended to be a private dining room for legislators but was later opened to the public."
 }
 
 
