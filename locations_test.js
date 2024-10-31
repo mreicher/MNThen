@@ -26,7 +26,7 @@ const locations = [
         title: "Michael 'Eyedea' Larsen",
         image: "https://www.mnthen.com/images/wsp_eyedea.jpg",
         creator: "Matt Reicher",
-        city: "St. Paul",
+        city: "Saint Paul",
         audio: "/audio/wsp/wsp_eyedea.mp3", 
         tours: "person",
         summary: "Michael 'Eyedea' Larsen was a talented battle rapper and hip-hop artist from St. Paul. He passed away at 28, but his memory lives on through his music.",
@@ -62,7 +62,7 @@ const locations = [
         title: "Theodore Hamm Mansion",
         image: "https://mnthen.com/tour/hamm/gallery/mansion/hamm_mansion5.jpg",
         creator: "Matt Reicher",
-        city: "St. Paul",
+        city: "Saint Paul",
         audio: "/exhibit/audio/stp/stp_hamm_mansion.mp3", 
         tours: "place",
         summary: "The Theodore Hamm mansion, a grand St. Paul landmark, was a symbol of the Hamm family's wealth. Built in the late 1800s, it was destroyed by fire in 1954.",
@@ -98,7 +98,7 @@ const locations = [
         title: "Minnesota’s Third State Capitol",
         image: "https://mnthen.com/exhibit/images/capitol3.jpg",
         creator: "Brian C. Pease",
-        city: "St. Paul",
+        city: "Saint Paul",
         audio: "/audio/exhibit/capitol3.mp3",
         tours: "place",
         summary: "Minnesota’s third state capitol, built between 1896 and 1905 by architect Cass Gilbert, is a stunning mix of artistry and innovation. Recent restorations preserved its historical beauty while adding modern updates.",
@@ -116,7 +116,7 @@ const locations = [
         title: "Whiskey the Horse (c. 1911 - 1943)",
         image: "https://mnthen.com/images/whiskey.jpg",
         creator: "Matt Reicher",
-        city: "St. Paul",
+        city: "Saint Paul",
         audio: "/audio/exhibit/whiskey.mp3",
         tours: "person",
         summary: "Whiskey, a rebellious Army horse, became a legendary performer and jumper under Lt. Hazelrigg's training at Fort Snelling, maintaining their bond until his death at 32 in 1943.",
@@ -134,7 +134,7 @@ const locations = [
         title: "Swede Hollow",
         image: "https://mnthen.com/tour/hamm/gallery/hollow/hamm_hollow1.jpg",
         creator: "Matt Reicher",
-        city: "St. Paul",
+        city: "Saint Paul",
         audio: "/audio/exhibit/swede_hollow.mp3",
         tours: "place",
         summary: "Swede Hollow was a hidden immigrant neighborhood in St. Paul from the 1850s to 1956. Despite no plumbing or electricity, it became a tight-knit, hardworking community.",
@@ -152,7 +152,7 @@ const locations = [
         title: "William R. Merriam Mansion",
         image: "https://mnthen.com/images/merriam_house.jpg",
         creator: "Matt Reicher",
-        city: "St. Paul",
+        city: "Saint Paul",
         audio: "/audio/exhibit/merriam_mansion.mp3",
         tours: "place",
         summary: "In 1880, William R. Merriam built an impressive Queen Anne-style mansion in St. Paul, designed by Clarence Johnston. The mansion, a social hub, was tragically destroyed by fire in 1896.",
@@ -161,6 +161,7 @@ const locations = [
         imageSource: "William R. Merriam residence, (c.1890). via St Paul Historical",
         additionalInfo: "After serving as Minnesota's governor, Merriam was appointed by President McKinley to direct the U.S. Census Bureau in 1899."
     },
+    
     {
     "id": "1019",
     "lat": 45.08507176751576,
@@ -177,6 +178,24 @@ const locations = [
     "link": "https://mnthen.com/blog/place/boomsite.html",
     "imageSource": "Men working the boom via the Forest Lake Times",
     "additionalInfo": "Recent efforts to clean up and preserve the St. Croix Boom Site have helped highlight its natural beauty and historical significance."
+},
+
+{
+        id: "1020",
+        lat: 44.92708547231108,
+        lng: -93.11986294501678,
+        name: "Morgan, Samuel Huntington (1911 - 2000)",
+        title: "Morgan, Samuel Huntington",
+        image: "/images/exhibit/morgan.jpg",
+        creator: "Matt Reicher",
+        city: "Saint Paul",
+        audio: "/audio/exhibit/morgan.mp3", 
+        tours: "person",
+        summary: "Samuel Huntington Morgan championed environmental preservation, establishing parks and trails like Fort Snelling and Gateway Trail, leaving a legacy celebrated through lasting open spaces.",
+        today: "Intersection of Shepard Rd. and Randolph",
+        link: "https://www.mnopedia.org/person/morgan-samuel-huntington-1911-2000",
+        imageSource: "Image of Samuel H. Morgan, ca 1990s. via MNOpedia",
+        additionalInfo: "The Samuel H. Morgan Land Fund supports Minnesota land conservation by funding acquisitions to expand state parks, public trails, and green spaces."
 }
 
 
