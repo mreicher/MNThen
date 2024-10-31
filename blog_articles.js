@@ -260,6 +260,14 @@ const blogArticles = [
   url: "https://mnthen.com/blog/place/merriam_mansion.html",
   keywords: ["saint paul", "st. paul", "merriam", "mansion", "capitol", "park", "cass", "place", "all"],
 },
+{
+    "headline": "State Capitol Rathskeller",
+    "blurb": "The State Capitol's German-themed gathering place was restored after decades of neglect, offering a glimpse into the past.",
+    "icon": "fa-building",
+    "image": "https://mnthen.com/images/exhibit/caprath.jpg",
+    "url": "https://mnthen.com/blog/place/caprath.html",
+    "keywords": ["saint paul", "st. paul", "capitol", "rathskeller", "cafeteria", "German", "place", "all"]
+}
 
 
     // Add more articles as needed
