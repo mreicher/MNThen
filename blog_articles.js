@@ -229,7 +229,7 @@ const blogArticles = [
       keywords: ["hot dog", "St. Paul", "Saint Paul", "vendor", "person", "george", "weckman", "all"],
     },
         {
-      headline: "St. Croix Boom Site" (1856 - 1914)",
+      headline: "St. Croix Boom Site (1856 - 1914)",
       blurb: "In 1914, the last log passed through St. Croix Boom Site, ending a remarkable era of lumber history that shaped Minnesota's development.",
   icon: "fa-user",
       image: "https://mnthen.com/images/boom1.jpg",
