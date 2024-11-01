@@ -1036,45 +1036,54 @@ function updateUserLocation(position, forceUpdate = false) {
     }
 
     const distance = lastPosition ? calculateDistance(lastPosition, newPosition) : 0;
+    const timeDelta = lastPosition ? (newPosition.timestamp - lastPosition.timestamp) / 1000 : 0;
+    const currentSpeed = timeDelta > 0 ? distance / timeDelta : 0;
+    const isMovingFast = currentSpeed > 2.5; // meters per second
 
-if (distance > EXTENDED_DISTANCE_THRESHOLD || forceUpdate || !lastPosition) {
-    console.log("Large distance or forced update. New position:", newPosition);
-    try {
-        // Immediate, precise update with the exact new coordinates
-        userMarker.setLatLng([newPosition.lat, newPosition.lng]);
-        
-        // Reset all filters and buffers to this exact position
-        lastPosition = {
-            lat: newPosition.lat,
-            lng: newPosition.lng,
-            accuracy: newPosition.accuracy,
-            timestamp: newPosition.timestamp
-        };
-        positionBuffer = [lastPosition];
-        kalmanFilter.reset(lastPosition);
-        lastVelocity = { lat: 0, lng: 0 };
-        
-        // Instant map update without animation
-        if (!isMapInteracting && !userIsInteracting) {
-            map.setView([newPosition.lat, newPosition.lng], map.getZoom(), {
-                animate: false,
-                duration: 0
-            });
-        }
-    } catch (error) {
-        console.error("Error updating user location for large move:", error);
-    }
-    } else {
-        console.log("Small distance update. Applying smoothing.");
+    if (distance > EXTENDED_DISTANCE_THRESHOLD || forceUpdate || !lastPosition) {
+        console.log("Large distance or forced update. New position:", newPosition);
         try {
-            const filteredPosition = kalmanFilter.update(newPosition);
+            userMarker.setLatLng([newPosition.lat, newPosition.lng]);
+            
+            lastPosition = {
+                lat: newPosition.lat,
+                lng: newPosition.lng,
+                accuracy: newPosition.accuracy,
+                timestamp: newPosition.timestamp
+            };
+            positionBuffer = [lastPosition];
+            kalmanFilter.reset(lastPosition);
+            lastVelocity = { lat: 0, lng: 0 };
+            
+            if (!isMapInteracting && !userIsInteracting) {
+                map.setView([newPosition.lat, newPosition.lng], map.getZoom(), {
+                    animate: false,
+                    duration: 0
+                });
+            }
+        } catch (error) {
+            console.error("Error updating user location for large move:", error);
+        }
+    } else {
+        console.log("Small distance update. Applying enhanced smoothing.");
+        try {
+            const filteredPosition = kalmanFilter.update(newPosition, currentSpeed);
             const velocityFilteredPosition = calculateVelocityFilter(filteredPosition, lastPosition);
             const exponentialSmoothedPosition = applyExponentialSmoothing(velocityFilteredPosition, lastPosition);
             
-            positionBuffer.push(exponentialSmoothedPosition);
+            // Movement prediction based on velocity
+            const predictedPosition = {
+                lat: exponentialSmoothedPosition.lat + (lastVelocity.lat * timeDelta),
+                lng: exponentialSmoothedPosition.lng + (lastVelocity.lng * timeDelta),
+                accuracy: exponentialSmoothedPosition.accuracy,
+                timestamp: exponentialSmoothedPosition.timestamp
+            };
+            
+            positionBuffer.push(isMovingFast ? predictedPosition : exponentialSmoothedPosition);
             if (positionBuffer.length > bufferSize) {
                 positionBuffer.shift();
             }
+            
             const smoothedPosition = calculateSmoothedPosition(positionBuffer);
 
             if (smoothedPosition && isFinite(smoothedPosition.lat) && isFinite(smoothedPosition.lng)) {
@@ -1083,12 +1092,20 @@ if (distance > EXTENDED_DISTANCE_THRESHOLD || forceUpdate || !lastPosition) {
                     
                     if (!isMapInteracting && !userIsInteracting) {
                         if (!isMarkerVisible(map, userMarker) || isMarkerNearEdge(map, userMarker)) {
+                            const animationDuration = isMovingFast ? 0.3 : 0.5;
                             map.setView([smoothedPosition.lat, smoothedPosition.lng], map.getZoom(), {
                                 animate: true,
-                                duration: 0.5
+                                duration: animationDuration
                             });
                         }
                     }
+                    
+                    // Update velocity for next prediction
+                    lastVelocity = {
+                        lat: (smoothedPosition.lat - lastPosition.lat) / Math.max(0.1, timeDelta),
+                        lng: (smoothedPosition.lng - lastPosition.lng) / Math.max(0.1, timeDelta)
+                    };
+                    
                     lastPosition = smoothedPosition;
                 } else {
                     console.warn("User marker not initialized");
@@ -1124,27 +1141,47 @@ if (distance > EXTENDED_DISTANCE_THRESHOLD || forceUpdate || !lastPosition) {
     lastUpdateTimestamp = Date.now();
     console.log("User location update complete");
 }
-        
+
 const kalmanFilter = {
     x: { estimate: 0, errorEstimate: 1, gain: 0 },
     y: { estimate: 0, errorEstimate: 1, gain: 0 },
     measurementError: 1,
     processError: 0.01,
+    lastMeasurement: null,
 
-    update(measurement) {
+    update(measurement, speed = 0) {
         if (this.x.estimate === 0 && this.y.estimate === 0) {
             this.x.estimate = measurement.lng;
             this.y.estimate = measurement.lat;
+            this.lastMeasurement = measurement;
             return measurement;
         }
 
+        // Adaptive process error based on speed
+        const adaptiveProcessError = speed > 2.5 ? this.processError * 2 : this.processError;
+        
         let predictedX = this.x.estimate;
         let predictedY = this.y.estimate;
-        let predictedErrorX = this.x.errorEstimate + this.processError;
-        let predictedErrorY = this.y.errorEstimate + this.processError;
 
-        this.x.gain = predictedErrorX / (predictedErrorX + this.measurementError);
-        this.y.gain = predictedErrorY / (predictedErrorY + this.measurementError);
+        // Add velocity-based prediction if we have previous measurements
+        if (this.lastMeasurement) {
+            const timeDelta = (measurement.timestamp - this.lastMeasurement.timestamp) / 1000;
+            if (timeDelta > 0) {
+                const velocityX = (measurement.lng - this.lastMeasurement.lng) / timeDelta;
+                const velocityY = (measurement.lat - this.lastMeasurement.lat) / timeDelta;
+                predictedX += velocityX * timeDelta;
+                predictedY += velocityY * timeDelta;
+            }
+        }
+
+        let predictedErrorX = this.x.errorEstimate + adaptiveProcessError;
+        let predictedErrorY = this.y.errorEstimate + adaptiveProcessError;
+
+        // Adaptive measurement error based on accuracy
+        const adaptiveMeasurementError = this.measurementError * (measurement.accuracy / 10);
+
+        this.x.gain = predictedErrorX / (predictedErrorX + adaptiveMeasurementError);
+        this.y.gain = predictedErrorY / (predictedErrorY + adaptiveMeasurementError);
 
         this.x.estimate = predictedX + this.x.gain * (measurement.lng - predictedX);
         this.y.estimate = predictedY + this.y.gain * (measurement.lat - predictedY);
@@ -1152,10 +1189,13 @@ const kalmanFilter = {
         this.x.errorEstimate = (1 - this.x.gain) * predictedErrorX;
         this.y.errorEstimate = (1 - this.y.gain) * predictedErrorY;
 
+        this.lastMeasurement = measurement;
+
         return {
             lat: this.y.estimate,
             lng: this.x.estimate,
-            accuracy: measurement.accuracy
+            accuracy: measurement.accuracy,
+            timestamp: measurement.timestamp
         };
     },
 
@@ -1164,9 +1204,10 @@ const kalmanFilter = {
         this.y.estimate = measurement.lat;
         this.x.errorEstimate = 1;
         this.y.errorEstimate = 1;
+        this.lastMeasurement = measurement;
     }
 };
-
+        
 function calculateWeightedAveragePosition(positions) {
     console.log("Calculating weighted average for positions:", JSON.stringify(positions));
 
