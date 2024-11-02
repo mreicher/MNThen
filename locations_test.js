@@ -228,7 +228,7 @@ const locations = [
     audio: "/audio/exhibit/nininger.mp3",
     tours: "place",
     summary: "Nininger, founded in 1856 by John Nininger and promoted by Ignatius Donnelly, boomed briefly before the 1857 Panic. Economic hardship and unfulfilled infrastructure promises led to its abandonment by 1869.",
-    today: "Nininger Town Hall",
+    today: "Nininger Town Hall, Hastings",
     link: "https://mnthen.com/blog/place/prom.html",
     imageSource: "Cyanotype photograph of Nininger c.1890 via MNopedia",
     additionalInfo: "Ignatius Donnelly later became famous for his writings on Atlantis, theories about Shakespeare’s works, and his political career."
