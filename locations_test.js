@@ -214,7 +214,25 @@ const locations = [
         link: "https://mnthen.com/blog/place/prom.html",
         imageSource: "Image of the Prom Ballroom via Discogs",
         additionalInfo: "The Beach Boys performed at the Prom Ballroom on August 2, 1963, during their first major nationwide tour."
-    }
+    },
+
+    {
+    id: "1022",
+    lat: 44.7695002003817,
+    lng: -92.90470981679262,
+    name: "Nininger",
+    title: "Nininger",
+    image: "https://mnthen.com/images/exhibit/nininger.jpg/",
+    creator: "Matt Reicher",
+    city: "Hastings",
+    audio: "/audio/exhibit/nininger.mp3",
+    tours: "place",
+    summary: "Nininger, founded in 1856 by John Nininger and promoted by Ignatius Donnelly, boomed briefly before the 1857 Panic. Economic hardship and unfulfilled infrastructure promises led to its abandonment by 1869.",
+    today: "Nininger Town Hall",
+    link: "https://mnthen.com/blog/place/prom.html",
+    imageSource: "Cyanotype photograph of Nininger c.1890 via MNopedia",
+    additionalInfo: "Ignatius Donnelly later became famous for his writings on Atlantis, theories about Shakespeare’s works, and his political career."
+}
 
 
 
