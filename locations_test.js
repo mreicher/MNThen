@@ -210,7 +210,7 @@ const locations = [
         audio: "/audio/exhibit/prom.mp3",
         tours: "place",
         summary: "The Prom Ballroom was a popular dance venue featuring famous musicians like Glenn Miller and Buddy Holly, before declining with suburban growth and eventually being demolished.",
-        today: "1190 University Ave W",
+        today: "1190 University Ave W in Saint Paul",
         link: "https://mnthen.com/blog/place/prom.html",
         imageSource: "Image of the Prom Ballroom via Discogs",
         additionalInfo: "The Beach Boys performed at the Prom Ballroom on August 2, 1963, during their first major nationwide tour."
