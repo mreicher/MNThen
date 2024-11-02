@@ -8,6 +8,14 @@ const blogArticles = [
       keywords: ["saint paul", "st. paul", "rap", "hip", "hop", "Rhymesayers", "person", "all"],
     },
     {
+    headline: "Prom Ballroom (1941 - 1987)",
+    blurb: "A historic venue that hosted legends like Glenn Miller and Buddy Holly, filling nights with dancing and unforgettable music from 1941-1987.",
+    icon: "fa-building",
+    image: "https://mnthen.com/images/prom1.jpg",
+    url: "https://mnthen.com/blog/place/prom.html",
+    keywords: ["saint paul", "st. paul", "prom", "ballroom", "big band", "university", "place", "all"],
+    },
+    {
       headline: "Hanging of the Dakota 38 (Dec. 26, 1862)",
       blurb: "Broken promises sparked deadly confrontation in 1862. On December 26, 38 Dakota men were hanged, marking the conflict's tragic end.",
       icon: "fa-calendar",
