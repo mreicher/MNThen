@@ -5,7 +5,7 @@ const locations_h = [
         lat: 44.915278600994434,
         lng: -93.08081040735343,
         image: "https://mnthen.com/tour/gangster/images/wsp_house.jpg",
-        audio: "https://mnthen.com/audio/mpls/mpls_grain_belt.mp3",
+        audio: "https://mnthen.com/audio/tour/gangster/robert.mp3",
         city: "West Saint Paul",
         creator: "Matt Reicher",
         link: "http://www.historictwincities.com/2021/07/12/barker-karpis-gang-hideout-house-1031-south-robert-street/",
@@ -18,7 +18,7 @@ const locations_h = [
     },
     {
         id: 2,
-        name: "Father Louis Hennepin Suspension Bridge",
+        name: "O'Connor Layover Agreement",
         lat: 45.14434783374931,
         lng: -93.00441148466629,
         image: "https://mnthen.com/images/wsp_eyedea.jpg",
