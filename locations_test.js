@@ -198,23 +198,23 @@ const locations = [
         additionalInfo: "The Samuel H. Morgan Land Fund supports Minnesota land conservation by funding acquisitions to expand state parks, public trails, and green spaces."
 },
 
-{
-    id: "1021",
-    lat: 44.95552119293967,
-    lng: -93.15009997756202,
-    name: "Prom Ballroom (1941 - 1987)",
-    title: "Prom Ballroom",
-    image: "https://mnthen.com/images/prom1.jpg",
-    creator: "Matt Reicher",
-    city: "Saint Paul",
-    audio: "/audio/exhibit/prom.mp3",
-    tours: "place",
-    summary: "The Prom Ballroom was a popular dance venue featuring famous musicians like Glenn Miller and Buddy Holly, before declining with suburban growth and eventually being demolished.",
-    today: "1190 University Ave W",
-    link: "https://mnthen.com/blog/place/prom.html",
-    imageSource: "Image of the Prom Ballroom via Discogs",
-    additionalInfo: "The Beach Boys performed at the Prom Ballroom on August 2, 1963, during their first major nationwide tour."
-}
+   {
+        id: "1021",
+        lat: 44.95552119293967,
+        lng: -93.15009997756202,
+        name: "Prom Ballroom (1941 - 1987)",
+        title: "Prom Ballroom",
+        image: "https://mnthen.com/images/prom1.jpg",
+        creator: "Matt Reicher",
+        city: "Saint Paul",
+        audio: "/audio/exhibit/prom.mp3",
+        tours: "place",
+        summary: "The Prom Ballroom was a popular dance venue featuring famous musicians like Glenn Miller and Buddy Holly, before declining with suburban growth and eventually being demolished.",
+        today: "1190 University Ave W",
+        link: "https://mnthen.com/blog/place/prom.html",
+        imageSource: "Image of the Prom Ballroom via Discogs",
+        additionalInfo: "The Beach Boys performed at the Prom Ballroom on August 2, 1963, during their first major nationwide tour."
+    }
 
 
 
