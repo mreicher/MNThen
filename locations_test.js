@@ -222,7 +222,7 @@ const locations = [
     lng: -92.90470981679262,
     name: "Nininger",
     title: "Nininger",
-    image: "https://mnthen.com/images/exhibit/nininger.jpg/",
+    image: "https://mnthen.com/images/exhibit/nininger.jpg",
     creator: "Matt Reicher",
     city: "Hastings",
     audio: "/audio/exhibit/nininger.mp3",
