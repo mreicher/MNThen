@@ -204,7 +204,7 @@ const locations = [
     lng: -93.15009997756202,
     name: "Prom Ballroom (1941 - 1987)",
     title: "Prom Ballroom",
-    image: "https://mnthen.com/images/prom1.jpg/",
+    image: "https://mnthen.com/images/prom1.jpg",
     creator: "Matt Reicher",
     city: "Saint Paul",
     audio: "/audio/exhibit/prom.mp3",
