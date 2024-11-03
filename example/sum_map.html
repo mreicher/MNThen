@@ -577,36 +577,87 @@
     <script src="/locations_test.js?v=1.0.4"></script>
 
     <script>
+// Constants
+const DISTANCE_THRESHOLD = 20; // 20 feet
+const BUFFER_SIZE = 3;
+const SMOOTHING_FACTOR = 0.6;
+const SPEED_THRESHOLD = 0.5;
+const DISTANCE_THRESHOLD_SMALL = 1;
+const BACKGROUND_THRESHOLD = 25000;
+const INACTIVITY_TIMEOUT = 30000;
+const UPDATE_INTERVAL = 50;
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 1000;
+const COOLDOWN_PERIOD = 3 * 60 * 1000;
+const MAX_ACCEPTABLE_ACCURACY = 50; // meters
+const MAX_SPEED = 50; // meters per second
+const MIN_DISTANCE_THRESHOLD = 0.5; // meters
+const VELOCITY_DECAY = 0.8;
+const BEARING_WEIGHT = 0.3;
+const EXTENDED_DISTANCE_THRESHOLD = 100; // meters
+
+// State variables
 let map, userMarker, markerClusterGroup;
 let currentLocationIndex = 0;
 let visitedLocations = [];
 let gameLocations = [];
-let inactivityTimer;
 let isLocationHuntVisible = false;
 let lastPosition = null;
 let positionBuffer = [];
-const bufferSize = 5;
-const smoothingFactor = 0.6;
 let filteredPosition = null;
-const DISTANCE_THRESHOLD = 20; // 20 feet to measure threshold distance to marker before opening location page.
-let lastUpdateTime = 0;
 let velocity = { lat: 0, lng: 0 };
 let isMapInteracting = false;
 let followUser = true;
 let locationCooldowns = {};
-
-const speedThreshold = 0.5;
-const distanceThreshold = 1;
-
 let lastHiddenTime = 0;
-const BACKGROUND_THRESHOLD = 25000;
-const INACTIVITY_TIMEOUT = 30000;
-
 let lastKnownPosition = null;
 let isTransitioning = false;
 let lastVisitedLocationId = null;
+let retryCount = 0;
+let lastVisitTime = 0;
+let lastUpdateTime = null;
+let lastVelocity = null;
 
-const UPDATE_INTERVAL = 50;
+// Utility functions
+const calculateDistance = (pos1, pos2) => {
+    const R = 6371e3;
+    const φ1 = pos1.lat * Math.PI / 180;
+    const φ2 = pos2.lat * Math.PI / 180;
+    const Δφ = (pos2.lat - pos1.lat) * Math.PI / 180;
+    const Δλ = (pos2.lng - pos1.lng) * Math.PI / 180;
+
+    const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
+            Math.cos(φ1) * Math.cos(φ2) *
+            Math.sin(Δλ/2) * Math.sin(Δλ/2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+
+    return R * c;
+};
+
+const lerp = (start, end, t) => start * (1 - t) + end * t;
+
+const predictPositionFromHeading = (position, heading, distance) => {
+    const R = 6371000; // Earth's radius in meters
+    const d = distance / R;
+    const bearing = heading * Math.PI / 180;
+    const lat1 = position.lat * Math.PI / 180;
+    const lng1 = position.lng * Math.PI / 180;
+
+    const lat2 = Math.asin(
+        Math.sin(lat1) * Math.cos(d) +
+        Math.cos(lat1) * Math.sin(d) * Math.cos(bearing)
+    );
+
+    const lng2 = lng1 + Math.atan2(
+        Math.sin(bearing) * Math.sin(d) * Math.cos(lat1),
+        Math.cos(d) - Math.sin(lat1) * Math.sin(lat2)
+    );
+
+    return {
+        lat: lat2 * 180 / Math.PI,
+        lng: lng2 * 180 / Math.PI
+    };
+};
 
 function initMap() {
     map = L.map('map', {
@@ -843,7 +894,6 @@ function calculateSmoothedPosition(positions) {
     };
 }
 
-const EXTENDED_DISTANCE_THRESHOLD = 100;
 const EDGE_THRESHOLD_PERCENTAGE = 0.25;
 const STRICT_EDGE_THRESHOLD_PERCENTAGE = 0.15;
 const CRITICAL_EDGE_THRESHOLD_PERCENTAGE = 0.07;
@@ -851,7 +901,6 @@ const MAX_ACCURACY_THRESHOLD = 2500;
 const TARGET_ACCURACY_THRESHOLD = 100;
 
 let currentAccuracyThreshold = MAX_ACCURACY_THRESHOLD;
-let lastVelocity = { lat: 0, lng: 0 };
 let lastUpdateTimestamp = Date.now();
 let lastRecenterTime = Date.now();
 const MIN_RECENTER_INTERVAL = 2000;
@@ -938,6 +987,7 @@ function shouldRecenter(map, marker) {
     if (isCritical) {
         lastRecenterTime = now;
         return {
+            
             needsRecenter: true,
             isEmergency: true,
             edgeInfo: edgeInfo
@@ -960,18 +1010,19 @@ function shouldRecenter(map, marker) {
     };
 }       
         
-function applyExponentialSmoothing(newPosition, lastPosition, alpha = 0.3) {
+function applyExponentialSmoothing(newPosition, lastPosition, alpha = 0.25) {
     if (!lastPosition) return newPosition;
     return {
         lat: alpha * newPosition.lat + (1 - alpha) * lastPosition.lat,
         lng: alpha * newPosition.lng + (1 - alpha) * lastPosition.lng,
-        accuracy: newPosition.accuracy
+        accuracy: newPosition.accuracy,
+        timestamp: newPosition.timestamp
     };
 }
 
 function calculateVelocityFilter(newPosition, lastPosition) {
     const timeElapsed = (Date.now() - lastUpdateTimestamp) / 1000;
-    if (!lastPosition || timeElapsed === 0) return newPosition;
+    if (!lastPosition || timeElapsed <= 0) return newPosition;
     
     const currentVelocity = {
         lat: (newPosition.lat - lastPosition.lat) / timeElapsed,
@@ -979,134 +1030,23 @@ function calculateVelocityFilter(newPosition, lastPosition) {
     };
     
     lastVelocity = {
-        lat: 0.8 * lastVelocity.lat + 0.2 * currentVelocity.lat,
-        lng: 0.8 * lastVelocity.lng + 0.2 * currentVelocity.lng
+        lat: 0.85 * lastVelocity.lat + 0.15 * currentVelocity.lat,
+        lng: 0.85 * lastVelocity.lng + 0.15 * currentVelocity.lng
     };
     
     return {
         lat: lastPosition.lat + lastVelocity.lat * timeElapsed,
         lng: lastPosition.lng + lastVelocity.lng * timeElapsed,
-        accuracy: newPosition.accuracy
+        accuracy: newPosition.accuracy,
+        timestamp: newPosition.timestamp
     };
 }
 
-function updateUserLocation(position, forceUpdate = false) {
-    console.log("Updating user location with:", JSON.stringify(position));
-
-    if (!position || !position.coords) {
-        console.warn("Invalid position object received");
-        return;
-    }
-
-    const newPosition = {
-        lat: position.coords.latitude,
-        lng: position.coords.longitude,
-        accuracy:  position.coords.accuracy
-    };
-
-    if (isNaN(newPosition.lat) || isNaN(newPosition.lng)) {
-        console.warn("Invalid coordinates received:", newPosition);
-        return;
-    }
-
-    if (lastPosition && currentAccuracyThreshold > TARGET_ACCURACY_THRESHOLD) {
-        currentAccuracyThreshold = Math.max(
-            TARGET_ACCURACY_THRESHOLD,
-            currentAccuracyThreshold * 0.95
-        );
-    }
-
-    if (newPosition.accuracy > currentAccuracyThreshold && !forceUpdate) {
-        console.log(`Current accuracy threshold: ${currentAccuracyThreshold}m`);
-        console.warn(`Low accuracy position (${newPosition.accuracy}m), skipping update`);
-        return;
-    }
-
-    const distance = lastPosition ? calculateDistance(lastPosition, newPosition) : 0;
-
-    if (distance > EXTENDED_DISTANCE_THRESHOLD || forceUpdate) {
-        console.log("Large distance or forced update. New position:", newPosition);
-        try {
-            userMarker.setLatLng([newPosition.lat, newPosition.lng]);
-            lastPosition = newPosition;
-            positionBuffer = [newPosition];
-            kalmanFilter.reset(newPosition);
-            lastVelocity = { lat: 0, lng: 0 };
-            
-            if (!isMapInteracting && !userIsInteracting) {
-                map.setView([newPosition.lat, newPosition.lng], map.getZoom(), {
-                    animate: false
-                });
-            }
-        } catch (error) {
-            console.error("Error updating user location for large move:", error);
-        }
-    } else {
-        console.log("Small distance update. Applying smoothing.");
-        const filteredPosition = kalmanFilter.update(newPosition);
-        const velocityFilteredPosition = calculateVelocityFilter(filteredPosition, lastPosition);
-        const exponentialSmoothedPosition = applyExponentialSmoothing(velocityFilteredPosition, lastPosition);
-        
-        positionBuffer.push(exponentialSmoothedPosition);
-        if (positionBuffer.length > bufferSize) {
-            positionBuffer.shift();
-        }
-        const smoothedPosition = calculateSmoothedPosition(positionBuffer);
-
-        if (smoothedPosition) {
-            try {
-                if (userMarker) {
-                    userMarker.setLatLng([smoothedPosition.lat, smoothedPosition.lng]);
-                    
-                    if (!isMapInteracting && !userIsInteracting) {
-                        if (!isMarkerVisible(map, userMarker) || isMarkerNearEdge(map, userMarker)) {
-                            map.setView([smoothedPosition.lat, smoothedPosition.lng], map.getZoom(), {
-                                animate: true,
-                                duration: 0.5
-                            });
-                        }
-                    }
-                } else {
-                    console.warn("User marker not initialized");
-                    return;
-                }
-                lastPosition = smoothedPosition;
-            } catch (error) {
-                console.error("Error updating user location for small move:", error);
-            }
-        } else {
-            console.warn("Invalid smoothed position, falling back to new position");
-            try {
-                if (userMarker) {
-                    userMarker.setLatLng([newPosition.lat, newPosition.lng]);
-                    
-                    if (!isMapInteracting && !userIsInteracting) {
-                        if (!isMarkerVisible(map, userMarker) || isMarkerNearEdge(map, userMarker)) {
-                            map.setView([newPosition.lat, newPosition.lng], map.getZoom(), {
-                                animate: true,
-                                duration: 0.5
-                            });
-                        }
-                    }
-                }
-                lastPosition = newPosition;
-            } catch (error) {
-                console.error("Error applying fallback position:", error);
-            }
-        }
-    }
-
-    updateDistanceBox();
-    lastUpdateTime = Date.now();
-    lastUpdateTimestamp = Date.now();
-    console.log("User location update complete");
-}
-        
 const kalmanFilter = {
-    x: { estimate: 0, errorEstimate: 1, gain: 0 },
-    y: { estimate: 0, errorEstimate: 1, gain: 0 },
-    measurementError: 1,
-    processError: 0.01,
+    x: { estimate: 0, error: 1 },
+    y: { estimate: 0, error: 1 },
+    q: 0.015, // Process noise
+    r: 1, // Measurement noise - updated dynamically
 
     update(measurement) {
         if (this.x.estimate === 0 && this.y.estimate === 0) {
@@ -1115,35 +1055,150 @@ const kalmanFilter = {
             return measurement;
         }
 
-        let predictedX = this.x.estimate;
-        let predictedY = this.y.estimate;
-        let predictedErrorX = this.x.errorEstimate + this.processError;
-        let predictedErrorY = this.y.errorEstimate + this.processError;
+        // X coordinate
+        const predX = this.x.estimate;
+        const predErrX = this.x.error + this.q;
+        const gainX = predErrX / (predErrX + this.r);
+        this.x.estimate = predX + gainX * (measurement.lng - predX);
+        this.x.error = (1 - gainX) * predErrX;
 
-        this.x.gain = predictedErrorX / (predictedErrorX + this.measurementError);
-        this.y.gain = predictedErrorY / (predictedErrorY + this.measurementError);
-
-        this.x.estimate = predictedX + this.x.gain * (measurement.lng - predictedX);
-        this.y.estimate = predictedY + this.y.gain * (measurement.lat - predictedY);
-
-        this.x.errorEstimate = (1 - this.x.gain) * predictedErrorX;
-        this.y.errorEstimate = (1 - this.y.gain) * predictedErrorY;
+        // Y coordinate
+        const predY = this.y.estimate;
+        const predErrY = this.y.error + this.q;
+        const gainY = predErrY / (predErrY + this.r);
+        this.y.estimate = predY + gainY * (measurement.lat - predY);
+        this.y.error = (1 - gainY) * predErrY;
 
         return {
             lat: this.y.estimate,
             lng: this.x.estimate,
-            accuracy: measurement.accuracy
+            accuracy: measurement.accuracy,
+            timestamp: measurement.timestamp
         };
     },
 
     reset(measurement) {
         this.x.estimate = measurement.lng;
         this.y.estimate = measurement.lat;
-        this.x.errorEstimate = 1;
-        this.y.errorEstimate = 1;
+        this.x.error = 1;
+        this.y.error = 1;
     }
 };
 
+function updateUserLocation(position, forceUpdate = false) {
+    if (!position?.coords) {
+        console.warn("Invalid position data received");
+        return;
+    }
+
+    const currentTime = Date.now();
+    const timeDelta = lastUpdateTime ? (currentTime - lastUpdateTime) / 1000 : 0;
+
+    const newPosition = {
+        lat: position.coords.latitude,
+        lng: position.coords.longitude,
+        accuracy: position.coords.accuracy,
+        heading: position.coords.heading || null,
+        timestamp: currentTime
+    };
+
+    // Basic validation
+    if (isNaN(newPosition.lat) || isNaN(newPosition.lng)) {
+        console.warn("Invalid coordinates received");
+        return;
+    }
+
+    // Initialize lastPosition if it's the first update
+    if (!lastPosition) {
+        lastPosition = newPosition;
+        userMarker.setLatLng([newPosition.lat, newPosition.lng]);
+        kalmanFilter.reset(newPosition);
+        lastUpdateTime = currentTime;
+        return;
+    }
+
+    const distance = calculateDistance(lastPosition, newPosition);
+
+    // Skip update if accuracy is poor and not forced
+    if (newPosition.accuracy > MAX_ACCEPTABLE_ACCURACY && !forceUpdate) {
+        console.debug("Skipping update due to poor accuracy");
+        return;
+    }
+
+    // Skip update if movement is too small
+    if (distance < MIN_DISTANCE_THRESHOLD && !forceUpdate) {
+        console.debug("Skipping update due to minimal movement");
+        return;
+    }
+
+    // Skip update if speed is unrealistic
+    if (timeDelta > 0 && (distance / timeDelta > MAX_SPEED) && !forceUpdate) {
+        console.debug("Skipping update due to unrealistic speed");
+        return;
+    }
+
+    try {
+        if (distance > EXTENDED_DISTANCE_THRESHOLD || forceUpdate) {
+            // Direct update for large movements
+            userMarker.setLatLng([newPosition.lat, newPosition.lng]);
+            lastPosition = newPosition;
+            positionBuffer = [newPosition];
+            kalmanFilter.reset(newPosition);
+            lastVelocity = { lat: 0, lng: 0 };
+        } else {
+            // Apply Kalman filtering
+            kalmanFilter.r = newPosition.accuracy / 100;
+            const filteredPosition = kalmanFilter.update(newPosition);
+
+            // Calculate confidence weight
+            const confidenceWeight = Math.max(0, Math.min(1, 
+                1 - (newPosition.accuracy / MAX_ACCEPTABLE_ACCURACY)
+            ));
+
+            // Apply heading-based prediction if available
+            if (newPosition.heading !== null) {
+                const predictedPosition = predictPositionFromHeading(
+                    filteredPosition, 
+                    newPosition.heading, 
+                    distance * BEARING_WEIGHT
+                );
+                filteredPosition.lat = lerp(filteredPosition.lat, predictedPosition.lat, BEARING_WEIGHT);
+                filteredPosition.lng = lerp(filteredPosition.lng, predictedPosition.lng, BEARING_WEIGHT);
+            }
+
+            // Update position buffer
+            positionBuffer.push(filteredPosition);
+            if (positionBuffer.length > BUFFER_SIZE) {
+                positionBuffer.shift();
+            }
+
+            const finalPosition = calculateWeightedPosition(positionBuffer);
+            userMarker.setLatLng([finalPosition.lat, finalPosition.lng]);
+            lastPosition = finalPosition;
+        }
+
+        // Update map view if necessary
+        if (!isMapInteracting && !userIsInteracting) {
+            const markerLatLng = userMarker.getLatLng();
+            map.setView([markerLatLng.lat, markerLatLng.lng], map.getZoom(), {
+                animate: true,
+                duration: 0.3
+            });
+        }
+
+    } catch (error) {
+        console.error("Error updating location:", error);
+        // Fallback to raw position
+        userMarker.setLatLng([newPosition.lat, newPosition.lng]);
+        lastPosition = newPosition;
+    }
+
+    updateDistanceBox();
+    lastUpdateTime = Date.now();
+    lastUpdateTimestamp = Date.now();
+    console.log("User location update complete");
+}
+        
 function calculateWeightedAveragePosition(positions) {
     console.log("Calculating weighted average for positions:", JSON.stringify(positions));
 
@@ -1162,7 +1217,7 @@ function calculateWeightedAveragePosition(positions) {
             continue;
         }
 
-        const weight = Math.pow(smoothingFactor, positions.length - i - 1);
+        const weight = Math.pow(SMOOTHING_FACTOR, positions.length - i - 1);
         sumLat += positions[i].lat * weight;
         sumLng += positions[i].lng * weight;
         totalWeight += weight;
@@ -1189,22 +1244,6 @@ function calculateWeightedAveragePosition(positions) {
     return result;
 }
         
-function calculateDistance(pos1, pos2) {
-    const R = 6371e3;
-    
-    const φ1 = pos1.lat * Math.PI / 180;
-    const φ2 = pos2.lat * Math.PI / 180;
-    const Δφ = (pos2.lat - pos1.lat) * Math.PI / 180;
-    const Δλ = (pos2.lng - pos1.lng) * Math.PI / 180;
-
-    const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
-            Math.cos(φ1) * Math.cos(φ2) *
-            Math.sin(Δλ/2) * Math.sin(Δλ/2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-
-    return R * c;
-}
-
 function centerMapOnUser(position, immediate = false) {
     if (!map || !position || typeof position.lat !== 'number' || typeof position.lng !== 'number') {
         console.warn('Invalid map or position for centering');
@@ -1214,7 +1253,7 @@ function centerMapOnUser(position, immediate = false) {
     const center = map.getCenter();
     const distance = calculateDistance(center, position);
 
-    if (distance > distanceThreshold || immediate) {
+    if (distance > DISTANCE_THRESHOLD_SMALL || immediate) {
         map.panTo(position, {
             animate: !immediate,
             duration: 0.5,
@@ -1223,10 +1262,6 @@ function centerMapOnUser(position, immediate = false) {
     }
 }
           
-const MAX_RETRIES = 3;
-const RETRY_DELAY = 1000;
-let retryCount = 0;
-
 function handleLocationError(error) {
     console.warn("Error getting user location:", error);
     
@@ -1417,10 +1452,84 @@ function checkInactivity() {
     }
 }
 
-function closeAllPopups() {
-    if (map) {
-        map.closePopup();
+function startHunt() {
+    gameLocations = locations.sort((a, b) => a.id - b.id);
+    currentLocationIndex = 0;
+    locationCooldowns = {};
+    lastVisitedLocationId = null;
+    loadAllLocations();
+}
+
+function getMarkerColor(tours) {
+    switch (tours.toLowerCase()) {
+        case 'person': return '#FFA500';
+        case 'gangster': return '#3f9b0b';
+        case 'event': return '#8B0000';
+        case 'place': return '#0f2bab';
+        default: return '#0f2bab';
     }
+}
+
+function loadAllLocations() {
+    gameLocations.forEach((location, index) => {
+        const markerColor = getMarkerColor(location.tours);
+        
+        const locationMarker = L.marker([location.lat, location.lng], {
+            icon: L.divIcon({
+                className: 'custom-pin-icon',
+                html: `<div class="pin-head" style="background-color: ${markerColor};"></div>`,
+                iconSize: [30, 30],
+                iconAnchor: [15, 30],
+            })
+        });
+                
+        const popupContent = `
+            <div class="popup-content">
+                <img src="${location.image}" alt="${location.name}" class="location-image">
+                <h4 class="location-name">
+                    <a href="${location.link}" target="_blank" rel="noopener noreferrer" style="text-decoration: none; color: inherit;">${location.name}</a>
+                </h4>
+                <div class="popup-buttons">
+                    <button class="button route-button" data-lat="${location.lat}" data-lng="${location.lng}">Directions</button>
+                    <button class="button summary-button" data-location-id="${location.id}">Summary</button>
+                </div>
+            </div>
+        `;
+        
+        locationMarker.bindPopup(popupContent, {
+            offset: L.point(0, -25),
+            className: 'custom-popup'
+        });
+        
+        locationMarker.on('popupopen', function(e) {
+            const popup = e.popup._contentNode;
+            const routeButton = popup.querySelector('.route-button');
+            const summaryButton = popup.querySelector('.summary-button');
+            
+            if (routeButton) {
+                routeButton.addEventListener('click', function(event) {
+                    event.preventDefault();
+                    const lat = this.getAttribute('data-lat');
+                    const lng = this.getAttribute('data-lng');
+                    showDirectionsModal(lat, lng);
+                });
+            }
+            
+            if (summaryButton) {
+                summaryButton.addEventListener('click', function(event) {
+                    event.preventDefault();
+                    const locationId = this.getAttribute('data-location-id');
+                    showLocationSummary(locationId);
+                });
+            }
+        });
+        
+        markerClusterGroup.addLayer(locationMarker);
+    });
+
+    map.addLayer(markerClusterGroup);
+    updateDistanceBox();
+    resetInactivityTimer();
 }
 
 function updateDistanceBox() {
@@ -1445,7 +1554,7 @@ function updateDistanceBox() {
     }
 
     let closestDistance = Infinity;
-    let closestLocation =  null;
+    let closestLocation = null;
 
     const userPos = { lat: userLat, lng: userLng };
 
@@ -1482,16 +1591,13 @@ function updateDistanceBox() {
     }
 }
 
-let lastVisitTime = 0;
-const cooldownPeriod = 3 * 60 * 1000;
-        
 function showLocationHunt(location) {
     const now = performance.now();
-    if (location.id === lastVisitedLocationId && now - lastVisitTime < cooldownPeriod) {
+    if (location.id === lastVisitedLocationId && now - lastVisitTime < COOLDOWN_PERIOD) {
         console.log(`Location ${location.id} is on cooldown. Skipping.`);
         return;
     }
-    
+
     lastVisitedLocationId = location.id;
     lastVisitTime = now;
     isLocationHuntVisible = true;
@@ -1530,7 +1636,7 @@ function showLocationHunt(location) {
     `;
 
     scrollableContent.appendChild(locationImage);
- 
+
     const contentContainer = document.createElement('div');
     contentContainer.classList.add('lochunt-content');
     contentContainer.style.cssText = `
@@ -1738,7 +1844,7 @@ function createBlueBar(location) {
         position: sticky;
         bottom: 0;
     `;
-    
+
     const infoButton = document.createElement('button');
     infoButton.innerHTML = '<i class="bi bi-info-circle-fill text-white" style="font-size: 1.5rem; z-index: 2500;"></i>';
     infoButton.classList.add('btn', 'btn-sm', 'me-2');
@@ -1760,7 +1866,7 @@ function createBlueBar(location) {
     blueBar.appendChild(infoButton);
     blueBar.appendChild(feedbackButton);
     return blueBar;
-}        
+}
 
 function initAudioPlayer() {
     const audio = document.getElementById('locationAudio');
@@ -1772,6 +1878,43 @@ function initAudioPlayer() {
     const currentTimeSpan = document.getElementById('currentTime');
     const durationSpan = document.getElementById('duration');
 
+    const togglePlay = () => {
+        if (audio.paused) {
+            audio.play();
+            playPauseBtn.innerHTML = '<i class="bi bi-pause"></i>';
+        } else {
+            audio.pause();
+            playPauseBtn.innerHTML = '<i class="bi bi-play"></i>';
+        }
+    };
+
+    const seek = (seconds) => {
+        audio.currentTime = Math.max(0, Math.min(audio.currentTime + seconds, audio.duration));
+    };
+
+    const updateProgress = () => {
+        const percent = (audio.currentTime / audio.duration) * 100;
+        progressBar.style.width = `${percent}%`;
+        currentTimeSpan.textContent = formatTime(audio.currentTime);
+    };
+
+    const setProgress = (e) => {
+        const width = progressContainer.clientWidth;
+        const clickX = e.offsetX;
+        const duration = audio.duration;
+        audio.currentTime = (clickX / width) * duration;
+    };
+
+    const setDuration = () => {
+        durationSpan.textContent = formatTime(audio.duration);
+    };
+
+    const formatTime = (time) => {
+        const minutes = Math.floor(time / 60);
+        const seconds = Math.floor(time % 60);
+        return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+    };
+
     playPauseBtn.addEventListener('click', togglePlay);
     rewindBtn.addEventListener('click', () => seek(-10));
     forwardBtn.addEventListener('click', () => seek(10));
@@ -1782,53 +1925,15 @@ function initAudioPlayer() {
         showAdditionalInfo();
     });
     progressContainer.addEventListener('click', setProgress);
-
-    function togglePlay() {
-        if (audio.paused) {
-            audio.play();
-            playPauseBtn.innerHTML = '<i class="bi bi-pause"></i>';
-        } else {
-            audio.pause();
-            playPauseBtn.innerHTML = '<i class="bi bi-play"></i>';
-        }
-    }
-
-    function seek(seconds) {
-        audio.currentTime = Math.max(0, Math.min(audio.currentTime + seconds, audio.duration));
-    }
-
-    function updateProgress() {
-        const percent = (audio.currentTime / audio.duration) * 100;
-        progressBar.style.width = `${percent}%`;
-        currentTimeSpan.textContent = formatTime(audio.currentTime);
-    }
-
-    function setProgress(e) {
-        const width = this.clientWidth;
-        const clickX = e.offsetX;
-        const duration = audio.duration;
-        audio.currentTime = (clickX / width) * duration;
-    }
-
-    function setDuration() {
-        durationSpan.textContent = formatTime(audio.duration);
-    }
-
-    function formatTime(time) {
-        const minutes = Math.floor(time / 60);
-        const seconds = Math.floor(time % 60);
-        return `${minutes}:${seconds.toString().padStart(2, '0')}`;
-    }
 }
 
 function showAdditionalInfo() {
-    // Find the location using lastVisitedLocationId
     const location = gameLocations.find(loc => loc.id === lastVisitedLocationId);
     console.log('Current location:', location);
-    
+
     const additionalInfoContainer = document.querySelector('.additional-info-container');
     additionalInfoContainer.style.display = 'block';
-    
+
     document.getElementById('additionalInfo').textContent = location.additionalInfo;
 
     const continueButton = document.getElementById('continueButton');
@@ -1841,115 +1946,130 @@ function showAdditionalInfo() {
 }
 
 function showDirectionsModal(lat, lng) {
-    const modal = document.getElementById('directionsModal');
-    modal.style.display = 'block';
+    const modal = document.createElement('div');
+    modal.className = 'modal';
+    modal.innerHTML = `
+        <div class="modal-content">
+            <h3>Choose your preferred navigation app:</h3>
+            <div class="modal-buttons">
+                <button class="modal-button google-maps">Google Maps</button>
+                <button class="modal-button waze">Waze</button>
+                <button class="modal-button apple-maps">Apple Maps</button>
+                <button class="modal-button cancel">Cancel</button>
+            </div>
+        </div>
+    `;
 
-    const mapBtn = document.getElementById('mapButton');
-    const cancelBtn = document.getElementById('cancelButton');
-
-    mapBtn.onclick = () => {
-        window.open(`https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`, '_blank');
-        modal.style.display = 'none';
-    };
-
-    cancelBtn.onclick = () => {
-        modal.style.display = 'none';
-    };
-
-    window.onclick = (event) => {
-        if (event.target == modal) {
-            modal.style.display = 'none';
-        }
-    };
-}
-/*
-function showLocationSummary(locationId) {
-    console.log("Showing summary for location ID:", locationId);
-    console.log("All locations:", locations);
-    console.log("Location IDs:", locations.map(loc => loc.id));
-
-    console.log("Location ID type:", typeof locationId);
-    console.log("First location ID type:", typeof locations[0].id);
-    const location =  locations.find(loc => loc.id === locationId || loc.id === parseInt(locationId));
-    console.log("Found location:", location);
-
-    if (location && location.summary) {
-        const modal = document.getElementById('summaryModal');
-        const summaryContent = document.getElementById('summaryContent');
-
-        modal.style.backgroundColor = 'rgba(0, 0, 0, 0.5)';
-        modal.style.display = 'flex';
-        modal.style.justifyContent = 'center';
-        modal.style.alignItems = 'center';
-
-        const modalContent = modal.querySelector('.modal-content');
-        modalContent.style.cssText = `
-            background-color: white;
-            padding: 30px;
-            border-radius: 10px;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.025);
-            max-width: 500px;
-            width: 90%;
-            max-height: 80vh;
-            overflow-y: auto;
-        `;
-
-        const closeBtn = modal.querySelector('.close');
-        if (closeBtn) {
-            closeBtn.remove();
-        }
-
-        summaryContent.style.textAlign = 'left';
-        summaryContent.innerHTML = `
-           <h3 style="color: #005f9e; font-size: 22px; margin-bottom: 15px; text-align: center;">${location.name}</h3>
-            <p style="line-height: 1.6; margin-bottom: 10px;">${location.summary}</p>
-        `;
-        
-        const continueButton = document.createElement('button');
-        continueButton.textContent = 'Continue';
-        continueButton.style.cssText = `
-            display: block;
-            width: auto;
-            padding: 12px 20px;
-            background-color: #005f9e;
-            color: white;
-            border: none;
-            border-radius: 10px;
-            cursor: pointer;
-            font-size: 18px;
-            font-weight: bold;
-            transition: background-color 0.3s ease;
-            margin: 0 auto;
-        `;
-
-        continueButton.onmouseover = function() {
-            this.style.backgroundColor = '#0077c2';
-        };
-
-        continueButton.onmouseout = function() {
-            this.style.backgroundColor = '#005f9e';
-        };
-
-        continueButton.onclick = function() {
-            modal.style.display = 'none';
-        };
-
-        summaryContent.appendChild(continueButton);
-
-        modal.style.display = 'flex';
-
-        window.onclick = function(event) {
-            if (event.target === modal) {
-                modal.style.display = 'none';
+    if (!document.querySelector('#modal-styles')) {
+        const style = document.createElement('style');
+        style.id = 'modal-styles';
+        style.textContent = `
+            .modal {
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background: rgba(0, 0, 0, 0.75);
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                z-index: 1000;
+                padding: 16px;
+                backdrop-filter: blur(4px);
             }
-        };
-    } else {
-        console.log("Location or summary not found. Location ID:", locationId);
-        console.log("Available IDs:", locations.map(loc => loc.id));
-        showPopup("Error", "Summary not available for this location.");
+            .modal-content {
+                background: white;
+                padding: 24px 16px;
+                border-radius: 16px;
+                width: 100%;
+                max-width: 320px;
+                text-align: center;
+                box-shadow: 0 20px 40px rgba(0,0,0,0.2);
+            }
+            .modal-buttons {
+                margin-top: 20px;
+                display: flex;
+                flex-direction: column;
+                gap: 12px;
+                align-items: center;
+            }
+            .modal-button {
+                padding: 16px;
+                border-radius: 12px;
+                width: 100%;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 16px;
+                font-weight: 500;
+                border: none;
+                cursor: pointer;
+                transition: transform 0.15s ease;
+            }
+            .modal-button:active {
+                transform: scale(0.98);
+            }
+            .google-maps {
+                background: #4285F4;
+                color: white;
+                box-shadow: 0 2px 8px rgba(66,133,244,0.3);
+            }
+            .waze {
+                background: #33ccff;
+                color: white;
+                box-shadow: 0 2px 8px rgba(51,204,255,0.3);
+            }
+            .apple-maps {
+                background: #000000;
+                color: white;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+            }
+            .cancel {
+                background: #f2f2f2;
+                color: #666;
+            }
+        `;
+        document.head.appendChild(style);
     }
+
+    document.body.appendChild(modal);
+
+    modal.querySelector('.google-maps').addEventListener('click', () => {
+        window.location.href = `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`;
+        modal.remove();
+    });
+
+    modal.querySelector('.waze').addEventListener('click', () => {
+        window.location.href = `https://www.waze.com/ul?ll=${lat}%2C${lng}&navigate=yes`;
+        modal.remove();
+    });
+
+    modal.querySelector('.apple-maps').addEventListener('click', () => {
+        const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+        if (isIOS) {
+            window.location.href = `maps://maps.apple.com/?daddr=${lat},${lng}`;
+            modal.remove();
+        } else {
+            const alertEl = document.createElement('div');
+            alertEl.className = 'modal';
+            alertEl.innerHTML = `
+                <div class="modal-content">
+                    <p>Apple Maps is only available on iOS devices</p>
+                    <button class="modal-button">OK</button>
+                </div>
+            `;
+            document.body.appendChild(alertEl);
+            alertEl.querySelector('button').onclick = () =>  alertEl.remove();
+        }
+    });
+
+    modal.querySelector('.cancel').addEventListener('click', () => modal.remove());
+
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) modal.remove();
+    });
 }
-*/
 
 function showLocationSummary(locationId) {
     console.log("Showing summary for location ID:", locationId);
@@ -2030,235 +2150,13 @@ function showLocationSummary(locationId) {
         showPopup("Error", "Summary not available for this location.");
     }
 }
-        
-function startHunt() {
-    gameLocations = locations.sort((a, b) => a.id - b.id);
-    currentLocationIndex = 0;
-    locationCooldowns = {};
-    lastVisitedLocationId = null;
-    loadAllLocations();
-}
 
-function getMarkerColor(tours) {
-    switch (tours.toLowerCase()) {
-        case 'person':
-            return '#FFA500';
-        case 'gangster':
-            return '#3f9b0b';
-        case 'event':
-            return '#8B0000';
-        case 'place':
-            return '#0f2bab';
-        default:
-            return '#0f2bab';
-    }
-}
-        
-function loadAllLocations() {
-    gameLocations.forEach((location, index) => {
-        const markerColor = getMarkerColor(location.tours);
-        
-        const locationMarker = L.marker([location.lat, location.lng], {
-            icon: L.divIcon({
-                className: 'custom-pin-icon',
-                html: `<div class="pin-head" style="background-color: ${markerColor};">
-                       </div>`,
-                iconSize: [30, 30],
-                iconAnchor: [15, 30],
-            })
-        });
-                
-        const popupContent = `
-            <div class="popup-content">
-                <img src="${location.image}" alt="${location.name}" class="location-image">
-                <h4 class="location-name">
-                    <a href="${location.link}" target="_blank" rel="noopener noreferrer" style="text-decoration: none; color: inherit;">${location.name}</a>
-                </h4>
-                <div class="popup-buttons">
-                    <button class="button route-button" data-lat="${location.lat}" data-lng="${location.lng}">Directions</button>
-                    <button class="button summary-button" data-location-id="${location.id}">Summary</button>
-                </div>
-            </div>
-        `;
-
-        locationMarker.bindPopup(popupContent, {
-            offset: L.point(0, -25),
-            className: 'custom-popup'
-        });
-
-        locationMarker.on('popupopen', function(e) {
-            const popup = e.popup._contentNode;
-            const routeButton = popup.querySelector('.route-button');
-            const summaryButton = popup.querySelector('.summary-button');
-            
-            if (routeButton) {
-                routeButton.addEventListener('click', function(event) {
-                    event.preventDefault();
-                    const lat = this.getAttribute('data-lat');
-                    const lng = this.getAttribute('data-lng');
-                    
-                    // Create and show the modal
-                    const modal = document.createElement('div');
-                    modal.className = 'modal';
-                    modal.innerHTML = `
-                        <div class="modal-content">
-                            <h3>Choose your preferred navigation app:</h3>
-                            <div class="modal-buttons">
-                                <button class="modal-button google-maps">
-                                    Google Maps
-                                </button>
-                                <button class="modal-button waze">
-                                    Waze
-                                </button>
-                                <button class="modal-button apple-maps">
-                                    Apple Maps
-                                </button>
-                                <button class="modal-button cancel">Cancel</button>
-                            </div>
-                        </div>
-                    `;
-
-                    // Add styles if not already in your CSS
-                    if (!document.querySelector('#modal-styles')) {
-                        const style = document.createElement('style');
-                        style.id = 'modal-styles';
-                        style.textContent = `
-                            .modal {
-                                position: fixed;
-                                top: 0;
-                                left: 0;
-                                width: 100%;
-                                height: 100%;
-                                background: rgba(0, 0, 0, 0.5);
-                                display: flex;
-                                justify-content: center;
-                                align-items: center;
-                                z-index: 1000;
-                            }
-                            .modal-content {
-                                background: white;
-                                padding: 20px;
-                                border-radius: 10px;
-                                max-width: 80%;
-                                text-align: center;
-                            }
-                            .modal-buttons {
-                                margin-top: 20px;
-                                display: flex;
-                                flex-direction: column;
-                                gap: 10px;
-                                align-items: center;
-                            }
-                            .modal-button {
-                                padding: 10px 20px;
-                                border-radius: 10px;
-                                border: 2px solid #ddd;
-                                cursor: pointer;
-                                width: 200px;
-                                display: flex;
-                                align-items: center;
-                                justify-content: center;
-                                gap: 10px;
-                                background: white;
-                                transition: background-color 0.2s;
-                            }
-                            .modal-button:hover {
-                                background-color: #f5f5f5;
-                            }
-                            .google-maps {
-                                color: #4285F4;
-                            }
-                            .waze {
-                                color: #33ccff;
-                            }
-                            .apple-maps {
-                                color: #000000;
-                            }
-                            .cancel {
-                                background: #6c757d;
-                                color: white;
-                                border: none;
-                            }
-                        `;
-                        document.head.appendChild(style);
-                    }
-
-                    document.body.appendChild(modal);
-
-                    // Handle button clicks
-                    modal.querySelector('.google-maps').addEventListener('click', () => {
-                        window.location.href = `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`;
-                        modal.remove();
-                    });
-
-                    modal.querySelector('.waze').addEventListener('click', () => {
-                        window.location.href = `https://www.waze.com/ul?ll=${lat}%2C${lng}&navigate=yes`;
-                        modal.remove();
-                    });
-
-                    modal.querySelector('.apple-maps').addEventListener('click', () => {
-                        const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
-                        if (isIOS) {
-                            window.location.href = `maps://maps.apple.com/?daddr=${lat},${lng}`;
-                        } else {
-                            alert('Apple Maps is only available on iOS devices');
-                        }
-                        modal.remove();
-                    });
-
-                    modal.querySelector('.cancel').addEventListener('click', () => {
-                        modal.remove();
-                    });
-
-                    // Close modal if clicking outside
-                    modal.addEventListener('click', (e) => {
-                        if (e.target === modal) {
-                            modal.remove();
-                        }
-                    });
-                });
-            }
-            
-            if (summaryButton) {
-                summaryButton.addEventListener('click', function(event) {
-                    event.preventDefault();
-                    const locationId = this.getAttribute('data-location-id');
-                    showLocationSummary(locationId);
-                });
-            }
-        });
-        
-        markerClusterGroup.addLayer(locationMarker);
-    });
-    map.addLayer(markerClusterGroup);
-    updateDistanceBox();
-    resetInactivityTimer();
-}        
-        
-function returnToIndex() {
-    showPopup("Confirm", "Are you ready to exit?", 'info', () => {
-        window.location.href = "/index.html";
-    });
-    document.getElementById('returnButton').classList.remove('active');
-}
-
-function toggleNavigationTips() {
-    const tipsElement = document.querySelector('.navigation-tips');
-    const computedStyle = window.getComputedStyle(tipsElement);
-
-    if (computedStyle.display === 'none') {
-        tipsElement.style.display = 'block';
-    } else {
-        tipsElement.style.display = 'none';
-    }
-
-    document.getElementById('tipsButton').classList.toggle('active');
-}
-
-function closeNavigationTips() {
-    document.querySelector('.navigation-tips').style.display =  'none';
-    document.getElementById('tipsButton').classList.remove('active');
-}
+// Main execution
+document.addEventListener('DOMContentLoaded', () => {
+    initMap();
+    addUIEventListeners();
+    addMapEventListeners();
+});
 
 setInterval(() => {
     if (lastPosition && followUser) {
@@ -2269,11 +2167,17 @@ setInterval(() => {
     }
 }, UPDATE_INTERVAL);
 
-document.addEventListener('DOMContentLoaded', function() {
-    initMap();
-    addUIEventListeners();
-    addMapEventListeners();
-});
+// Export functions for testing or external use
+module.exports = {
+    initMap,
+    updateUserLocation,
+    handleLocationError,
+    showLocationHunt,
+    showDirectionsModal,
+    showLocationSummary
+};
+
+console.log("Optimized location-based game script loaded successfully.");
     </script>
   </body>
 </html>
