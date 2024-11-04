@@ -19,36 +19,52 @@ const locations_h = [
     {
         id: 2,
         name: "O'Connor Layover Agreement",
-        lat: 45.14434783374931,
-        lng: -93.00441148466629,
-        image: "https://mnthen.com/images/wsp_eyedea.jpg",
-        audio: "https://mnthen.com/audio/mpls/mpls_grain_belt.mp3",
-        city: "Minneapolis",
+        lat: 44.94347828994008,
+        lng:  -93.09743701161382,
+        image: "https://mnthen.com/images/gangster/layover/stp_oconnor_1.jpg",
+        audio: "https://mnthen.com/audio/tour/gangster/oconnor.mp3",
+        city: "Saint Paul",
         creator: "Matt Reicher",
-        link: "https://mnthen.com/blog/place/wildwood.html",
-        imageSource: "The Plantation Nightclub via the White Bear Press",
+        link: "https://www.mnopedia.org/thing/oconnor-layover-agreement",
+        imageSource: "John O’Connor during the height of his power in St. Paul, c. 1912. via MNHS",
         trivia: {
-            question: "What year was Minneapolis founded?",
-            options: ["1850", "1867", "1872", "1890"],
+            question: "What year did Dan Hogan took over as O'Connor Agreement liaison?",
+            options: ["1902", "1913", "1919", "1924"],
             answer: 1
         }
     },
     {
         id: 3,
-        name: "Location 2",
+        name: "Death of 'Dapper' Dan Hogan",
         lat: 45.144664056565475,
         lng: -93.0030220919916,
-        image: "https://mnthen.com/images/wsp_eyedea.jpg",
-        audio: "https://mnthen.com/audio/mpls/mpls_grain_belt.mp3",
-        city: "St. Paul",
-        creator: "Jane Smith",
-        link: "https://mnthen.com/blog/place/wildwood.html",
-        imageSource: "The Plantation Nightclub via the White Bear Press",
+        image: "https://mnthen.com/images/gangster/hogan/stp_hogan.jpg",
+        audio: "https://mnthen.com/audio/tour/gangster/hogan.mp3",
+        city: "Saint Paul",
+        creator: "Matt Reicher",
+        link: "https://mnthen.com/blog/event/stp_hogan.html",
+        imageSource: "Saint Paul Pioneer Press; Dec 5, 1928 via SPPHS",
         trivia: {
-            question: "What is the nickname of St. Paul?",
-            options: ["The Capital City", "The Twin City", "The Saintly City", "The River City"],
+            question: "Why was Dan Hogan nicknamed 'Dapper'?",
+            options: ["Impressive smile", "His classic car", "Stylish Dress", "Intelligence"],
             answer: 2
         }
     },
-    // Add more locations as needed
+    {
+        id: 4,
+        name: "Shooting of Roy McCord",
+        lat: 45.144664056565475,
+        lng: -93.0030220919916,
+        image: "https://mnthen.com/images/gangster/mccord/stp_mccord_holly.jpg",
+        audio: "https://mnthen.com/audio/tour/gangster/mccord.mp3",
+        city: "Saint Paul",
+        creator: "Matt Reicher",
+        link: "https://mnthen.com/blog/event/stp_mccord_shooting.html",
+        imageSource: "562 Holly Ave. (2013) via the author",
+        trivia: {
+            question: "What was Roy McCord's occupation?",
+            options: ["Pilot", "Custodian", "Radio operator", "Police Officer"],
+            answer: 2
+        }
+    },
 ];
