@@ -36,8 +36,8 @@ const locations_h = [
     {
         id: 3,
         name: "Death of 'Dapper' Dan Hogan",
-        lat: 45.144664056565475,
-        lng: -93.0030220919916,
+        lat: 44.91686647393094,
+        lng:  -93.1429757197338,
         image: "https://mnthen.com/images/gangster/hogan/stp_hogan.jpg",
         audio: "https://mnthen.com/audio/tour/gangster/hogan.mp3",
         city: "Saint Paul",
@@ -53,8 +53,8 @@ const locations_h = [
     {
         id: 4,
         name: "Shooting of Roy McCord",
-        lat: 45.144664056565475,
-        lng: -93.0030220919916,
+        lat: 44.943518677677204,
+        lng: -93.13142857825974,
         image: "https://mnthen.com/images/gangster/mccord/stp_mccord_holly.jpg",
         audio: "https://mnthen.com/audio/tour/gangster/mccord.mp3",
         city: "Saint Paul",
