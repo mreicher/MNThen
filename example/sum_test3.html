@@ -1095,7 +1095,289 @@ function getSpeedBasedZoom(speedMPS) {
     // If speed is 8 MPH or less, return -1 to indicate that the user should control the zoom
     return -1;
 }
+
+// Constants
+const MAX_SPEED = 50; // meters per second
+const MIN_DISTANCE_THRESHOLD = 0.5; // meters
+const VELOCITY_DECAY = 0.8;
+const BEARING_WEIGHT = 0.3;
+const SMOOTHING_FACTOR = 0.3;
+const EXTENDED_DISTANCE_THRESHOLD = 100; // meters
+const STATIONARY_THRESHOLD = 1; // meters
+const STATIONARY_TIME_THRESHOLD = 5000; // 5 seconds
+const STATIONARY_CHECK_INTERVAL = 2500; // 2.5 seconds
+const MAX_ACCEPTABLE_ACCURACY = 30; // meters
+const BUFFER_SIZE = 5;
+
+// Global variables
+let lastUpdateTime = null;
+let lastVelocity = null;
+let isStationary = false;
+let stationaryStartTime = null;
+let stationaryCheckTimeout = null;
+let lastUpdateTimestamp = null;
+let lastPosition = null;
+let positionBuffer = [];
+
+function calculateDistance(pos1, pos2) {
+    const R = 6371e3; // Earth's radius in meters
+    const φ1 = pos1.lat * Math.PI / 180;
+    const φ2 = pos2.lat * Math.PI / 180;
+    const Δφ = (pos2.lat - pos1.lat) * Math.PI / 180;
+    const Δλ = (pos2.lng - pos1.lng) * Math.PI / 180;
+
+    const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
+             Math.cos(φ1) * Math.cos(φ2) *
+             Math.sin(Δλ/2) * Math.sin(Δλ/2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+
+    return R * c;
+}
+
+function applyExponentialSmoothing(newPos, lastPos, alpha) {
+    return {
+        lat: lastPos.lat + alpha * (newPos.lat - lastPos.lat),
+        lng: lastPos.lng + alpha * (newPos.lng - lastPos.lng),
+        accuracy: Math.min(newPos.accuracy, lastPos.accuracy),
+        heading: newPos.heading,
+        timestamp: newPos.timestamp,
+        speedMPS: newPos.speedMPS
+    };
+}
+
+function calculateSmoothedPosition(buffer) {
+    if (!buffer || buffer.length === 0) return null;
+    
+    const validPositions = buffer.filter(pos => pos && typeof pos.lat === 'number' && typeof pos.lng === 'number');
+    if (validPositions.length === 0) return null;
+
+    const weights = validPositions.map((pos, index) => {
+        const accuracyWeight = 1 / Math.max(1, pos.accuracy);
+        const recencyWeight = (index + 1) / validPositions.length;
+        return accuracyWeight * recencyWeight;
+    });
+
+    const totalWeight = weights.reduce((sum, w) => sum + w, 0);
+
+    return {
+        lat: validPositions.reduce((sum, pos, i) => sum + pos.lat * weights[i], 0) / totalWeight,
+        lng: validPositions.reduce((sum, pos, i) => sum + pos.lng * weights[i], 0) / totalWeight,
+        accuracy: Math.min(...validPositions.map(pos => pos.accuracy)),
+        heading: validPositions[validPositions.length - 1].heading,
+        timestamp: validPositions[validPositions.length - 1].timestamp,
+        speedMPS: validPositions[validPositions.length - 1].speedMPS
+    };
+}
+
+function calculateVelocityFilter(newPos, lastPos) {
+    if (!lastVelocity) {
+        lastVelocity = { lat: 0, lng: 0 };
+    }
+
+    const dt = (newPos.timestamp - lastPos.timestamp) / 1000;
+    if (dt <= 0) return newPos;
+
+    const currentVelocity = {
+        lat: (newPos.lat - lastPos.lat) / dt,
+        lng: (newPos.lng - lastPos.lng) / dt
+    };
+
+    lastVelocity = {
+        lat: lastVelocity.lat * VELOCITY_DECAY + currentVelocity.lat * (1 - VELOCITY_DECAY),
+        lng: lastVelocity.lng * VELOCITY_DECAY + currentVelocity.lng * (1 - VELOCITY_DECAY)
+    };
+
+    return {
+        ...newPos,
+        lat: lastPos.lat + lastVelocity.lat * dt,
+        lng: lastPos.lng + lastVelocity.lng * dt
+    };
+}
+
+function predictPositionFromHeading(position, heading, distance) {
+    const R = 6371e3; // Earth's radius in meters
+    const d = distance / R; // Angular distance
+    const θ = heading * Math.PI / 180; // Heading in radians
+    const φ1 = position.lat * Math.PI / 180;
+    const λ1 = position.lng * Math.PI / 180;
+
+    const φ2 = Math.asin(
+        Math.sin(φ1) * Math.cos(d) +
+        Math.cos(φ1) * Math.sin(d) * Math.cos(θ)
+    );
+
+    const λ2 = λ1 + Math.atan2(
+        Math.sin(θ) * Math.sin(d) * Math.cos(φ1),
+        Math.cos(d) - Math.sin(φ1) * Math.sin(φ2)
+    );
+
+    return {
+        lat: φ2 * 180 / Math.PI,
+        lng: λ2 * 180 / Math.PI
+    };
+}
+
+function lerp(a, b, t) {
+    return a + (b - a) * t;
+}
+
+function getSpeedBasedZoom(speedMPS) {
+    if (speedMPS < 1) return 18;
+    if (speedMPS < 5) return 17;
+    if (speedMPS < 10) return 16;
+    if (speedMPS < 20) return 15;
+    if (speedMPS < 40) return 14;
+    return 13;
+}
+
+function updateUserLocation(position, forceUpdate = false) {
+    if (!position || !position.coords || isNaN(position.coords.latitude) || isNaN(position.coords.longitude)) {
+        console.warn("Invalid position data received");
+        return;
+    }
+
+    const currentTime = Date.now();
+    const timeDelta = lastUpdateTime ? (currentTime - lastUpdateTime) / 1000 : 0;
+
+    const newPosition = {
+        lat: position.coords.latitude,
+        lng: position.coords.longitude,
+        accuracy: position.coords.accuracy,
+        heading: position.coords.heading || null,
+        timestamp: currentTime,
+        speedMPS: position.coords.speed || 0
+    };
+
+    if (!lastPosition) {
+        lastPosition = newPosition;
+        userMarker.setLatLng([newPosition.lat, newPosition.lng], { animate: false });
+        kalmanFilter.reset(newPosition);
+        lastUpdateTime = currentTime;
+        stationaryStartTime = currentTime;
+        positionBuffer = [newPosition];
+
+        const zoomLevel = getSpeedBasedZoom(newPosition.speedMPS);
+        if (zoomLevel !== -1) {
+            map.setZoom(zoomLevel, { animate: false });
+        }
+        map.setView([newPosition.lat, newPosition.lng], map.getZoom(), { animate: false, duration: 0 });
+        updateDistanceBox();
+        return;
+    }
+
+    const distance = calculateDistance(lastPosition, newPosition);
+
+    if (distance > EXTENDED_DISTANCE_THRESHOLD || forceUpdate) {
+        userMarker.setLatLng([newPosition.lat, newPosition.lng], { animate: false });
+        lastPosition = newPosition;
+        positionBuffer = [newPosition];
+        kalmanFilter.reset(newPosition);
+        lastVelocity = { lat: 0, lng: 0 };
+
+        const zoomLevel = getSpeedBasedZoom(newPosition.speedMPS);
+        if (zoomLevel !== -1) {
+            map.setZoom(zoomLevel, { animate: false });
+        }
+        map.setView([newPosition.lat, newPosition.lng], map.getZoom(), { animate: false, duration: 0 });
+        updateDistanceBox();
+        lastUpdateTime = currentTime;
+        lastUpdateTimestamp = currentTime;
+        return;
+    }
+
+    if (distance < STATIONARY_THRESHOLD && !forceUpdate) {
+        if (!isStationary) {
+            if (!stationaryStartTime) {
+                stationaryStartTime = currentTime;
+            } else if (currentTime - stationaryStartTime >= STATIONARY_TIME_THRESHOLD) {
+                isStationary = true;
+                console.debug("Device became stationary");
+            }
+        }
+
+        if (isStationary) {
+            const smoothedPosition = {
+                ...lastPosition,
+                lat: lastPosition.lat * 0.9 + newPosition.lat * 0.1,
+                lng: lastPosition.lng * 0.9 + newPosition.lng * 0.1
+            };
+            userMarker.setLatLng([smoothedPosition.lat, smoothedPosition.lng], { animate: false });
+            lastPosition = smoothedPosition;
+            updateDistanceBox();
+            return;
+        }
+    } else {
+        isStationary = false;
+        stationaryStartTime = null;
+    }
+
+    if (!forceUpdate) {
+        if (newPosition.accuracy > MAX_ACCEPTABLE_ACCURACY) {
+            console.debug("Skipping update due to poor accuracy");
+            return;
+        }
+
+        if (distance < MIN_DISTANCE_THRESHOLD) {
+            console.debug("Skipping update due to minimal movement");
+            return;
+        }
+
+        if (timeDelta > 0 && (distance / timeDelta > MAX_SPEED)) {
+            console.debug("Skipping update due to unrealistic speed");
+            return;
+        }
+    }
+
+    try {
+        const velocityFiltered = calculateVelocityFilter(newPosition, lastPosition);
+        const adaptiveAlpha = Math.max(0.1, Math.min(0.9, velocityFiltered.accuracy / MAX_ACCEPTABLE_ACCURACY));
+        const smoothedPosition = applyExponentialSmoothing(velocityFiltered, lastPosition, adaptiveAlpha);
+
+        kalmanFilter.r = smoothedPosition.accuracy / 100;
+        const filteredPosition = kalmanFilter.update(smoothedPosition);
+
+        if (smoothedPosition.heading !== null) {
+            const predictedPosition = predictPositionFromHeading(
+                filteredPosition,
+                smoothedPosition.heading,
+                distance * BEARING_WEIGHT
+            );
+            filteredPosition.lat = lerp(filteredPosition.lat, predictedPosition.lat, BEARING_WEIGHT);
+            filteredPosition.lng = lerp(filteredPosition.lng, predictedPosition.lng, BEARING_WEIGHT);
+        }
+
+        positionBuffer.push(filteredPosition);
+        if (positionBuffer.length > BUFFER_SIZE) {
+            positionBuffer.shift();
+        }
+
+        const finalPosition = calculateSmoothedPosition(positionBuffer);
+        userMarker.setLatLng([finalPosition.lat, finalPosition.lng], { animate: true, duration: 0.3 });
+        lastPosition = finalPosition;
+
+        const zoomLevel = getSpeedBasedZoom(newPosition.speedMPS);
+        if (zoomLevel !== -1) {
+            map.setZoom(zoomLevel, { animate: true, duration: 0.5 });
+        }
+
+        updateDistanceBox();
+
+        if (!isMapInteracting && !userIsInteracting) {
+            const markerLatLng = userMarker.getLatLng();
+            map.setView([markerLatLng.lat, markerLatLng.lng], map.getZoom(), { animate: true, duration: 0.3 });
+        }
+    } catch (error) {
+        console.error("Error updating location:", error);
+        userMarker.setLatLng([newPosition.lat, newPosition.lng], { animate: true, duration: 0.3 });
+        lastPosition = newPosition;
+        updateDistanceBox();
+    }
+
+    lastUpdateTime = currentTime;
+    lastUpdateTimestamp = currentTime;
+}
         
+/*        
 const MAX_SPEED = 50; // meters per second
 const MIN_DISTANCE_THRESHOLD = 0.5; // meters
 const VELOCITY_DECAY = 0.8;
@@ -1115,6 +1397,7 @@ let isStationary = false;
 let stationaryStartTime = null;
 let stationaryCheckTimeout = null;
 lastUpdateTimestamp = null;
+*/
 /*
 function updateUserLocation(position, forceUpdate = false) {
   // Check if position data is valid
