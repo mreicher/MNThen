@@ -105,4 +105,4 @@ By contributing, you agree that your contributions will be licensed under its GP
 
 ## Contact
 
-For more information or support, please contact mattreicher@protonmail.com
+For more information or support, please contact mattreicher@protonmail.com. See the project in action at [Minnesota Then](https://www.mnthen.com)
