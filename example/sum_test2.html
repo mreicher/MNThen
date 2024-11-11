@@ -12,7 +12,7 @@
     <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.4.1/dist/MarkerCluster.css" />
     <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.4.1/dist/MarkerCluster.Default.css" />
     <link rel="stylesheet" href="https://www.mnthen.com/css/mainmap.css">
-    
+   
 </head>
 <body>
     <div id="map"></div>
@@ -101,13 +101,13 @@ let isMapInteracting = false;
 let followUser = true;
 let locationCooldowns = {};
 
-const MIN_DISTANCE_THRESHOLD = 0.5; // meters
+//const MICRO_MOVEMENT_THRESHOLD = 0.3; // Slightly lower for better stationary detection
+//const STATIONARY_ACCURACY_MULTIPLIER = 1.1; // Tighter accuracy bounds
+
 const speedThreshold = 0.5;
 const distanceThreshold = 1;
 
-const STATIONARY_DURATION_THRESHOLD = 30000; // 30 seconds
-        
-const MAX_ACCEPTABLE_ACCURACY = 59; // meters
+const MAX_ACCEPTABLE_ACCURACY = 39; // meters
 
 let lastHiddenTime = 0;
 const BACKGROUND_THRESHOLD = 25000;
@@ -229,7 +229,7 @@ function hideLoadingMessage() {
         document.body.removeChild(loadingMessage);
     }
 }
-/*
+
 function initializeUserLocation(position) {
     console.log("Initial position data:", JSON.stringify(position));
 
@@ -262,63 +262,14 @@ function initializeUserLocation(position) {
     startPositionUpdates();
     startHunt();
 }
-*/
 
-function initializeUserLocation(position) {
-    console.log("Initial position data:", JSON.stringify(position));
-
-    if (!position || !position.coords) {
-        console.error("Invalid initial position object");
-        handleLocationError(new Error("Invalid initial position"));
-        return;
-    }
-
-    const { latitude: userLat, longitude: userLng, accuracy } = position.coords;
-
-    if (isNaN(userLat) || isNaN(userLng)) {
-        console.error("Invalid initial coordinates:", { userLat, userLng });
-        handleLocationError(new Error("Invalid initial coordinates"));
-        return;
-    }
-
-    console.log("Valid initial position:", { userLat, userLng, accuracy });
-
-    try {
-        if (!userMarker) {
-            userMarker = L.marker([userLat, userLng]).addTo(map);
-        } else {
-            userMarker.setLatLng([userLat, userLng]);
-        }
-        map.setView([userLat, userLng], 18);
-    } catch (error) {
-        console.error("Error setting initial user location:", error);
-        handleLocationError(error);
-        return;
-    }
-
-    hideLoadingMessage();
-    startPositionUpdates();
-    startHunt();
-}
-        
 function startPositionUpdates() {
-    let lastUpdateTime = 0;
-    const updateInterval = 1000; // 1 second
-
     navigator.geolocation.watchPosition(
-        (position) => {
-            const currentTime = Date.now();
-            const timeDelta = currentTime - lastUpdateTime;
-
-            if (timeDelta >= updateInterval) {
-                updateUserLocation(position);
-                lastUpdateTime = currentTime;
-            }
-        },
+        handlePositionUpdate,
         handleLocationError,
         {
             enableHighAccuracy: true,
-            maximumAge: 0, // Use the most recent position update
+            maximumAge: 1000,
             timeout: 10000
         }
     );
@@ -353,42 +304,48 @@ function updateLocationAfterBackground() {
         navigator.geolocation.getCurrentPosition(
             (position) => {
                 console.log("Background update raw position:", JSON.stringify(position));
-
                 if (!position || !position.coords) {
                     console.warn("Invalid position object in background update");
                     return;
                 }
-
                 const { latitude, longitude, accuracy } = position.coords;
-
                 if (isNaN(latitude) || isNaN(longitude)) {
                     console.warn("Invalid coordinates in background update:", { latitude, longitude });
                     return;
                 }
-
                 const newPosition = { lat: latitude, lng: longitude };
                 
                 console.log("Valid background position update:", newPosition);
-
                 try {
                     updateUserLocation(position, true);
                 } catch (error) {
                     console.error("Error in updateUserLocation during background update:", error);
                 }
-
                 lastPosition = null;
                 positionBuffer = [];
                 filteredPosition = null;
                 velocity = { lat: 0, lng: 0 };
                 
                 updateDistanceBox();
-                
                 followUser = true;
-                
                 map.invalidateSize();
             },
             (error) => {
                 console.error("Error getting location after background:", error);
+                if (error.code === 3) { // If timeout, retry with lower accuracy
+                    navigator.geolocation.getCurrentPosition(
+                        position => {
+                            console.log("Retry successful with lower accuracy");
+                            updateUserLocation(position, true);
+                        },
+                        error => console.error("Error on retry:", error),
+                        {
+                            enableHighAccuracy: false,
+                            timeout: 20000,
+                            maximumAge: 30000
+                        }
+                    );
+                }
             },
             {
                 enableHighAccuracy: true,
@@ -401,67 +358,53 @@ function updateLocationAfterBackground() {
     }
 }
 
-function calculateSmoothedPosition(positions, alpha = 0.8) {
-    if (positions.length === 0) {
-        return lastKnownPosition || { lat: 0, lng: 0 };
-    }
-
-    const STATIONARY_ALPHA = 0.95; // Higher alpha for more smoothing when stationary
-
-    // Calculate recent movement
-    const recentMovement = positions.length > 1 ? 
-        calculateDistance(positions[positions.length - 1], positions[positions.length - 2]) : 0;
+function calculateSmoothedPosition(buffer, baseAlpha = 0.8) {
+    if (!buffer || buffer.length === 0) return null;
     
-    // Adjust alpha based on recent movement
+    const validPositions = buffer.filter(pos => isValidPosition(pos));
+    if (validPositions.length === 0) return null;
+
+    // Calculate adaptive alpha based on movement
+    const recentMovement = validPositions.length > 1 ? 
+        calculateDistance(validPositions[validPositions.length - 1], validPositions[validPositions.length - 2]) : 0;
+    
+    let alpha = baseAlpha;
     if (recentMovement < MIN_DISTANCE_THRESHOLD) {
-        alpha = STATIONARY_ALPHA; // Use higher alpha when stationary
+        alpha = Math.min(0.9, alpha + 0.1); // More weight to older positions when stationary
+    } else {
+        alpha = Math.max(0.6, alpha - 0.1); // More weight to newer positions when moving
     }
 
-    let sumLat = 0, sumLng = 0, totalWeight = 0;
-    let sumAccuracy = 0;
+    // Calculate weights combining accuracy, recency, and adaptive alpha
+    const weights = validPositions.map((pos, index) => {
+        const accuracyWeight = 1 / Math.max(1, pos.accuracy);
+        const recencyWeight = Math.pow(alpha, validPositions.length - index - 1);
+        const combinedWeight = accuracyWeight * recencyWeight;
+        return Math.max(0.1, combinedWeight); // Ensure minimum weight
+    });
 
-    const len = positions.length;
-    for (let i = 0; i < len; i++) {
-        const weight = Math.pow(alpha, len - i - 1);
-        
-        // Additional weight factor based on accuracy
-        const accuracyWeight = 1 - (positions[i].accuracy / MAX_ACCEPTABLE_ACCURACY);
-        const finalWeight = weight * Math.max(0.1, accuracyWeight);
-        
-        sumLat += positions[i].lat * finalWeight;
-        sumLng += positions[i].lng * finalWeight;
-        sumAccuracy += positions[i].accuracy * weight;
-        totalWeight += finalWeight;
-    }
+    const totalWeight = weights.reduce((sum, w) => sum + w, 0);
+    if (totalWeight === 0) return null;
 
-    // Calculate the weighted average of recent positions
-    const smoothedLat = sumLat / totalWeight;
-    const smoothedLng = sumLng / totalWeight;
-
-    // If stationary, apply additional smoothing
-    if (recentMovement < MIN_DISTANCE_THRESHOLD) {
-        const lastPosition = positions[positions.length - 1];
-        return {
-            lat: lastPosition.lat * 0.2 + smoothedLat * 0.8,
-            lng: lastPosition.lng * 0.2 + smoothedLng * 0.8,
-            accuracy: sumAccuracy / positions.length,
-            timestamp: lastPosition.timestamp,
-            heading: lastPosition.heading
-        };
-    }
-
-    return {
-        lat: smoothedLat,
-        lng: smoothedLng,
-        accuracy: sumAccuracy / positions.length,
-        timestamp: positions[positions.length - 1].timestamp,
-        heading: positions[positions.length - 1].heading
+    const smoothedPos = {
+        lat: validPositions.reduce((sum, pos, i) => sum + pos.lat * weights[i], 0) / totalWeight,
+        lng: validPositions.reduce((sum, pos, i) => sum + pos.lng * weights[i], 0) / totalWeight,
+        accuracy: Math.min(...validPositions.map(pos => pos.accuracy)),
+        heading: validPositions[validPositions.length - 1].heading,
+        timestamp: validPositions[validPositions.length - 1].timestamp,
+        speedMPS: validPositions[validPositions.length - 1].speedMPS
     };
+
+    if (!isValidPosition(smoothedPos)) {
+        return null;
+    }
+
+    return smoothedPos;
 }
-               
+        
 const EDGE_THRESHOLD_PERCENTAGE = 0.25;
 const STRICT_EDGE_THRESHOLD_PERCENTAGE = 0.15;
-const CRITICAL_EDGE_THRESHOLD_PERCENTAGE = 0.10;
+const CRITICAL_EDGE_THRESHOLD_PERCENTAGE = 0.07;
 const MAX_ACCURACY_THRESHOLD = 2500;
 const TARGET_ACCURACY_THRESHOLD = 100;
 
@@ -483,8 +426,7 @@ function calculateEdgeProximity(map, point) {
         west: Math.abs(point.lng - bounds.getWest()) / lngSpan
     };
 }
-        
-/*
+
 function isMarkerNearEdge(map, marker, isStrict = false) {
     const bounds = map.getBounds();
     const point = marker.getLatLng();
@@ -507,51 +449,7 @@ function isMarkerNearEdge(map, marker, isStrict = false) {
         proximities: proximities
     };
 }
-*/
 
-function isMarkerNearEdge(map, marker, isStrict = false) {
-    const bounds = map.getBounds();
-    const point = marker.getLatLng();
-    const proximities = calculateEdgeProximity(map, point);
-
-    const thresholdPercentage = isStrict ?
-        STRICT_EDGE_THRESHOLD_PERCENTAGE :
-        EDGE_THRESHOLD_PERCENTAGE;
-
-    const edges = {
-        north: proximities.north < thresholdPercentage,
-        south: proximities.south < thresholdPercentage,
-        east: proximities.east < thresholdPercentage,
-        west: proximities.west < thresholdPercentage
-    };
-
-    const isNearEdge = Object.values(edges).some(edge => edge);
-
-    // Check if the marker is near the critical edge threshold
-    const isCriticallyNearEdge = Object.values(edges).some(edge => edge < CRITICAL_EDGE_THRESHOLD_PERCENTAGE);
-
-    // Adjust the accuracy threshold based on the marker's proximity to the edge
-    if (isNearEdge) {
-        currentAccuracyThreshold = Math.max(
-            TARGET_ACCURACY_THRESHOLD,
-            currentAccuracyThreshold - (isCriticallyNearEdge ? 500 : 100)
-        );
-    } else {
-        currentAccuracyThreshold = Math.min(
-            MAX_ACCURACY_THRESHOLD,
-            currentAccuracyThreshold + 100
-        );
-    }
-
-    return {
-        isNearEdge,
-        isCriticallyNearEdge,
-        edges,
-        proximities,
-        currentAccuracyThreshold
-    };
-}
-        
 function isMarkerVisible(map, marker) {
     const bounds = map.getBounds();
     const point = marker.getLatLng();
@@ -618,204 +516,51 @@ function shouldRecenter(map, marker) {
         isEmergency: false,
         edgeInfo: edgeInfo
     };
-}       
-/*
-var kalmanFilter = {
+}      
+        
+        var kalmanFilter = {
     x: { estimate: 0, error: 1 },
     y: { estimate: 0, error: 1 },
-    vx: { estimate: 0, error: 1 },
-    vy: { estimate: 0, error: 1 },
-    q: 0.015, // Initial process noise
-    r: 1, // Initial measurement noise
-    lastTimestamp: 0,
-    movingAverageWindow: [], // Add moving average for smoothing
-    maxWindowSize: 3, // Configurable window size
-    stationaryThreshold: 0.5, // Threshold for considering the user as stationary
-    maxVelocity: 20, // Maximum allowed velocity (m/s)
-
+    q: 0.015,
+    r: 1,
+    
     update: function(measurement) {
-        // Handle invalid measurements
-        if (!this.isValidMeasurement(measurement)) {
-            return this.getLastValidEstimate();
+        if (this.x.estimate === 0 && this.y.estimate === 0) {
+            this.x.estimate = measurement.lng;
+            this.y.estimate = measurement.lat;
+            return measurement;
         }
-
-        const dt = this.calculateTimeDelta(measurement.timestamp);
-
-        // Initial state handling
-        if (this.isInitialState()) {
-            return this.initializeState(measurement);
-        }
-
-        // Kalman filter core calculations
-        const prediction = this.predict(dt);
-        const updated = this.updateEstimates(prediction, measurement, dt);
-
-        // Enhanced smoothing using moving average
-        this.updateMovingAverage(updated);
-
-        // Adaptive parameter tuning with enhanced logic
-        this.adaptParameters(measurement, prediction, dt);
-
-        return this.getSmoothedEstimate();
-    },
-
-    isValidMeasurement: function(measurement) {
-        return measurement &&
-               !isNaN(measurement.lat) &&
-               !isNaN(measurement.lng) &&
-               measurement.accuracy > 0 &&
-               measurement.accuracy < 100 && // Reject very inaccurate readings
-               this.isWithinVelocityLimit(measurement, this.getLastValidEstimate());
-    },
-
-    isWithinVelocityLimit: function(measurement, lastValidEstimate) {
-        if (!lastValidEstimate) {
-            return true;
-        }
-
-        const distance = this.calculateDistance(measurement, lastValidEstimate);
-        const velocity = distance / this.calculateTimeDelta(measurement.timestamp);
-        return velocity <= this.maxVelocity;
-    },
-
-    calculateTimeDelta: function(timestamp) {
-        const dt = (timestamp - this.lastTimestamp) / 1000;
-        this.lastTimestamp = timestamp;
-        return Math.min(dt, 1); // Cap maximum time delta
-    },
-
-    calculateDistance: function(pos1, pos2) {
-        return Math.sqrt(
-            Math.pow(pos1.lng - pos2.lng, 2) +
-            Math.pow(pos1.lat - pos2.lat, 2)
-        );
-    },
-
-    predict: function(dt) {
+        
+        // X coordinate (longitude)
+        var predX = this.x.estimate;
+        var predErrX = this.x.error + this.q;
+        var gainX = predErrX / (predErrX + this.r);
+        this.x.estimate = predX + gainX * (measurement.lng - predX);
+        this.x.error = (1 - gainX) * predErrX;
+        
+        // Y coordinate (latitude)
+        var predY = this.y.estimate;
+        var predErrY = this.y.error + this.q;
+        var gainY = predErrY / (predErrY + this.r);
+        this.y.estimate = predY + gainY * (measurement.lat - predY);
+        this.y.error = (1 - gainY) * predErrY;
+        
         return {
-            x: this.x.estimate + this.vx.estimate * dt,
-            y: this.y.estimate + this.vy.estimate * dt,
-            errorX: this.x.error + this.q * dt,
-            errorY: this.y.error + this.q * dt,
-            errorVx: this.vx.error + this.q * dt,
-            errorVy: this.vy.error + this.q * dt
+            lat: this.y.estimate,
+            lng: this.x.estimate,
+            accuracy: measurement.accuracy,
+            timestamp: measurement.timestamp
         };
     },
-
-    updateEstimates: function(pred, measurement, dt) {
-        // Calculate Kalman gains with improved noise handling
-        const gainX = pred.errorX / (pred.errorX + this.r * measurement.accuracy);
-        const gainY = pred.errorY / (pred.errorY + this.r * measurement.accuracy);
-        const gainVx = pred.errorVx / (pred.errorVx + this.r * measurement.accuracy / dt);
-        const gainVy = pred.errorVy / (pred.errorVy + this.r * measurement.accuracy / dt);
-
-        // Update state estimates with velocity dampening
-        const velocityDamping = 0.95; // Slight dampening to prevent oscillation
-
-        const updated = {
-            lat: pred.y + gainY * (measurement.lat - pred.y),
-            lng: pred.x + gainX * (measurement.lng - pred.x),
-            vx: this.vx.estimate * velocityDamping +
-                gainVx * ((measurement.lng - pred.x) / dt - this.vx.estimate),
-            vy: this.vy.estimate * velocityDamping +
-                gainVy * ((measurement.lat - pred.y) / dt - this.vy.estimate)
-        };
-
-        // Update error estimates
-        this.x.error = (1 - gainX) * pred.errorX;
-        this.y.error = (1 - gainY) * pred.errorY;
-        this.vx.error = (1 - gainVx) * pred.errorVx;
-        this.vy.error = (1 - gainVy) * pred.errorVy;
-
-        // Update state
-        this.x.estimate = updated.lng;
-        this.y.estimate = updated.lat;
-        this.vx.estimate = updated.vx;
-        this.vy.estimate = updated.vy;
-
-        return updated;
-    },
-
-    updateMovingAverage: function(position) {
-        this.movingAverageWindow.push(position);
-        if (this.movingAverageWindow.length > this.maxWindowSize) {
-            this.movingAverageWindow.shift();
-        }
-    },
-
-    adaptParameters: function(measurement, prediction, dt) {
-        // Calculate innovation with heading consideration
-        const innovation = this.calculateDistance(measurement, prediction);
-
-        // Enhanced adaptive factor calculation
-        const velocityMagnitude = Math.sqrt(
-            this.vx.estimate * this.vx.estimate +
-            this.vy.estimate * this.vy.estimate
-        );
-
-        const adaptiveFactor = Math.min(
-            Math.max(
-                (innovation / measurement.accuracy) *
-                (1 + velocityMagnitude),
-                0.1
-            ),
-            10
-        );
-
-        // Update noise parameters with smoothing
-        this.q = 0.015 * adaptiveFactor;
-        this.r = Math.max(1, measurement.accuracy * adaptiveFactor);
-
-        // Adjust process noise (Q) based on user's movement pattern
-        if (velocityMagnitude < this.stationaryThreshold) {
-            this.q *= 0.5; // Reduce process noise for stationary users
-        } else {
-            this.q *= 1.5; // Increase process noise for moving users
-        }
-    },
-
-    getSmoothedEstimate: function() {
-        if (this.movingAverageWindow.length === 0) {
-            return {
-                lat: this.y.estimate,
-                lng: this.x.estimate,
-                accuracy: Math.sqrt(this.x.error + this.y.error),
-                timestamp: this.lastTimestamp,
-                velocity: Math.sqrt(
-                    this.vx.estimate * this.vx.estimate +
-                    this.vy.estimate * this.vy.estimate
-                )
-            };
-        }
-
-        // Calculate weighted average favoring recent positions
-        const weights = this.movingAverageWindow.map((_, i) =>
-            i + 1);
-        const sumWeights = weights.reduce((a, b) => a + b, 0);
-
-        const smoothed = this.movingAverageWindow.reduce((acc, pos, i) => ({
-            lat: acc.lat + pos.lat * weights[i],
-            lng: acc.lng + pos.lng * weights[i]
-        }), { lat: 0, lng: 0 });
-
-        return {
-            lat: smoothed.lat / sumWeights,
-            lng: smoothed.lng / sumWeights,
-            accuracy: Math.sqrt(this.x.error + this.y.error),
-            timestamp: this.lastTimestamp,
-            velocity: Math.sqrt(
-                this.vx.estimate * this.vx.estimate +
-                this.vy.estimate * this.vy.estimate
-            )
-        };
-    },
-
+    
     reset: function(measurement) {
-        // Your existing reset code
-        this.movingAverageWindow = []; // Add this line
+        this.x.estimate = measurement.lng;
+        this.y.estimate = measurement.lat;
+        this.x.error = 1;
+        this.y.error = 1;
     }
 };
-        
+
 function calculateWeightedPosition(positions, smoothingFactor = 0.8) {
     console.log("Calculating weighted average for positions:", JSON.stringify(positions));
     if (!Array.isArray(positions) || positions.length === 0) {
@@ -860,230 +605,6 @@ function calculateWeightedPosition(positions, smoothingFactor = 0.8) {
 
     return result;
 }
-      */
-
-var kalmanFilter = {
-    x: { estimate: 0, error: 1 },
-    y: { estimate: 0, error: 1 },
-    vx: { estimate: 0, error: 1 },
-    vy: { estimate: 0, error: 1 },
-    q: 0.015, // Initial process noise
-    r: 1, // Initial measurement noise
-    lastTimestamp: 0,
-    movingAverageWindow: [], // Add moving average for smoothing
-    maxWindowSize: 3, // Configurable window size
-    stationaryThreshold: 0.5, // Threshold for considering the user as stationary
-    maxVelocity: 20, // Maximum allowed velocity (m/s)
-
-    update: function(measurement) {
-        // Handle invalid measurements
-        if (!this.isValidMeasurement(measurement)) {
-            return this.getLastValidEstimate();
-        }
-
-        const dt = this.calculateTimeDelta(measurement.timestamp);
-
-        // Initial state handling
-        if (this.isInitialState()) {
-            return this.initializeState(measurement);
-        }
-
-        // Kalman filter core calculations
-        const prediction = this.predict(dt);
-        const updated = this.updateEstimates(prediction, measurement, dt);
-
-        // Enhanced smoothing using moving average
-        this.updateMovingAverage(updated);
-
-        // Adaptive parameter tuning with enhanced logic
-        this.adaptParameters(measurement, prediction, dt);
-
-        return this.getSmoothedEstimate();
-    },
-
-    isValidMeasurement: function(measurement) {
-        return measurement &&
-               !isNaN(measurement.lat) &&
-               !isNaN(measurement.lng) &&
-               measurement.accuracy > 0 &&
-               measurement.accuracy < 100 && // Reject very inaccurate readings
-               this.isWithinVelocityLimit(measurement, this.getLastValidEstimate());
-    },
-
-    isWithinVelocityLimit: function(measurement, lastValidEstimate) {
-        if (!lastValidEstimate) {
-            return true;
-        }
-
-        const distance = this.calculateDistance(measurement, lastValidEstimate);
-        const velocity = distance / this.calculateTimeDelta(measurement.timestamp);
-        return velocity <= this.maxVelocity;
-    },
-
-    calculateTimeDelta: function(timestamp) {
-        const dt = (timestamp - this.lastTimestamp) / 1000;
-        this.lastTimestamp = timestamp;
-        return Math.min(dt, 1); // Cap maximum time delta
-    },
-
-    calculateDistance: function(pos1, pos2) {
-        return Math.sqrt(
-            Math.pow(pos1.lng - pos2.lng, 2) +
-            Math.pow(pos1.lat - pos2.lat, 2)
-        );
-    },
-
-    predict: function(dt) {
-        return {
-            x: this.x.estimate + this.vx.estimate * dt,
-            y: this.y.estimate + this.vy.estimate * dt,
-            errorX: this.x.error + this.q * dt,
-            errorY: this.y.error + this.q * dt,
-            errorVx: this.vx.error + this.q * dt,
-            errorVy: this.vy.error + this.q * dt
-        };
-    },
-
-    updateEstimates: function(pred, measurement, dt) {
-        // Calculate Kalman gains with improved noise handling
-        const gainX = pred.errorX / (pred.errorX + this.r * measurement.accuracy);
-        const gainY = pred.errorY / (pred.errorY + this.r * measurement.accuracy);
-        const gainVx = pred.errorVx / (pred.errorVx + this.r * measurement.accuracy / dt);
-        const gainVy = pred.errorVy / (pred.errorVy + this.r * measurement.accuracy / dt);
-
-        // Update state estimates with velocity dampening
-        const velocityDamping = 0.95; // Slight dampening to prevent oscillation
-
-        const updated = {
-            lat: pred.y + gainY * (measurement.lat - pred.y),
-            lng: pred.x + gainX * (measurement.lng - pred.x),
-            vx: this.vx.estimate * velocityDamping +
-                gainVx * ((measurement.lng - pred.x) / dt - this.vx.estimate),
-            vy: this.vy.estimate * velocityDamping +
-                gainVy * ((measurement.lat - pred.y) / dt - this.vy.estimate)
-        };
-
-        // Update error estimates
-        this.x.error = (1 - gainX) * pred.errorX;
-        this.y.error = (1 - gainY) * pred.errorY;
-        this.vx.error = (1 - gainVx) * pred.errorVx;
-        this.vy.error = (1 - gainVy) * pred.errorVy;
-
-        // Update state
-        this.x.estimate = updated.lng;
-        this.y.estimate = updated.lat;
-        this.vx.estimate = updated.vx;
-        this.vy.estimate = updated.vy;
-
-        return updated;
-    },
-
-    updateMovingAverage: function(position) {
-        this.movingAverageWindow.push(position);
-        if (this.movingAverageWindow.length > this.maxWindowSize) {
-            this.movingAverageWindow.shift();
-        }
-    },
-
-    adaptParameters: function(measurement, prediction, dt) {
-        // Calculate innovation with heading consideration
-        const innovation = this.calculateDistance(measurement, prediction);
-
-        // Enhanced adaptive factor calculation
-        const velocityMagnitude = Math.sqrt(
-            this.vx.estimate * this.vx.estimate +
-            this.vy.estimate * this.vy.estimate
-        );
-
-        const adaptiveFactor = Math.min(
-            Math.max(
-                (innovation / measurement.accuracy) *
-                (1 + velocityMagnitude),
-                0.1
-            ),
-            10
-        );
-
-        // Update noise parameters with smoothing
-        this.q = 0.015 * adaptiveFactor;
-        this.r = Math.max(1, measurement.accuracy * adaptiveFactor);
-
-        // Adjust process noise (Q) based on user's movement pattern
-        if (velocityMagnitude < this.stationaryThreshold) {
-            this.q *= 0.5; // Reduce process noise for stationary users
-        } else {
-            this.q *= 1.5; // Increase process noise for moving users
-        }
-    },
-
-    getSmoothedEstimate: function() {
-        if (this.movingAverageWindow.length === 0) {
-            return {
-                lat: this.y.estimate,
-                lng: this.x.estimate,
-                accuracy: Math.sqrt(this.x.error + this.y.error),
-                timestamp: this.lastTimestamp,
-                velocity: Math.sqrt(
-                    this.vx.estimate * this.vx.estimate +
-                    this.vy.estimate * this.vy.estimate
-                )
-            };
-        }
-
-        // Calculate weighted average favoring recent positions
-        const weights = this.movingAverageWindow.map((_, i) => i + 1);
-        const sumWeights = weights.reduce((a, b) => a + b, 0);
-
-        const smoothed = this.movingAverageWindow.reduce((acc, pos, i) => ({
-            lat: acc.lat + pos.lat * weights[i],
-            lng: acc.lng + pos.lng * weights[i]
-        }), { lat: 0, lng: 0 });
-
-        return {
-            lat: smoothed.lat / sumWeights,
-            lng: smoothed.lng / sumWeights,
-            accuracy: Math.sqrt(this.x.error + this.y.error),
-            timestamp: this.lastTimestamp,
-            velocity: Math.sqrt(
-                this.vx.estimate * this.vx.estimate +
-                this.vy.estimate * this.vy.estimate
-            )
-        };
-    },
-
-    reset: function(measurement) {
-        // Your existing reset code
-        this.movingAverageWindow = []; // Add this line
-    },
-
-    isInitialState: function() {
-        return this.lastTimestamp === 0;
-    },
-
-    initializeState: function(measurement) {
-        this.x.estimate = measurement.lng;
-        this.y.estimate = measurement.lat;
-        this.vx.estimate = 0;
-        this.vy.estimate = 0;
-        this.lastTimestamp = measurement.timestamp;
-        this.movingAverageWindow = [measurement];
-        return measurement;
-    },
-
-    getLastValidEstimate: function() {
-        return {
-            lat: this.y.estimate,
-            lng: this.x.estimate,
-            accuracy: Math.sqrt(this.x.error + this.y.error),
-            timestamp: this.lastTimestamp,
-            velocity: Math.sqrt(
-                this.vx.estimate * this.vx.estimate +
-                this.vy.estimate * this.vy.estimate
-            )
-        };
-    }
-};
-   
 //change the zoom based on the speed of the user device. Logic should be added to the updateUserLocation function.
 const SPEED_ZOOM_THRESHOLDS = [
     { speed: 35, zoom: 13 },  // Highway speeds
@@ -1108,11 +629,12 @@ function getSpeedBasedZoom(speedMPS) {
 
 // Existing constants
 const MAX_SPEED = 50;
+const MIN_DISTANCE_THRESHOLD = 2;
 const VELOCITY_DECAY = 0.8;
 const BEARING_WEIGHT = 0.3;
 const SMOOTHING_FACTOR = 0.3;
 const EXTENDED_DISTANCE_THRESHOLD = 100;
-const STATIONARY_THRESHOLD = 1;
+const STATIONARY_THRESHOLD = 2;
 const STATIONARY_TIME_THRESHOLD = 5000;
 const STATIONARY_CHECK_INTERVAL = 2500;
 
@@ -1141,63 +663,113 @@ function isValidPosition(pos) {
            typeof pos.accuracy === 'number' && !isNaN(pos.accuracy);
 }
 
-function calculateVelocityFilter(newPosition, lastPosition) {
-    if (!newPosition || !lastPosition || typeof newPosition.lat !== 'number' || typeof newPosition.lng !== 'number' || 
+const STATIONARY_THRESHOLDB = 3; // Number of consecutive stationary positions to consider user as stationary
+const MAX_ALPHA = 0.2; // Maximum alpha value for high movement
+const MIN_ALPHA = 0.025; // Minimum alpha value for stationary state
+
+let stationaryCount = 0;
+let lastSmoothedPosition = null;
+
+function applyExponentialSmoothing(newPosition, lastPosition, baseAlpha = 0.25) {
+    // Validate inputs
+    if (!newPosition || !lastPosition || 
+        typeof newPosition.lat !== 'number' || typeof newPosition.lng !== 'number' || 
         typeof lastPosition.lat !== 'number' || typeof lastPosition.lng !== 'number') {
-        console.warn("Invalid input to calculateVelocityFilter");
+        console.warn("Invalid input to applyExponentialSmoothing");
         return newPosition;
     }
 
-    const timeElapsed = (newPosition.timestamp - lastPosition.timestamp) / 1000;
+    // Initialize lastSmoothedPosition if it doesn't exist
+    if (!lastSmoothedPosition) {
+        lastSmoothedPosition = lastPosition;
+    }
+
+    const distance = calculateDistance(newPosition, lastSmoothedPosition);
     
-    if (timeElapsed <= 0 || timeElapsed > 10) {
-        lastVelocity = { lat: 0, lng: 0 };
-        return newPosition;
+    // Enhanced stationary detection
+    if (distance < MIN_DISTANCE_THRESHOLD) {
+        stationaryCount = Math.min(stationaryCount + 1, STATIONARY_THRESHOLD);
+    } else {
+        stationaryCount = Math.max(stationaryCount - 1, 0);
     }
 
-    const currentVelocity = {
-        lat: (newPosition.lat - lastPosition.lat) / timeElapsed,
-        lng: (newPosition.lng - lastPosition.lng) / timeElapsed
+    // Calculate adaptive alpha
+    let alpha = baseAlpha;
+
+    // Adjust alpha based on movement state
+    if (stationaryCount >= STATIONARY_THRESHOLD) {
+        alpha = MIN_ALPHA;
+    } else {
+        // Gradually reduce alpha as we approach stationary state
+        alpha = MAX_ALPHA - (stationaryCount / STATIONARY_THRESHOLD) * (MAX_ALPHA - MIN_ALPHA);
+    }
+
+    // Accuracy-based adjustment
+    const accuracyRatio = Math.max(0, Math.min(1, 1 - (newPosition.accuracy / MAX_ACCEPTABLE_ACCURACY)));
+    alpha = alpha * (0.5 + 0.5 * accuracyRatio);
+
+    // Speed-based adjustment
+    if (newPosition.speedMPS !== undefined && newPosition.speedMPS < 0.5) {
+        alpha *= 0.4; // Extra smoothing at very low speeds
+    }
+
+    // Time-based adjustment to handle GPS jitter
+    const timeDelta = newPosition.timestamp - lastPosition.timestamp;
+    if (timeDelta < 1000) { // If updates are very frequent
+        alpha *= 0.7; // Reduce impact of rapid updates
+    }
+
+    // Apply smoothing with weighted factors
+    const smoothedPosition = {
+        lat: lastSmoothedPosition.lat + alpha * (newPosition.lat - lastSmoothedPosition.lat),
+        lng: lastSmoothedPosition.lng + alpha * (newPosition.lng - lastSmoothedPosition.lng),
+        accuracy: Math.min(newPosition.accuracy, lastSmoothedPosition.accuracy),
+        heading: newPosition.heading,
+        timestamp: newPosition.timestamp,
+        speedMPS: newPosition.speedMPS ? 
+                  lastSmoothedPosition.speedMPS * 0.7 + newPosition.speedMPS * 0.3 : // Smooth speed changes
+                  newPosition.speedMPS
     };
 
+    // Apply additional smoothing to heading when stationary
+    if (stationaryCount >= STATIONARY_THRESHOLD && lastSmoothedPosition.heading !== undefined) {
+        smoothedPosition.heading = alpha * newPosition.heading + (1 - alpha) * lastSmoothedPosition.heading;
+    }
+
+    // Additional stabilization for very small movements
+    if (distance < MIN_DISTANCE_THRESHOLD * 0.5) {
+        smoothedPosition.lat = lastSmoothedPosition.lat * 0.95 + smoothedPosition.lat * 0.05;
+        smoothedPosition.lng = lastSmoothedPosition.lng * 0.95 + smoothedPosition.lng * 0.05;
+    }
+
+    // Update last smoothed position
+    lastSmoothedPosition = smoothedPosition;
+
+    return smoothedPosition;
+}
+        
+function calculateVelocityFilter(newPos, lastPos) {
     if (!lastVelocity) {
         lastVelocity = { lat: 0, lng: 0 };
     }
 
-    const accuracyRatio = Math.min(1, Math.max(0, 1 - (newPosition.accuracy / MAX_ACCEPTABLE_ACCURACY)));
-    const smoothingFactor = 0.8 * accuracyRatio + 0.1;
+    const dt = (newPos.timestamp - lastPos.timestamp) / 1000;
+    if (dt <= 0) return newPos;
 
-    lastVelocity = {
-        lat: smoothingFactor * lastVelocity.lat + (1 - smoothingFactor) * currentVelocity.lat,
-        lng: smoothingFactor * lastVelocity.lng + (1 - smoothingFactor) * currentVelocity.lng
+    const currentVelocity = {
+        lat: (newPos.lat - lastPos.lat) / dt,
+        lng: (newPos.lng - lastPos.lng) / dt
     };
 
-    const maxAcceleration = 2; // m/s^2
-    const velocityDelta = {
-        lat: lastVelocity.lat - currentVelocity.lat,
-        lng: lastVelocity.lng - currentVelocity.lng
-    };
-    
-    if (Math.abs(velocityDelta.lat) > maxAcceleration * timeElapsed) {
-        lastVelocity.lat = currentVelocity.lat + (maxAcceleration * timeElapsed * Math.sign(velocityDelta.lat));
-    }
-    if (Math.abs(velocityDelta.lng) > maxAcceleration * timeElapsed) {
-        lastVelocity.lng = currentVelocity.lng + (maxAcceleration * timeElapsed * Math.sign(velocityDelta.lng));
-    }
-
-    const maxVelocity = 50; // m/s
     lastVelocity = {
-        lat: Math.max(-maxVelocity, Math.min(maxVelocity, lastVelocity.lat)),
-        lng: Math.max(-maxVelocity, Math.min(maxVelocity, lastVelocity.lng))
+        lat: lastVelocity.lat * VELOCITY_DECAY + currentVelocity.lat * (1 - VELOCITY_DECAY),
+        lng: lastVelocity.lng * VELOCITY_DECAY + currentVelocity.lng * (1 - VELOCITY_DECAY)
     };
 
     return {
-        lat: lastPosition.lat + lastVelocity.lat * timeElapsed,
-        lng: lastPosition.lng + lastVelocity.lng * timeElapsed,
-        accuracy: newPosition.accuracy,
-        timestamp: newPosition.timestamp,
-        heading: newPosition.heading,
-        speedMPS: Math.sqrt(lastVelocity.lat * lastVelocity.lat + lastVelocity.lng * lastVelocity.lng)
+        ...newPos,
+        lat: lastPos.lat + lastVelocity.lat * dt,
+        lng: lastPos.lng + lastVelocity.lng * dt
     };
 }
 
@@ -1294,390 +866,208 @@ function calculateStationaryPosition(newPos) {
         speedMPS: 0
     };
 }
-     /*
-function isValidLatitude(lat) {
-   return lat >= -90 && lat <= 90;
-}
 
-function isValidLongitude(lng) {
-   return lng >= -180 && lng <= 180;
+function checkStationaryState(newPosition) {
+    if (!lastPosition) return;
+    
+    const distance = calculateDistance(lastPosition, newPosition);
+    
+    if (distance >= MICRO_MOVEMENT_THRESHOLD) {
+        isStationary = false;
+        stationaryStartTime = null;
+        console.debug("Movement detected, resuming normal updates");
+    }
+    
+    if (stationaryCheckTimeout) {
+        clearTimeout(stationaryCheckTimeout);
+        stationaryCheckTimeout = null;
+    }
+    
+    if (isStationary) {
+        stationaryCheckTimeout = setTimeout(() => checkStationaryState(newPosition), STATIONARY_CHECK_INTERVAL);
+    }
 }
 
 function updateUserLocation(position, forceUpdate = false) {
-   // Enhanced initial validation
-   if (!position || !position.coords || isNaN(position.coords.latitude) || isNaN(position.coords.longitude)) {
-       console.warn("Invalid position data received");
-       return;
+ if (!position?.coords?.latitude || !position?.coords?.longitude) {
+   console.warn("Invalid position data received");
+   return;
+ }
+
+ const currentTime = Date.now();
+ const timeDelta = lastUpdateTime ? (currentTime - lastUpdateTime) / 1000 : 0;
+
+ const newPosition = {
+   lat: position.coords.latitude,
+   lng: position.coords.longitude,
+   accuracy: position.coords.accuracy || 20,
+   heading: position.coords.heading ?? null,
+   timestamp: currentTime,
+   speedMPS: position.coords.speed || 0
+ };
+
+ if (!lastPosition) {
+   lastPosition = newPosition;
+   userMarker.setLatLng([newPosition.lat, newPosition.lng]);
+   kalmanFilter.reset(newPosition);
+   lastUpdateTime = currentTime;
+   stationaryStartTime = currentTime;
+   positionBuffer = [newPosition];
+   
+   const zoomLevel = getSpeedBasedZoom(newPosition.speedMPS);
+   if (zoomLevel !== -1) {
+     map.setZoom(zoomLevel, { animate: false });
    }
+   map.setView([newPosition.lat, newPosition.lng], map.getZoom(), { animate: false });
+   updateDistanceBox();
+   return;
+ }
 
-   // Add validation for obviously incorrect coordinates
-   if (position.coords.accuracy > 3000 || 
-       !isValidLatitude(position.coords.latitude) ||  
-       !isValidLongitude(position.coords.longitude)) { 
-       console.warn("Rejecting suspicious position data:", position.coords);
-       return;
+ const distance = calculateDistance(lastPosition, newPosition);
+
+ if (distance > EXTENDED_DISTANCE_THRESHOLD || forceUpdate) {
+   if (stationaryCheckTimeout) {
+       clearTimeout(stationaryCheckTimeout);
+       stationaryCheckTimeout = null;
    }
+   isStationary = false;
+   stationaryStartTime = null;
 
-   const currentTime = Date.now();
-   const timeDelta = lastUpdateTime ? (currentTime - lastUpdateTime) / 1000 : 0;
+   const smoothedPosition = applyExponentialSmoothing(newPosition, lastPosition);
+   userMarker.setLatLng([smoothedPosition.lat, smoothedPosition.lng], { animate: false });
+   lastPosition = smoothedPosition;
+   positionBuffer = [smoothedPosition];
+   kalmanFilter.reset(smoothedPosition);
+   lastVelocity = { lat: 0, lng: 0 };
 
-   const newPosition = {
-       lat: position.coords.latitude,
-       lng: position.coords.longitude,
-       accuracy: position.coords.accuracy,
-       heading: position.coords.heading || null,
-       timestamp: currentTime,
-       speedMPS: position.coords.speed || 0
-   };
-
-   // Initialize lastPosition if it's the first update
-   if (!lastPosition) {
-       lastPosition = newPosition;
-       userMarker.setLatLng([newPosition.lat, newPosition.lng], { animate: false });
-       kalmanFilter.reset(newPosition);
-       lastUpdateTime = currentTime;
-       stationaryStartTime = currentTime;
-       positionBuffer = [newPosition]; // Initialize buffer with first position
-
-       const zoomLevel = getSpeedBasedZoom(newPosition.speedMPS);
-       if (zoomLevel !== -1) {
-           map.setZoom(zoomLevel, { animate: false });
-       }
-       map.setView([newPosition.lat, newPosition.lng], map.getZoom(), { animate: false, duration: 0 });
-       updateDistanceBox();
-       return;
+   const zoomLevel = getSpeedBasedZoom(smoothedPosition.speedMPS);
+   if (zoomLevel !== -1) {
+       map.setZoom(zoomLevel, { animate: false });
    }
-
-   // Check if lastPosition is valid
-   if (!lastPosition || typeof lastPosition.lat !== 'number' || typeof lastPosition.lng !== 'number') {
-       console.error("Invalid lastPosition, resetting to new position");
-       lastPosition = newPosition;
-       positionBuffer = [newPosition];
-       userMarker.setLatLng([newPosition.lat, newPosition.lng], { animate: false });
-       return;
-   }
-
-   const distance = calculateDistance(lastPosition, newPosition);
-
-   // Move extended distance check earlier and always recenter
-   if (distance > EXTENDED_DISTANCE_THRESHOLD || forceUpdate) {
-       userMarker.setLatLng([newPosition.lat, newPosition.lng], { animate: false });
-       lastPosition = newPosition;
-       positionBuffer = [newPosition];
-       kalmanFilter.reset(newPosition);
-       lastVelocity = { lat: 0, lng: 0 };
-
-       const zoomLevel = getSpeedBasedZoom(newPosition.speedMPS);
-       if (zoomLevel !== -1) {
-           map.setZoom(zoomLevel, { animate: false });
-       }
-       map.setView([newPosition.lat, newPosition.lng], map.getZoom(), { animate: false, duration: 0 });
-       updateDistanceBox();
-       lastUpdateTime = currentTime;
-       lastUpdateTimestamp = currentTime;
-       console.log("Extended distance update complete");
-       return;
-   }
-
-   // Check if device is stationary
-   if (distance < STATIONARY_THRESHOLD && !forceUpdate) {
-       if (!isStationary) {
-           if (!stationaryStartTime) {
-               stationaryStartTime = currentTime;
-           } else if (currentTime - stationaryStartTime >= STATIONARY_TIME_THRESHOLD) {
-               isStationary = true;
-               console.debug("Device became stationary");
-
-               // Set up periodic check for significant movement
-               if (stationaryCheckTimeout) clearTimeout(stationaryCheckTimeout);
-               stationaryCheckTimeout = setTimeout(() => {
-                   if (calculateDistance(lastPosition, newPosition) >= STATIONARY_THRESHOLD) {
-                       isStationary = false;
-                       stationaryStartTime = null;
-                       console.debug("Movement detected, resuming normal updates");
-                   }
-               }, STATIONARY_CHECK_INTERVAL);
-
-               // Apply additional smoothing when device is stationary
-               const additionalAlpha = 0.95;
-               const smoothedPosition = applyExponentialSmoothing(newPosition, lastPosition, additionalAlpha);
-               if (smoothedPosition) {
-                   lastPosition = smoothedPosition;
-                   positionBuffer = [smoothedPosition];
-                   kalmanFilter.reset(smoothedPosition);
-                   userMarker.setLatLng([smoothedPosition.lat, smoothedPosition.lng], { animate: false });
-                   updateDistanceBox();
-               }
-               return;
-           }
-       }
-
-       if (isStationary) {
-           console.debug("Skipping update - device is stationary");
-           return;
-       }
-   } else {
-       isStationary = false;
-       stationaryStartTime = null;
-       if (stationaryCheckTimeout) {
-           clearTimeout(stationaryCheckTimeout);
-           stationaryCheckTimeout = null;
-       }
-   }
-
-   // Skip update if accuracy is poor and not forced
-   if (newPosition.accuracy > MAX_ACCEPTABLE_ACCURACY && !forceUpdate) {
-       console.debug("Skipping update due to poor accuracy");
-       return;
-   }
-
-   // Skip update if movement is too small
-   if (distance < MIN_DISTANCE_THRESHOLD && !forceUpdate) {
-       console.debug("Skipping update due to minimal movement");
-       return;
-   }
-
-   // Skip update if speed is unrealistic
-   if (timeDelta > 0 && (distance / timeDelta > MAX_SPEED) && !forceUpdate) {
-       console.debug("Skipping update due to unrealistic speed");
-       return;
-   }
-
-   try {
-       // Apply velocity filtering first
-       const velocityFiltered = calculateVelocityFilter(newPosition, lastPosition);
-       if (!velocityFiltered) throw new Error("Velocity filtering failed");
-
-       // Apply exponential smoothing with adaptive alpha
-       const adaptiveAlpha = Math.max(0.1, Math.min(0.9, velocityFiltered.accuracy / MAX_ACCEPTABLE_ACCURACY));
-       const smoothedPosition = applyExponentialSmoothing(velocityFiltered, lastPosition, adaptiveAlpha);
-       if (!smoothedPosition) throw new Error("Smoothing failed");
-
-       // Apply Kalman filtering
-       kalmanFilter.r = smoothedPosition.accuracy / 100;
-       const filteredPosition = kalmanFilter.update(smoothedPosition);
-       if (!filteredPosition) throw new Error("Kalman filtering failed");
-
-       // Calculate confidence weight
-       const confidenceWeight = Math.max(0, Math.min(1, 1 - (smoothedPosition.accuracy / MAX_ACCEPTABLE_ACCURACY)));
-
-       // Apply heading-based prediction if available
-       if (smoothedPosition.heading !== null) {
-           const predictedPosition = predictPositionFromHeading(
-               filteredPosition,
-               smoothedPosition.heading,
-               distance * BEARING_WEIGHT
-           );
-           if (predictedPosition && typeof predictedPosition.lat === 'number' && typeof predictedPosition.lng === 'number') {
-               filteredPosition.lat = lerp(filteredPosition.lat, predictedPosition.lat, BEARING_WEIGHT);
-               filteredPosition.lng = lerp(filteredPosition.lng, predictedPosition.lng, BEARING_WEIGHT);
-           }
-       }
-
-       // Update position buffer with validation
-       if (Array.isArray(positionBuffer)) {
-           positionBuffer.push(filteredPosition);
-           if (positionBuffer.length > BUFFER_SIZE) {
-               positionBuffer.shift();
-           }
-       } else {
-           positionBuffer = [filteredPosition];
-       }
-
-       // Ensure we have valid positions in buffer before calculating final position
-       const validPositions = positionBuffer.filter(pos => 
-           pos && typeof pos.lat === 'number' && typeof pos.lng === 'number'
-       );
-
-       if (validPositions.length === 0) {
-           throw new Error("No valid positions in buffer");
-       }
-
-       const finalPosition = calculateSmoothedPosition(validPositions);
-       if (!finalPosition || typeof finalPosition.lat !== 'number' || typeof finalPosition.lng !== 'number') {
-           throw new Error("Invalid final position calculated");
-       }
-
-       userMarker.setLatLng([finalPosition.lat, finalPosition.lng], { animate: true, duration: 0.3 });
-       lastPosition = finalPosition;
-
-       // Set the zoom level based on speed
-       const zoomLevel = getSpeedBasedZoom(newPosition.speedMPS);
-       if (zoomLevel !== -1) {
-           map.setZoom(zoomLevel, { animate: true, duration: 0.5 });
-       }
-
-       updateDistanceBox();
-
-       // Update map view if necessary
-       if (!isMapInteracting && !userIsInteracting) {
-           const markerLatLng = userMarker.getLatLng();
-           if (markerLatLng && typeof markerLatLng.lat === 'number' && typeof markerLatLng.lng === 'number') {
-               map.setView([markerLatLng.lat, markerLatLng.lng], map.getZoom(), { animate: true, duration: 0.3 });
-           }
-       }
-
-   } catch (error) {
-       console.error("Error updating location:", error);
-       // Fallback to raw position
-       userMarker.setLatLng([newPosition.lat, newPosition.lng], { animate: true, duration: 0.3 });
-       lastPosition = newPosition;
-       positionBuffer = [newPosition]; // Reset buffer with current position
-       updateDistanceBox();
-   }
-
+   map.setView([smoothedPosition.lat, smoothedPosition.lng], map.getZoom(), { 
+       animate: false, 
+       duration: 0,
+       noMoveStart: true
+   });
+   
    lastUpdateTime = currentTime;
    lastUpdateTimestamp = currentTime;
-   console.log("User location update complete");
-}
-    */
-        
-function calculateVelocity(currentLocation, previousLocation) {
-  // Calculate the velocity based on the current and previous locations
-  // For example:
-  const distance = getDistanceBetweenLocations(currentLocation, previousLocation);
-  const time = getCurrentTime() - getPreviousTime();
-  const velocity = distance / time;
-  return velocity;
-}
-        
-function updateUserLocation(position, forceUpdate = false) {
-   if (!position || !position.coords || isNaN(position.coords.latitude) || isNaN(position.coords.longitude)) {
-       console.warn("Invalid position data received");
-       return;
+   updateDistanceBox();
+   
+   if (map._container) {
+       map._onResize();
    }
+   return;
+ }
 
-   const currentTime = Date.now();
-   const timeDelta = lastUpdateTime ? (currentTime - lastUpdateTime) : 0;
-   const timeDeltaSeconds = timeDelta / 1000;
+ const MICRO_MOVEMENT_THRESHOLD = 0.3;
+ const STATIONARY_ACCURACY_MULTIPLIER = 1.1;
+ 
+ kalmanFilter.r = newPosition.accuracy / 100;
+ const kalmanFiltered = kalmanFilter.update({
+   lat: newPosition.lat,
+   lng: newPosition.lng,
+   accuracy: newPosition.accuracy
+ });
 
-   const newPosition = {
-       lat: position.coords.latitude,
-       lng: position.coords.longitude,
-       accuracy: position.coords.accuracy,
-       heading: position.coords.heading || null,
-       timestamp: currentTime,
-       speedMPS: position.coords.speed || 0
-   };
-
-   if (!lastPosition) {
-       lastPosition = newPosition;
-       userMarker.setLatLng([newPosition.lat, newPosition.lng], { animate: false });
-       kalmanFilter.reset(newPosition);
-       lastUpdateTime = currentTime;
+ if (distance < MICRO_MOVEMENT_THRESHOLD && !forceUpdate) {
+   if (!isStationary) {
+     if (!stationaryStartTime) {
        stationaryStartTime = currentTime;
-       positionBuffer = [newPosition];
-
-       const zoomLevel = getSpeedBasedZoom(newPosition.speedMPS);
-       if (zoomLevel !== -1) {
-           map.setZoom(zoomLevel, { animate: false });
-       }
-       map.setView([newPosition.lat, newPosition.lng], map.getZoom(), { animate: false, duration: 0 });
+     } else if (currentTime - stationaryStartTime >= STATIONARY_TIME_THRESHOLD) {
+       isStationary = true;
+       
+       kalmanFilter.r = Math.min(newPosition.accuracy, lastPosition.accuracy) / 200;
+       const stationaryPosition = kalmanFilter.update({
+         lat: newPosition.lat,
+         lng: newPosition.lng,
+         accuracy: Math.min(lastPosition.accuracy, newPosition.accuracy) * STATIONARY_ACCURACY_MULTIPLIER
+       });
+       
+       const smoothedStationaryPosition = applyExponentialSmoothing(stationaryPosition, lastPosition);
+       userMarker.setLatLng([smoothedStationaryPosition.lat, smoothedStationaryPosition.lng], { animate: false });
+       lastPosition = smoothedStationaryPosition;
+       positionBuffer = [smoothedStationaryPosition];
+       
+       if (stationaryCheckTimeout) clearTimeout(stationaryCheckTimeout);
+       stationaryCheckTimeout = setTimeout(() => checkStationaryState(newPosition), STATIONARY_CHECK_INTERVAL);
+       
        updateDistanceBox();
        return;
+     }
    }
-
-   const distance = calculateDistance(lastPosition, newPosition);
-
-   if (distance > EXTENDED_DISTANCE_THRESHOLD || forceUpdate) {
-       userMarker.setLatLng([newPosition.lat, newPosition.lng], { animate: false });
-       lastPosition = newPosition;
-       positionBuffer = [newPosition];
-       kalmanFilter.reset(newPosition);
-       lastVelocity = { lat: 0, lng: 0 };
-
-       const zoomLevel = getSpeedBasedZoom(newPosition.speedMPS);
-       if (zoomLevel !== -1) {
-           map.setZoom(zoomLevel, { animate: false });
+   
+   if (isStationary) {
+     if (newPosition.accuracy < lastPosition.accuracy * 0.9) {
+       kalmanFilter.r = newPosition.accuracy / 400;
+       const refinedPosition = kalmanFilter.update({
+         lat: newPosition.lat,
+         lng: newPosition.lng,
+         accuracy: newPosition.accuracy
+       });
+       
+       const smoothedRefinedPosition = applyExponentialSmoothing(refinedPosition, lastPosition);
+       if (calculateDistance(lastPosition, smoothedRefinedPosition) < MICRO_MOVEMENT_THRESHOLD / 2) {
+         userMarker.setLatLng([smoothedRefinedPosition.lat, smoothedRefinedPosition.lng], { animate: false });
+         lastPosition = smoothedRefinedPosition;
+         updateDistanceBox();
        }
-       map.setView([newPosition.lat, newPosition.lng], map.getZoom(), { animate: false, duration: 0 });
-       updateDistanceBox();
-       return;
+     }
+     return;
    }
-
-   if (distance < STATIONARY_THRESHOLD && !forceUpdate) {
-       if (!isStationary) {
-           if (!stationaryStartTime) {
-               stationaryStartTime = currentTime;
-           } else if (currentTime - stationaryStartTime >= STATIONARY_TIME_THRESHOLD) {
-               isStationary = true;
-           }
-       }
-
-       if (isStationary) {
-           const smoothedPosition = applyExponentialSmoothing(lastPosition, adaptiveAlpha);
-           userMarker.setLatLng([smoothedPosition.lat, smoothedPosition.lng], { animate: false });
-           lastPosition = smoothedPosition;
-           updateDistanceBox();
-           return;
-       }
-   } else {
-       isStationary = false;
-       stationaryStartTime = null;
-       }
-
-   try {
-       const velocityFiltered = calculateVelocityFilter(newPosition, lastPosition);
-       if (!velocityFiltered || typeof velocityFiltered.lat !== 'number' || typeof velocityFiltered.lng !== 'number') {
-           throw new Error("Invalid velocity filtered position");
-       }
-
-       const adaptiveAlpha = Math.max(0.1, Math.min(0.9, velocityFiltered.accuracy / MAX_ACCEPTABLE_ACCURACY));
-       const smoothedPosition = applyExponentialSmoothing(velocityFiltered, lastPosition, adaptiveAlpha);
-       if (!smoothedPosition || typeof smoothedPosition.lat !== 'number' || typeof smoothedPosition.lng !== 'number') {
-           throw new Error("Invalid smoothed position");
-       }
-
-       kalmanFilter.r = smoothedPosition.accuracy / 100;
-       const filteredPosition = kalmanFilter.update(smoothedPosition);
-       if (!filteredPosition || typeof filteredPosition.lat !== 'number' || typeof filteredPosition.lng !== 'number') {
-           throw new Error("Invalid Kalman filtered position");
-       }
-
-       if (smoothedPosition.heading !== null) {
-           const predictedPosition = predictPositionFromHeading(
-               filteredPosition,
-               smoothedPosition.heading,
-               distance * BEARING_WEIGHT
-           );
-           filteredPosition.lat = lerp(filteredPosition.lat, predictedPosition.lat, BEARING_WEIGHT);
-           filteredPosition.lng = lerp(filteredPosition.lng, predictedPosition.lng, BEARING_WEIGHT);
-       }
-
-       positionBuffer.push(filteredPosition);
-       if (positionBuffer.length > BUFFER_SIZE) {
-           positionBuffer.shift();
-       }
-
-       const finalPosition = calculateSmoothedPosition(positionBuffer);
-       if (!finalPosition || typeof finalPosition.lat !== 'number' || typeof finalPosition.lng !== 'number') {
-           throw new Error("Invalid final position calculated");
-       }
-
-       userMarker.setLatLng([finalPosition.lat, finalPosition.lng], { animate: true, duration: 0.3 });
-       lastPosition = finalPosition;
-
-       const zoomLevel = getSpeedBasedZoom(newPosition.speedMPS);
-       if (zoomLevel !== -1) {
-           map.setZoom(zoomLevel, { animate: true, duration: 0.5 });
-       }
-
-       updateDistanceBox();
-
-       if (!isMapInteracting && !userIsInteracting) {
-           const markerLatLng = userMarker.getLatLng();
-           map.setView([markerLatLng.lat, markerLatLng.lng], map.getZoom(), { animate: true, duration: 0.3 });
-       }
-   } catch (error) {
-       console.error("Error updating location:", error);
-       userMarker.setLatLng([newPosition.lat, newPosition.lng], { animate: true, duration: 0.3 });
-       lastPosition = newPosition;
-       updateDistanceBox();
+ } else {
+   isStationary = false;
+   stationaryStartTime = null;
+   if (stationaryCheckTimeout) {
+     clearTimeout(stationaryCheckTimeout);
+     stationaryCheckTimeout = null;
    }
+   kalmanFilter.r = newPosition.accuracy / 50;
+ }
 
+ if (!forceUpdate && (
+   newPosition.accuracy > MAX_ACCEPTABLE_ACCURACY ||
+   distance < MIN_DISTANCE_THRESHOLD ||
+   (timeDelta > 0 && distance / timeDelta > MAX_SPEED)
+ )) {
+   return;
+ }
+
+ try {
+   kalmanFilter.r = newPosition.accuracy / 75;
+   const filteredPosition = kalmanFilter.update({
+     lat: newPosition.lat,
+     lng: newPosition.lng,
+     accuracy: newPosition.accuracy,
+     heading: newPosition.heading,
+     speedMPS: newPosition.speedMPS
+   });
+
+   const smoothedPosition = applyExponentialSmoothing(filteredPosition, lastPosition);
+   updatePositionBuffer(smoothedPosition);
+
+   const finalPosition = calculateFinalPosition();
+   if (!finalPosition) throw new Error("Final position calculation failed");
+
+   const finalSmoothedPosition = applyExponentialSmoothing(finalPosition, lastPosition);
+
+   updateMarkerAndMap(finalSmoothedPosition, newPosition.speedMPS);
+
+   lastPosition = finalSmoothedPosition;
    lastUpdateTime = currentTime;
    lastUpdateTimestamp = currentTime;
-        }
+
+ } catch (error) {
+   console.error("Location update error:", error);
+   kalmanFilter.r = newPosition.accuracy / 50;
+   const fallbackPosition = kalmanFilter.update(newPosition);
+   const smoothedFallbackPosition = applyExponentialSmoothing(fallbackPosition, lastPosition);
+   userMarker.setLatLng([smoothedFallbackPosition.lat, smoothedFallbackPosition.lng], { animate: true, duration: 0.3 });
+   lastPosition = smoothedFallbackPosition;
+   positionBuffer = [smoothedFallbackPosition];
+   updateDistanceBox();
+ }
+}
         
 function updateDistanceBox() {
     const distanceBox = document.getElementById('distanceBox');
@@ -1748,149 +1138,81 @@ function updateDistanceBox() {
     }
 }
 
-const STATIONARY_THRESHOLDB = 3; // Number of consecutive stationary positions to consider user as stationary
-const MAX_ALPHA = 0.3; // Maximum alpha value for high movement
-const MIN_ALPHA = 0.05; // Minimum alpha value for stationary state
-//const MIN_DISTANCE_THRESHOLD = 2; // Minimum distance in meters to consider movement
-//const MAX_ACCEPTABLE_ACCURACY = 20; // Maximum acceptable accuracy in meters
+function calculateVelocityFilter(newPosition, lastPosition) {
+    const timeElapsed = (newPosition.timestamp - lastPosition.timestamp) / 1000;
 
-let stationaryCount = 0;
-let lastSmoothedPosition = null;
-
-function applyExponentialSmoothing(newPosition, lastPosition, baseAlpha = 0.25) {
-    // Validate inputs
-    if (!newPosition || !lastPosition || 
-        typeof newPosition.lat !== 'number' || typeof newPosition.lng !== 'number' || 
-        typeof lastPosition.lat !== 'number' || typeof lastPosition.lng !== 'number') {
-        console.warn("Invalid input to applyExponentialSmoothing");
+      if (!newPos || !lastPos || typeof newPos.lat !== 'number' || typeof newPos.lng !== 'number' || 
+      typeof lastPos.lat !== 'number' || typeof lastPos.lng !== 'number') {
+    return null;
+  }
+    
+    if (timeElapsed <= 0 || timeElapsed > 10) {
+        lastVelocity = { lat: 0, lng: 0 };
         return newPosition;
     }
 
-    // Initialize lastSmoothedPosition if it doesn't exist
-    if (!lastSmoothedPosition) {
-        lastSmoothedPosition = lastPosition;
-    }
-
-    const distance = calculateDistance(newPosition, lastSmoothedPosition);
-    
-    // Enhanced stationary detection
-    if (distance < MIN_DISTANCE_THRESHOLD) {
-        stationaryCount = Math.min(stationaryCount + 1, STATIONARY_THRESHOLD);
-    } else {
-        stationaryCount = Math.max(stationaryCount - 1, 0);
-    }
-
-    // Calculate adaptive alpha
-    let alpha = baseAlpha;
-
-    // Adjust alpha based on movement state
-    if (stationaryCount >= STATIONARY_THRESHOLD) {
-        alpha = MIN_ALPHA;
-    } else {
-        // Gradually reduce alpha as we approach stationary state
-        alpha = MAX_ALPHA - (stationaryCount / STATIONARY_THRESHOLD) * (MAX_ALPHA - MIN_ALPHA);
-    }
-
-    // Accuracy-based adjustment
-    const accuracyRatio = Math.max(0, Math.min(1, 1 - (newPosition.accuracy / MAX_ACCEPTABLE_ACCURACY)));
-    alpha = alpha * (0.5 + 0.5 * accuracyRatio);
-
-    // Speed-based adjustment
-    if (newPosition.speedMPS !== undefined && newPosition.speedMPS < 0.5) {
-        alpha *= 0.4; // Extra smoothing at very low speeds
-    }
-
-    // Time-based adjustment to handle GPS jitter
-    const timeDelta = newPosition.timestamp - lastPosition.timestamp;
-    if (timeDelta < 1000) { // If updates are very frequent
-        alpha *= 0.7; // Reduce impact of rapid updates
-    }
-
-    // Apply smoothing with weighted factors
-    const smoothedPosition = {
-        lat: lastSmoothedPosition.lat + alpha * (newPosition.lat - lastSmoothedPosition.lat),
-        lng: lastSmoothedPosition.lng + alpha * (newPosition.lng - lastSmoothedPosition.lng),
-        accuracy: Math.min(newPosition.accuracy, lastSmoothedPosition.accuracy),
-        heading: newPosition.heading,
-        timestamp: newPosition.timestamp,
-        speedMPS: newPosition.speedMPS ? 
-                  lastSmoothedPosition.speedMPS * 0.7 + newPosition.speedMPS * 0.3 : // Smooth speed changes
-                  newPosition.speedMPS
+    const currentVelocity = {
+        lat: (newPosition.lat - lastPosition.lat) / timeElapsed,
+        lng: (newPosition.lng - lastPosition.lng) / timeElapsed
     };
 
-    // Apply additional smoothing to heading when stationary
-    if (stationaryCount >= STATIONARY_THRESHOLD && lastSmoothedPosition.heading !== undefined) {
-        smoothedPosition.heading = alpha * newPosition.heading + (1 - alpha) * lastSmoothedPosition.heading;
+    if (!lastVelocity) {
+        lastVelocity = { lat: 0, lng: 0 };
     }
 
-    // Additional stabilization for very small movements
-    if (distance < MIN_DISTANCE_THRESHOLD * 0.5) {
-        smoothedPosition.lat = lastSmoothedPosition.lat * 0.95 + smoothedPosition.lat * 0.05;
-        smoothedPosition.lng = lastSmoothedPosition.lng * 0.95 + smoothedPosition.lng * 0.05;
+    const accuracyRatio = Math.min(1, Math.max(0, 1 - (newPosition.accuracy / MAX_ACCEPTABLE_ACCURACY)));
+    const smoothingFactor = 0.8 * accuracyRatio + 0.1;
+
+    lastVelocity = {
+        lat: smoothingFactor * lastVelocity.lat + (1 - smoothingFactor) * currentVelocity.lat,
+        lng: smoothingFactor * lastVelocity.lng + (1 - smoothingFactor) * currentVelocity.lng
+    };
+
+    const maxAcceleration = 2;
+    const velocityDelta = {
+        lat: lastVelocity.lat - currentVelocity.lat,
+        lng: lastVelocity.lng - currentVelocity.lng
+    };
+    
+    if (Math.abs(velocityDelta.lat) > maxAcceleration * timeElapsed) {
+        lastVelocity.lat = currentVelocity.lat + (maxAcceleration * timeElapsed * Math.sign(velocityDelta.lat));
+    }
+    if (Math.abs(velocityDelta.lng) > maxAcceleration * timeElapsed) {
+        lastVelocity.lng = currentVelocity.lng + (maxAcceleration * timeElapsed * Math.sign(velocityDelta.lng));
     }
 
-    // Update last smoothed position
-    lastSmoothedPosition = smoothedPosition;
+    const maxVelocity = 50;
+    lastVelocity = {
+        lat: Math.max(-maxVelocity, Math.min(maxVelocity, lastVelocity.lat)),
+        lng: Math.max(-maxVelocity, Math.min(maxVelocity, lastVelocity.lng))
+    };
 
-    return smoothedPosition;
+    return {
+        lat: lastPosition.lat + lastVelocity.lat * timeElapsed,
+        lng: lastPosition.lng + lastVelocity.lng * timeElapsed,
+        accuracy: newPosition.accuracy,
+        timestamp: newPosition.timestamp,
+        heading: newPosition.heading
+    };
+}
+        
+// Make sure you have this helper function defined
+function calculateDistance(pos1, pos2) {
+    // Haversine formula implementation
+    const R = 6371000; // Earth's radius in meters
+    const lat1 = pos1.lat * Math.PI / 180;
+    const lat2 = pos2.lat * Math.PI / 180;
+    const deltaLat = (pos2.lat - pos1.lat) * Math.PI / 180;
+    const deltaLng = (pos2.lng - pos1.lng) * Math.PI / 180;
+
+    const a = Math.sin(deltaLat/2) * Math.sin(deltaLat/2) +
+            Math.cos(lat1) * Math.cos(lat2) *
+            Math.sin(deltaLng/2) * Math.sin(deltaLng/2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+
+    return R * c;
 }
 
-function calculateDistance(pos1, pos2, previousPos1 = null, previousPos2 = null) {
-  const EARTH_RADIUS = 6371000; // Earth's radius in meters
-
-  // Check if pos1 and pos2 are valid objects with lat and lng properties
-  if (pos1 && pos2 && typeof pos1.lat === 'number' && typeof pos1.lng === 'number' && typeof pos2.lat === 'number' && typeof pos2.lng === 'number') {
-    // Convert latitude and longitude to radians
-    const lat1 = (pos1.lat * Math.PI) / 180;
-    const lat2 = (pos2.lat * Math.PI) / 180;
-    const lng1 = (pos1.lng * Math.PI) / 180;
-    const lng2 = (pos2.lng * Math.PI) / 180;
-
-    // Calculate the differences between the coordinates
-    const deltaLat = lat2 - lat1;
-    const deltaLng = lng2 - lng1;
-
-    // Apply the Haversine formula
-    const a = Math.sin(deltaLat / 2) * Math.sin(deltaLat / 2) + Math.cos(lat1) * Math.cos(lat2) * Math.sin(deltaLng / 2) * Math.sin(deltaLng / 2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    return EARTH_RADIUS * c;
-  } else if (previousPos1 && previousPos2) {
-    // Fall back to the previous valid location
-    return calculateDistance(previousPos1, previousPos2);
-  } else {
-    // No valid locations available, return a fallback value or error
-    return 0; // or throw an error
-  }
-}
-
-function predictPositionFromHeading(position, heading, distance) {
-  const EARTH_RADIUS = 6371000; // Earth's radius in meters
-  const distanceInRadians = distance / EARTH_RADIUS;
-  const bearingInRadians = (heading * Math.PI) / 180;
-
-  // Convert the starting position to radians
-  const startingLatInRadians = (position.lat * Math.PI) / 180;
-  const startingLngInRadians = (position.lng * Math.PI) / 180;
-
-  // Calculate the predicted latitude and longitude in radians
-  const predictedLatInRadians = Math.asin(
-    Math.sin(startingLatInRadians) * Math.cos(distanceInRadians) +
-      Math.cos(startingLatInRadians) * Math.sin(distanceInRadians) * Math.cos(bearingInRadians)
-  );
-  const predictedLngInRadians =
-    startingLngInRadians +
-    Math.atan2(
-      Math.sin(bearingInRadians) * Math.sin(distanceInRadians) * Math.cos(startingLatInRadians),
-      Math.cos(distanceInRadians) - Math.sin(startingLatInRadians) * Math.sin(predictedLatInRadians)
-    );
-
-  // Convert the predicted latitude and longitude back to degrees
-  return {
-    lat: (predictedLatInRadians * 180) / Math.PI,
-    lng: (predictedLngInRadians * 180) / Math.PI,
-  };
-}
-   
 function centerMapOnUser(position, immediate = false) {
     if (!map || !position || typeof position.lat !== 'number' || typeof position.lng !== 'number') {
         console.warn('Invalid map or position for centering');
