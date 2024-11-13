@@ -156,6 +156,14 @@ const blogArticles = [
   url: "https://mnthen.com/blog/event/stp_mccord_shooting.html",
   keywords: ["saint paul", "st. paul", "mccord", "gangster", "barker", "karpis", "shooting", "event", "all"],
 },
+    { 
+    headline: "Northfield Bank Raid (September 7, 1876)", 
+    blurb: "The infamous James-Younger gang's daring bank robbery attempt in Northfield, Minnesota in 1876 was thwarted by the town's citizens, leading to a deadly confrontation.", 
+    icon: "fa-calendar", 
+    image: "https://mnthen.com/images/northfield.jpg", 
+    url: "https://mnthen.com/blog/event/northfield.html", 
+    keywords: ["northfield", "bank", "raid", "James", "Younger", "event", "all"], 
+    },
        {
   headline: "Theodore Hamm Mansion (c. 1886 - 1954)",
   blurb: "The Theodore Hamm mansion once stood majestically over Swede Hollow, embodying St. Paul's brewing heritage and the Hamm family legacy.",
