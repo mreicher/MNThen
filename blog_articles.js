@@ -139,14 +139,6 @@ const blogArticles = [
       keywords: ["amusement", "park", "mahtomedi", "wildwood", "streetcar", "place", "all"],
 
     },
-   {
-  headline: "Shooting of Roy McCord (Jan. 13, 1934)",
-  blurb: "After work, Roy McCord joined friends to search for 'peeping toms,' inadvertently encountering the Barker-Karpis Gang, leading to his near-fatal shooting.",
-  icon: "fa-calendar",
-  image: "https://mnthen.com/images/gangster/mccord/stp_mccord_holly.jpg",
-  url: "https://mnthen.com/blog/event/stp_mccord_shooting.html",
-  keywords: ["saint paul", "st. paul", "mccord", "gangster", "barker", "karpis", "shooting", "event", "all"],
-},
     { 
     headline: "Northfield Bank Raid (September 7, 1876)", 
     blurb: "The infamous James-Younger gang's daring bank robbery attempt in Northfield, Minnesota in 1876 was thwarted by the town's citizens, leading to a deadly confrontation.", 
@@ -178,14 +170,6 @@ const blogArticles = [
       image: "https://mnthen.com/tour/hamm/gallery/kidnap/hamm_kidnap1.jpg",
       url: "https://mnthen.com/blog/event/hamm_kidnap.html",
        keywords: ["kidnapping", "st. paul", "saint paul", "gangster", "Karpis", "Barker", "event", "all"],
-    },
-         {
-      headline: "Death of \"Dapper\" Dan Hogan (Dec 4, 1928)",
-      blurb: "Gangster \"Dapper\" Dan Hogan, a pivotal link between St. Paul's criminal underworld and law enforcement, was killed in a bombing. His murderers remain unidentified.",
-      icon: "fa-calendar",
-      image: "https://mnthen.com/images/gangster/hogan/stp_hogan.jpg",
-      url: "https://mnthen.com/blog/event/stp_hogan.html",
-      keywords: ["saint paul", "st. paul", "hogan", "bomb", "layover", "gangster", "event", "all"],
     },
              {
       headline: "St. Paul's Downtown Ball Park (aka the \'Pillbox') 1903 - 1909",
