@@ -130,15 +130,6 @@ const blogArticles = [
       keywords: ["saint paul", "st. paul", "Summit", "summit", "beer", "stutrud", "Stutrud", "place", "all"],
 
     },
-    {
-      headline: "Native American Burial Mounds (White Bear Lake)",
-      blurb: "Centuries of Native American history in White Bear Lake area erased in 1889 as sacred burial mounds were demolished to accommodate expanding European settlement.",
-                 icon: "fa-building",
-      image: "https://mnthen.com/tour/wbl/gallery/mound/wbl_mound1.jpg",
-      url: "https://mnthen.com/blog/place/wbl_mounds.html",
-      keywords: ["burial", "mounds", "bear", "Bear", "lake", "place", "all"],
-
-    },
         {
       headline: "Wildwood Amusement Park",
       blurb: "Wildwood Amusement Park on White Bear Lake, the 'Coney Island of Saint Paul,' entertained generations until financial woes forced its closure in the 1930s",
