@@ -81,10 +81,10 @@ const locations = [
         image: "/locations/gallery/mpls/henn_bridge/henn_bridge_1.jpg",
         creator: "Matt Reicher",
         city: "Minneapolis",
-        audio: "/audio/mpls/mpls_henn_bridge.mp3", 
+        audio: "/audio/exhibit/hennepin.mp3", 
         tours: "place",
         summary: "The Father Louis Hennepin Bridge, built in 1855, was the first to span the Mississippi River above St. Anthony Falls. It connected Minneapolis to the east bank, spurring incredible growth.",
-        today: "Dowtown Minneapolis",
+        today: "Downtown Minneapolis",
         link: "https://www.mnopedia.org/structure/father-louis-hennepin-suspension-bridge",
         imageSource: "First suspension bridge in Minneapolis, (c. 1858) via MNopedia",
         additionalInfo: "The original bridge was a suspension bridge, a relatively new and innovative design at the time."
