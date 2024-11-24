@@ -8,12 +8,12 @@ const blogArticles = [
       keywords: ["saint paul", "st. paul", "rap", "hip", "hop", "Rhymesayers", "person", "all"],
     },
     {
-  headline: "Hamm's Bear Mascot (1953-1999)",
+  headline: "Hamm's Bear (1953-1999)",
   blurb: "Hamm's Beer's iconic cartoon bear mascot, created in 1952, revolutionized advertising and became a beloved Minnesota cultural symbol.",
   icon: "fa-user",  
   image: "https://mnthen.com/images/exhibit/hamms_bear.jpg",
-  url: "https://mnthen.com/blog/person/hamms_bear.html",
-  keywords: ["saint paul", "st. paul", "hamms", "beer", "advertising", "cartoon", "mascot", "all"],
+  url: "https://mnthen.com/blog/people/hamms_bear.html",
+  keywords: ["saint paul", "st. paul", "hamms", "beer", "advertising", "cartoon", "person", "all"],
 },
     {
     headline: "Prom Ballroom (1941 - 1987)",
