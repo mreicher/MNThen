@@ -63,7 +63,7 @@ const blogArticles = [
       blurb: "Oscar Erickson was killed by the Barker-Karpis gang during a robbery getaway, fueling calls to end the era of brazen criminals terrorizing citizens.",
             icon: "fa-calendar",
       image: "https://mnthen.com/images/erickson.jpg",
-      url: "https://mnthen.com/blog/people/erickson.html",
+      url: "https://mnthen.com/blog/event/erickson.html",
       keywords: ["saint paul", "st. paul", "gangster", "barker", "karpis", "shooting", "event", "all"],
 
     },
