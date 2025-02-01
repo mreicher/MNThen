@@ -266,8 +266,15 @@ const blogArticles = [
     "image": "https://mnthen.com/images/exhibit/caprath.jpg",
     "url": "https://mnthen.com/blog/place/caprath.html",
     "keywords": ["saint paul", "st. paul", "capitol", "rathskeller", "cafeteria", "German", "place", "all"]
-}
-
+},
+{
+    "headline": "Murder of Louis Arbogast (May 13, 1909)",
+    "blurb": "The 1909 murder of St. Paul butcher Louis Arbogast in his burning bed remains a chilling, unsolved mystery.",
+    "icon": "fa-calendar",
+    "image": "https://mnthen.com/images/arbogast.jpg",
+    "url": "https://mnthen.com/blog/event/arbogast.html",
+    "keywords": ["saint paul", "st. paul", "unsolved", "true crime", "crime", "event", "all"]
+},
 
     // Add more articles as needed
 ];
