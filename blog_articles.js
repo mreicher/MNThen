@@ -278,7 +278,7 @@ const blogArticles = [
 {
   headline: "Orth, John (1821 - 1887)",
   blurb: "German immigrant John Frederick Orth founded Minneapolis's first commercial brewery in 1850, transforming it from a small operation into a major regional powerhouse.",
-  icon: "fa-person",
+  icon: "fa-user",
   image: "https://mnthen.com/images/exhibit/orth.jpg",
   url: "https://mnthen.com/blog/people/orth.html",
   keywords: ["beer", "brewer", "Orth", "minneapolis", "Minneapolis", "northeast", "nordeast", "person", "all"]
