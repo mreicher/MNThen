@@ -282,6 +282,14 @@ const blogArticles = [
   image: "https://mnthen.com/images/exhibit/orth.jpg",
   url: "https://mnthen.com/blog/people/orth.html",
   keywords: ["beer", "brewer", "Orth", "minneapolis", "Minneapolis", "northeast", "nordeast", "person", "all"]
+},
+{
+  headline: "Hamm, Theodore (1825 - 1903)",
+  blurb: "German immigrant Theodore Hamm acquired a St. Paul brewery in 1865, building it into a thriving enterprise that became one of Minnesota's leading beer producers.",
+  icon: "fa-user",
+  image: "https://mnthen.com/images/thamm.jpg",
+  url: "https://mnthen.com/blog/people/thamm.html",
+  keywords: ["beer", "brewer", "Hamm", "st paul", "Swede Hollow", "bluff", "east side", "person", "all"]
 }
 
     // Add more articles as needed
