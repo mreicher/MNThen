@@ -1,7 +1,7 @@
 const blogArticles = [
     {
   "headline": "Molter, Dorothy 'The Root Beer Lady' (1907 - 1986)",
-  "blurb": "Defying isolation, she was the last non-indeginous BWCAW resident, brewing 10,000 bottles of root beer annually for resort visitors.",
+  "blurb": "Defying isolation, she was the last non-indeginous full-time BWCAW resident, brewing 10,000 bottles of root beer annually for resort visitors.",
   "icon": "fa-user",
   "image": "https://mnthen.com/images/molter.jpg",
   "url": "https://mnthen.com/blog/people/molter.html",
