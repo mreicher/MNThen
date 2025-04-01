@@ -180,6 +180,9 @@ const EDGE_THRESHOLD_PERCENTAGE = 0.25 // Percentage of viewport to trigger rece
 const CRITICAL_EDGE_THRESHOLD = 0.125 // Critical threshold for emergency recenter (reduced)
 const RECENTER_COOLDOWN = 1500 // ms - minimum time between recenters (reduced)
 
+// Speed accuracy parameters
+const SPEED_ACCURACY_THRESHOLD = 5.0; // 5 m/s accuracy is reasonable for most GPS systems
+
 // State variables
 let lastUpdateTime = null
 let lastVelocity = { lat: 0, lng: 0 }
@@ -1401,48 +1404,76 @@ const tracking = AdaptiveKalmanFilterFactory.createFilterAndInterpolator(
   "cubic",
 )
 
-// Calculate appropriate zoom level based on speed
+// Calculate appropriate zoom level based on speed with device movement filtering
 function calculateZoomLevel(speedMPS) {
   // Update current speed for global access
   currentSpeed = speedMPS
-
-  // Determine zoom level based on speed
-  let zoomLevel
-  if (isStationary || speedMPS < 0.5) {
+  
+  // Check if this is genuine GPS movement or potential device movement
+  const isGenuineMovement = lastPosition?.hasOwnProperty('speedAccuracy') && 
+                           lastPosition.speedAccuracy < SPEED_ACCURACY_THRESHOLD
+  
+  // Use a more conservative speed estimate for non-GPS-confirmed movement
+  const reliableSpeed = isGenuineMovement ? speedMPS : Math.min(speedMPS, 1.0)
+  
+  // Determine target zoom level based on reliable speed
+  let targetZoomLevel;
+  
+  if (isStationary || reliableSpeed < 0.5) {
     // Stationary or very slow movement
-    zoomLevel = MAX_ZOOM_LEVEL
-  } else if (speedMPS < WALKING_SPEED_THRESHOLD) {
+    targetZoomLevel = MAX_ZOOM_LEVEL;
+  } else if (reliableSpeed < WALKING_SPEED_THRESHOLD) {
     // Walking speed
-    zoomLevel = WALKING_ZOOM_LEVEL
-  } else if (speedMPS < RUNNING_SPEED_THRESHOLD) {
+    targetZoomLevel = WALKING_ZOOM_LEVEL;
+  } else if (reliableSpeed < RUNNING_SPEED_THRESHOLD) {
     // Running speed - linear interpolation between walking and running zoom levels
-    const t = (speedMPS - WALKING_SPEED_THRESHOLD) / (RUNNING_SPEED_THRESHOLD - WALKING_SPEED_THRESHOLD)
-    zoomLevel = WALKING_ZOOM_LEVEL - t
-  } else if (speedMPS < DRIVING_SPEED_THRESHOLD) {
+    const t = (reliableSpeed - WALKING_SPEED_THRESHOLD) / (RUNNING_SPEED_THRESHOLD - WALKING_SPEED_THRESHOLD);
+    targetZoomLevel = WALKING_ZOOM_LEVEL - t;
+  } else if (reliableSpeed < DRIVING_SPEED_THRESHOLD) {
     // Driving speed - linear interpolation between running and driving zoom levels
-    const t = (speedMPS - RUNNING_SPEED_THRESHOLD) / (DRIVING_SPEED_THRESHOLD - RUNNING_SPEED_THRESHOLD)
-    zoomLevel = WALKING_ZOOM_LEVEL - 1 - t
+    const t = (reliableSpeed - RUNNING_SPEED_THRESHOLD) / (DRIVING_SPEED_THRESHOLD - RUNNING_SPEED_THRESHOLD);
+    targetZoomLevel = WALKING_ZOOM_LEVEL - 1 - t;
   } else {
     // High speed
-    zoomLevel = MIN_ZOOM_LEVEL
+    targetZoomLevel = MIN_ZOOM_LEVEL;
   }
-
+  
+  // For non-GPS-confirmed movement, be more conservative with zoom changes
+  let smoothingFactor = isGenuineMovement ? 0.15 : 0.05;
+  
+  // For GPS-confirmed movement, check for significant speed changes
+  if (isGenuineMovement) {
+    const speedChange = lastPosition ? Math.abs(speedMPS - lastPosition.speedMPS) : 0;
+    const significantSpeedChange = speedChange > 1.0;
+    
+    // More responsive when speed changes significantly
+    if (significantSpeedChange) {
+      smoothingFactor = 0.4;
+    }
+  }
+  
   // Smooth zoom level changes
+  let zoomLevel = targetZoomLevel;
   if (lastZoomLevel !== null) {
-    // Apply smoothing to avoid abrupt zoom changes
-    zoomLevel = lastZoomLevel * 0.85 + zoomLevel * 0.15 // More responsive zoom changes
+    zoomLevel = lastZoomLevel * (1 - smoothingFactor) + targetZoomLevel * smoothingFactor;
   }
-
+  
+  // Ensure more immediate response for significant genuine GPS speed transitions
+  if (isGenuineMovement && 
+      ((isStationary && speedMPS > 1.0) || (!isStationary && speedMPS < 0.5))) {
+    zoomLevel = lastZoomLevel * 0.6 + targetZoomLevel * 0.4;
+  }
+  
   // Round to one decimal place for smoother transitions
-  zoomLevel = Math.round(zoomLevel * 10) / 10
-
+  zoomLevel = Math.round(zoomLevel * 10) / 10;
+  
   // Clamp to valid zoom range
-  zoomLevel = Math.max(MIN_ZOOM_LEVEL, Math.min(MAX_ZOOM_LEVEL, zoomLevel))
-
+  zoomLevel = Math.max(MIN_ZOOM_LEVEL, Math.min(MAX_ZOOM_LEVEL, zoomLevel));
+  
   // Update last zoom level
-  lastZoomLevel = zoomLevel
-
-  return zoomLevel
+  lastZoomLevel = zoomLevel;
+  
+  return zoomLevel;
 }
 
 // Enhanced stationary position calculation
@@ -2219,8 +2250,16 @@ function performEdgeRecenter(recenterInfo) {
   // Get current speed (in meters per second)
   const currentSpeed = lastPosition?.speedMPS || 0
   
-  // Calculate appropriate zoom level based on speed
-  const dynamicZoom = calculateZoomLevel(currentSpeed)
+  // Only trust GPS-reported speed, not calculated from position changes
+  // This helps filter out device movements like shaking
+  const isGenuineMovement = lastPosition?.hasOwnProperty('speedAccuracy') && 
+                            lastPosition.speedAccuracy < SPEED_ACCURACY_THRESHOLD
+  
+  // Use a conservative speed value if we're not confident in the movement
+  const reliableSpeed = isGenuineMovement ? currentSpeed : Math.min(currentSpeed, 1.0)
+  
+  // Calculate appropriate zoom level based on reliable speed
+  const dynamicZoom = calculateZoomLevel(reliableSpeed)
   
   // Get current map center
   const currentCenter = map.getCenter()
@@ -2234,19 +2273,13 @@ function performEdgeRecenter(recenterInfo) {
   // Find the minimum proximity (closest edge)
   const minProximity = Math.min(proximity.north, proximity.south, proximity.east, proximity.west)
   
-  // Calculate speed factor (0-1) - higher speeds need more aggressive recentering
-  // Walking speed ~1.4 m/s, running ~4 m/s, cycling ~6-8 m/s, driving ~14+ m/s
-  const SPEED_THRESHOLD_SLOW = 1.4  // walking
-  const SPEED_THRESHOLD_FAST = 10.0 // fast cycling/slow driving
-  
-  // Normalize speed between 0-1 based on thresholds
-  const speedFactor = Math.min(1, Math.max(0, (currentSpeed - SPEED_THRESHOLD_SLOW) / 
+  // Calculate speed factor (0-1) based on reliable speed
+  const SPEED_THRESHOLD_SLOW = 2.0
+  const SPEED_THRESHOLD_FAST = 10.0
+  const speedFactor = Math.min(1, Math.max(0, (reliableSpeed - SPEED_THRESHOLD_SLOW) / 
                               (SPEED_THRESHOLD_FAST - SPEED_THRESHOLD_SLOW)))
   
-  // Calculate combined transition factor considering both edge proximity and speed
-  // Lower values = more aggressive correction
-  // At low speeds: 0.3-0.8 range (gentler transitions)
-  // At high speeds: 0.1-0.5 range (more aggressive transitions)
+  // Calculate combined transition factor
   const baseTransitionFactor = Math.max(0.3, Math.min(0.8, minProximity * 2))
   const speedAdjustedFactor = baseTransitionFactor - (speedFactor * 0.3)
   
@@ -2256,9 +2289,9 @@ function performEdgeRecenter(recenterInfo) {
     lng: currentCenter.lng + (optimalCenter.lng - currentCenter.lng) * (1 - speedAdjustedFactor)
   }
   
-  // Calculate direction of movement
+  // Only apply forward bias for genuine GPS movement
   let adjustedCenter = blendedCenter
-  if (lastPosition) {
+  if (lastPosition && isGenuineMovement) {
     const direction = {
       lat: position.lat - lastPosition.lat,
       lng: position.lng - lastPosition.lng
@@ -2269,7 +2302,7 @@ function performEdgeRecenter(recenterInfo) {
     
     // Only apply forward bias if moving significantly
     if (movement > 0.00001) {
-      // Apply greater forward bias at higher speeds
+      // Apply forward bias scaled to speed
       const forwardBiasAmount = 0.00005 + (speedFactor * 0.0001)
       
       // Normalize direction and apply forward bias
@@ -2280,7 +2313,7 @@ function performEdgeRecenter(recenterInfo) {
     }
   }
   
-  // Calculate duration based on speed - faster transitions for higher speeds
+  // Calculate duration based on reliable speed
   const baseDuration = recenterInfo.isEmergency ? 0.2 : ZOOM_TRANSITION_DURATION
   const speedAdjustedDuration = baseDuration * (1 - (speedFactor * 0.5))
   
@@ -2289,7 +2322,7 @@ function performEdgeRecenter(recenterInfo) {
     animate: true,
     duration: speedAdjustedDuration,
     noMoveStart: true,
-    easeLinearity: 0.3 + (speedFactor * 0.2), // More linear for higher speeds
+    easeLinearity: 0.3 + (speedFactor * 0.2)
   })
   
   // Reset edge recenter flag after animation completes
