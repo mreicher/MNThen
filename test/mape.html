@@ -3903,6 +3903,80 @@ function updatePositionBuffer(position) {
   }
 }
 
+// Constants for zoom levels based on speed (m/s)
+const ZOOM_LEVELS = {
+  STATIONARY: 17,   // 0-1.5 m/s
+  WALKING: 17,      // 1.5-3 m/s
+  RUNNING: 16,      // 3-6 m/s
+  BIKING: 16,       // 6-10 m/s
+  CITY_DRIVING: 15, // 10-20 m/s
+  HIGHWAY: 14       // 20+ m/s
+};
+
+const SPEED_THRESHOLDS = {
+  STATIONARY: 1.5,
+  WALKING: 3,
+  RUNNING: 6,
+  BIKING: 10,
+  CITY_DRIVING: 20
+};
+
+function getZoomLevelForSpeed(speedMPS) {
+  if (speedMPS < SPEED_THRESHOLDS.STATIONARY) return ZOOM_LEVELS.STATIONARY;
+  if (speedMPS < SPEED_THRESHOLDS.WALKING) return ZOOM_LEVELS.WALKING;
+  if (speedMPS < SPEED_THRESHOLDS.RUNNING) return ZOOM_LEVELS.RUNNING;
+  if (speedMPS < SPEED_THRESHOLDS.BIKING) return ZOOM_LEVELS.BIKING;
+  if (speedMPS < SPEED_THRESHOLDS.CITY_DRIVING) return ZOOM_LEVELS.CITY_DRIVING;
+  return ZOOM_LEVELS.HIGHWAY;
+}
+
+function centerMapOnPosition(position, immediate = false, zoomLevel = null) {
+  if (!position || !map) {
+    console.warn("Cannot center map: invalid position or map not initialized");
+    return;
+  }
+
+  const latLng = L.latLng(position.lat, position.lng);
+  const targetZoom = zoomLevel !== null ? zoomLevel : getZoomLevelForSpeed(position.speedMPS);
+  const isStationary = position.speedMPS < SPEED_THRESHOLDS.STATIONARY;
+
+  // Update user marker (always centered)
+  if (userMarker) {
+    userMarker.setLatLng(latLng, {
+      animate: !immediate && position.speedMPS < 10,
+      duration: 0.3
+    });
+  }
+
+  if (followUser) {
+    if (immediate) {
+      // Snap immediately to position
+      map.setView(latLng, targetZoom, { animate: false });
+    } else {
+      // Smooth transition
+      if (map.getZoom() !== targetZoom) {
+        map.setView(latLng, targetZoom, {
+          animate: true,
+          duration: 0.5,
+          easeLinearity: 0.25
+        });
+      } else {
+        map.panTo(latLng, {
+          animate: true,
+          duration: 0.5,
+          easeLinearity: 0.25,
+          noMoveStart: true // Prevents rubber-banding
+        });
+      }
+    }
+  }
+
+  // Update compass if available
+  if (position.heading !== undefined && position.heading !== null) {
+    updateCompass(position.heading);
+  }
+}
+
 function updateUserLocation(position, forceUpdate = false) {
   console.log("Received position input:", JSON.stringify(position));
   
@@ -3926,43 +4000,31 @@ function updateUserLocation(position, forceUpdate = false) {
     }
   }
 
-  // Check for required coordinates with proper number validation
+  // Extract coordinates
   const coords = position.coords || position;
   const lat = coords.latitude !== undefined ? coords.latitude : coords.lat;
   const lng = coords.longitude !== undefined ? coords.longitude : coords.lng;
 
-  if (typeof lat !== 'number' || isNaN(lat)) {
-    console.warn("Invalid latitude", lat);
-    return;
-  }
-  if (typeof lng !== 'number' || isNaN(lng)) {
-    console.warn("Invalid longitude", lng);
+  // Validate coordinates
+  if (typeof lat !== 'number' || isNaN(lat) || typeof lng !== 'number' || isNaN(lng)) {
+    console.warn("Invalid coordinates", { lat, lng });
     return;
   }
 
   const currentTime = Date.now();
   const timeDelta = lastUpdateTime ? (currentTime - lastUpdateTime) / 1000 : 0;
 
-  // Create position object with enhanced metadata
+  // Create enhanced position object
   const newPosition = {
     lat: lat,
     lng: lng,
     accuracy: coords.accuracy || 20,
-    heading: coords.heading !== null ? coords.heading : lastHeadingValue || undefined,
+    heading: coords.heading !== null ? coords.heading : (lastPosition ? lastPosition.heading : undefined),
     timestamp: currentTime,
     speedMPS: coords.speed !== null ? coords.speed : 
-      (lastPosition ? calculateDistance(lastPosition, {lat: lat, lng: lng}) / Math.max(0.1, timeDelta) : 0),
+      (lastPosition ? calculateDistance(lastPosition, { lat, lng }) / Math.max(0.1, timeDelta) : 0),
     updateType: position.updateType || 'REGULAR'
   };
-
-  // Safety check before proceeding
-  if (newPosition.lat === undefined || newPosition.lng === undefined) {
-    console.error("Cannot center map: invalid coordinates", newPosition);
-    return;
-  }
-
-  // Update speed samples for dynamic zoom
-  updateSpeedSamples(newPosition);
 
   // First position initialization
   if (!lastPosition) {
@@ -3970,130 +4032,78 @@ function updateUserLocation(position, forceUpdate = false) {
     lastValidPosition = newPosition;
     userMarker.setLatLng([newPosition.lat, newPosition.lng]);
     lastUpdateTime = currentTime;
-    lastUpdateTimestamp = currentTime;
-    centerMapOnPosition(newPosition, true);
+    centerMapOnPosition(newPosition, true, ZOOM_LEVELS.STATIONARY);
     return;
   }
 
   // Calculate distance from last position
   const distance = calculateDistance(lastPosition, newPosition);
-  
-  // Calculate adaptive threshold based on accuracy and speed
   const adaptiveThreshold = Math.max(
     EXTENDED_DISTANCE_THRESHOLD * 0.5,
     Math.min(EXTENDED_DISTANCE_THRESHOLD * 2, newPosition.accuracy * 3)
   );
 
-  // Adjust movement detection threshold based on speed (faster = higher threshold)
-  const movementThreshold = Math.max(2, Math.min(10, newPosition.speedMPS * 2));
-
-  // Check for sudden movements with adaptive sensitivity
-  const isJump = !forceUpdate && detectSuddenMovement(newPosition, lastPosition, movementThreshold);
-
-  // If we're stationary and a jump is detected, verify with additional checks
-  if (isJump && isStationary && stationaryPositionLocked) {
-    const isValidJump = validatePositionJump(newPosition, lastPosition);
-    
-    if (!isValidJump) {
-      console.log("Position jump detected while stationary, ignoring update");
-      isJumpDetected = true;
-      
-      if (!stationaryCheckTimeout) {
-        stationaryCheckTimeout = setTimeout(() => {
-          navigator.geolocation.getCurrentPosition(
-            pos => updateUserLocation(pos, true),
-            err => console.warn("Position verification error:", err),
-            {enableHighAccuracy: true, maximumAge: 0, timeout: 10000}
-          );
-          stationaryCheckTimeout = null;
-        }, 2000);
-      }
-      return;
-    }
-  }
-
-  // Handle large position changes or forced updates
+  // Handle large position changes
   if (distance > adaptiveThreshold || forceUpdate) {
-    handleLargePositionChange(newPosition);
+    lastPosition = newPosition;
+    lastValidPosition = newPosition;
     userMarker.setLatLng([newPosition.lat, newPosition.lng], { animate: false });
     centerMapOnPosition(newPosition, true);
     return;
   }
 
-  // Skip updates with poor accuracy or unrealistic movement
-  if (!forceUpdate &&
-    (newPosition.accuracy > MAX_ACCEPTABLE_ACCURACY * (1 + newPosition.speedMPS/10) || 
-    (timeDelta > 0 && distance / timeDelta > 40))
-  ) {
+  // Skip poor accuracy updates
+  if (!forceUpdate && (newPosition.accuracy > MAX_ACCEPTABLE_ACCURACY * (1 + newPosition.speedMPS/10) || 
+      (timeDelta > 0 && distance / timeDelta > 40)) {
     console.log("Skipping update due to poor accuracy or unrealistic movement");
     return;
   }
 
   try {
-    // Enhanced motion detection with speed and position history
+    // Motion detection
     const motionDetected = detectMotion(newPosition, lastPosition, timeDelta);
-
-    // Improved stationary state detection
     checkStationaryState(newPosition, motionDetected);
 
-    // Calculate appropriate zoom level based on speed
-    const zoomLevel = calculateZoomLevel(newPosition.speedMPS);
+    // Position smoothing
+    const smoothedPosition = {
+      lat: lastPosition.lat * 0.6 + newPosition.lat * 0.4,
+      lng: lastPosition.lng * 0.6 + newPosition.lng * 0.4,
+      accuracy: newPosition.accuracy,
+      heading: newPosition.heading,
+      speedMPS: newPosition.speedMPS,
+      timestamp: newPosition.timestamp
+    };
 
-    // Enhanced stationary handling with jitter elimination
+    // Stationary position locking
     if (isStationary && stationaryPositionLocked && lastStationaryPosition) {
-      const driftDistance = calculateDistance(lastStationaryPosition, newPosition);
+      const driftDistance = calculateDistance(lastStationaryPosition, smoothedPosition);
       const minDriftThreshold = Math.max(MIN_STATIONARY_DRIFT_THRESHOLD, lastStationaryPosition.accuracy * 0.25);
       
       if (driftDistance < minDriftThreshold && !forceUpdate) {
         userMarker.setLatLng([lastStationaryPosition.lat, lastStationaryPosition.lng], { animate: false });
-        centerMapOnPosition(lastStationaryPosition, false, zoomLevel);
-        updateDistanceBox();
-        checkProximityForZoom();
-        adjustUpdateFrequency(true);
+        centerMapOnPosition(lastStationaryPosition, false, ZOOM_LEVELS.STATIONARY);
         return;
-      }
-      
-      if (driftDistance < minDriftThreshold * 2) {
-        newPosition.lat = lastStationaryPosition.lat * STATIONARY_DAMPING_FACTOR + newPosition.lat * (1 - STATIONARY_DAMPING_FACTOR);
-        newPosition.lng = lastStationaryPosition.lng * STATIONARY_DAMPING_FACTOR + newPosition.lng * (1 - STATIONARY_DAMPING_FACTOR);
       }
     }
 
-    // Simplified smoothing as replacement for enhancedTracking
-    const smoothedPosition = simpleSmoothing(newPosition, lastPosition);
-
-    // Update position buffer and history
-    updatePositionBuffer(smoothedPosition);
-    updatePositionHistory(smoothedPosition);
-
-    // Update user marker position first to ensure responsiveness
+    // Update marker and map
     userMarker.setLatLng([smoothedPosition.lat, smoothedPosition.lng], { 
       animate: smoothedPosition.speedMPS < 10,
       duration: 0.3
     });
 
-    // Animation frame processing with zoom level
-    requestAnimationFrame(() => {
-      positionUpdateQueue.push(smoothedPosition);
-      processPositionUpdateQueue();
-      centerMapOnPosition(smoothedPosition, smoothedPosition.speedMPS > 25, zoomLevel);
-    });
-    
-    // Update state variables
+    const zoomLevel = getZoomLevelForSpeed(smoothedPosition.speedMPS);
+    centerMapOnPosition(smoothedPosition, smoothedPosition.speedMPS > 25, zoomLevel);
+
+    // Update state
     lastPosition = smoothedPosition;
     lastValidPosition = smoothedPosition;
     lastUpdateTime = currentTime;
-    lastUpdateTimestamp = currentTime;
-    
-    // Update UI components
-    updateDistanceBox();
-    adjustUpdateFrequency(smoothedPosition.speedMPS > 15 ? false : isStationary);
-    checkProximityForZoom();
-    updateDynamicZoom(smoothedPosition.speedMPS);
+    currentSpeed = smoothedPosition.speedMPS;
+
   } catch (error) {
     console.error("Error in updateUserLocation:", error);
-    
-    const fallbackPosition = {
+    const fallbackPosition = lastValidPosition || {
       lat: newPosition.lat,
       lng: newPosition.lng,
       accuracy: newPosition.accuracy,
@@ -4103,18 +4113,26 @@ function updateUserLocation(position, forceUpdate = false) {
     };
     
     userMarker.setLatLng([fallbackPosition.lat, fallbackPosition.lng], { animate: false });
-    
-    requestAnimationFrame(() => {
-      updateUserMarkerPosition(fallbackPosition);
-      centerMapOnPosition(fallbackPosition, false);
-    });
-    
-    lastPosition = fallbackPosition;
-    lastValidPosition = fallbackPosition;
-    lastRenderPosition = fallbackPosition;
-    updateDistanceBox();
-    checkProximityForZoom();
-    updateDynamicZoom();
+    centerMapOnPosition(fallbackPosition, false);
+  }
+}
+
+// Helper functions you already have
+function detectMotion(newPos, lastPos, timeDelta) {
+  if (!lastPos) return true;
+  const distance = calculateDistance(newPos, lastPos);
+  return distance > (newPos.accuracy + lastPos.accuracy) / 3;
+}
+
+function checkStationaryState(position, motionDetected) {
+  const isNowStationary = position.speedMPS < SPEED_THRESHOLDS.STATIONARY && !motionDetected;
+  
+  if (isNowStationary !== isStationary) {
+    isStationary = isNowStationary;
+    stationaryPositionLocked = false;
+    if (!isStationary) {
+      lastStationaryPosition = null;
+    }
   }
 }
 
