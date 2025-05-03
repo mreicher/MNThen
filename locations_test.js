@@ -240,7 +240,7 @@ const locations = [
     lng: -93.16029125041885,
     name: "Northfield Bank Raid (September 7, 1876)",
     title: "Northfield Bank Raid",
-    image: "https://mnthen.com/locations/gallery/mahtomedi/wildwood/wildwood_2.jpg",
+    image: "https://mnthen.com/images/northfield.jpg",
     creator: "Matt Reicher",
     city: "Northfield",
     audio: "/audio/northfield.mp3",
