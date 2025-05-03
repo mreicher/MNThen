@@ -232,8 +232,25 @@ const locations = [
     link: "https://mnthen.com/blog/place/prom.html",
     imageSource: "Cyanotype photograph of Nininger c.1890 via MNopedia",
     additionalInfo: "Ignatius Donnelly later became famous for his writings on Atlantis, theories about Shakespeare’s works, and his political career."
-}
+    },
 
+    {
+    id: "1023",
+    lat: 44.4558710955559,
+    lng: -93.16029125041885,
+    name: "Northfield Bank Raid (September 7, 1876)",
+    title: "Northfield Bank Raid",
+    image: "https://mnthen.com/locations/gallery/mahtomedi/wildwood/wildwood_2.jpg",
+    creator: "Matt Reicher",
+    city: "Northfield",
+    audio: "/audio/northfield.mp3",
+    tours: "event",
+    summary: "The 1876 Northfield bank robbery by the James-Younger gang failed when townspeople opened fire, killing two gang members. The remaining robbers fled with only $26.70, leaving two dead behind.",
+    today: "Outside the Northfield Historical Society",
+    link: "https://mnthen.com/blog/event/northfield.html",
+    imageSource: "Northfield Bank Raid 1876 via Northfield History Center",
+    additionalInfo: "After their capture, Cole Younger had 11 bullet wounds in his body - more than any other survivor of the Northfield Raid."
+    }
 
 
     // Add more locations here
