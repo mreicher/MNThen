@@ -137,6 +137,7 @@ const blogArticles = [
   url: "https://mnthen.com/blog/people/bones.html",
   keywords: ["saint paul", "st paul", "bones", "rice", "north end", "person", "all"],
 },
+    /*
         {
       headline: "Summit Brewing (1986 - )",
       blurb: "Founded by Mark Stutrud, Summit grew from a small brewery focusing on underrepresented beer styles to one of Minnesota's largest breweries.",
@@ -146,6 +147,7 @@ const blogArticles = [
       keywords: ["saint paul", "st. paul", "Summit", "summit", "beer", "stutrud", "Stutrud", "place", "all"],
 
     },
+    */
         {
       headline: "Wildwood Amusement Park",
       blurb: "Wildwood Amusement Park on White Bear Lake, the 'Coney Island of Saint Paul,' entertained generations until financial woes forced its closure in the 1930s",
