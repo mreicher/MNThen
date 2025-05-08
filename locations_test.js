@@ -250,8 +250,24 @@ const locations = [
   "link": "https://mnthen.com/blog/event/washburn_mill.html",
   "imageSource": "Washburn Mill Explosion via General Mills",
   "additionalInfo": "In 1928, Washburn-Crosby Company merged with several other regional milling companies to form General Mills, which remains a major food corporation today."
+},
+    {
+  "id": "1024",
+  "lat": 44.45572863141056,
+  "lng": -93.16030365602623,
+  "name": "Northfield Bank Raid (September 7, 1876)",
+  "title": "Northfield Bank Raid",
+  "image": "https://mnthen.com/images/northfield.jpg",
+  "creator": "Matt Reicher",
+  "city": "Northfield",
+  "audio": "/audio/northfield.mp3",
+  "tours": "event",
+  "summary": "In 1876, Jesse James’ gang botched a Northfield bank robbery when armed townspeople fought back. Two outlaws died, the Youngers were caught, and Jesse fled.",
+  "today": "Northfield History Center",
+  "link": "https://mnthen.com/blog/event/northfield.html",
+  "imageSource": "Northfield Bank Raid 1876 via Northfield History Center",
+  "additionalInfo": "Despite being shot 11 times during the raid and manhunt, Cole Younger survived—only to spend 25 years in prison before being pardoned."
 }
-
 
     // Add more locations here
 ];
