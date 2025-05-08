@@ -303,7 +303,7 @@ const blogArticles = [
 },
 {
   headline: "Washburn 'A' Mill Explosion (May 2, 1878)",
-  blurb: "The 1878 Washburn "A" Mill explosion in killed 18 people when flour dust ignited. This disaster transformed industrial safety practices and prompted improved technology.",
+  blurb: "The 1878 Washburn 'A' Mill explosion in killed 18 people when flour dust ignited. This disaster transformed industrial safety practices and prompted improved technology.",
   icon: "fa-calendar",
   image: "https://mnthen.com/images/mill-explosion.webp",
   url: "https://mnthen.com/blog/event/washburn_mill.html",
