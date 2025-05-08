@@ -235,7 +235,7 @@ const locations = [
     },
 
     {
-  "id": "1024",
+  "id": "1023",
   "lat": 44.97998830008001,
   "lng": -93.25704091894147,
   "name": "Washburn ‘A’ Mill Explosion (May 2, 1878)",
@@ -244,7 +244,7 @@ const locations = [
   "creator": "Matt Reicher",
   "city": "Minneapolis",
   "audio": "/audio/washburn_mill.mp3",
-  "tours": "calendar",
+  "tours": "event",
   "summary": "Minneapolis' Washburn ‘A’ Mill exploded in 1878 when flour dust ignited, killing 18 people. Owner Cadwallader Washburn rebuilt with innovative safety systems, revolutionizing industrial practices while supporting victims' families.",
   "today": "Mill Ruins Park",
   "link": "https://mnthen.com/blog/event/washburn_mill.html",
