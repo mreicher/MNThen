@@ -235,22 +235,22 @@ const locations = [
     },
 
     {
-    id: "1023",
-    lat: 44.4558710955559,
-    lng: -93.16029125041885,
-    name: "Northfield Bank Raid (September 7, 1876)",
-    title: "Northfield Bank Raid",
-    image: "https://mnthen.com/images/northfield.jpg",
-    creator: "Matt Reicher",
-    city: "Northfield",
-    audio: "/audio/northfield.mp3",
-    tours: "event",
-    summary: "The 1876 Northfield bank robbery by the James-Younger gang failed when townspeople opened fire, killing two gang members. The remaining robbers fled with only $26.70, leaving two dead behind.",
-    today: "Outside the Northfield Historical Society",
-    link: "https://mnthen.com/blog/event/northfield.html",
-    imageSource: "Northfield Bank Raid 1876 via Northfield History Center",
-    additionalInfo: "After their capture, Cole Younger had 11 bullet wounds in his body - more than any other survivor of the Northfield Raid."
-    }
+  "id": "1024",
+  "lat": 44.97998830008001,
+  "lng": -93.25704091894147,
+  "name": "Washburn ‘A’ Mill Explosion (May 2, 1878)",
+  "title": "Washburn ‘A’ Mill Explosion",
+  "image": "https://mnthen.com/images/mill-explosion.webp",
+  "creator": "Matt Reicher",
+  "city": "Minneapolis",
+  "audio": "/audio/washburn_mill.mp3",
+  "tours": "calendar",
+  "summary": "Minneapolis' Washburn ‘A’ Mill exploded in 1878 when flour dust ignited, killing 18 people. Owner Cadwallader Washburn rebuilt with innovative safety systems, revolutionizing industrial practices while supporting victims' families.",
+  "today": "Mill Ruins Park",
+  "link": "https://mnthen.com/blog/event/washburn_mill.html",
+  "imageSource": "Washburn Mill Explosion via General Mills",
+  "additionalInfo": "In 1928, Washburn-Crosby Company merged with several other regional milling companies to form General Mills, which remains a major food corporation today."
+}
 
 
     // Add more locations here
