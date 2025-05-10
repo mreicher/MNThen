@@ -76,8 +76,8 @@ Pull requests are the best way to propose changes to the codebase. We actively w
 ### Any contributions you make will be under the GPL v3 Software License
 In short, when you submit code changes, your submissions are understood to be under the same [GPL v3 License](https://www.gnu.org/licenses/gpl-3.0.en.html) that covers the project.
 
-### Report bugs using Github's [issues](https://github.com/yourusername/minnesota-then/issues)
-We use GitHub issues to track public bugs. Report a bug by [opening a new issue](https://github.com/yourusername/minnesota-then/issues/new); it's that easy!
+### Report bugs using Github's [issues](https://github.com/mreicher/MNThen/issues/)
+We use GitHub issues to track public bugs. Report a bug by [opening a new issue] (https://github.com/mreicher/MNThen/issues/new); it's that easy!
 
 ### Write bug reports with detail, background, and sample code
 
