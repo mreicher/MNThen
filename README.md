@@ -77,7 +77,7 @@ Pull requests are the best way to propose changes to the codebase. We actively w
 In short, when you submit code changes, your submissions are understood to be under the same [GPL v3 License](https://www.gnu.org/licenses/gpl-3.0.en.html) that covers the project.
 
 ### Report bugs using Github's [issues](https://github.com/mreicher/MNThen/issues/)
-We use GitHub issues to track public bugs. Report a bug by [opening a new issue] (https://github.com/mreicher/MNThen/issues/new); it's that easy!
+We use GitHub issues to track public bugs. Report a bug by [opening a new issue] (https://github.com/mreicher/MNThen/issues/); it's that easy!
 
 ### Write bug reports with detail, background, and sample code
 
