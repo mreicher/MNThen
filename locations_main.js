@@ -24,7 +24,7 @@ const locations = [
         lng: -93.10991227113067,
         name: "Michael 'Eyedea' Larsen (1981 - 2010)",
         title: "Michael 'Eyedea' Larsen",
-        image: "https://mnthen.com/images/wsp_eyedea.jpg",
+        image: "https://mnthen.com/images/wsp_eyedea.webp",
         creator: "Matt Reicher",
         city: "Saint Paul",
         audio: "/audio/wsp/wsp_eyedea.mp3", 
