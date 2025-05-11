@@ -1,108 +1,127 @@
-# Minnesota Then | Museum Without Walls
+# Minnesota Then: Museum Without Walls
 
-## Description
+![Minnesota Then Logo](https://mnthen.com/images/logo.webp)
 
-Minnesota Then is an interactive, location-based web application that serves as a "Museum Without Walls". It allows users to explore historical locations throughout Minnesota using a map interface, providing audio tours, images, and additional information about each site.
+## Overview
 
-## Features
+Minnesota Then is an innovative "Museum Without Walls" concept that transforms the traditional museum experience by bringing history directly to where it happened. This location-based web application allows users to explore historical sites throughout Minnesota by physically visiting locations and unlocking rich multimedia content including images, audio narration, and historical information.
 
-- Interactive map interface using Leaflet.js
-- Geolocation-based user tracking
-- Custom location markers with popup information
-- Audio player for location-specific content
-- Responsive design for mobile and desktop use
-- Navigation assistance to historical sites
-- Summary information for each location
-- Multiple navigation app options (Google Maps, Waze, Apple Maps)
+## 🌟 Key Features
 
-## Technical Details
+- **Interactive Map Interface**: Navigate through historical points of interest using an optimized Leaflet.js map
+- **Location-Based Content**: Unlock historical information when physically near points of interest (within 20 feet)
+- **Audio Tours**: Listen to narrated historical information about each location
+- **Responsive Design**: Optimized for all devices with special attention to mobile experience
+- **Advanced Geolocation**: Sophisticated position tracking with Kalman filtering and adaptive smoothing
+- **Offline Capability**: Core functionality works with limited connectivity
+- **Multiple Navigation Options**: Integration with Google Maps, Apple Maps, and Waze for directions
 
-- Built with HTML5, CSS3, and JavaScript
-- Uses Leaflet.js for map functionality
-- Implements the Geolocation API for user positioning
-- Utilizes Bootstrap for responsive design elements
-- Custom audio player implementation
-- Marker clustering for improved map performance
+## 🧠 Technical Implementation
 
-## Setup and Usage
+The application is built using modern web technologies:
 
-1. Clone the repository to your local machine.
-2. Ensure you have a web server set up to serve the files (e.g., Apache, Nginx, or a simple Python HTTP server).
-3. Update the `locations_test.js` file with your specific location data.
-4. Customize the styling in `mainmap.css` as needed.
-5. Deploy the application to your web server.
+- **Frontend**: HTML5, CSS3, JavaScript (ES6+)
+- **Mapping**: Leaflet.js with custom markers and clustering
+- **Geolocation**: HTML5 Geolocation API with advanced filtering algorithms
+- **Media**: Optimized image loading and HTML5 audio
+- **Performance**: Lazy loading, resource hints, and critical CSS inlining
 
-## Key Components
+### Geolocation Optimization
 
-- `index.html`: Main entry point of the application
-- `locations_test.js`: Contains data for all historical locations
-- `mainmap.css`: Custom styles for the application
-- JavaScript functions within `index.html`:
-  - `initMap()`: Initializes the Leaflet map
-  - `updateUserLocation()`: Handles user location updates
-  - `showLocationHunt()`: Displays information when near a historical site
-  - `loadAllLocations()`: Populates the map with location markers
+The application implements several advanced techniques to provide accurate and smooth location tracking:
 
-## Future Improvements
+- Kalman filtering for position smoothing
+- Adaptive velocity prediction
+- Stationary state detection
+- Jitter reduction algorithms
+- Background/foreground state management
+- Accuracy-based filtering
 
-- Implement offline functionality for better performance in areas with poor connectivity
-- Add user accounts for saving favorite locations and tracking visited sites
-- Integrate more multimedia content such as videos or AR experiences
-- Develop a backend API for easier content management and updates
+### Map Rendering
 
-## Contributing
+The map interface features:
 
-We love your input! We want to make contributing to this project as easy and transparent as possible, whether it's:
+- Custom marker clustering
+- Optimized tile loading
+- Responsive zoom levels based on movement speed
+- Edge proximity detection for optimal centering
+- Touch gesture optimization for mobile devices
 
-- Reporting a bug
-- Discussing the current state of the code
-- Submitting a fix
-- Proposing new features
-- Becoming a maintainer
+## 📱 User Experience
 
-### We Develop with Github
-We use github to host code, to track issues and feature requests, as well as accept pull requests.
+The application guides users through historical locations with:
 
-### We Use [Github Flow](https://guides.github.com/introduction/flow/index.html), So All Code Changes Happen Through Pull Requests
-Pull requests are the best way to propose changes to the codebase. We actively welcome your pull requests:
+1. **Discovery**: Users navigate to historical points using the interactive map
+2. **Proximity Detection**: When within 20 feet of a location, content automatically unlocks
+3. **Engagement**: Users view historical images and listen to narrated information
+4. **Learning**: Additional historical context is provided after the audio tour
+5. **Exploration**: Users can continue to other nearby locations
 
-1. Fork the repo and create your branch from `main`.
-2. If you've added code that should be tested, add tests.
-3. If you've changed APIs, update the documentation.
-4. Ensure the test suite passes.
-5. Make sure your code lints.
-6. Issue that pull request!
+## 🚀 Getting Started
 
-### Any contributions you make will be under the GPL v3 Software License
-In short, when you submit code changes, your submissions are understood to be under the same [GPL v3 License](https://www.gnu.org/licenses/gpl-3.0.en.html) that covers the project.
+To run this project locally:
 
-### Report bugs using Github's [issues](https://github.com/mreicher/MNThen/issues/)
-We use GitHub issues to track public bugs. Report a bug by [opening a new issue] (https://github.com/mreicher/MNThen/issues/); it's that easy!
+1. Clone the repository
+2. Open `index.html` in a modern web browser
+3. Allow location permissions when prompted
+4. Navigate to a test location or use the developer tools to simulate GPS coordinates
 
-### Write bug reports with detail, background, and sample code
+## 📂 Project Structure
 
-**Great Bug Reports** tend to have:
+```
+minnesota-then/
+├── css/                  # Stylesheets
+│   ├── mainmap.css       # Main map styling
+│   └── mnthen_main_map2.css # Additional map styling
+├── images/               # Image assets
+│   ├── logo.webp         # Site logo
+│   └── ...               # Other images
+├── js/                   # JavaScript files
+│   └── locations_main.js # Location data and functionality
+├── index.html            # Main entry point
+└── README.md             # Project documentation
+```
 
-- A quick summary and/or background
-- Steps to reproduce
-  - Be specific!
-  - Give sample code if you can.
-- What you expected would happen
-- What actually happens
-- Notes (possibly including why you think this might be happening, or stuff you tried that didn't work)
+## 🔧 Core Components
 
-### Use a Consistent Coding Style
+The main application file contains several key components:
 
-* 2 spaces for indentation rather than tabs
-* You can try running `npm run lint` for style unification
+1. **Map Initialization**: Sets up the Leaflet map with optimized settings
+2. **Geolocation Handling**: Manages user position tracking and updates
+3. **Location Hunt**: Displays content when users are near points of interest
+4. **Audio Player**: Controls for audio playback of historical narration
+5. **UI Components**: Modals, popups, and interactive elements
+6. **Event Listeners**: Handles user interactions and device events
 
-## References
-This document was adapted from the open-source contribution guidelines for [Facebook's Draft](https://github.com/facebook/draft-js/blob/master/CONTRIBUTING.md)
+## 🔮 Future Enhancements
 
-## License
+- Augmented reality views of historical sites
+- User contributions and community stories
+- Gamification elements like badges and challenges
+- Integration with museum collections API
+- Offline content caching for areas with poor connectivity
 
-By contributing, you agree that your contributions will be licensed under its GPL v3 License.
+## 📄 License
 
-## Contact
+This project is licensed under the GNU General Public License v3.0 (GPL-3.0).
 
-For more information or support, please contact mattreicher@protonmail.com. See the project in action at [Minnesota Then](https://www.mnthen.com)
+### What this means:
+
+- You are free to use, modify, and distribute this software.
+- If you distribute this software or derivative works, you must make the source code available under the same license.
+- Any modifications you make must be released under the same license if distributed.
+- No warranty is provided with this software.
+
+For the full license text, see [the GNU GPL v3 License](https://www.gnu.org/licenses/gpl-3.0.en.html).
+
+## 🙏 Acknowledgements
+
+- Minnesota Historical Society for historical data and photographs
+- Metropolitan State University for research methodology
+- OpenStreetMap for map data and tiles
+- Leaflet.js for mapping functionality
+- All contributors, researchers, and testers who made this project possible
+
+## 📞 Contact
+
+For questions or feedback, please contact: mattreicher@protonmail.com
