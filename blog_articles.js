@@ -11,7 +11,7 @@ const blogArticles = [
      headline: "Larsen, Michael 'Eyedea' (1981 - 2010)",
       blurb: "A remarkable rapper and artist who left an indelible mark on underground hip-hop before his untimely death.",
        icon: "fa-user",
-      image: "https://mnthen.com/images/wsp_eyedea.jpg",
+      image: "https://mnthen.com/images/wsp_eyedea.webp",
       url: "https://mnthen.com/blog/people/eyedea_larsen.html",
       keywords: ["saint paul", "st. paul", "rap", "hip", "hop", "Rhymesayers", "person", "all"],
     },
