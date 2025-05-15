@@ -42,7 +42,7 @@ const locations = [
         lng: -94.00311590799822,
         name: "Hanging of the Dakota 38 (Dec 26, 1862)",
         title: "Hanging of the Dakota 38",
-        image: "https://mnthen.com/markers/mankato/images/mankato_38.jpg",
+        image: "https://mnthen.com/markers/mankato/images/mankato_38.webp",
         creator: "Matt Reicher",
         city: "Mankato",
         audio: "/audio/mankato/man_dakota_38.mp3", 
