@@ -35,7 +35,7 @@ const blogArticles = [
       headline: "Hanging of the Dakota 38 (Dec. 26, 1862)",
       blurb: "Broken promises sparked deadly confrontation in 1862. On December 26, 38 Dakota men were hanged, marking the conflict's tragic end.",
       icon: "fa-calendar",
-      image: "https://mnthen.com/markers/mankato/images/mankato_38.jpg",
+      image: "https://mnthen.com/markers/mankato/images/mankato_38.webp",
       url: "https://mnthen.com/blog/event/dakota_conflict.html",
       keywords: ["Dakota", "dakota", "Mankato", "1982", "war", "conflict", "event", "all"],
     },
