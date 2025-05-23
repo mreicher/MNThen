@@ -9,7 +9,7 @@ const locations = [
         image: "https://mnthen.com/locations/gallery/mahtomedi/wildwood/wildwood_2.jpg",
         creator: "Matt Reicher",
         city: "Mahtomedi",
-        audio: "/audio/mahtomedi/wildwood.mp3", 
+        audio: "/audio/exhibit/wildwood.mp3", 
         tours: "place",
         summary: "Wildwood entertained Twin Cities families with rides, shows, and lakeside activities from the 1890s until 1932, when it closed due to financial troubles. Today, the park is long since gone, but its memory lives on.",
         today: "Southeast corner of White Bear Lake",
