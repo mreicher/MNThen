@@ -2,8 +2,8 @@ const locations = [
 
     {
         id: "1010",
-        lat: 45.05648381562563,
-        lng: -92.96040208835049,
+        lat: 45.05667788084499,
+        lng: -92.95965368539532,
         name: "Wildwood Amusement Park (1889 - 1932)",
         title: "Wildwood Amusement Park",
         image: "https://mnthen.com/locations/gallery/mahtomedi/wildwood/wildwood_2.jpg",
