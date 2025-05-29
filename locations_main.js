@@ -267,7 +267,26 @@ const locations = [
   "link": "https://mnthen.com/blog/event/northfield.html",
   "imageSource": "Northfield Bank Raid 1876 via Northfield History Center",
   "additionalInfo": "Despite being shot 11 times during the raid and manhunt, Cole Younger survived—only to spend 25 years in prison before being pardoned."
+},
+
+{
+  "id": "1025",
+  "lat": 45.08605825417038,
+  "lng": -92.99964796360983,
+  "name": "Erd-Geist Gazebo",
+  "title": "Erd-Geist Gazebo",
+  "image": "https://mnthen.com/images/exhibit/gazebo.jpg",
+  "creator": "Matt Reicher",
+  "city": "Mahtomedi",
+  "audio": "/audio/exhibit/geist.mp3",
+  "tours": "place",
+  "summary": "The Erd-Geist Gazebo, built in 1883 as a wedding gift, has survived multiple relocations and restorations through community efforts. Originally on White Bear Lake's south shore, it now sits in Matoska Park as a beloved local landmark.",
+  "today": "Matoska Park alongside White Bear Lake",
+  "link": "https://mnthen.com/blog/place/geist.html",
+  "imageSource": "Geist Gazebo, White Bear Lake(1885) via MN Digital Library",
+  "additionalInfo": "Local legend has it that the gazebo was moved across the frozen White Bear Lake in 1974. However, the ice was deemed too thin to safely support the structure and the plan was changed."
 }
+
 
     // Add more locations here
 ];
