@@ -310,7 +310,7 @@ const blogArticles = [
   keywords: ["flour", "mill", "Washburn", "Minneapolis", "explosion", "event", "all"]
 },
 {
-  "headline": "Geist Gazebo",
+  "headline": "Erd-Geist Gazebo",
   "blurb": "Built in 1883 as a wedding gift, this Victorian gazebo survived multiple relocations and restorations to become White Bear Lake's beloved landmark",
   "icon": "fa-building",
   "image": "https://mnthen.com/images/exhibit/gazebo.jpg",
