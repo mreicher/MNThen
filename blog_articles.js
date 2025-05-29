@@ -309,5 +309,13 @@ const blogArticles = [
   url: "https://mnthen.com/blog/event/washburn_mill.html",
   keywords: ["flour", "mill", "Washburn", "Minneapolis", "explosion", "event", "all"]
 },
+{
+  "headline": "Geist Gazebo",
+  "blurb": "Built in 1883 as a wedding gift, this Victorian gazebo survived multiple relocations and restorations to become White Bear Lake's beloved landmark",
+  "icon": "fa-building",
+  "image": "https://mnthen.com/images/exhibit/gazebo.jpg",
+  "url": "https://mnthen.com/blog/place/geist.html",
+  "keywords": ["gazebo", "park", "White Bear Lake", "Matoska", "wedding", "place", "all"]
+}
     // Add more articles as needed
 ];
