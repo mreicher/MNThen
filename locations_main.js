@@ -1,5 +1,5 @@
 const locations = [
-
+/*
     {
         id: "1010",
         lat: 45.05667788084499,
@@ -17,7 +17,7 @@ const locations = [
         imageSource: "Image of the slide at Wildwood Park c. 1905 via MPRNews",
         additionalInfo: "Wildwood featured the popular 'Scenic Railway,' a wooden roller coaster designed by Fred W. Pearce. It was later moved to his Excelsior Amusement Park."
     },
-
+*/
     {
         id: "1011",
         lat: 44.922167523742054,
