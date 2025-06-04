@@ -154,7 +154,7 @@ const locations = [
         creator: "Matt Reicher",
         city: "Saint Paul",
         audio: "/audio/exhibit/merriam_mansion.mp3",
-        tours: "place",
+        tours: "history",
         summary: "In 1880, William R. Merriam built an impressive Queen Anne-style mansion in St. Paul, designed by Clarence Johnston. The mansion, a social hub, was tragically destroyed by fire in 1896.",
         today: "Cass Gilbert Park",
         link: "https://mnthen.com/blog/place/merriam_mansion.html",
