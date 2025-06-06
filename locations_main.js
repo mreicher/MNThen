@@ -1,9 +1,9 @@
 const locations = [
-/*
+
     {
         id: "1010",
-        lat: 45.05667788084499,
-        lng: -92.95965368539532,
+        lat: 45.05702204168715,
+        lng: -92.9591929076619,
         name: "Wildwood Amusement Park (1889 - 1932)",
         title: "Wildwood Amusement Park",
         image: "https://mnthen.com/locations/gallery/mahtomedi/wildwood/wildwood_2.jpg",
@@ -17,7 +17,7 @@ const locations = [
         imageSource: "Image of the slide at Wildwood Park c. 1905 via MPRNews",
         additionalInfo: "Wildwood featured the popular 'Scenic Railway,' a wooden roller coaster designed by Fred W. Pearce. It was later moved to his Excelsior Amusement Park."
     },
-*/
+
     {
         id: "1011",
         lat: 44.922167523742054,
