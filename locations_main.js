@@ -164,8 +164,8 @@ const locations = [
     
     {
     "id": "1019",
-    "lat": 45.08504478331554,
-    "lng": -92.7854640461975,
+    "lat": 45.08421675605315,
+    "lng": -92.78683662323817,
     "name": "St. Croix Boom Site (1856 - 1914)",
     "title": "St. Croix Boom Site",
     "image": "https://mnthen.com/images/boom1.jpg",
