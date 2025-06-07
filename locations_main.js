@@ -64,7 +64,7 @@ const locations = [
         creator: "Matt Reicher",
         city: "Saint Paul",
         audio: "/exhibit/audio/stp/stp_hamm_mansion.mp3", 
-        tours: "place",
+        tours: "history",
         summary: "The Theodore Hamm mansion, a grand St. Paul landmark, was a symbol of the Hamm family's wealth. Built in the late 1800s, it was destroyed by fire in 1954.",
         today: "Upper Swede Hollow Park",
         link: "https://mnthen.com/blog/place/stp_hamm_mansion.html",
