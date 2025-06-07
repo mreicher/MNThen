@@ -27,7 +27,7 @@ const locations = [
         image: "https://mnthen.com/images/wsp_eyedea.webp",
         creator: "Matt Reicher",
         city: "St. Paul",
-        audio: "/audio/wsp/wsp_eyedea.mp3", 
+        audio: "/audio/exhibit/eyedea.mp3", 
         tours: "person",
         summary: "Michael 'Eyedea' Larsen was a talented battle rapper and hip-hop artist from St. Paul. He passed away at 28, but his memory lives on through his music.",
         today: "Cherokee Regional Park",
