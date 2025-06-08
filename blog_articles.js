@@ -4,7 +4,7 @@ const blogArticles = [
   "blurb": "Defying isolation, she was the last non-indigenous full-time BWCAW resident, brewing 10,000 bottles of root beer annually for resort visitors.",
   "icon": "fa-user",
   "author": "Matt Reicher",
-  "date": "August 1, 2020",
+  "date": "February 25, 2025",
   "image": "https://mnthen.com/images/molter.jpg",
   "url": "https://mnthen.com/blog/people/molter.html",
   "keywords": ["root beer", "BWCA", "Northwoods", "Boundary Waters", "Root Beer Lady", "person", "all"]
