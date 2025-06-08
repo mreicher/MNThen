@@ -1,14 +1,14 @@
 const blogArticles = [
-    {
-  "headline": "Molter, Dorothy 'The Root Beer Lady' (1907 - 1986)",
-  "blurb": "Defying isolation, she was the last non-indeginous full-time BWCAW resident, brewing 10,000 bottles of root beer annually for resort visitors.",
-  "icon": "fa-user",
-  "author": "Matt Reicher",
-  "date": "August 1. 2020",
-  "image": "https://mnthen.com/images/molter.jpg",
-  "url": "https://mnthen.com/blog/people/molter.html",
-  "keywords": ["root beer", "BWCA", "Northwoods", "Boundary Waters", "Root Beer Lady", "person", "all"]
-},
+  {
+    "headline": "Molter, Dorothy 'The Root Beer Lady' (1907 - 1986)",
+    "blurb": "Defying isolation, she was the last non-indeginous full-time BWCAW resident, brewing 10,000 bottles of root beer annually for resort visitors.",
+    "icon": "fa-user",
+    "author": "Matt Reicher",
+    "date": "August 1, 2020",
+    "image": "https://mnthen.com/images/molter.jpg",
+    "url": "https://mnthen.com/blog/people/molter.html",
+    "keywords": ["root beer", "BWCA", "Northwoods", "Boundary Waters", "Root Beer Lady", "person", "all"]
+  },
     {
      headline: "Larsen, Michael 'Eyedea' (1981 - 2010)",
       blurb: "A remarkable rapper and artist who left an indelible mark on underground hip-hop before his untimely death.",
