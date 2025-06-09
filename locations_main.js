@@ -303,8 +303,24 @@ const locations = [
   "link": "https://mnthen.com/blog/people/clifford.html",
   "imageSource": "Image of Clifford’s brothel via MNopedia",
   "additionalInfo": "Legend claimed secret tunnels connected Clifford's brothel to the exclusive Minnesota Club, though this was later debunked."
+},
+{
+  "id": "1027",
+  "lat": 44.91348615039166,
+  "lng": -93.13984099221071,
+  "name": "Summit Brewing Company",
+  "title": "Summit Brewing Company",
+  "image": "https://mnthen.com/images/exhibit/today/summit_now.jpg",
+  "creator": "Matt Reicher",
+  "city": "St. Paul",
+  "audio": "/audio/exhibit/summit.mp3",
+  "tours": "place",
+  "summary": "Summit Brewing Company began in 1986 when Mark Stutrud converted a St. Paul auto parts store into a brewery, focusing on underrepresented beer styles. Despite increasing competition from hundreds of new Minnesota breweries, Summit maintained its industry leadership position.",
+  "today": "Crosby Business Center",
+  "link": "https://mnthen.com/blog/place/summit.html",
+  "imageSource": "Summit Brewing Co. via All About Beer",
+  "additionalInfo": "Summit founder Mark Stutrud retired as CEO in 2023 after 37 years, succeeded by former Chief Strategy Officer Brandon Bland."
 }
-
 
 
     // Add more locations here
