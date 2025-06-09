@@ -260,6 +260,16 @@ const blogArticles = [
     "keywords": ["saint paul", "st. paul", "hamm", "mansion", "east side", "place", "all"]
   },
   {
+   "headline": "Summit Brewing Company (1986 - )",
+   "blurb": "Summit Brewing Company pioneered underrepresented beer styles in Minnesota, starting in a converted auto parts store and becoming a statewide industry leader.",
+   "icon": "fa-building",
+   "author": "Matt Reicher",
+   "date": "October 8, 2023",
+   "image": "https://mnthen.com/images/exhibit/summit.webp",
+   "url": "https://mnthen.com/blog/place/summit.html",
+   "keywords": ["saint paul", "st. paul", "summit", "beer", "brewery", "university", "place", "all"]
+  },
+  {
     "headline": "Hanging of the Dakota 38 (Dec. 26, 1862)",
     "blurb": "Broken promises sparked deadly confrontation in 1862. On December 26, 38 Dakota men were hanged, marking the conflict's tragic end.",
     "icon": "fa-calendar",
