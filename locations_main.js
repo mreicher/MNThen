@@ -320,7 +320,26 @@ const locations = [
   "link": "https://mnthen.com/blog/place/summit.html",
   "imageSource": "Summit Brewing Co. via All About Beer",
   "additionalInfo": "Summit founder Mark Stutrud retired as CEO in 2023 after 37 years, succeeded by former Chief Strategy Officer Brandon Bland."
+},
+
+{
+  "id": "1028",
+  "lat": 44.95354376638059,
+  "lng": -93.09708926359092,
+  "name": "Downtown Ballpark (Pillbox) 1903 - 1909",
+  "title": "Downtown Ballpark (Pillbox)",
+  "image": "https://mnthen.com/images/exhibit/pillbox.jpg",
+  "creator": "Matt Reicher",
+  "city": "St. Paul",
+  "audio": "/audio/exhibit/pillbox.mp3",
+  "tours": "history",
+  "summary": "St. Paul's Downtown Ballpark, nicknamed \"The Pillbox,\" served as home to the St. Paul Saints from 1903-1909. This compact downtown stadium featured extremely small dimensions—just 210 feet to right field—before being abandoned and sold.",
+  "today": "State Capitol Complex",
+  "link": "https://mnthen.com/blog/place/pillbox.html",
+  "imageSource": "Pillbox (1903) via MPR News",
+  "additionalInfo": "Hall of Famer Andrew \"Rube\" Foster threw a no-hitter for the St. Paul Colored Gophers at the Pillbox in 1908."
 }
+
 
 
     // Add more locations here
