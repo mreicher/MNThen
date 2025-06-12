@@ -205,7 +205,7 @@ const blogArticles = [
     "icon": "fa-building",
     "author": "Matt Reicher",
     "date": "August 3, 2024",
-    "image": "https://mnthen.com/images/pillbox.jpg",
+    "image": "https://mnthen.com/images/exhibit/pillbox.jpg",
     "url": "https://mnthen.com/blog/place/pillbox.html",
     "keywords": ["saint paul", "st. paul", "baseball", "Saints", "sports", "ballpark", "place", "all"]
   },
