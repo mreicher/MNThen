@@ -338,6 +338,24 @@ const locations = [
   "link": "https://mnthen.com/blog/place/pillbox.html",
   "imageSource": "Pillbox (1903) via MPR News",
   "additionalInfo": "Hall of Famer Andrew \"Rube\" Foster threw a no-hitter for the St. Paul Colored Gophers at the Pillbox in 1908."
+},
+
+{
+  "id": "1029",
+  "lat": 44.9621358458752,
+  "lng": -93.07103242234,
+  "name": "William Hamm Jr. Kidnapping (June 15-19, 1933)",
+  "title": "William Hamm Jr. Kidnapping",
+  "image": "https://mnthen.com/tour/hamm/gallery/kidnap/hamm_kidnap1.jpg",
+  "creator": "Matt Reicher",
+  "city": "St. Paul",
+  "audio": "/audio/exhibit/hamm_kidnap.mp3",
+  "tours": "event",
+  "summary": "On June 15, 1933, the Barker-Karpis Gang kidnapped Hamm's Brewing president William Hamm Jr. in St. Paul, demanding $100,000 ransom. Though released unharmed, he lived in fear and reclusion afterward.",
+  "today": "St. Paul Brewing Co.",
+  "link": "https://mnthen.com/blog/event/hamm_kidnap.html",
+  "imageSource": "Investigators inspect the home of Theodore Hamm via 1889 Minnesota Good Age",
+  "additionalInfo": "The Barker-Karpis gang brought in a strategist from Al Capone's Chicago syndicate to help plan Hamm Jr.'s kidnapping."
 }
 
 
