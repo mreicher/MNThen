@@ -229,7 +229,7 @@ const locations = [
     tours: "place",
     summary: "Nininger, founded in 1856 by John Nininger and promoted by Ignatius Donnelly, boomed briefly before the 1857 Panic. Economic hardship and unfulfilled infrastructure promises led to its abandonment by 1869.",
     today: "Nininger Town Hall, Hastings",
-    link: "https://mnthen.com/blog/place/prom.html",
+    link: "https://www3.mnhs.org/mnopedia/search/index/place/nininger",
     imageSource: "Cyanotype photograph of Nininger c.1890 via MNopedia",
     additionalInfo: "Ignatius Donnelly later became famous for his writings on Atlantis, theories about Shakespeare’s works, and his political career."
     },
@@ -277,7 +277,7 @@ const locations = [
   "title": "Erd-Geist Gazebo",
   "image": "https://mnthen.com/images/exhibit/gazebo.jpg",
   "creator": "Matt Reicher",
-  "city": "Mahtomedi",
+  "city": "White Bear Lake",
   "audio": "/audio/exhibit/geist.mp3",
   "tours": "place",
   "summary": "The Erd-Geist Gazebo, built in 1883 as a wedding gift, has survived multiple relocations and restorations through community efforts. Originally on White Bear Lake's south shore, it now sits in Matoska Park as a beloved local landmark.",
