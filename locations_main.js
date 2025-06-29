@@ -280,7 +280,7 @@ const locations = [
   "city": "White Bear Lake",
   "audio": "/audio/exhibit/geist.mp3",
   "tours": "place",
-  "summary": "The Erd-Geist Gazebo, built in 1883 as a wedding gift, has survived multiple relocations and restorations through community efforts. Originally on White Bear Lake's south shore, it now sits in Matoska Park as a beloved local landmark.",
+  "summary": "The Erd-Geist Gazebo, built in 1883 as a wedding gift, has survived relocation and restorations through community efforts. Originally on White Bear Lake's south shore, it now sits in Matoska Park.",
   "today": "Matoska Park alongside White Bear Lake",
   "link": "https://mnthen.com/blog/place/geist.html",
   "imageSource": "Geist Gazebo, White Bear Lake(1885) via MN Digital Library",
