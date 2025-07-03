@@ -27,17 +27,33 @@ const STRATEGIES = {
   CRITICAL: 'critical',
   API_DATA: 'api-data',
   MEDIA: 'media',
+  TILES: 'tiles',
   FALLBACK: 'fallback'
 };
 
-// Enhanced trusted origins
+// Enhanced trusted origins - MAP TILES SECTION UPDATED
 const TRUSTED_ORIGINS = [
   self.location.origin,
   'https://cdn.jsdelivr.net',
   'https://unpkg.com',
   'https://cdnjs.cloudflare.com',
-  'https://tile.openstreetmap.org',
   'https://api.mnthen.com'
+];
+
+// Map tile providers - these should be handled differently
+const MAP_TILE_PROVIDERS = [
+  'https://tile.openstreetmap.org',
+  'https://a.tile.openstreetmap.org',
+  'https://b.tile.openstreetmap.org',
+  'https://c.tile.openstreetmap.org',
+  'https://cartodb-basemaps-a.global.ssl.fastly.net',
+  'https://cartodb-basemaps-b.global.ssl.fastly.net',
+  'https://cartodb-basemaps-c.global.ssl.fastly.net',
+  'https://cartodb-basemaps-d.global.ssl.fastly.net',
+  'https://server.arcgisonline.com',
+  'https://mt1.google.com',
+  'https://mt2.google.com',
+  'https://mt3.google.com'
 ];
 
 // Track in-flight requests to prevent duplicates
@@ -224,6 +240,12 @@ self.addEventListener('fetch', (event) => {
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
     return;
   }
+
+  // CRITICAL: Skip map tile requests entirely to avoid CORS issues
+  if (isMapTileRequest(url)) {
+    console.log('[SW] Skipping map tile request:', url.href);
+    return; // Let the browser handle map tiles directly
+  }
   
   event.respondWith(
     (async () => {
@@ -243,8 +265,32 @@ self.addEventListener('fetch', (event) => {
   );
 });
 
+// NEW: Check if request is for map tiles
+function isMapTileRequest(url) {
+  // Check if URL matches known map tile providers
+  const isMapTileProvider = MAP_TILE_PROVIDERS.some(provider => 
+    url.origin === new URL(provider).origin
+  );
+  
+  if (isMapTileProvider) {
+    return true;
+  }
+  
+  // Check for common map tile URL patterns
+  const tilePatterns = [
+    /\/\d+\/\d+\/\d+\.png$/,  // Common tile pattern: /z/x/y.png
+    /\/\d+\/\d+\/\d+\.jpg$/,  // Common tile pattern: /z/x/y.jpg
+    /\/\d+\/\d+\/\d+\.webp$/, // Common tile pattern: /z/x/y.webp
+    /\/tile\/\d+\/\d+\/\d+/,  // Alternative tile pattern
+    /\/tiles\/\d+\/\d+\/\d+/, // Alternative tile pattern
+    /MapServer\/tile\/\d+\/\d+\/\d+/ // ArcGIS tile pattern
+  ];
+  
+  return tilePatterns.some(pattern => pattern.test(url.pathname));
+}
+
 function determineStrategy(request, url) {
-  // Security: Only cache trusted origins
+  // Security: Only cache trusted origins (excluding map tiles)
   if (!TRUSTED_ORIGINS.includes(url.origin)) {
     return STRATEGIES.FALLBACK;
   }
