@@ -249,3 +249,4 @@ function calculateDistance(pos1, pos2) {
 
   return R * c;
 }
+
