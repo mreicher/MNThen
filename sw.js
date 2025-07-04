@@ -1,113 +1,131 @@
-const CACHE_NAME = 'mnthen-enterprise-v8';
-const MAX_CACHE_SIZE = 150 * 1024 * 1024; // 150MB
-const CACHE_TTL = {
-  STATIC: 24 * 60 * 60 * 1000, // 24 hours
-  API: 12 * 60 * 60 * 1000,    // 12 hours
-  MEDIA: 7 * 24 * 60 * 60 * 1000, // 1 week
-  HTML: 60 * 60 * 1000         // 1 hour
-};
+const CACHE_NAME = 'mnthen-complete-v10';
+const CACHE_VERSION = '10.0.0';
 
-const NETWORK_TIMEOUT = 10000;
-const MAX_RETRIES = 2;
-
-// Critical files to precache
-const PRECACHE_FILES = [
+// Complete precache list - all your pages and assets
+const PRECACHE_URLS = [
+  // Main pages
   '/',
+  '/index.html',
   '/offline.html',
+  
+  // CSS files
   '/css/mainmap.css',
   '/css/mnthen_main_map2.css',
+  
+  // JavaScript files
+  '/locations_main.js',
+  '/js/app.js',
+  '/js/map.js',
+  
+  // Images
   '/images/logo.webp',
   '/images/mnthenfav.ico',
   '/images/splash_screen.webp',
+  '/images/social-share.jpg',
+  '/placeholder.svg',
+  
+  // Other assets
   '/manifest.json',
-  '/locations_main.js'
+  
+  // Add your other pages here - examples:
+  '/about.html',
+  '/contact.html',
+  '/locations.html',
+  '/history.html',
+  '/explore.html'
 ];
 
-// External domains to completely ignore
-const EXTERNAL_DOMAINS = [
+// Domains to skip
+const SKIP_DOMAINS = [
   'googleapis.com',
   'gstatic.com',
   'jsdelivr.net',
   'unpkg.com',
   'cdnjs.cloudflare.com',
-  'bootstrapcdn.com',
-  'fontawesome.com',
-  'jquery.com',
   'openstreetmap.org',
+  'tile.openstreetmap.org',
   'fastly.net',
   'arcgisonline.com',
-  'tile.openstreetmap.org'
+  'bootstrapcdn.com',
+  'fontawesome.com',
+  'jquery.com'
 ];
 
-// Request tracking
-const pendingRequests = new Map();
-let cacheSize = 0;
-
-// Install event - precache critical files
+// Install event - precache all files
 self.addEventListener('install', (event) => {
-  console.log('[SW] Installing version:', CACHE_NAME);
+  console.log('[SW] Installing:', CACHE_NAME);
   
   event.waitUntil(
     (async () => {
       try {
         const cache = await caches.open(CACHE_NAME);
         
-        // Precache files individually with error handling
-        const cachePromises = PRECACHE_FILES.map(async (url) => {
-          try {
-            const response = await fetch(url);
-            if (response.ok) {
-              await cache.put(url, response);
-              console.log('[SW] Precached:', url);
+        // Cache files one by one to handle failures gracefully
+        const results = await Promise.allSettled(
+          PRECACHE_URLS.map(async (url) => {
+            try {
+              const response = await fetch(url);
+              if (response.ok) {
+                await cache.put(url, response);
+                console.log('[SW] Precached:', url);
+                return { url, success: true };
+              } else {
+                console.warn('[SW] Failed to precache (not ok):', url, response.status);
+                return { url, success: false, error: `Status ${response.status}` };
+              }
+            } catch (error) {
+              console.warn('[SW] Failed to precache (error):', url, error.message);
+              return { url, success: false, error: error.message };
             }
-          } catch (error) {
-            console.warn('[SW] Failed to precache:', url, error.message);
-          }
-        });
+          })
+        );
         
-        await Promise.allSettled(cachePromises);
-        await calculateCacheSize();
+        // Log results
+        const successful = results.filter(r => r.value?.success).length;
+        const failed = results.filter(r => !r.value?.success).length;
+        
+        console.log(`[SW] Precache complete: ${successful} successful, ${failed} failed`);
+        
+        // Skip waiting to activate immediately
         await self.skipWaiting();
-        
-        console.log('[SW] Installation complete');
       } catch (error) {
-        console.error('[SW] Installation failed:', error);
+        console.error('[SW] Install failed:', error);
       }
     })()
   );
 });
 
-// Activate event - cleanup and take control
+// Activate event
 self.addEventListener('activate', (event) => {
-  console.log('[SW] Activating version:', CACHE_NAME);
+  console.log('[SW] Activating:', CACHE_NAME);
   
   event.waitUntil(
     (async () => {
       try {
-        // Delete old caches
+        // Clean old caches
         const cacheNames = await caches.keys();
         await Promise.all(
-          cacheNames
-            .filter(name => name !== CACHE_NAME)
-            .map(name => {
-              console.log('[SW] Deleting old cache:', name);
-              return caches.delete(name);
-            })
+          cacheNames.map(cacheName => {
+            if (cacheName !== CACHE_NAME) {
+              console.log('[SW] Deleting old cache:', cacheName);
+              return caches.delete(cacheName);
+            }
+          })
         );
         
         // Take control of all clients
         await self.clients.claim();
         
-        // Initialize cache size tracking
-        await calculateCacheSize();
-        
-        console.log('[SW] Activation complete, cache size:', formatBytes(cacheSize));
+        console.log('[SW] Activation complete');
         
         // Notify clients
-        broadcastToClients({
-          type: 'SW_ACTIVATED',
-          version: CACHE_NAME,
-          cacheSize: cacheSize
+        const clients = await self.clients.matchAll();
+        clients.forEach(client => {
+          client.postMessage({
+            type: 'SW_ACTIVATED',
+            version: CACHE_VERSION,
+            precachedFiles: PRECACHE_URLS.length
+          });
         });
       } catch (error) {
         console.error('[SW] Activation failed:', error);
@@ -116,9 +134,9 @@ self.addEventListener('activate', (event) => {
   );
 });
 
-// Main fetch handler
+// Fetch event handler
 self.addEventListener('fetch', (event) => {
-  const { request } = event;
+  const request = event.request;
   const url = new URL(request.url);
   
   // Only handle GET requests
@@ -126,112 +144,291 @@ self.addEventListener('fetch', (event) => {
     return;
   }
   
-  // Skip external domains completely
-  if (isExternalDomain(url.hostname)) {
+  // Skip non-HTTP requests
+  if (!request.url.startsWith('http')) {
     return;
   }
   
-  // Skip non-HTTP protocols
-  if (!url.protocol.startsWith('http')) {
+  // Skip external domains
+  if (shouldSkipDomain(url.hostname)) {
     return;
   }
   
   // Skip development requests
-  if (url.searchParams.has('t') || url.pathname.includes('__vite')) {
+  if (url.pathname.includes('__vite') || url.searchParams.has('t')) {
     return;
   }
   
   event.respondWith(handleRequest(request));
 });
 
+// Check if we should skip this domain
+function shouldSkipDomain(hostname) {
+  const currentOrigin = new URL(self.location.origin).hostname;
+  
+  // Always handle requests from same origin
+  if (hostname === currentOrigin) {
+    return false;
+  }
+  
+  // Skip known external domains
+  return SKIP_DOMAINS.some(domain => hostname.includes(domain));
+}
+
 // Main request handler
 async function handleRequest(request) {
   const url = new URL(request.url);
-  const cacheKey = getCacheKey(request);
   
-  // Prevent duplicate requests
-  if (pendingRequests.has(cacheKey)) {
-    return pendingRequests.get(cacheKey);
-  }
-  
-  const responsePromise = (async () => {
-    try {
-      // Determine strategy based on request type
-      const strategy = getStrategy(request, url);
-      
-      switch (strategy) {
-        case 'cache-first':
-          return await cacheFirst(request);
-        case 'network-first':
-          return await networkFirst(request);
-        case 'stale-while-revalidate':
-          return await staleWhileRevalidate(request);
-        case 'network-only':
-          return await networkOnly(request);
-        default:
-          return await cacheFirst(request);
-      }
-    } catch (error) {
-      console.error('[SW] Request failed:', request.url, error.message);
-      return handleError(request, error);
+  try {
+    // Check if this is a precached file first
+    if (isPrecachedFile(url.pathname)) {
+      return await handlePrecachedFile(request);
     }
-  })();
-  
-  pendingRequests.set(cacheKey, responsePromise);
-  
-  // Clean up when done
-  responsePromise.finally(() => {
-    pendingRequests.delete(cacheKey);
-  });
-  
-  return responsePromise;
+    
+    // Handle different request types
+    if (isNavigationRequest(request)) {
+      return await handleNavigation(request);
+    } else if (isStaticAsset(url)) {
+      return await handleStaticAsset(request);
+    } else if (isApiRequest(url)) {
+      return await handleApiRequest(request);
+    } else {
+      return await handleDefault(request);
+    }
+  } catch (error) {
+    console.error('[SW] Request failed:', request.url, error);
+    return await handleError(request, error);
+  }
 }
 
-// Cache-first strategy (for static assets)
-async function cacheFirst(request) {
+// Check if file is precached
+function isPrecachedFile(pathname) {
+  return PRECACHE_URLS.includes(pathname) || 
+         PRECACHE_URLS.includes(pathname + '.html') ||
+         (pathname === '/' && PRECACHE_URLS.includes('/index.html'));
+}
+
+// Handle precached files
+async function handlePrecachedFile(request) {
   const cache = await caches.open(CACHE_NAME);
-  const cachedResponse = await cache.match(request);
+  const url = new URL(request.url);
   
-  if (cachedResponse && !isExpired(cachedResponse)) {
+  // Try exact match first
+  let cachedResponse = await cache.match(request);
+  
+  // Try with .html extension
+  if (!cachedResponse && !url.pathname.endsWith('.html')) {
+    cachedResponse = await cache.match(url.pathname + '.html');
+  }
+  
+  // Try index.html for root
+  if (!cachedResponse && url.pathname === '/') {
+    cachedResponse = await cache.match('/index.html');
+  }
+  
+  if (cachedResponse) {
+    console.log('[SW] Serving precached file:', request.url);
     return cachedResponse;
   }
   
+  // If not found in cache, try network
   try {
-    const networkResponse = await fetchWithTimeout(request);
+    const networkResponse = await fetchWithTimeout(request, 5000);
+    if (networkResponse.ok) {
+      // Update cache
+      cache.put(request, networkResponse.clone()).catch(err => {
+        console.warn('[SW] Failed to update cache:', err);
+      });
+      return networkResponse;
+    }
+  } catch (error) {
+    console.warn('[SW] Network failed for precached file:', error.message);
+  }
+  
+  throw new Error('Precached file not available');
+}
+
+// Check if this is a navigation request
+function isNavigationRequest(request) {
+  return request.mode === 'navigate' || 
+         request.destination === 'document' ||
+         (request.headers.get('accept') || '').includes('text/html');
+}
+
+// Check if this is a static asset
+function isStaticAsset(url) {
+  const extension = url.pathname.split('.').pop()?.toLowerCase();
+  return ['css', 'js', 'png', 'jpg', 'jpeg', 'webp', 'svg', 'ico', 'woff', 'woff2', 'ttf', 'otf'].includes(extension);
+}
+
+// Check if this is an API request
+function isApiRequest(url) {
+  return url.pathname.startsWith('/api/');
+}
+
+// Handle navigation requests
+async function handleNavigation(request) {
+  console.log('[SW] Navigation request:', request.url);
+  
+  const cache = await caches.open(CACHE_NAME);
+  const url = new URL(request.url);
+  
+  // Try cache first for navigation
+  let cachedResponse = await cache.match(request);
+  
+  // Try to find matching cached page
+  if (!cachedResponse) {
+    // Try with .html extension
+    if (!url.pathname.endsWith('.html') && !url.pathname.endsWith('/')) {
+      cachedResponse = await cache.match(url.pathname + '.html');
+    }
+    
+    // Try index.html for root or directories
+    if (!cachedResponse && (url.pathname === '/' || url.pathname.endsWith('/'))) {
+      cachedResponse = await cache.match('/index.html') || await cache.match('/');
+    }
+  }
+  
+  // If we have a cached version, serve it and update in background
+  if (cachedResponse) {
+    console.log('[SW] Serving cached navigation');
+    
+    // Update in background
+    fetchWithTimeout(request, 3000)
+      .then(networkResponse => {
+        if (networkResponse.ok) {
+          cache.put(request, networkResponse.clone());
+          console.log('[SW] Updated cached navigation');
+        }
+      })
+      .catch(err => console.warn('[SW] Background update failed:', err));
+    
+    return cachedResponse;
+  }
+  
+  // No cache, try network
+  try {
+    const networkResponse = await fetchWithTimeout(request, 5000);
     
     if (networkResponse.ok) {
-      await safeCacheResponse(cache, request, networkResponse.clone());
+      // Cache the response
+      cache.put(request, networkResponse.clone()).catch(err => {
+        console.warn('[SW] Failed to cache navigation:', err);
+      });
+      return networkResponse;
     }
     
-    return networkResponse;
+    throw new Error('Network response not ok');
   } catch (error) {
-    // Return stale cache if available
-    if (cachedResponse) {
-      console.log('[SW] Returning stale cache for:', request.url);
-      return cachedResponse;
+    console.log('[SW] Navigation network failed:', error.message);
+    
+    // Try to serve offline page or root page
+    const offlineResponse = await cache.match('/offline.html') || 
+                           await cache.match('/') || 
+                           await cache.match('/index.html');
+    
+    if (offlineResponse) {
+      console.log('[SW] Serving offline fallback');
+      return offlineResponse;
     }
+    
     throw error;
   }
 }
 
-// Network-first strategy (for API calls)
-async function networkFirst(request) {
+// Handle static assets
+async function handleStaticAsset(request) {
+  const cache = await caches.open(CACHE_NAME);
+  
+  // Try cache first
+  const cachedResponse = await cache.match(request);
+  
+  if (cachedResponse) {
+    console.log('[SW] Serving cached static asset');
+    
+    // Update in background if old
+    const cacheDate = cachedResponse.headers.get('sw-cache-date');
+    if (!cacheDate || (Date.now() - parseInt(cacheDate)) > 24 * 60 * 60 * 1000) {
+      fetchWithTimeout(request, 8000)
+        .then(networkResponse => {
+          if (networkResponse.ok) {
+            const headers = new Headers(networkResponse.headers);
+            headers.set('sw-cache-date', Date.now().toString());
+            
+            const responseToCache = new Response(networkResponse.body, {
+              status: networkResponse.status,
+              statusText: networkResponse.statusText,
+              headers: headers
+            });
+            
+            cache.put(request, responseToCache);
+          }
+        })
+        .catch(err => console.warn('[SW] Background update failed:', err));
+    }
+    
+    return cachedResponse;
+  }
+  
+  // Not in cache, fetch from network
   try {
-    const networkResponse = await fetchWithTimeout(request);
+    const networkResponse = await fetchWithTimeout(request, 10000);
+    
+    if (networkResponse.ok) {
+      const headers = new Headers(networkResponse.headers);
+      headers.set('sw-cache-date', Date.now().toString());
+      
+      const responseToCache = new Response(networkResponse.body, {
+        status: networkResponse.status,
+        statusText: networkResponse.statusText,
+        headers: headers
+      });
+      
+      cache.put(request, responseToCache).catch(err => {
+        console.warn('[SW] Failed to cache static asset:', err);
+      });
+      
+      return networkResponse;
+    }
+    
+    throw new Error('Network response not ok');
+  } catch (error) {
+    console.log('[SW] Static asset network failed:', error.message);
+    throw error;
+  }
+}
+
+// Handle API requests
+async function handleApiRequest(request) {
+  try {
+    const networkResponse = await fetchWithTimeout(request, 8000);
     
     if (networkResponse.ok) {
       const cache = await caches.open(CACHE_NAME);
-      await safeCacheResponse(cache, request, networkResponse.clone());
+      const headers = new Headers(networkResponse.headers);
+      headers.set('sw-cache-date', Date.now().toString());
+      
+      const responseToCache = new Response(networkResponse.body, {
+        status: networkResponse.status,
+        statusText: networkResponse.statusText,
+        headers: headers
+      });
+      
+      cache.put(request, responseToCache).catch(err => {
+        console.warn('[SW] Failed to cache API response:', err);
+      });
+      
+      return networkResponse;
     }
     
-    return networkResponse;
+    throw new Error('Network response not ok');
   } catch (error) {
-    // Fallback to cache
+    // Try cache as fallback
     const cache = await caches.open(CACHE_NAME);
     const cachedResponse = await cache.match(request);
     
     if (cachedResponse) {
-      console.log('[SW] Network failed, using cache for:', request.url);
+      console.log('[SW] Serving cached API response');
       return cachedResponse;
     }
     
@@ -239,185 +436,60 @@ async function networkFirst(request) {
   }
 }
 
-// Stale-while-revalidate strategy (for HTML pages)
-async function staleWhileRevalidate(request) {
-  const cache = await caches.open(CACHE_NAME);
-  const cachedResponse = await cache.match(request);
-  
-  // Start network request in background
-  const networkPromise = fetchWithTimeout(request)
-    .then(networkResponse => {
-      if (networkResponse.ok) {
-        safeCacheResponse(cache, request, networkResponse.clone());
-      }
-      return networkResponse;
-    })
-    .catch(error => {
-      console.warn('[SW] Background fetch failed:', request.url, error.message);
-    });
-  
-  // Return cache immediately if available
-  if (cachedResponse) {
-    return cachedResponse;
-  }
-  
-  // Wait for network if no cache
-  return networkPromise;
-}
-
-// Network-only strategy (for external resources)
-async function networkOnly(request) {
-  return fetchWithTimeout(request);
-}
-
-// Determine caching strategy based on request
-function getStrategy(request, url) {
-  // Navigation requests
-  if (request.mode === 'navigate') {
-    return 'stale-while-revalidate';
-  }
-  
-  // API endpoints
-  if (url.pathname.startsWith('/api/')) {
-    return 'network-first';
-  }
-  
-  // Static assets
-  const extension = getFileExtension(url.pathname);
-  if (['css', 'js', 'woff', 'woff2', 'ttf', 'ico'].includes(extension)) {
-    return 'cache-first';
-  }
-  
-  // Media files
-  if (['jpg', 'jpeg', 'png', 'webp', 'svg', 'mp3', 'ogg', 'wav'].includes(extension)) {
-    return 'cache-first';
-  }
-  
-  // HTML pages
-  if (request.destination === 'document' || url.pathname.endsWith('.html')) {
-    return 'stale-while-revalidate';
-  }
-  
-  return 'cache-first';
-}
-
-// Enhanced fetch with timeout and retry
-async function fetchWithTimeout(request, timeout = NETWORK_TIMEOUT) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeout);
-  
+// Handle default requests
+async function handleDefault(request) {
   try {
-    const response = await fetch(request.clone(), {
-      signal: controller.signal
-    });
-    
-    clearTimeout(timeoutId);
-    return response;
+    return await fetchWithTimeout(request, 10000);
   } catch (error) {
-    clearTimeout(timeoutId);
-    
-    if (error.name === 'AbortError') {
-      throw new Error('Request timeout');
-    }
-    
+    console.log('[SW] Default request failed:', error.message);
     throw error;
   }
 }
 
-// Safe cache response with size management
-async function safeCacheResponse(cache, request, response) {
-  if (!response.ok || response.status === 206) {
-    return;
-  }
-  
-  // Check cache control headers
-  const cacheControl = response.headers.get('cache-control') || '';
-  if (cacheControl.includes('no-store') || cacheControl.includes('no-cache')) {
-    return;
-  }
-  
-  try {
-    // Manage cache size
-    if (cacheSize > MAX_CACHE_SIZE * 0.9) {
-      await cleanupCache();
-    }
-    
-    // Add metadata headers
-    const headers = new Headers(response.headers);
-    headers.set('sw-cached-at', Date.now().toString());
-    headers.set('sw-cache-version', CACHE_NAME);
-    
-    const responseToCache = new Response(response.body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: headers
-    });
-    
-    await cache.put(request, responseToCache);
-    
-    // Update cache size tracking
-    const blob = await response.blob();
-    cacheSize += blob.size;
-    
-  } catch (error) {
-    console.warn('[SW] Failed to cache response:', request.url, error.message);
-  }
-}
-
-// Check if cached response is expired
-function isExpired(response) {
-  const cachedAt = response.headers.get('sw-cached-at');
-  if (!cachedAt) return true;
-  
-  const cacheTime = parseInt(cachedAt);
-  const now = Date.now();
-  
-  // Determine TTL based on content type
-  const url = new URL(response.url);
-  const extension = getFileExtension(url.pathname);
-  
-  let ttl = CACHE_TTL.STATIC;
-  if (url.pathname.startsWith('/api/')) {
-    ttl = CACHE_TTL.API;
-  } else if (['jpg', 'jpeg', 'png', 'webp', 'svg', 'mp3', 'ogg', 'wav'].includes(extension)) {
-    ttl = CACHE_TTL.MEDIA;
-  } else if (extension === 'html' || url.pathname === '/') {
-    ttl = CACHE_TTL.HTML;
-  }
-  
-  return (now - cacheTime) > ttl;
-}
-
-// Error handling
+// Handle errors
 async function handleError(request, error) {
-  console.error('[SW] Handling error for:', request.url, error.message);
+  console.log('[SW] Handling error for:', request.url);
   
-  // For navigation requests, return offline page
-  if (request.mode === 'navigate') {
+  if (isNavigationRequest(request)) {
     const cache = await caches.open(CACHE_NAME);
-    const offlinePage = await cache.match('/offline.html');
     
-    if (offlinePage) {
-      return offlinePage;
+    // Try offline page first
+    const offlineResponse = await cache.match('/offline.html');
+    if (offlineResponse) {
+      return offlineResponse;
     }
     
+    // Try root page
+    const rootResponse = await cache.match('/') || await cache.match('/index.html');
+    if (rootResponse) {
+      return rootResponse;
+    }
+    
+    // Create basic offline response
     return new Response(`
       <!DOCTYPE html>
       <html>
-        <head><title>Offline</title></head>
+        <head>
+          <title>Offline - MN Then</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <style>
+            body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
+            button { padding: 10px 20px; font-size: 16px; }
+          </style>
+        </head>
         <body>
           <h1>You're offline</h1>
           <p>Please check your internet connection and try again.</p>
+          <button onclick="window.location.reload()">Retry</button>
         </body>
       </html>
     `, {
-      status: 503,
+      status: 200,
       headers: { 'Content-Type': 'text/html' }
     });
   }
   
-  // For API requests, return JSON error
-  if (request.url.includes('/api/')) {
+  if (isApiRequest(new URL(request.url))) {
     return new Response(JSON.stringify({
       error: 'Service unavailable',
       message: 'Please check your connection and try again'
@@ -427,180 +499,112 @@ async function handleError(request, error) {
     });
   }
   
-  // For other requests, return generic error
   return new Response('Service unavailable', {
     status: 503,
     headers: { 'Content-Type': 'text/plain' }
   });
 }
 
-// Cache cleanup
-async function cleanupCache() {
+// Fetch with timeout
+async function fetchWithTimeout(request, timeout = 10000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
+  
   try {
-    const cache = await caches.open(CACHE_NAME);
-    const requests = await cache.keys();
-    
-    // Sort by cache time (oldest first)
-    const entries = [];
-    for (const request of requests) {
-      const response = await cache.match(request);
-      if (response) {
-        const cachedAt = response.headers.get('sw-cached-at');
-        const isPrecached = PRECACHE_FILES.includes(new URL(request.url).pathname);
-        
-        if (!isPrecached && cachedAt) {
-          entries.push({
-            request,
-            cachedAt: parseInt(cachedAt),
-            size: (await response.blob()).size
-          });
-        }
-      }
-    }
-    
-    // Sort by oldest first
-    entries.sort((a, b) => a.cachedAt - b.cachedAt);
-    
-    // Delete oldest entries until we're under 70% capacity
-    const targetSize = MAX_CACHE_SIZE * 0.7;
-    let currentSize = cacheSize;
-    
-    for (const entry of entries) {
-      if (currentSize <= targetSize) break;
-      
-      await cache.delete(entry.request);
-      currentSize -= entry.size;
-      console.log('[SW] Cleaned up:', entry.request.url);
-    }
-    
-    cacheSize = currentSize;
-    console.log('[SW] Cache cleanup complete, new size:', formatBytes(cacheSize));
-    
+    const response = await fetch(request, { signal: controller.signal });
+    clearTimeout(timeoutId);
+    return response;
   } catch (error) {
-    console.error('[SW] Cache cleanup failed:', error);
-  }
-}
-
-// Calculate total cache size
-async function calculateCacheSize() {
-  try {
-    const cache = await caches.open(CACHE_NAME);
-    const requests = await cache.keys();
-    
-    let totalSize = 0;
-    for (const request of requests) {
-      try {
-        const response = await cache.match(request);
-        if (response) {
-          const blob = await response.blob();
-          totalSize += blob.size;
-        }
-      } catch (error) {
-        console.warn('[SW] Error calculating size for:', request.url);
-      }
+    clearTimeout(timeoutId);
+    if (error.name === 'AbortError') {
+      throw new Error('Request timeout');
     }
-    
-    cacheSize = totalSize;
-    return totalSize;
-  } catch (error) {
-    console.error('[SW] Error calculating cache size:', error);
-    return 0;
+    throw error;
   }
 }
 
 // Message handling
-self.addEventListener('message', async (event) => {
+self.addEventListener('message', (event) => {
   const { data, ports } = event;
   
-  if (!data?.type) return;
+  if (!data || !data.type) return;
   
   switch (data.type) {
-    case 'GET_CACHE_SIZE':
-      const size = await calculateCacheSize();
-      ports[0]?.postMessage({ type: 'CACHE_SIZE', size: formatBytes(size) });
+    case 'GET_CACHE_INFO':
+      getCacheInfo().then(info => {
+        ports[0]?.postMessage({ type: 'CACHE_INFO', data: info });
+      });
       break;
       
     case 'CLEAR_CACHE':
-      await clearAllCache();
-      ports[0]?.postMessage({ type: 'CACHE_CLEARED' });
+      clearDynamicCache().then(() => {
+        ports[0]?.postMessage({ type: 'CACHE_CLEARED' });
+      });
       break;
       
-    case 'PREFETCH_URLS':
+    case 'PRECACHE_URLS':
       if (data.urls) {
-        await prefetchUrls(data.urls);
-        ports[0]?.postMessage({ type: 'PREFETCH_COMPLETE' });
+        precacheUrls(data.urls).then(() => {
+          ports[0]?.postMessage({ type: 'PRECACHE_COMPLETE' });
+        });
       }
       break;
   }
 });
 
-// Clear all cache except precached files
-async function clearAllCache() {
+// Get cache info
+async function getCacheInfo() {
+  try {
+    const cache = await caches.open(CACHE_NAME);
+    const keys = await cache.keys();
+    
+    return {
+      version: CACHE_VERSION,
+      totalFiles: keys.length,
+      precachedFiles: PRECACHE_URLS.length
+    };
+  } catch (error) {
+    console.error('[SW] Error getting cache info:', error);
+    return null;
+  }
+}
+
+// Clear dynamic cache (keep precached)
+async function clearDynamicCache() {
   try {
     const cache = await caches.open(CACHE_NAME);
     const requests = await cache.keys();
     
-    const toDelete = requests.filter(request => {
-      const path = new URL(request.url).pathname;
-      return !PRECACHE_FILES.includes(path);
-    });
+    const deletePromises = requests
+      .filter(request => {
+        const url = new URL(request.url);
+        return !isPrecachedFile(url.pathname);
+      })
+      .map(request => cache.delete(request));
     
-    await Promise.all(toDelete.map(request => cache.delete(request)));
-    await calculateCacheSize();
-    
-    console.log('[SW] Cleared cache, kept', PRECACHE_FILES.length, 'precached files');
+    await Promise.all(deletePromises);
+    console.log('[SW] Dynamic cache cleared');
   } catch (error) {
     console.error('[SW] Error clearing cache:', error);
   }
 }
 
-// Prefetch URLs
-async function prefetchUrls(urls) {
+// Precache additional URLs
+async function precacheUrls(urls) {
   const cache = await caches.open(CACHE_NAME);
   
-  for (const url of urls.slice(0, 20)) { // Limit to 20 URLs
+  for (const url of urls.slice(0, 20)) {
     try {
-      const response = await fetchWithTimeout(new Request(url));
+      const response = await fetchWithTimeout(new Request(url), 5000);
       if (response.ok) {
-        await safeCacheResponse(cache, new Request(url), response.clone());
+        await cache.put(url, response);
+        console.log('[SW] Precached additional URL:', url);
       }
     } catch (error) {
-      console.warn('[SW] Prefetch failed for:', url, error.message);
+      console.warn('[SW] Failed to precache URL:', url, error.message);
     }
   }
 }
 
-// Utility functions
-function isExternalDomain(hostname) {
-  return EXTERNAL_DOMAINS.some(domain => hostname.includes(domain));
-}
-
-function getFileExtension(pathname) {
-  return pathname.split('.').pop()?.toLowerCase() || '';
-}
-
-function getCacheKey(request) {
-  return `${request.method}:${request.url}`;
-}
-
-function formatBytes(bytes) {
-  if (bytes === 0) return '0 Bytes';
-  const k = 1024;
-  const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-}
-
-function broadcastToClients(message) {
-  self.clients.matchAll().then(clients => {
-    clients.forEach(client => {
-      try {
-        client.postMessage(message);
-      } catch (error) {
-        console.warn('[SW] Failed to send message to client:', error);
-      }
-    });
-  });
-}
-
 console.log('[SW] Service Worker initialized:', CACHE_NAME);
+console.log('[SW] Will precache', PRECACHE_URLS.length, 'files');
