@@ -1,4 +1,4 @@
-const CACHE_NAME = 'mnthen-enterprise-v6';
+const CACHE_NAME = 'mnthen-enterprise-v7';
 const MAX_CACHE_SIZE = 150 * 1024 * 1024; // 150MB
 const LOCATION_CACHE_TTL = 12 * 60 * 60 * 1000; // 12 hours
 const AUDIO_CACHE_TTL = 7 * 24 * 60 * 60 * 1000; // 1 week
@@ -19,7 +19,7 @@ const PRECACHE_URLS = [
   '/placeholder.svg',
   '/manifest.json',
   '/locations_main.js'
-].map(url => `${url}?v=6`);
+].map(url => `${url}?v=7`);
 
 // Cache strategies
 const STRATEGIES = {
@@ -27,21 +27,27 @@ const STRATEGIES = {
   CRITICAL: 'critical',
   API_DATA: 'api-data',
   MEDIA: 'media',
-  TILES: 'tiles',
   FALLBACK: 'fallback'
 };
 
-// Enhanced trusted origins - MAP TILES SECTION UPDATED
+// FIXED: More restrictive trusted origins - only cache from your own domain
 const TRUSTED_ORIGINS = [
   self.location.origin,
-  'https://cdn.jsdelivr.net',
-  'https://unpkg.com',
-  'https://cdnjs.cloudflare.com',
   'https://api.mnthen.com'
 ];
 
-// Map tile providers - these should be handled differently
-const MAP_TILE_PROVIDERS = [
+// FIXED: Comprehensive list of origins to NEVER cache or interfere with
+const EXTERNAL_ORIGINS_TO_SKIP = [
+  'https://cdn.jsdelivr.net',
+  'https://unpkg.com',
+  'https://cdnjs.cloudflare.com',
+  'https://fonts.googleapis.com',
+  'https://fonts.gstatic.com',
+  'https://ajax.googleapis.com',
+  'https://code.jquery.com',
+  'https://stackpath.bootstrapcdn.com',
+  'https://maxcdn.bootstrapcdn.com',
+  'https://use.fontawesome.com',
   'https://tile.openstreetmap.org',
   'https://a.tile.openstreetmap.org',
   'https://b.tile.openstreetmap.org',
@@ -221,7 +227,7 @@ self.addEventListener('activate', (event) => {
   );
 });
 
-// Fetch event
+// FIXED: Completely revamped fetch event with proper filtering
 self.addEventListener('fetch', (event) => {
   const { request } = event;
   const url = new URL(request.url);
@@ -241,10 +247,16 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // CRITICAL: Skip map tile requests entirely to avoid CORS issues
-  if (isMapTileRequest(url)) {
-    console.log('[SW] Skipping map tile request:', url.href);
-    return; // Let the browser handle map tiles directly
+  // CRITICAL FIX: Skip ALL external origins - let browser handle them normally
+  if (shouldSkipRequest(url)) {
+    console.log('[SW] Skipping external request:', url.href);
+    return; // Let browser handle this request completely
+  }
+  
+  // FIXED: Only handle requests from trusted origins (your own domain)
+  if (!TRUSTED_ORIGINS.includes(url.origin)) {
+    console.log('[SW] Skipping untrusted origin:', url.origin);
+    return;
   }
   
   event.respondWith(
@@ -265,36 +277,49 @@ self.addEventListener('fetch', (event) => {
   );
 });
 
-// NEW: Check if request is for map tiles
-function isMapTileRequest(url) {
-  // Check if URL matches known map tile providers
-  const isMapTileProvider = MAP_TILE_PROVIDERS.some(provider => 
-    url.origin === new URL(provider).origin
+// FIXED: Comprehensive function to determine what to skip
+function shouldSkipRequest(url) {
+  // Skip all external CDN and tile providers
+  const isExternalOrigin = EXTERNAL_ORIGINS_TO_SKIP.some(origin => 
+    url.origin === new URL(origin).origin
   );
   
-  if (isMapTileProvider) {
+  if (isExternalOrigin) {
     return true;
   }
   
-  // Check for common map tile URL patterns
+  // Skip map tile patterns
   const tilePatterns = [
-    /\/\d+\/\d+\/\d+\.png$/,  // Common tile pattern: /z/x/y.png
-    /\/\d+\/\d+\/\d+\.jpg$/,  // Common tile pattern: /z/x/y.jpg
-    /\/\d+\/\d+\/\d+\.webp$/, // Common tile pattern: /z/x/y.webp
-    /\/tile\/\d+\/\d+\/\d+/,  // Alternative tile pattern
-    /\/tiles\/\d+\/\d+\/\d+/, // Alternative tile pattern
-    /MapServer\/tile\/\d+\/\d+\/\d+/ // ArcGIS tile pattern
+    /\/\d+\/\d+\/\d+\.(png|jpg|jpeg|webp)$/,
+    /\/tile\/\d+\/\d+\/\d+/,
+    /\/tiles\/\d+\/\d+\/\d+/,
+    /MapServer\/tile\/\d+\/\d+\/\d+/
   ];
   
-  return tilePatterns.some(pattern => pattern.test(url.pathname));
+  if (tilePatterns.some(pattern => pattern.test(url.pathname))) {
+    return true;
+  }
+  
+  // Skip any request with common external patterns
+  const externalPatterns = [
+    /googleapis\.com/,
+    /gstatic\.com/,
+    /fontawesome\.com/,
+    /bootstrapcdn\.com/,
+    /jsdelivr\.net/,
+    /unpkg\.com/,
+    /cdnjs\.cloudflare\.com/,
+    /jquery\.com/,
+    /openstreetmap\.org/,
+    /fastly\.net/,
+    /arcgisonline\.com/,
+    /google\.com/
+  ];
+  
+  return externalPatterns.some(pattern => pattern.test(url.hostname));
 }
 
 function determineStrategy(request, url) {
-  // Security: Only cache trusted origins (excluding map tiles)
-  if (!TRUSTED_ORIGINS.includes(url.origin)) {
-    return STRATEGIES.FALLBACK;
-  }
-  
   // Check if it's a precached asset
   const isPreCached = PRECACHE_URLS.some(precacheUrl => {
     const cleanUrl = precacheUrl.split('?')[0];
@@ -378,7 +403,7 @@ async function handlePrecache(request, cache) {
   const cachedResponse = await cache.match(request);
   if (cachedResponse) {
     metrics.cacheHits++;
-    return addSecurityHeaders(cachedResponse);
+    return cachedResponse; // FIXED: Don't add security headers to precached content
   }
   
   metrics.cacheMisses++;
@@ -404,7 +429,7 @@ async function handleCriticalAssets(request, cache, event) {
       );
     }
     
-    return addSecurityHeaders(cachedResponse);
+    return cachedResponse; // FIXED: Don't modify cached responses
   }
   
   // Fallback to network
@@ -415,7 +440,7 @@ async function handleCriticalAssets(request, cache, event) {
     );
   }
   metrics.networkRequests++;
-  return addSecurityHeaders(networkResponse);
+  return networkResponse; // FIXED: Don't modify network responses
 }
 
 async function handleApiData(request, cache) {
@@ -428,13 +453,13 @@ async function handleApiData(request, cache) {
         .catch(error => console.warn('[SW] Cache update failed:', error));
     }
     metrics.networkRequests++;
-    return addSecurityHeaders(networkResponse);
+    return networkResponse;
   } catch (error) {
     // Fallback to cache
     const cachedResponse = await cache.match(request);
     if (cachedResponse) {
       metrics.cacheHits++;
-      return addSecurityHeaders(cachedResponse);
+      return cachedResponse;
     }
     throw error;
   }
@@ -445,7 +470,7 @@ async function handleMedia(request, cache, event) {
   const cachedResponse = await cache.match(request);
   if (cachedResponse && !isResponseStale(cachedResponse, AUDIO_CACHE_TTL)) {
     metrics.cacheHits++;
-    return addSecurityHeaders(cachedResponse);
+    return cachedResponse;
   }
   
   // Network with cache update
@@ -457,12 +482,12 @@ async function handleMedia(request, cache, event) {
       );
     }
     metrics.networkRequests++;
-    return addSecurityHeaders(networkResponse);
+    return networkResponse;
   } catch (error) {
     // Return stale cache if available
     if (cachedResponse) {
       metrics.cacheHits++;
-      return addSecurityHeaders(cachedResponse);
+      return cachedResponse;
     }
     throw error;
   }
@@ -473,13 +498,13 @@ async function handleFallback(request, cache) {
   try {
     const networkResponse = await fetchWithRetry(request);
     metrics.networkRequests++;
-    return addSecurityHeaders(networkResponse);
+    return networkResponse;
   } catch (error) {
     // Try cache
     const cachedResponse = await cache.match(request);
     if (cachedResponse) {
       metrics.cacheHits++;
-      return addSecurityHeaders(cachedResponse);
+      return cachedResponse;
     }
     
     // HTML fallback
@@ -539,7 +564,7 @@ async function cacheResponse(cache, request, response, strategy) {
       await cacheManager.purgeOldEntries();
     }
     
-    // Prepare response
+    // FIXED: Don't modify headers - cache response as-is
     const headers = new Headers(response.headers);
     headers.set('sw-cached-at', Date.now().toString());
     headers.set('sw-strategy', strategy);
@@ -558,27 +583,7 @@ async function cacheResponse(cache, request, response, strategy) {
   }
 }
 
-function addSecurityHeaders(response) {
-  if (!response) return response;
-  
-  const headers = new Headers(response.headers);
-  
-  if (!headers.has('X-Content-Type-Options')) {
-    headers.set('X-Content-Type-Options', 'nosniff');
-  }
-  if (!headers.has('X-Frame-Options')) {
-    headers.set('X-Frame-Options', 'DENY');
-  }
-  if (!headers.has('Referrer-Policy')) {
-    headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
-  }
-  
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers
-  });
-}
+// REMOVED: addSecurityHeaders function completely as it was causing issues
 
 function isResponseStale(response, maxAge = LOCATION_CACHE_TTL) {
   const cachedAt = response.headers.get('sw-cached-at');
