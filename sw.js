@@ -1,13 +1,17 @@
-const CACHE_NAME = 'mnthen-enterprise-v7';
+const CACHE_NAME = 'mnthen-enterprise-v8';
 const MAX_CACHE_SIZE = 150 * 1024 * 1024; // 150MB
-const LOCATION_CACHE_TTL = 12 * 60 * 60 * 1000; // 12 hours
-const AUDIO_CACHE_TTL = 7 * 24 * 60 * 60 * 1000; // 1 week
-const MAX_RETRY_ATTEMPTS = 3;
-const RETRY_DELAY_BASE = 1000;
-const NETWORK_TIMEOUT = 15000;
+const CACHE_TTL = {
+  STATIC: 24 * 60 * 60 * 1000, // 24 hours
+  API: 12 * 60 * 60 * 1000,    // 12 hours
+  MEDIA: 7 * 24 * 60 * 60 * 1000, // 1 week
+  HTML: 60 * 60 * 1000         // 1 hour
+};
 
-// Enhanced precache list with versioning
-const PRECACHE_URLS = [
+const NETWORK_TIMEOUT = 10000;
+const MAX_RETRIES = 2;
+
+// Critical files to precache
+const PRECACHE_FILES = [
   '/',
   '/offline.html',
   '/css/mainmap.css',
@@ -15,210 +19,95 @@ const PRECACHE_URLS = [
   '/images/logo.webp',
   '/images/mnthenfav.ico',
   '/images/splash_screen.webp',
-  '/images/social-share.jpg',
-  '/placeholder.svg',
   '/manifest.json',
   '/locations_main.js'
-].map(url => `${url}?v=7`);
-
-// Cache strategies
-const STRATEGIES = {
-  PRECACHE: 'precache',
-  CRITICAL: 'critical',
-  API_DATA: 'api-data',
-  MEDIA: 'media',
-  FALLBACK: 'fallback'
-};
-
-// FIXED: More restrictive trusted origins - only cache from your own domain
-const TRUSTED_ORIGINS = [
-  self.location.origin,
-  'https://api.mnthen.com'
 ];
 
-// FIXED: Comprehensive list of origins to NEVER cache or interfere with
-const EXTERNAL_ORIGINS_TO_SKIP = [
-  'https://cdn.jsdelivr.net',
-  'https://unpkg.com',
-  'https://cdnjs.cloudflare.com',
-  'https://fonts.googleapis.com',
-  'https://fonts.gstatic.com',
-  'https://ajax.googleapis.com',
-  'https://code.jquery.com',
-  'https://stackpath.bootstrapcdn.com',
-  'https://maxcdn.bootstrapcdn.com',
-  'https://use.fontawesome.com',
-  'https://tile.openstreetmap.org',
-  'https://a.tile.openstreetmap.org',
-  'https://b.tile.openstreetmap.org',
-  'https://c.tile.openstreetmap.org',
-  'https://cartodb-basemaps-a.global.ssl.fastly.net',
-  'https://cartodb-basemaps-b.global.ssl.fastly.net',
-  'https://cartodb-basemaps-c.global.ssl.fastly.net',
-  'https://cartodb-basemaps-d.global.ssl.fastly.net',
-  'https://server.arcgisonline.com',
-  'https://mt1.google.com',
-  'https://mt2.google.com',
-  'https://mt3.google.com'
+// External domains to completely ignore
+const EXTERNAL_DOMAINS = [
+  'googleapis.com',
+  'gstatic.com',
+  'jsdelivr.net',
+  'unpkg.com',
+  'cdnjs.cloudflare.com',
+  'bootstrapcdn.com',
+  'fontawesome.com',
+  'jquery.com',
+  'openstreetmap.org',
+  'fastly.net',
+  'arcgisonline.com',
+  'tile.openstreetmap.org'
 ];
 
-// Track in-flight requests to prevent duplicates
-const inFlightRequests = new Map();
+// Request tracking
+const pendingRequests = new Map();
+let cacheSize = 0;
 
-// Simplified metrics
-const metrics = {
-  cacheHits: 0,
-  cacheMisses: 0,
-  networkRequests: 0,
-  errors: 0,
-  prefetches: 0,
-  startTime: Date.now(),
-  lastUpdated: Date.now()
-};
-
-// Simplified cache manager
-class CacheManager {
-  constructor() {
-    this.currentSize = 0;
-  }
-  
-  async calculateSize() {
-    try {
-      const cache = await caches.open(CACHE_NAME);
-      const keys = await cache.keys();
-      
-      this.currentSize = 0;
-      for (const request of keys) {
-        try {
-          const response = await cache.match(request);
-          if (response) {
-            const blob = await response.blob();
-            this.currentSize += blob.size;
-          }
-        } catch (error) {
-          console.warn('[SW] Error calculating cache size for:', request.url);
-        }
-      }
-      
-      return this.currentSize;
-    } catch (error) {
-      console.error('[SW] Error calculating total cache size:', error);
-      return 0;
-    }
-  }
-  
-  async purgeOldEntries(targetSize = MAX_CACHE_SIZE * 0.2) {
-    try {
-      const cache = await caches.open(CACHE_NAME);
-      const keys = await cache.keys();
-      const entries = [];
-      
-      // Collect entries with timestamps
-      for (const request of keys) {
-        try {
-          const response = await cache.match(request);
-          if (response) {
-            const blob = await response.blob();
-            const cachedAt = response.headers.get('sw-cached-at') || '0';
-            const isPrecached = PRECACHE_URLS.some(url => request.url.includes(url.split('?')[0]));
-            
-            if (!isPrecached) {
-              entries.push({
-                request,
-                size: blob.size,
-                cachedAt: parseInt(cachedAt),
-                url: request.url
-              });
-            }
-          }
-        } catch (error) {
-          console.warn('[SW] Error processing cache entry:', request.url);
-        }
-      }
-      
-      // Sort by oldest first
-      entries.sort((a, b) => a.cachedAt - b.cachedAt);
-      
-      let bytesFreed = 0;
-      for (const entry of entries) {
-        if (bytesFreed >= targetSize) break;
-        
-        try {
-          await cache.delete(entry.request);
-          bytesFreed += entry.size;
-          console.log(`[SW] Purged: ${entry.url} (${entry.size} bytes)`);
-        } catch (error) {
-          console.warn('[SW] Error deleting cache entry:', entry.url);
-        }
-      }
-      
-      this.currentSize = Math.max(0, this.currentSize - bytesFreed);
-      return bytesFreed;
-    } catch (error) {
-      console.error('[SW] Error during cache purge:', error);
-      return 0;
-    }
-  }
-}
-
-const cacheManager = new CacheManager();
-
-// Install event
+// Install event - precache critical files
 self.addEventListener('install', (event) => {
-  console.log('[SW] Installing Enterprise SW version', CACHE_NAME);
+  console.log('[SW] Installing version:', CACHE_NAME);
   
   event.waitUntil(
     (async () => {
       try {
         const cache = await caches.open(CACHE_NAME);
         
-        // Precache files one by one to avoid overwhelming the system
-        for (const url of PRECACHE_URLS) {
+        // Precache files individually with error handling
+        const cachePromises = PRECACHE_FILES.map(async (url) => {
           try {
-            await cache.add(url);
+            const response = await fetch(url);
+            if (response.ok) {
+              await cache.put(url, response);
+              console.log('[SW] Precached:', url);
+            }
           } catch (error) {
             console.warn('[SW] Failed to precache:', url, error.message);
           }
-        }
+        });
         
-        console.log('[SW] Precaching complete');
+        await Promise.allSettled(cachePromises);
+        await calculateCacheSize();
         await self.skipWaiting();
+        
+        console.log('[SW] Installation complete');
       } catch (error) {
-        console.error('[SW] Install failed:', error);
+        console.error('[SW] Installation failed:', error);
       }
     })()
   );
 });
 
-// Activate event
+// Activate event - cleanup and take control
 self.addEventListener('activate', (event) => {
-  console.log('[SW] Activating Enterprise SW');
+  console.log('[SW] Activating version:', CACHE_NAME);
   
   event.waitUntil(
     (async () => {
       try {
-        // Clean up old caches
+        // Delete old caches
         const cacheNames = await caches.keys();
         await Promise.all(
-          cacheNames.map(name => {
-            if (name !== CACHE_NAME) {
+          cacheNames
+            .filter(name => name !== CACHE_NAME)
+            .map(name => {
               console.log('[SW] Deleting old cache:', name);
               return caches.delete(name);
-            }
-          })
+            })
         );
         
-        // Initialize cache management
-        await cacheManager.calculateSize();
-        
-        // Claim clients
+        // Take control of all clients
         await self.clients.claim();
         
-        console.log('[SW] Activation complete');
-        broadcastMessage({ 
-          type: 'SW_ACTIVATED', 
+        // Initialize cache size tracking
+        await calculateCacheSize();
+        
+        console.log('[SW] Activation complete, cache size:', formatBytes(cacheSize));
+        
+        // Notify clients
+        broadcastToClients({
+          type: 'SW_ACTIVATED',
           version: CACHE_NAME,
-          initialCacheSize: cacheManager.currentSize 
+          cacheSize: cacheSize
         });
       } catch (error) {
         console.error('[SW] Activation failed:', error);
@@ -227,505 +116,491 @@ self.addEventListener('activate', (event) => {
   );
 });
 
-// FIXED: Completely revamped fetch event with proper filtering
+// Main fetch handler
 self.addEventListener('fetch', (event) => {
   const { request } = event;
   const url = new URL(request.url);
   
-  // Skip non-GET and non-http(s) requests
-  if (request.method !== 'GET' || !url.protocol.startsWith('http')) {
+  // Only handle GET requests
+  if (request.method !== 'GET') {
     return;
   }
   
-  // Skip Vite HMR requests
-  if (url.pathname.includes('__vite_ping') || url.searchParams.has('t')) {
+  // Skip external domains completely
+  if (isExternalDomain(url.hostname)) {
     return;
   }
   
-  // Skip chrome-extension and other non-web protocols
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    return;
-  }
-
-  // CRITICAL FIX: Skip ALL external origins - let browser handle them normally
-  if (shouldSkipRequest(url)) {
-    console.log('[SW] Skipping external request:', url.href);
-    return; // Let browser handle this request completely
-  }
-  
-  // FIXED: Only handle requests from trusted origins (your own domain)
-  if (!TRUSTED_ORIGINS.includes(url.origin)) {
-    console.log('[SW] Skipping untrusted origin:', url.origin);
+  // Skip non-HTTP protocols
+  if (!url.protocol.startsWith('http')) {
     return;
   }
   
-  event.respondWith(
-    (async () => {
-      try {
-        const strategy = determineStrategy(request, url);
-        const response = await handleRequest(request, strategy, event);
-        
-        // Update metrics safely
-        updateMetrics(response);
-        return response;
-      } catch (error) {
-        console.error('[SW] Request failed:', error);
-        metrics.errors++;
-        return handleRequestError(request, error);
-      }
-    })()
-  );
+  // Skip development requests
+  if (url.searchParams.has('t') || url.pathname.includes('__vite')) {
+    return;
+  }
+  
+  event.respondWith(handleRequest(request));
 });
 
-// FIXED: Comprehensive function to determine what to skip
-function shouldSkipRequest(url) {
-  // Skip all external CDN and tile providers
-  const isExternalOrigin = EXTERNAL_ORIGINS_TO_SKIP.some(origin => 
-    url.origin === new URL(origin).origin
-  );
+// Main request handler
+async function handleRequest(request) {
+  const url = new URL(request.url);
+  const cacheKey = getCacheKey(request);
   
-  if (isExternalOrigin) {
-    return true;
+  // Prevent duplicate requests
+  if (pendingRequests.has(cacheKey)) {
+    return pendingRequests.get(cacheKey);
   }
   
-  // Skip map tile patterns
-  const tilePatterns = [
-    /\/\d+\/\d+\/\d+\.(png|jpg|jpeg|webp)$/,
-    /\/tile\/\d+\/\d+\/\d+/,
-    /\/tiles\/\d+\/\d+\/\d+/,
-    /MapServer\/tile\/\d+\/\d+\/\d+/
-  ];
+  const responsePromise = (async () => {
+    try {
+      // Determine strategy based on request type
+      const strategy = getStrategy(request, url);
+      
+      switch (strategy) {
+        case 'cache-first':
+          return await cacheFirst(request);
+        case 'network-first':
+          return await networkFirst(request);
+        case 'stale-while-revalidate':
+          return await staleWhileRevalidate(request);
+        case 'network-only':
+          return await networkOnly(request);
+        default:
+          return await cacheFirst(request);
+      }
+    } catch (error) {
+      console.error('[SW] Request failed:', request.url, error.message);
+      return handleError(request, error);
+    }
+  })();
   
-  if (tilePatterns.some(pattern => pattern.test(url.pathname))) {
-    return true;
-  }
+  pendingRequests.set(cacheKey, responsePromise);
   
-  // Skip any request with common external patterns
-  const externalPatterns = [
-    /googleapis\.com/,
-    /gstatic\.com/,
-    /fontawesome\.com/,
-    /bootstrapcdn\.com/,
-    /jsdelivr\.net/,
-    /unpkg\.com/,
-    /cdnjs\.cloudflare\.com/,
-    /jquery\.com/,
-    /openstreetmap\.org/,
-    /fastly\.net/,
-    /arcgisonline\.com/,
-    /google\.com/
-  ];
-  
-  return externalPatterns.some(pattern => pattern.test(url.hostname));
-}
-
-function determineStrategy(request, url) {
-  // Check if it's a precached asset
-  const isPreCached = PRECACHE_URLS.some(precacheUrl => {
-    const cleanUrl = precacheUrl.split('?')[0];
-    return url.pathname === cleanUrl;
+  // Clean up when done
+  responsePromise.finally(() => {
+    pendingRequests.delete(cacheKey);
   });
-  
-  if (isPreCached) {
-    return STRATEGIES.PRECACHE;
-  }
-  
-  // API endpoints
-  if (url.pathname.startsWith('/api/')) {
-    return url.pathname.includes('/locations') ? STRATEGIES.API_DATA : STRATEGIES.FALLBACK;
-  }
-  
-  // Static assets by extension
-  const extension = url.pathname.split('.').pop()?.toLowerCase();
-  switch (extension) {
-    case 'css':
-    case 'js':
-    case 'woff':
-    case 'woff2':
-    case 'ttf':
-      return STRATEGIES.CRITICAL;
-      
-    case 'jpg':
-    case 'jpeg':
-    case 'png':
-    case 'webp':
-    case 'svg':
-    case 'mp3':
-    case 'ogg':
-    case 'wav':
-      return STRATEGIES.MEDIA;
-      
-    default:
-      return STRATEGIES.FALLBACK;
-  }
-}
-
-async function handleRequest(request, strategy, event) {
-  const cache = await caches.open(CACHE_NAME);
-  const requestKey = `${request.method}:${request.url}`;
-  
-  // Check for in-flight requests
-  if (inFlightRequests.has(requestKey)) {
-    return inFlightRequests.get(requestKey);
-  }
-  
-  let responsePromise;
-  
-  switch (strategy) {
-    case STRATEGIES.PRECACHE:
-      responsePromise = handlePrecache(request, cache);
-      break;
-      
-    case STRATEGIES.CRITICAL:
-      responsePromise = handleCriticalAssets(request, cache, event);
-      break;
-      
-    case STRATEGIES.API_DATA:
-      responsePromise = handleApiData(request, cache);
-      break;
-      
-    case STRATEGIES.MEDIA:
-      responsePromise = handleMedia(request, cache, event);
-      break;
-      
-    default:
-      responsePromise = handleFallback(request, cache);
-  }
-  
-  // Track in-flight requests
-  inFlightRequests.set(requestKey, responsePromise);
-  responsePromise.finally(() => inFlightRequests.delete(requestKey));
   
   return responsePromise;
 }
 
-async function handlePrecache(request, cache) {
+// Cache-first strategy (for static assets)
+async function cacheFirst(request) {
+  const cache = await caches.open(CACHE_NAME);
   const cachedResponse = await cache.match(request);
-  if (cachedResponse) {
-    metrics.cacheHits++;
-    return cachedResponse; // FIXED: Don't add security headers to precached content
-  }
   
-  metrics.cacheMisses++;
-  throw new Error('Precached resource not found');
-}
-
-async function handleCriticalAssets(request, cache, event) {
-  // Try cache first
-  const cachedResponse = await cache.match(request);
-  if (cachedResponse) {
-    metrics.cacheHits++;
-    
-    // Update in background if not too recent
-    if (isResponseStale(cachedResponse, LOCATION_CACHE_TTL)) {
-      event.waitUntil(
-        fetchWithRetry(request)
-          .then(networkResponse => {
-            if (networkResponse?.ok) {
-              return cacheResponse(cache, request, networkResponse.clone(), STRATEGIES.CRITICAL);
-            }
-          })
-          .catch(error => console.warn('[SW] Background update failed:', error))
-      );
-    }
-    
-    return cachedResponse; // FIXED: Don't modify cached responses
-  }
-  
-  // Fallback to network
-  const networkResponse = await fetchWithRetry(request);
-  if (networkResponse.ok) {
-    event.waitUntil(
-      cacheResponse(cache, request, networkResponse.clone(), STRATEGIES.CRITICAL)
-    );
-  }
-  metrics.networkRequests++;
-  return networkResponse; // FIXED: Don't modify network responses
-}
-
-async function handleApiData(request, cache) {
-  // Network first for API data
-  try {
-    const networkResponse = await fetchWithRetry(request);
-    if (networkResponse.ok) {
-      // Cache in background
-      cacheResponse(cache, request, networkResponse.clone(), STRATEGIES.API_DATA)
-        .catch(error => console.warn('[SW] Cache update failed:', error));
-    }
-    metrics.networkRequests++;
-    return networkResponse;
-  } catch (error) {
-    // Fallback to cache
-    const cachedResponse = await cache.match(request);
-    if (cachedResponse) {
-      metrics.cacheHits++;
-      return cachedResponse;
-    }
-    throw error;
-  }
-}
-
-async function handleMedia(request, cache, event) {
-  // Cache first for media
-  const cachedResponse = await cache.match(request);
-  if (cachedResponse && !isResponseStale(cachedResponse, AUDIO_CACHE_TTL)) {
-    metrics.cacheHits++;
+  if (cachedResponse && !isExpired(cachedResponse)) {
     return cachedResponse;
   }
   
-  // Network with cache update
   try {
-    const networkResponse = await fetchWithRetry(request);
+    const networkResponse = await fetchWithTimeout(request);
+    
     if (networkResponse.ok) {
-      event.waitUntil(
-        cacheResponse(cache, request, networkResponse.clone(), STRATEGIES.MEDIA)
-      );
+      await safeCacheResponse(cache, request, networkResponse.clone());
     }
-    metrics.networkRequests++;
+    
     return networkResponse;
   } catch (error) {
     // Return stale cache if available
     if (cachedResponse) {
-      metrics.cacheHits++;
+      console.log('[SW] Returning stale cache for:', request.url);
       return cachedResponse;
     }
     throw error;
   }
 }
 
-async function handleFallback(request, cache) {
-  // Network first
+// Network-first strategy (for API calls)
+async function networkFirst(request) {
   try {
-    const networkResponse = await fetchWithRetry(request);
-    metrics.networkRequests++;
+    const networkResponse = await fetchWithTimeout(request);
+    
+    if (networkResponse.ok) {
+      const cache = await caches.open(CACHE_NAME);
+      await safeCacheResponse(cache, request, networkResponse.clone());
+    }
+    
     return networkResponse;
   } catch (error) {
-    // Try cache
+    // Fallback to cache
+    const cache = await caches.open(CACHE_NAME);
     const cachedResponse = await cache.match(request);
-    if (cachedResponse) {
-      metrics.cacheHits++;
-      return cachedResponse;
-    }
     
-    // HTML fallback
-    if (request.headers.get('accept')?.includes('text/html')) {
-      const offlineResponse = await cache.match('/offline.html');
-      if (offlineResponse) {
-        return offlineResponse;
-      }
+    if (cachedResponse) {
+      console.log('[SW] Network failed, using cache for:', request.url);
+      return cachedResponse;
     }
     
     throw error;
   }
 }
 
-async function fetchWithRetry(request, attempt = 1) {
-  if (attempt > MAX_RETRY_ATTEMPTS) {
-    throw new Error(`Max retries exceeded for ${request.url}`);
+// Stale-while-revalidate strategy (for HTML pages)
+async function staleWhileRevalidate(request) {
+  const cache = await caches.open(CACHE_NAME);
+  const cachedResponse = await cache.match(request);
+  
+  // Start network request in background
+  const networkPromise = fetchWithTimeout(request)
+    .then(networkResponse => {
+      if (networkResponse.ok) {
+        safeCacheResponse(cache, request, networkResponse.clone());
+      }
+      return networkResponse;
+    })
+    .catch(error => {
+      console.warn('[SW] Background fetch failed:', request.url, error.message);
+    });
+  
+  // Return cache immediately if available
+  if (cachedResponse) {
+    return cachedResponse;
   }
   
+  // Wait for network if no cache
+  return networkPromise;
+}
+
+// Network-only strategy (for external resources)
+async function networkOnly(request) {
+  return fetchWithTimeout(request);
+}
+
+// Determine caching strategy based on request
+function getStrategy(request, url) {
+  // Navigation requests
+  if (request.mode === 'navigate') {
+    return 'stale-while-revalidate';
+  }
+  
+  // API endpoints
+  if (url.pathname.startsWith('/api/')) {
+    return 'network-first';
+  }
+  
+  // Static assets
+  const extension = getFileExtension(url.pathname);
+  if (['css', 'js', 'woff', 'woff2', 'ttf', 'ico'].includes(extension)) {
+    return 'cache-first';
+  }
+  
+  // Media files
+  if (['jpg', 'jpeg', 'png', 'webp', 'svg', 'mp3', 'ogg', 'wav'].includes(extension)) {
+    return 'cache-first';
+  }
+  
+  // HTML pages
+  if (request.destination === 'document' || url.pathname.endsWith('.html')) {
+    return 'stale-while-revalidate';
+  }
+  
+  return 'cache-first';
+}
+
+// Enhanced fetch with timeout and retry
+async function fetchWithTimeout(request, timeout = NETWORK_TIMEOUT) {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), NETWORK_TIMEOUT);
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
   
   try {
-    const response = await fetch(request, { signal: controller.signal });
+    const response = await fetch(request.clone(), {
+      signal: controller.signal
+    });
+    
     clearTimeout(timeoutId);
-    
-    if (!response.ok && response.status >= 500) {
-      throw new Error(`Server error: ${response.status}`);
-    }
-    
     return response;
   } catch (error) {
     clearTimeout(timeoutId);
     
-    if (attempt < MAX_RETRY_ATTEMPTS && (error.name === 'AbortError' || error.message.includes('Server error'))) {
-      const delay = RETRY_DELAY_BASE * Math.pow(2, attempt - 1);
-      await new Promise(resolve => setTimeout(resolve, delay));
-      return fetchWithRetry(request, attempt + 1);
+    if (error.name === 'AbortError') {
+      throw new Error('Request timeout');
     }
     
     throw error;
   }
 }
 
-async function cacheResponse(cache, request, response, strategy) {
-  if (!response?.ok) return;
+// Safe cache response with size management
+async function safeCacheResponse(cache, request, response) {
+  if (!response.ok || response.status === 206) {
+    return;
+  }
+  
+  // Check cache control headers
+  const cacheControl = response.headers.get('cache-control') || '';
+  if (cacheControl.includes('no-store') || cacheControl.includes('no-cache')) {
+    return;
+  }
   
   try {
-    // Check cache control
-    const cacheControl = response.headers.get('cache-control') || '';
-    if (cacheControl.includes('no-store')) {
-      return;
+    // Manage cache size
+    if (cacheSize > MAX_CACHE_SIZE * 0.9) {
+      await cleanupCache();
     }
     
-    // Check cache size before adding
-    if (cacheManager.currentSize > MAX_CACHE_SIZE * 0.8) {
-      await cacheManager.purgeOldEntries();
-    }
-    
-    // FIXED: Don't modify headers - cache response as-is
+    // Add metadata headers
     const headers = new Headers(response.headers);
     headers.set('sw-cached-at', Date.now().toString());
-    headers.set('sw-strategy', strategy);
     headers.set('sw-cache-version', CACHE_NAME);
     
-    const body = await response.blob();
-    cacheManager.currentSize += body.size;
-    
-    await cache.put(request, new Response(body, {
+    const responseToCache = new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
-      headers
-    }));
+      headers: headers
+    });
+    
+    await cache.put(request, responseToCache);
+    
+    // Update cache size tracking
+    const blob = await response.blob();
+    cacheSize += blob.size;
+    
   } catch (error) {
     console.warn('[SW] Failed to cache response:', request.url, error.message);
   }
 }
 
-// REMOVED: addSecurityHeaders function completely as it was causing issues
-
-function isResponseStale(response, maxAge = LOCATION_CACHE_TTL) {
+// Check if cached response is expired
+function isExpired(response) {
   const cachedAt = response.headers.get('sw-cached-at');
   if (!cachedAt) return true;
   
   const cacheTime = parseInt(cachedAt);
-  return Date.now() - cacheTime > maxAge;
+  const now = Date.now();
+  
+  // Determine TTL based on content type
+  const url = new URL(response.url);
+  const extension = getFileExtension(url.pathname);
+  
+  let ttl = CACHE_TTL.STATIC;
+  if (url.pathname.startsWith('/api/')) {
+    ttl = CACHE_TTL.API;
+  } else if (['jpg', 'jpeg', 'png', 'webp', 'svg', 'mp3', 'ogg', 'wav'].includes(extension)) {
+    ttl = CACHE_TTL.MEDIA;
+  } else if (extension === 'html' || url.pathname === '/') {
+    ttl = CACHE_TTL.HTML;
+  }
+  
+  return (now - cacheTime) > ttl;
 }
 
-function updateMetrics(response) {
-  try {
-    if (response?.headers?.get('sw-cached-at')) {
-      metrics.cacheHits++;
-    } else {
-      metrics.networkRequests++;
+// Error handling
+async function handleError(request, error) {
+  console.error('[SW] Handling error for:', request.url, error.message);
+  
+  // For navigation requests, return offline page
+  if (request.mode === 'navigate') {
+    const cache = await caches.open(CACHE_NAME);
+    const offlinePage = await cache.match('/offline.html');
+    
+    if (offlinePage) {
+      return offlinePage;
     }
-    metrics.lastUpdated = Date.now();
-  } catch (error) {
-    console.warn('[SW] Error updating metrics:', error);
-  }
-}
-
-function handleRequestError(request, error) {
-  console.error('[SW] Request error:', request.url, error.message);
-  
-  // HTML fallback
-  if (request.headers.get('accept')?.includes('text/html')) {
-    return caches.match('/offline.html')
-      .then(response => response || new Response('Offline - Please check your connection', {
-        status: 503,
-        headers: { 'Content-Type': 'text/html' }
-      }))
-      .catch(() => new Response('Service unavailable', { status: 503 }));
+    
+    return new Response(`
+      <!DOCTYPE html>
+      <html>
+        <head><title>Offline</title></head>
+        <body>
+          <h1>You're offline</h1>
+          <p>Please check your internet connection and try again.</p>
+        </body>
+      </html>
+    `, {
+      status: 503,
+      headers: { 'Content-Type': 'text/html' }
+    });
   }
   
-  // API fallback
+  // For API requests, return JSON error
   if (request.url.includes('/api/')) {
-    return new Response(JSON.stringify({ 
+    return new Response(JSON.stringify({
       error: 'Service unavailable',
-      message: 'Please check your connection and try again later'
+      message: 'Please check your connection and try again'
     }), {
       status: 503,
       headers: { 'Content-Type': 'application/json' }
     });
   }
   
-  return new Response('Service unavailable', { status: 503 });
+  // For other requests, return generic error
+  return new Response('Service unavailable', {
+    status: 503,
+    headers: { 'Content-Type': 'text/plain' }
+  });
+}
+
+// Cache cleanup
+async function cleanupCache() {
+  try {
+    const cache = await caches.open(CACHE_NAME);
+    const requests = await cache.keys();
+    
+    // Sort by cache time (oldest first)
+    const entries = [];
+    for (const request of requests) {
+      const response = await cache.match(request);
+      if (response) {
+        const cachedAt = response.headers.get('sw-cached-at');
+        const isPrecached = PRECACHE_FILES.includes(new URL(request.url).pathname);
+        
+        if (!isPrecached && cachedAt) {
+          entries.push({
+            request,
+            cachedAt: parseInt(cachedAt),
+            size: (await response.blob()).size
+          });
+        }
+      }
+    }
+    
+    // Sort by oldest first
+    entries.sort((a, b) => a.cachedAt - b.cachedAt);
+    
+    // Delete oldest entries until we're under 70% capacity
+    const targetSize = MAX_CACHE_SIZE * 0.7;
+    let currentSize = cacheSize;
+    
+    for (const entry of entries) {
+      if (currentSize <= targetSize) break;
+      
+      await cache.delete(entry.request);
+      currentSize -= entry.size;
+      console.log('[SW] Cleaned up:', entry.request.url);
+    }
+    
+    cacheSize = currentSize;
+    console.log('[SW] Cache cleanup complete, new size:', formatBytes(cacheSize));
+    
+  } catch (error) {
+    console.error('[SW] Cache cleanup failed:', error);
+  }
+}
+
+// Calculate total cache size
+async function calculateCacheSize() {
+  try {
+    const cache = await caches.open(CACHE_NAME);
+    const requests = await cache.keys();
+    
+    let totalSize = 0;
+    for (const request of requests) {
+      try {
+        const response = await cache.match(request);
+        if (response) {
+          const blob = await response.blob();
+          totalSize += blob.size;
+        }
+      } catch (error) {
+        console.warn('[SW] Error calculating size for:', request.url);
+      }
+    }
+    
+    cacheSize = totalSize;
+    return totalSize;
+  } catch (error) {
+    console.error('[SW] Error calculating cache size:', error);
+    return 0;
+  }
 }
 
 // Message handling
-self.addEventListener('message', (event) => {
+self.addEventListener('message', async (event) => {
   const { data, ports } = event;
+  
   if (!data?.type) return;
   
   switch (data.type) {
-    case 'GET_METRICS':
-      ports[0]?.postMessage({ type: 'METRICS', data: metrics });
+    case 'GET_CACHE_SIZE':
+      const size = await calculateCacheSize();
+      ports[0]?.postMessage({ type: 'CACHE_SIZE', size: formatBytes(size) });
       break;
       
     case 'CLEAR_CACHE':
-      event.waitUntil(clearCache());
+      await clearAllCache();
+      ports[0]?.postMessage({ type: 'CACHE_CLEARED' });
       break;
       
-    case 'PREFETCH_AUDIO':
-      if (data.data?.locations) {
-        event.waitUntil(prefetchAudioFiles(data.data));
+    case 'PREFETCH_URLS':
+      if (data.urls) {
+        await prefetchUrls(data.urls);
+        ports[0]?.postMessage({ type: 'PREFETCH_COMPLETE' });
       }
       break;
   }
 });
 
-async function clearCache() {
+// Clear all cache except precached files
+async function clearAllCache() {
   try {
     const cache = await caches.open(CACHE_NAME);
     const requests = await cache.keys();
     
-    // Keep precached files
-    const toDelete = requests.filter(request => 
-      !PRECACHE_URLS.some(url => request.url.includes(url.split('?')[0]))
-    );
+    const toDelete = requests.filter(request => {
+      const path = new URL(request.url).pathname;
+      return !PRECACHE_FILES.includes(path);
+    });
     
     await Promise.all(toDelete.map(request => cache.delete(request)));
-    await cacheManager.calculateSize();
+    await calculateCacheSize();
     
-    console.log(`[SW] Cleared ${toDelete.length} cached items`);
-    broadcastMessage({ type: 'CACHE_CLEARED' });
+    console.log('[SW] Cleared cache, kept', PRECACHE_FILES.length, 'precached files');
   } catch (error) {
-    console.error('[SW] Cache clear failed:', error);
+    console.error('[SW] Error clearing cache:', error);
   }
 }
 
-async function prefetchAudioFiles({ userLocation, locations }) {
-  if (!Array.isArray(locations)) return;
+// Prefetch URLs
+async function prefetchUrls(urls) {
+  const cache = await caches.open(CACHE_NAME);
   
-  console.log(`[SW] Prefetching audio for ${locations.length} locations`);
-  
-  try {
-    const cache = await caches.open(CACHE_NAME);
-    let successful = 0;
-    
-    // Limit to 10 locations to prevent overwhelming
-    const limitedLocations = locations.slice(0, 10);
-    
-    for (const location of limitedLocations) {
-      if (location.audioUrl) {
-        try {
-          const response = await fetchWithRetry(new Request(location.audioUrl));
-          if (response.ok) {
-            await cacheResponse(cache, new Request(location.audioUrl), response.clone(), STRATEGIES.MEDIA);
-            successful++;
-          }
-        } catch (error) {
-          console.warn('[SW] Audio prefetch failed:', location.audioUrl, error.message);
-        }
+  for (const url of urls.slice(0, 20)) { // Limit to 20 URLs
+    try {
+      const response = await fetchWithTimeout(new Request(url));
+      if (response.ok) {
+        await safeCacheResponse(cache, new Request(url), response.clone());
       }
+    } catch (error) {
+      console.warn('[SW] Prefetch failed for:', url, error.message);
     }
-    
-    metrics.prefetches += successful;
-    console.log(`[SW] Audio prefetch complete: ${successful}/${limitedLocations.length} succeeded`);
-    
-    broadcastMessage({ 
-      type: 'PREFETCH_COMPLETE', 
-      data: { successful, total: limitedLocations.length } 
-    });
-  } catch (error) {
-    console.error('[SW] Prefetch failed:', error);
   }
 }
 
-function broadcastMessage(message) {
-  self.clients.matchAll()
-    .then(clients => {
-      clients.forEach(client => {
-        try {
-          client.postMessage(message);
-        } catch (error) {
-          console.warn('[SW] Failed to send message to client:', error);
-        }
-      });
-    })
-    .catch(error => console.warn('[SW] Failed to broadcast message:', error));
+// Utility functions
+function isExternalDomain(hostname) {
+  return EXTERNAL_DOMAINS.some(domain => hostname.includes(domain));
 }
 
-console.log('[SW] Enterprise Service Worker initialized');
+function getFileExtension(pathname) {
+  return pathname.split('.').pop()?.toLowerCase() || '';
+}
 
+function getCacheKey(request) {
+  return `${request.method}:${request.url}`;
+}
+
+function formatBytes(bytes) {
+  if (bytes === 0) return '0 Bytes';
+  const k = 1024;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+function broadcastToClients(message) {
+  self.clients.matchAll().then(clients => {
+    clients.forEach(client => {
+      try {
+        client.postMessage(message);
+      } catch (error) {
+        console.warn('[SW] Failed to send message to client:', error);
+      }
+    });
+  });
+}
+
+console.log('[SW] Service Worker initialized:', CACHE_NAME);
