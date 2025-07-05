@@ -356,7 +356,26 @@ const locations = [
   "link": "https://mnthen.com/blog/event/hamm_kidnap.html",
   "imageSource": "Investigators inspect the home of Theodore Hamm via 1889 Minnesota Good Age",
   "additionalInfo": "The Barker-Karpis gang brought in a strategist from Al Capone's Chicago syndicate to help plan Hamm Jr.'s kidnapping."
+},
+
+{
+  "id": "1030",
+  "lat": 44.987154491771946,
+  "lng": -93.25850396437934,
+  "name": "Nye's Polonaise Room (1950 - 2016)",
+  "title": "Nye's Polonaise Room",
+  "image": "https://mnthen.com/images/nyes.webp",
+  "creator": "Matt Reicher",
+  "city": "Minneapolis",
+  "audio": "/audio/exhibit/nyes.mp3",
+  "tours": "history",
+  "summary": "Nye's Polonaise Room was a beloved Minneapolis Polish bar and restaurant from 1950-2016, famous for its legendary staff, polka music, piano lounge, and welcoming atmosphere where everyone fit in.",
+  "today": "On East Hennepin Ave. in NE Minneapolis",
+  "link": "https://mnthen.com/blog/place/nyes.html",
+  "imageSource": "Nye's Polonaise Room, Minneapolis, March 27, 2009 via MPRNews",
+  "additionalInfo": "Guy Fieri featured Nye's on Season 13 of Food Network’s \"Diners, Drive-Ins and Dives,\" praising their pierogi and prime rib sandwich."
 }
+
 
 
 
