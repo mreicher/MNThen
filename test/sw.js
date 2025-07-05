@@ -1,7 +1,7 @@
-const CACHE_NAME = 'mnthen-map-v1.2.0';
-const DYNAMIC_CACHE = 'mnthen-dynamic-v1.2.0';
-const TILE_CACHE = 'mnthen-tiles-v1.2.0';
-const MEDIA_CACHE = 'mnthen-media-v1.2.0';
+const CACHE_NAME = 'mnthen-map-v1.2.1';
+const DYNAMIC_CACHE = 'mnthen-dynamic-v1.2.1';
+const TILE_CACHE = 'mnthen-tiles-v1.2.1';
+const MEDIA_CACHE = 'mnthen-media-v1.2.1';
 
 // Cache size limits to prevent storage bloat
 const CACHE_LIMITS = {
@@ -94,18 +94,69 @@ self.addEventListener('fetch', event => {
   if (event.request.method !== 'GET' || url.protocol.startsWith('chrome-extension')) {
     return;
   }
+
+  // CRITICAL FIX: Let audio requests pass through without interference for initial load
+  if (isAudioRequest(url)) {
+    event.respondWith(handleAudioRequest(event.request));
+    return;
+  }
   
-  // Route requests to appropriate handlers
+  // Route other requests to appropriate handlers
   if (isMapTile(url)) {
     event.respondWith(handleMapTile(event.request));
-  } else if (isMediaRequest(url)) {
-    event.respondWith(handleMedia(event.request));
+  } else if (isImageRequest(url)) {
+    event.respondWith(handleImage(event.request));
   } else if (isCoreAsset(url)) {
     event.respondWith(handleCoreAsset(event.request));
   } else {
     event.respondWith(handleDynamic(event.request));
   }
 });
+
+// CRITICAL FIX: Separate audio handling to prevent playback issues
+async function handleAudioRequest(request) {
+  console.log('SW: Handling audio request:', request.url);
+  
+  try {
+    // For audio, always try network first to ensure proper streaming
+    const response = await fetch(request, {
+      mode: 'cors',
+      credentials: 'omit'
+    });
+    
+    if (response.ok) {
+      // Only cache successful audio responses in background
+      const cache = await caches.open(MEDIA_CACHE);
+      // Clone for caching but don't wait for it
+      cache.put(request, response.clone()).catch(err => {
+        console.warn('SW: Audio cache failed:', err);
+      });
+      
+      // Return original response immediately
+      return response;
+    } else {
+      // If network fails, try cache
+      const cache = await caches.open(MEDIA_CACHE);
+      const cachedResponse = await cache.match(request);
+      return cachedResponse || response;
+    }
+  } catch (error) {
+    console.warn('SW: Audio network failed, trying cache:', error);
+    // Network failed, try cache
+    const cache = await caches.open(MEDIA_CACHE);
+    const cachedResponse = await cache.match(request);
+    
+    if (cachedResponse) {
+      return cachedResponse;
+    }
+    
+    // Return a proper error response for audio
+    return new Response('Audio not available', { 
+      status: 404,
+      headers: { 'Content-Type': 'text/plain' }
+    });
+  }
+}
 
 // Handle map tile requests - optimized for frequent access
 async function handleMapTile(request) {
@@ -137,8 +188,8 @@ async function handleMapTile(request) {
   }
 }
 
-// Handle media (images, audio) - cache first strategy
-async function handleMedia(request) {
+// FIXED: Separate image handling from audio
+async function handleImage(request) {
   const cache = await caches.open(MEDIA_CACHE);
   const cachedResponse = await cache.match(request);
   
@@ -157,7 +208,7 @@ async function handleMedia(request) {
     }
     return response;
   } catch (error) {
-    console.warn('SW: Media fetch failed:', request.url);
+    console.warn('SW: Image fetch failed:', request.url);
     return new Response('', { status: 404 });
   }
 }
@@ -212,17 +263,25 @@ async function handleDynamic(request) {
   }
 }
 
+// CRITICAL FIX: Separate audio detection from other media
+function isAudioRequest(url) {
+  const audioExtensions = ['.mp3', '.wav', '.ogg', '.m4a', '.aac', '.flac'];
+  const pathname = url.pathname.toLowerCase();
+  return audioExtensions.some(ext => pathname.endsWith(ext)) ||
+         url.searchParams.has('audio') ||
+         pathname.includes('/audio/');
+}
+
 // Helper functions for request classification
 function isMapTile(url) {
   return url.hostname.includes('tile.openstreetmap.org') ||
          url.pathname.match(/\/\d+\/\d+\/\d+\.png$/);
 }
 
-function isMediaRequest(url) {
-  const mediaExtensions = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.mp3', '.wav', '.ogg', '.m4a'];
+function isImageRequest(url) {
+  const imageExtensions = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.svg'];
   const pathname = url.pathname.toLowerCase();
-  return mediaExtensions.some(ext => pathname.endsWith(ext)) ||
-         url.hostname.includes('mnthen.com');
+  return imageExtensions.some(ext => pathname.endsWith(ext));
 }
 
 function isCoreAsset(url) {
@@ -322,7 +381,7 @@ self.addEventListener('message', event => {
   }
 });
 
-// Prefetch audio files for nearby locations
+// FIXED: Prefetch audio files for nearby locations with better error handling
 async function prefetchNearbyAudio(data) {
   const { userLocation, locations } = data;
   if (!userLocation || !locations) return;
@@ -338,20 +397,24 @@ async function prefetchNearbyAudio(data) {
   for (const location of nearbyLocations.slice(0, 5)) { // Limit to 5 locations
     if (location.audio) {
       try {
-        const audioRequest = new Request(location.audio);
+        const audioRequest = new Request(location.audio, {
+          mode: 'cors',
+          credentials: 'omit'
+        });
         const cachedResponse = await cache.match(audioRequest);
         
         if (!cachedResponse) {
           fetch(audioRequest).then(response => {
             if (response.ok) {
               cache.put(audioRequest, response.clone());
+              console.log('SW: Prefetched audio for', location.name);
             }
-          }).catch(() => {
-            // Silent fail for prefetch
+          }).catch(error => {
+            console.warn('SW: Audio prefetch failed for', location.name, error);
           });
         }
       } catch (error) {
-        // Silent fail for prefetch
+        console.warn('SW: Audio prefetch error for', location.name, error);
       }
     }
   }
