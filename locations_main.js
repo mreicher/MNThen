@@ -368,7 +368,7 @@ const locations = [
   "creator": "Matt Reicher",
   "city": "Minneapolis",
   "audio": "/audio/exhibit/nyes.mp3",
-  "tours": "history",
+  "tours": "place",
   "summary": "Nye's Polonaise Room was a beloved Minneapolis Polish bar and restaurant from 1950-2016, famous for its legendary staff, polka music, piano lounge, and welcoming atmosphere where everyone fit in.",
   "today": "On East Hennepin Ave. in NE Minneapolis",
   "link": "https://mnthen.com/blog/place/nyes.html",
