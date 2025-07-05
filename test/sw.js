@@ -1,425 +1,200 @@
-const CACHE_NAME = 'mnthen-map-v1.2.1';
-const DYNAMIC_CACHE = 'mnthen-dynamic-v1.2.1';
-const TILE_CACHE = 'mnthen-tiles-v1.2.1';
-const MEDIA_CACHE = 'mnthen-media-v1.2.1';
+// service-worker.js
+const IMAGE_CACHE = 'mnthen-images-v1';
+const AUDIO_CACHE = 'mnthen-audio-v1';
+const MAP_TILES_CACHE = 'mnthen-tiles-v1';
 
-// Cache size limits to prevent storage bloat
+// Cache size limits (in MB)
 const CACHE_LIMITS = {
-  tiles: 500,      // ~50MB of map tiles
-  media: 100,      // Audio/images for locations
-  dynamic: 50      // Other dynamic content
+  [IMAGE_CACHE]: 50 * 1024 * 1024,  // 50MB
+  [AUDIO_CACHE]: 100 * 1024 * 1024, // 100MB
+  [MAP_TILES_CACHE]: 75 * 1024 * 1024 // 75MB
 };
 
-// Assets to cache immediately on install
-const CORE_ASSETS = [
-  '/',
-  '/index.html',
-  '/manifest.json',
-  '/locations_main.js',
-  'https://cdn.jsdelivr.net/npm/leaflet@1.7.1/dist/leaflet.css',
-  'https://cdn.jsdelivr.net/npm/leaflet@1.7.1/dist/leaflet.js',
-  'https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css',
-  'https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js',
-  'https://unpkg.com/leaflet.markercluster@1.4.1/dist/leaflet.markercluster.js',
-  'https://unpkg.com/leaflet.markercluster@1.4.1/dist/MarkerCluster.css',
-  'https://unpkg.com/leaflet.markercluster@1.4.1/dist/MarkerCluster.Default.css'
-];
-
-// Install event - cache core assets
-self.addEventListener('install', event => {
-  console.log('SW: Installing...');
-  
-  event.waitUntil(
-    caches.open(CACHE_NAME)
-      .then(cache => {
-        console.log('SW: Caching core assets');
-        return cache.addAll(CORE_ASSETS.map(url => new Request(url, { mode: 'cors' })));
-      })
-      .then(() => {
-        console.log('SW: Core assets cached');
-        return self.skipWaiting();
-      })
-      .catch(error => {
-        console.warn('SW: Failed to cache some core assets:', error);
-        return self.skipWaiting(); // Still activate even if some assets fail
-      })
-  );
+self.addEventListener('install', (event) => {
+  event.waitUntil(self.skipWaiting());
 });
 
-// Activate event - clean up old caches
-self.addEventListener('activate', event => {
-  console.log('SW: Activating...');
+self.addEventListener('activate', (event) => {
+  const cacheWhitelist = [IMAGE_CACHE, AUDIO_CACHE, MAP_TILES_CACHE];
   
   event.waitUntil(
-    Promise.all([
-      // Clean up old caches
-      caches.keys().then(cacheNames => {
-        const validCaches = [CACHE_NAME, DYNAMIC_CACHE, TILE_CACHE, MEDIA_CACHE];
-        return Promise.all(
-          cacheNames.map(cacheName => {
-            if (!validCaches.includes(cacheName)) {
-              console.log('SW: Deleting old cache:', cacheName);
-              return caches.delete(cacheName);
-            }
-          })
-        );
-      }),
-      
-      // Claim all clients
-      self.clients.claim(),
-      
-      // Send activation message
-      self.clients.matchAll().then(clients => {
-        clients.forEach(client => {
-          client.postMessage({
-            type: 'SW_ACTIVATED',
-            version: CACHE_NAME
-          });
-        });
-      })
-    ]).then(() => {
-      console.log('SW: Activated successfully');
-      
-      // Perform cache cleanup
-      performCacheCleanup();
+    caches.keys().then((cacheNames) => {
+      return Promise.all(
+        cacheNames.map((cacheName) => {
+          if (!cacheWhitelist.includes(cacheName)) {
+            return caches.delete(cacheName);
+          }
+        })
+      );
+    })
+    .then(() => {
+      return self.clients.claim();
     })
   );
 });
 
-// Fetch event - handle all network requests
-self.addEventListener('fetch', event => {
+self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
   
-  // Skip non-GET requests and browser extension requests
-  if (event.request.method !== 'GET' || url.protocol.startsWith('chrome-extension')) {
+  // Skip non-GET requests
+  if (event.request.method !== 'GET') {
     return;
   }
 
-  // CRITICAL FIX: Let audio requests pass through without interference for initial load
-  if (isAudioRequest(url)) {
-    event.respondWith(handleAudioRequest(event.request));
-    return;
+  // Only cache specific resource types
+  if (isImageRequest(url) || isAudioRequest(url) || isMapTileRequest(url)) {
+    event.respondWith(handleCacheableRequest(event.request));
   }
-  
-  // Route other requests to appropriate handlers
-  if (isMapTile(url)) {
-    event.respondWith(handleMapTile(event.request));
-  } else if (isImageRequest(url)) {
-    event.respondWith(handleImage(event.request));
-  } else if (isCoreAsset(url)) {
-    event.respondWith(handleCoreAsset(event.request));
-  } else {
-    event.respondWith(handleDynamic(event.request));
-  }
+  // Let everything else pass through normally
 });
 
-// CRITICAL FIX: Separate audio handling to prevent playback issues
-async function handleAudioRequest(request) {
-  console.log('SW: Handling audio request:', request.url);
-  
-  try {
-    // For audio, always try network first to ensure proper streaming
-    const response = await fetch(request, {
-      mode: 'cors',
-      credentials: 'omit'
-    });
-    
-    if (response.ok) {
-      // Only cache successful audio responses in background
-      const cache = await caches.open(MEDIA_CACHE);
-      // Clone for caching but don't wait for it
-      cache.put(request, response.clone()).catch(err => {
-        console.warn('SW: Audio cache failed:', err);
-      });
-      
-      // Return original response immediately
-      return response;
-    } else {
-      // If network fails, try cache
-      const cache = await caches.open(MEDIA_CACHE);
-      const cachedResponse = await cache.match(request);
-      return cachedResponse || response;
-    }
-  } catch (error) {
-    console.warn('SW: Audio network failed, trying cache:', error);
-    // Network failed, try cache
-    const cache = await caches.open(MEDIA_CACHE);
-    const cachedResponse = await cache.match(request);
-    
-    if (cachedResponse) {
-      return cachedResponse;
-    }
-    
-    // Return a proper error response for audio
-    return new Response('Audio not available', { 
-      status: 404,
-      headers: { 'Content-Type': 'text/plain' }
-    });
-  }
-}
-
-// Handle map tile requests - optimized for frequent access
-async function handleMapTile(request) {
-  const cache = await caches.open(TILE_CACHE);
-  const cachedResponse = await cache.match(request);
-  
-  if (cachedResponse) {
-    // Return cached tile immediately, but fetch fresh one in background
-    fetchAndCache(request, TILE_CACHE);
-    return cachedResponse;
-  }
-  
-  // If not cached, fetch and cache
-  try {
-    const response = await fetch(request);
-    if (response.ok) {
-      // Clone before caching
-      const responseClone = response.clone();
-      await cache.put(request, responseClone);
-      
-      // Manage cache size
-      manageCacheSize(TILE_CACHE, CACHE_LIMITS.tiles);
-    }
-    return response;
-  } catch (error) {
-    console.warn('SW: Map tile fetch failed:', request.url);
-    // Return a transparent tile as fallback
-    return createTransparentTile();
-  }
-}
-
-// FIXED: Separate image handling from audio
-async function handleImage(request) {
-  const cache = await caches.open(MEDIA_CACHE);
-  const cachedResponse = await cache.match(request);
-  
-  if (cachedResponse) {
-    return cachedResponse;
-  }
-  
-  try {
-    const response = await fetch(request);
-    if (response.ok) {
-      const responseClone = response.clone();
-      await cache.put(request, responseClone);
-      
-      // Manage cache size
-      manageCacheSize(MEDIA_CACHE, CACHE_LIMITS.media);
-    }
-    return response;
-  } catch (error) {
-    console.warn('SW: Image fetch failed:', request.url);
-    return new Response('', { status: 404 });
-  }
-}
-
-// Handle core assets - cache first with network fallback
-async function handleCoreAsset(request) {
-  const cache = await caches.open(CACHE_NAME);
-  const cachedResponse = await cache.match(request);
-  
-  if (cachedResponse) {
-    return cachedResponse;
-  }
-  
-  try {
-    const response = await fetch(request);
-    if (response.ok) {
-      const responseClone = response.clone();
-      await cache.put(request, responseClone);
-    }
-    return response;
-  } catch (error) {
-    console.warn('SW: Core asset fetch failed:', request.url);
-    return new Response('', { status: 503 });
-  }
-}
-
-// Handle dynamic content - network first with cache fallback
-async function handleDynamic(request) {
-  try {
-    const response = await fetch(request);
-    
-    if (response.ok) {
-      const cache = await caches.open(DYNAMIC_CACHE);
-      const responseClone = response.clone();
-      await cache.put(request, responseClone);
-      
-      // Manage cache size
-      manageCacheSize(DYNAMIC_CACHE, CACHE_LIMITS.dynamic);
-    }
-    return response;
-  } catch (error) {
-    // Try cache fallback
-    const cache = await caches.open(DYNAMIC_CACHE);
-    const cachedResponse = await cache.match(request);
-    
-    if (cachedResponse) {
-      return cachedResponse;
-    }
-    
-    console.warn('SW: Dynamic content fetch failed:', request.url);
-    return new Response('Offline', { status: 503 });
-  }
-}
-
-// CRITICAL FIX: Separate audio detection from other media
-function isAudioRequest(url) {
-  const audioExtensions = ['.mp3', '.wav', '.ogg', '.m4a', '.aac', '.flac'];
-  const pathname = url.pathname.toLowerCase();
-  return audioExtensions.some(ext => pathname.endsWith(ext)) ||
-         url.searchParams.has('audio') ||
-         pathname.includes('/audio/');
-}
-
-// Helper functions for request classification
-function isMapTile(url) {
-  return url.hostname.includes('tile.openstreetmap.org') ||
-         url.pathname.match(/\/\d+\/\d+\/\d+\.png$/);
-}
-
+// Check if request is for an image
 function isImageRequest(url) {
-  const imageExtensions = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.svg'];
-  const pathname = url.pathname.toLowerCase();
-  return imageExtensions.some(ext => pathname.endsWith(ext));
+  return url.pathname.includes('/images/') || 
+         url.pathname.match(/\.(jpg|jpeg|png|gif|webp|svg)$/i);
 }
 
-function isCoreAsset(url) {
-  return CORE_ASSETS.some(asset => {
-    const assetUrl = new URL(asset, self.location.origin);
-    return url.href === assetUrl.href;
-  }) || url.pathname.endsWith('.css') || url.pathname.endsWith('.js');
+// Check if request is for audio
+function isAudioRequest(url) {
+  return url.pathname.includes('/audio/') || 
+         url.pathname.match(/\.(mp3|wav|ogg|m4a)$/i);
 }
 
-// Utility functions
-async function fetchAndCache(request, cacheName) {
+// Check if request is for map tiles
+function isMapTileRequest(url) {
+  return url.hostname.includes('tile.openstreetmap.org') ||
+         url.hostname.includes('tiles.') ||
+         (url.pathname.match(/\/\d+\/\d+\/\d+\.(png|jpg|jpeg)$/));
+}
+
+// Handle cacheable requests with cache-first strategy
+async function handleCacheableRequest(request) {
+  const cacheName = getCacheName(request);
+  
   try {
-    const response = await fetch(request);
-    if (response.ok) {
-      const cache = await caches.open(cacheName);
-      await cache.put(request, response.clone());
+    // Try cache first
+    const cachedResponse = await caches.match(request);
+    if (cachedResponse) {
+      return cachedResponse;
     }
+    
+    // Fallback to network
+    const networkResponse = await fetch(request);
+    
+    // Cache the response if successful
+    if (networkResponse.ok) {
+      const cache = await caches.open(cacheName);
+      await cache.put(request, networkResponse.clone());
+      
+      // Clean up cache if it's getting too large
+      await cleanupCache(cacheName);
+    }
+    
+    return networkResponse;
   } catch (error) {
-    // Silent fail for background updates
+    // If both cache and network fail, return a basic fallback
+    return createFallbackResponse(request);
   }
 }
 
-async function manageCacheSize(cacheName, maxItems) {
+// Determine appropriate cache based on request type
+function getCacheName(request) {
+  const url = new URL(request.url);
+  
+  if (isImageRequest(url)) {
+    return IMAGE_CACHE;
+  }
+  
+  if (isAudioRequest(url)) {
+    return AUDIO_CACHE;
+  }
+  
+  if (isMapTileRequest(url)) {
+    return MAP_TILES_CACHE;
+  }
+  
+  return IMAGE_CACHE; // fallback
+}
+
+// Clean up cache if it exceeds size limit
+async function cleanupCache(cacheName) {
   const cache = await caches.open(cacheName);
   const keys = await cache.keys();
   
-  if (keys.length > maxItems) {
-    // Remove oldest entries (FIFO)
-    const itemsToDelete = keys.length - maxItems;
-    for (let i = 0; i < itemsToDelete; i++) {
-      await cache.delete(keys[i]);
-    }
-    console.log(`SW: Cleaned ${itemsToDelete} items from ${cacheName}`);
+  if (keys.length > 100) { // Simple cleanup - remove oldest entries
+    const oldestKeys = keys.slice(0, 20);
+    await Promise.all(oldestKeys.map(key => cache.delete(key)));
   }
 }
 
-function createTransparentTile() {
-  // Create a small transparent PNG tile
-  const canvas = new OffscreenCanvas(256, 256);
-  const ctx = canvas.getContext('2d');
-  ctx.globalAlpha = 0;
-  ctx.fillRect(0, 0, 256, 256);
+// Create fallback response for failed requests
+function createFallbackResponse(request) {
+  const url = new URL(request.url);
   
-  return canvas.convertToBlob({ type: 'image/png' })
-    .then(blob => new Response(blob, {
-      status: 200,
-      headers: { 'Content-Type': 'image/png' }
-    }));
-}
-
-async function performCacheCleanup() {
-  // Clean up caches periodically
-  const cacheNames = [TILE_CACHE, MEDIA_CACHE, DYNAMIC_CACHE];
-  
-  for (const cacheName of cacheNames) {
-    try {
-      const cache = await caches.open(cacheName);
-      const keys = await cache.keys();
-      
-      // Remove items older than 7 days
-      const oneWeekAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
-      
-      for (const request of keys) {
-        const response = await cache.match(request);
-        if (response) {
-          const dateHeader = response.headers.get('date');
-          if (dateHeader) {
-            const responseDate = new Date(dateHeader).getTime();
-            if (responseDate < oneWeekAgo) {
-              await cache.delete(request);
-            }
-          }
-        }
-      }
-    } catch (error) {
-      console.warn('SW: Cache cleanup failed for', cacheName, error);
-    }
+  if (isImageRequest(url)) {
+    return new Response(
+      '<svg width="200" height="150" xmlns="http://www.w3.org/2000/svg"><rect width="100%" height="100%" fill="#f0f0f0"/><text x="50%" y="50%" font-family="sans-serif" font-size="14" text-anchor="middle" fill="#666">Image unavailable</text></svg>',
+      { headers: { 'Content-Type': 'image/svg+xml' } }
+    );
   }
+  
+  // For audio and map tiles, just let the request fail naturally
+  return new Response('Resource not available', {
+    status: 503,
+    statusText: 'Service Unavailable'
+  });
 }
 
-// Handle messages from the main thread
-self.addEventListener('message', event => {
-  const { type, data } = event.data;
-  
-  switch (type) {
-    case 'PREFETCH_AUDIO':
-      prefetchNearbyAudio(data);
-      break;
-    case 'CLEAR_CACHE':
-      clearAllCaches();
-      break;
-    case 'GET_CACHE_STATUS':
-      getCacheStatus().then(status => {
-        event.ports[0].postMessage(status);
-      });
-      break;
+// Handle messages from the client for audio prefetching
+self.addEventListener('message', (event) => {
+  if (event.data.type === 'PREFETCH_AUDIO') {
+    prefetchNearbyAudio(event.data.data);
   }
 });
 
-// FIXED: Prefetch audio files for nearby locations with better error handling
+// Prefetch audio files for nearby locations
 async function prefetchNearbyAudio(data) {
-  const { userLocation, locations } = data;
-  if (!userLocation || !locations) return;
+  if (!data || !data.userLocation || !data.locations) return;
   
-  const PREFETCH_RADIUS = 1000; // 1000 meters
-  const nearbyLocations = locations.filter(location => {
-    const distance = calculateDistance(userLocation, location);
-    return distance <= PREFETCH_RADIUS;
+  const cache = await caches.open(AUDIO_CACHE);
+  const MAX_DISTANCE = 1000; // meters
+  
+  // Filter nearby locations
+  const nearbyLocations = data.locations.filter(location => {
+    if (!location.audio || !location.lat || !location.lng) return false;
+    
+    const distance = calculateDistance(
+      { lat: data.userLocation.lat, lng: data.userLocation.lng },
+      { lat: location.lat, lng: location.lng }
+    );
+    
+    return distance <= MAX_DISTANCE;
   });
   
-  // Prefetch audio files for nearby locations
-  const cache = await caches.open(MEDIA_CACHE);
-  for (const location of nearbyLocations.slice(0, 5)) { // Limit to 5 locations
-    if (location.audio) {
-      try {
-        const audioRequest = new Request(location.audio, {
-          mode: 'cors',
-          credentials: 'omit'
-        });
-        const cachedResponse = await cache.match(audioRequest);
-        
-        if (!cachedResponse) {
-          fetch(audioRequest).then(response => {
-            if (response.ok) {
-              cache.put(audioRequest, response.clone());
-              console.log('SW: Prefetched audio for', location.name);
-            }
-          }).catch(error => {
-            console.warn('SW: Audio prefetch failed for', location.name, error);
-          });
-        }
-      } catch (error) {
-        console.warn('SW: Audio prefetch error for', location.name, error);
+  // Prefetch audio files (max 5 at a time to avoid overwhelming)
+  const limitedLocations = nearbyLocations.slice(0, 5);
+  
+  for (const location of limitedLocations) {
+    try {
+      const audioUrl = location.audio;
+      if (!audioUrl) continue;
+      
+      // Check if already cached
+      const cached = await cache.match(audioUrl);
+      if (cached) continue;
+      
+      // Fetch and cache
+      const response = await fetch(audioUrl);
+      if (response.ok) {
+        await cache.put(audioUrl, response.clone());
       }
+    } catch (error) {
+      // Silent fail for prefetch
     }
   }
 }
 
+// Helper function to calculate distance between coordinates
 function calculateDistance(pos1, pos2) {
   const R = 6371000; // Earth's radius in meters
   const lat1 = pos1.lat * Math.PI / 180;
@@ -434,29 +209,3 @@ function calculateDistance(pos1, pos2) {
 
   return R * c;
 }
-
-async function clearAllCaches() {
-  const cacheNames = await caches.keys();
-  await Promise.all(cacheNames.map(name => caches.delete(name)));
-  console.log('SW: All caches cleared');
-}
-
-async function getCacheStatus() {
-  const cacheNames = [CACHE_NAME, DYNAMIC_CACHE, TILE_CACHE, MEDIA_CACHE];
-  const status = {};
-  
-  for (const cacheName of cacheNames) {
-    try {
-      const cache = await caches.open(cacheName);
-      const keys = await cache.keys();
-      status[cacheName] = keys.length;
-    } catch (error) {
-      status[cacheName] = 0;
-    }
-  }
-  
-  return status;
-}
-
-// Log service worker lifecycle
-console.log('SW: Service Worker script loaded');
