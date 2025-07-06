@@ -278,7 +278,7 @@ const locations = [
   "image": "https://mnthen.com/images/exhibit/gazebo.jpg",
   "creator": "Matt Reicher",
   "city": "White Bear Lake",
-  "audio": "/audio/exhibit/geist.mp3",
+  "audio": "https://mnthen.com/audio/exhibit/geist.mp3",
   "tours": "place",
   "summary": "The Erd-Geist Gazebo, built in 1883 as a wedding gift, has survived relocation and restorations through community efforts. Originally on White Bear Lake's south shore, it now sits in Matoska Park.",
   "today": "Matoska Park alongside White Bear Lake",
