@@ -197,7 +197,7 @@ const locations = [
         imageSource: "Image of Samuel H. Morgan, ca 1990s. via MNOpedia",
         additionalInfo: "The Samuel H. Morgan Land Fund supports Minnesota land conservation by funding acquisitions to expand state parks, public trails, and green spaces."
 },
-
+/*
    {
         id: "1021",
         lat: 44.95552119293967,
@@ -215,7 +215,7 @@ const locations = [
         imageSource: "Image of the Prom Ballroom via Discogs",
         additionalInfo: "The Beach Boys performed at the Prom Ballroom on August 2, 1963, during their first major nationwide tour."
     },
-
+*/
     {
     id: "1022",
     lat: 44.7695002003817,
@@ -374,9 +374,25 @@ const locations = [
   "link": "https://mnthen.com/blog/place/nyes.html",
   "imageSource": "Nye's Polonaise Room, Minneapolis, March 27, 2009 via MPRNews",
   "additionalInfo": "Guy Fieri featured Nye's on Season 13 of Food Network’s \"Diners, Drive-Ins and Dives,\" praising their pierogi and prime rib sandwich."
+},
+
+{
+  "id": "1031",
+  "lat": 45.20298779768933,
+  "lng": -96.01921054075744,
+  "name": "Appleton, MN: A Living Memorial (1947 - Present)",
+  "title": "Appleton, MN: A Living Memorial",
+  "image": "https://mnthen.com/images/exhibit/apple1.jpg",
+  "creator": "Matt Reicher",
+  "city": "Appleton",
+  "audio": "/audio/exhibit/appleton.mp3",
+  "tours": "place",
+  "summary": "Appleton, Minnesota transformed its entire street grid into America's most unique \"living memorial,\" honoring fallen soldiers by weaving their names into the fabric of daily life.",
+  "today": "Appleton Veterans Memorial",
+  "link": "https://mnthen.com/blog/place/appleton.html",
+  "imageSource": "Street signs denoting the names of fallen veterans via Appleton Website",
+  "additionalInfo": "Some streets carry not just one name, but several from the same family—like Werring and Nelson Avenues—honoring brothers and cousins who died in war."
 }
-
-
 
 
     // Add more locations here
