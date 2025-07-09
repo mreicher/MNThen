@@ -1,5 +1,15 @@
 const blogArticles = [
   {
+  "headline": "Appleton, MN: A Living Memorial (1947 - Present)",
+  "blurb": "Appleton, Minnesota transformed its street grid into a living war memorial, naming nearly every street after local soldiers killed in combat.",
+  "icon": "fa-building",
+  "author": "Matt Reicher",
+  "date": "July 9, 2025",
+  "image": "https://mnthen.com/images/exhibit/apple1.jpg",
+  "url": "https://mnthen.com/blog/place/appleton.html",
+  "keywords": ["fallen", "veterans", "Appleton", "memorial", "western", "place", "all"]
+},
+  {
     "headline": "Erd-Geist Gazebo",
     "blurb": "Built in 1883 as a wedding gift, this Victorian gazebo survived multiple relocations and restorations to become White Bear Lake's beloved landmark",
     "icon": "fa-building",
