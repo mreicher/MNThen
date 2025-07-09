@@ -270,7 +270,7 @@ const blogArticles = [
     "keywords": ["saint paul", "st. paul", "hamm", "mansion", "east side", "place", "all"]
   },
   {
-   "headline": "Summit Brewing Company (1986 - )",
+   "headline": "Summit Brewing Company (1986 - Present)",
    "blurb": "Summit Brewing Company pioneered underrepresented beer styles in Minnesota, starting in a converted auto parts store and becoming a statewide industry leader.",
    "icon": "fa-building",
    "author": "Matt Reicher",
