@@ -296,7 +296,7 @@ const locations = [
   "image": "https://mnthen.com/images/gangster/clifford/clifford1.jpg",
   "creator": "Matt Reicher",
   "city": "St. Paul",
-  "audio": "/audio/exhibit/wsp_eyedea.mp3",
+  "audio": "/audio/exhibit/clifford.mp3",
   "tours": "person",
   "summary": "Nina Clifford operated St. Paul's most prominent brothel in the 1890s, becoming a wealthy businesswoman and generous philanthropist who defied Victorian gender expectations.",
   "today": "Downtown St. Paul",
