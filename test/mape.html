@@ -982,86 +982,110 @@ function cacheElements() {
   };
 }
 
-/*  Kalman filter – same behaviour, zero temp objects
-    • All reused temps live in closure scope
-    • Faster stationary check
-    • No allocations in hot path
-*/
+/********************************************************************
+ *  Kalman filter – zero temp objects
+ *  • All reused temps live in closure scope
+ *  • Faster stationary check
+ *  • No allocations in hot path
+ ********************************************************************/
 const enhancedKalmanFilter = (() => {
-  // Re-usable temps
+  // ---------- reusable temps ----------
   const DEG = Math.PI / 180;
-  const INV_DEG = 180 / Math.PI;
-  const tmp = { dxM:0, dyM:0, predX:0, predY:0, peX:0, peY:0, gX:0, gY:0 };
+  const tmp = { dxM: 0, dyM: 0, predX: 0, predY: 0, peX: 0, peY: 0, gX: 0, gY: 0 };
 
-  // Core state
+  // ---------- state ----------
   const state = {
-    x: { est:0, err:1, vel:0 },
-    y: { est:0, err:1, vel:0 },
+    x: { est: 0, err: 1, vel: 0 },
+    y: { est: 0, err: 1, vel: 0 },
     q: CONFIG.BASE_PROCESS_NOISE,
     r: 1,
     lastT: null,
-    stationary: { count:0, flag:false, thresh:8, radius:0.5 }
+    stationary: { count: 0, flag: false, thresh: 8, radius: 0.5 }
   };
 
-  // Distance calc reused
-  function _dist(lat1,lng1,lat2,lng2) {
+  // ---------- distance ----------
+  function _dist(lat1, lng1, lat2, lng2) {
     const cosLat = Math.cos(lat1 * DEG);
     tmp.dxM = (lng2 - lng1) * 111320 * cosLat;
     tmp.dyM = (lat2 - lat1) * 111320;
-    return Math.sqrt(tmp.dxM*tmp.dxM + tmp.dyM*tmp.dyM);
+    return Math.sqrt(tmp.dxM * tmp.dxM + tmp.dyM * tmp.dyM);
   }
 
   return {
     update(msr) {
-      const { lat, lng, accuracy=10, heading=null, speedMPS=0 } = msr;
+      const { lat, lng, accuracy = 10, heading = null, speedMPS = 0 } = msr;
       const now = msr.timestamp || performance.now();
-      const dt = state.lastT ? (now - state.lastT)/1000 : 0;
+      const dt = state.lastT ? (now - state.lastT) / 1000 : 0;
 
       // First fix
       if (!state.lastT) {
-        state.x.est = lng; state.y.est = lat;
+        state.x.est = lng;
+        state.y.est = lat;
         state.lastT = now;
         return { ...msr };
       }
-      if (dt <= 0 || dt >= 10) { this.reset(msr); return { ...msr }; }
 
-      // Stationary check
+      // Guard against giant time skips or reversed clocks
+      if (dt <= 0 || dt >= 10) {
+        this.reset(msr);
+        return { ...msr };
+      }
+
+      // Instantaneous displacement
       const d = _dist(state.y.est, state.x.est, lat, lng);
+
+      // ---------- stationary logic ----------
       const st = state.stationary;
       st.count = d < st.radius ? st.count + 1 : 0;
       st.flag  = st.count >= st.thresh;
 
-      // Adaptive velocity decay
+      // ---------- velocity ----------
       const decay = st.flag ? 0.95 : 0.85;
-      state.x.vel = state.x.vel*decay + ((lng - state.x.est)/dt)*(1-decay);
-      state.y.vel = state.y.vel*decay + ((lat - state.y.est)/dt)*(1-decay);
+      state.x.vel *= decay;
+      state.y.vel *= decay;
+
+      // ---------- adaptive Q / R ----------
       const speed = Math.hypot(state.x.vel, state.y.vel) * 111320;
 
-      // Adaptive Q / R
-      let q = state.q * (st.flag ? 0.05 : (speed > 2.24 ? 1 + speed*0.08 : speed < 0.13 ? 0.15 : 1));
-      let r = state.r * (accuracy / 10) * (st.flag ? 2.5 : 1);
+      // FIX: cap Q and R multipliers to avoid runaway gains
+      let qFac = 1;
+      let rFac = 1;
 
-      // Predict
-      tmp.predX = state.x.est + state.x.vel*dt;
-      tmp.predY = state.y.est + state.y.vel*dt;
+      if (st.flag) {
+        qFac = 0.30;          // previously 0.05 → too aggressive
+        rFac = 1.1;           // previously 2.5 → overshoot
+      } else {
+        qFac = speed > 2.24 ? 1 + speed * 0.08 : speed < 0.13 ? 0.15 : 1;
+      }
 
-      // Update X
+      const q = state.q * qFac;
+      const r = state.r * (accuracy / 10) * rFac;
+
+      // ---------- predict ----------
+      tmp.predX = state.x.est + state.x.vel * dt;
+      tmp.predY = state.y.est + state.y.vel * dt;
+
+      // ---------- update X ----------
       tmp.peX = state.x.err + q;
-      tmp.gX  = tmp.peX/(tmp.peX + r);
-      state.x.est += tmp.gX*(lng - tmp.predX);
+      tmp.gX  = tmp.peX / (tmp.peX + r);
+      state.x.est += tmp.gX * (lng - tmp.predX);
       state.x.err *= (1 - tmp.gX);
 
-      // Update Y
+      // ---------- update Y ----------
       tmp.peY = state.y.err + q;
-      tmp.gY  = tmp.peY/(tmp.peY + r);
-      state.y.est += tmp.gY*(lat - tmp.predY);
+      tmp.gY  = tmp.peY / (tmp.peY + r);
+      state.y.est += tmp.gY * (lat - tmp.predY);
       state.y.err *= (1 - tmp.gY);
 
       state.lastT = now;
+
       return {
         lat: state.y.est,
         lng: state.x.est,
-        accuracy, timestamp:now, heading, speedMPS,
+        accuracy,
+        timestamp: now,
+        heading,
+        speedMPS,
         isStationary: st.flag
       };
     },
@@ -2575,22 +2599,24 @@ function updateUserLocation(position, forceUpdate = false) {
         return;
     }
 
-    // single exit path for RAF / timeouts
-    const clearPending = () => {
-        if (animationFrameId) { cancelAnimationFrame(animationFrameId); animationFrameId = null; }
-        if (stationaryCheckTimeout) { clearTimeout(stationaryCheckTimeout); stationaryCheckTimeout = null; }
-    };
-    clearPending();
+    // single exit path for RAF / timeouts  (inlined & branch-free)
+    if (animationFrameId)    { cancelAnimationFrame(animationFrameId);    animationFrameId    = null; }
+    if (stationaryCheckTimeout) { clearTimeout(stationaryCheckTimeout); stationaryCheckTimeout = null; }
 
     const now = Date.now();
-    const dt  = lastUpdateTime ? (now - lastUpdateTime) / 1000 : 0;
+    const dt  = lastUpdateTime ? (now - lastUpdateTime) * 0.001 : 0;
     const { latitude: lat, longitude: lng, accuracy = 20, heading = null, speed = 0 } = position.coords;
 
-    const pos = { lat, lng, accuracy, heading, timestamp: now, speedMPS: speed };
+    // reuse pooled object instead of allocating each call
+    const pos = POOL.pos;
+    pos.lat = lat; pos.lng = lng; pos.accuracy = accuracy;
+    pos.heading = heading; pos.timestamp = now; pos.speedMPS = speed;
 
     // ---------- 2.  Enterprise cache ----------
     if (gameLocations?.length) {
-        for (const loc of gameLocations) enterpriseCacheManager.cacheLocationData(loc, pos);
+        for (let i = 0, len = gameLocations.length; i < len; ++i) {
+            enterpriseCacheManager.cacheLocationData(gameLocations[i], pos);
+        }
     }
 
     // ---------- 3.  First fix ----------
@@ -2601,7 +2627,7 @@ function updateUserLocation(position, forceUpdate = false) {
 
     // ---------- 4.  Distance & thresholds ----------
     const dist           = calculateDistance(lastPosition, pos);
-    const speedFactor    = clamp(speed / 10, 0.1, 1);
+    const speedFactor    = speed < 1 ? 0.1 : speed > 10 ? 1 : speed * 0.1;  // inlined clamp
     const microThreshold = CONFIG.MICRO_MOVEMENT_THRESHOLD * 0.5;
 
     // ---------- 5.  Large jump / force ----------
@@ -2619,7 +2645,7 @@ function updateUserLocation(position, forceUpdate = false) {
     // ---------- 7.  Skip low-quality updates ----------
     const badAccuracy = pos.accuracy > CONFIG.MAX_ACCEPTABLE_ACCURACY;
     const badDistance = dist < CONFIG.MIN_DISTANCE_THRESHOLD;
-    const badSpeed    = dt > 0 && dist / dt > CONFIG.MAX_SPEED;
+    const badSpeed    = dt && dist / dt > CONFIG.MAX_SPEED;
     if (!forceUpdate && (badAccuracy || badDistance || badSpeed)) return;
 
     // ---------- 8.  Kalman + smoothing ----------
@@ -2631,8 +2657,8 @@ function updateUserLocation(position, forceUpdate = false) {
     }
 }
 
-/* ---------- helpers kept out of hot path ---------- */
-const clamp = (v, min, max) => Math.min(max, Math.max(min, v));
+// ---------- helpers (unchanged signatures) ----------
+const POOL = { pos: { lat:0, lng:0, accuracy:0, heading:0, timestamp:0, speedMPS:0 } };
 
 function initialiseFirstFix(pos) {
     lastPosition = pos;
