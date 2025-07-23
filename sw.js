@@ -1,16 +1,16 @@
 // sw.js – Minnesota Then Service Worker
-// Version: 2.0.0
+// Version: 3.0.0
 // Caching Strategy: Cache-first for static assets, network-first for HTML, stale-while-revalidate for map tiles
 
 // ------------------------------------------------------------------
 // 1. CACHE CONFIGURATION
 // ------------------------------------------------------------------
 const CACHE_VERSIONS = {
-  STATIC: 'mnthen-static-v3',
-  IMAGES: 'mnthen-images-v3',
-  AUDIO: 'mnthen-audio-v3',
-  TILES: 'mnthen-tiles-v3',
-  RUNTIME: 'mnthen-runtime-v3'
+  STATIC: 'mnthen-static-v4',
+  IMAGES: 'mnthen-images-v4',
+  AUDIO: 'mnthen-audio-v4',
+  TILES: 'mnthen-tiles-v4',
+  RUNTIME: 'mnthen-runtime-v4'
 };
 
 const CACHE_LIMITS = {
