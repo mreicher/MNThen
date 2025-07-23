@@ -26,7 +26,7 @@ const APP_SHELL = [
   '/index.html',
   '/css/mainmap.css',
   '/css/mnthen_main_map2.css',
-  '/js/locations_main.js',
+  '/locations_main.js',
   '/manifest.json',
   '/images/mnthenfav.ico',
   '/images/logo.webp',
