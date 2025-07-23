@@ -30,8 +30,7 @@ const APP_SHELL = [
   '/manifest.json',
   '/images/mnthenfav.ico',
   '/images/logo.webp',
-  '/images/splash_screen.webp',
-  '/images/social-share.jpg'
+  '/images/splash_screen.webp'
 ];
 
 // Critical map assets
