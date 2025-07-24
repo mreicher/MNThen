@@ -510,25 +510,70 @@ if ('serviceWorker' in navigator) {
         navigator.serviceWorker.register('/sw.js')
             .then(registration => {
                 console.log('Enterprise SW registered: ', registration);
-
+                
                 // Listen for service worker messages
                 navigator.serviceWorker.addEventListener('message', event => {
-                    if (event.data.type === 'SW_ACTIVATED') {
+                    if (event.data && event.data.type === 'SW_ACTIVATED') {
                         console.log('Enterprise Service Worker activated, version:', event.data.version);
                     }
                 });
-
+                
+                // Handle registration state changes
+                registration.addEventListener('updatefound', () => {
+                    const newWorker = registration.installing;
+                    if (newWorker) {
+                        newWorker.addEventListener('statechange', () => {
+                            if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+                                console.log('Enterprise SW update available');
+                                // Optionally dispatch custom event for UI notification
+                                window.dispatchEvent(new CustomEvent('sw-update-available', { 
+                                    detail: { registration } 
+                                }));
+                            }
+                        });
+                    }
+                });
+                
                 // ---- light-touch extras ----
-                // Periodic update check (silent)
-                setInterval(() => registration.update(), 60 * 60 * 1000);
-
-                // Detect first-time activation
+                // Periodic update check (silent) with error handling
+                const updateInterval = setInterval(() => {
+                    registration.update().catch(updateError => {
+                        console.warn('SW update check failed:', updateError);
+                    });
+                }, 60 * 60 * 1000);
+                
+                // Clean up interval on page unload
+                window.addEventListener('beforeunload', () => {
+                    clearInterval(updateInterval);
+                });
+                
+                // Detect first-time activation with enhanced logic
                 if (registration.waiting && !navigator.serviceWorker.controller) {
                     console.log('Enterprise SW installed & waiting');
+                } else if (!navigator.serviceWorker.controller) {
+                    console.log('Enterprise SW first-time installation');
                 }
+                
+                // Handle controller change (when SW takes control)
+                navigator.serviceWorker.addEventListener('controllerchange', () => {
+                    console.log('Enterprise SW controller changed - reloading for fresh cache');
+                    window.location.reload();
+                });
+                
             })
             .catch(registrationError => {
-                console.log('SW registration failed: ', registrationError);
+                console.error('SW registration failed: ', registrationError);
+                
+                // Optional: Retry registration once after brief delay
+                setTimeout(() => {
+                    navigator.serviceWorker.register('/sw.js')
+                        .then(retryRegistration => {
+                            console.log('Enterprise SW registered on retry: ', retryRegistration);
+                        })
+                        .catch(retryError => {
+                            console.error('SW retry registration failed: ', retryError);
+                        });
+                }, 5000);
             });
     });
 }
@@ -540,99 +585,258 @@ class EnterpriseCacheManager {
         this.maxCacheSize = 50 * 1024 * 1024; // 50MB
         this.maxCacheAge = 7 * 24 * 60 * 60 * 1000; // 7 days
         this.proximityThreshold = 1000; // Cache locations within 1000 feet
+        this.cleanupInterval = null;
+        this.encryptionKey = null;
     }
 
     async init() {
-        await this.cleanupExpiredCache();
-        this.startPeriodicCleanup();
+        try {
+            await this.initializeEncryption();
+            await this.cleanupExpiredCache();
+            this.startPeriodicCleanup();
+            console.log('EnterpriseCacheManager initialized successfully');
+        } catch (error) {
+            console.error('Failed to initialize EnterpriseCacheManager:', error);
+            throw error;
+        }
+    }
+
+    async initializeEncryption() {
+        if (!window.crypto?.subtle) return;
+        
+        try {
+            // Generate or retrieve persistent key
+            const keyData = localStorage.getItem(`${this.cachePrefix}key`);
+            if (keyData) {
+                const keyBuffer = new Uint8Array(atob(keyData).split('').map(c => c.charCodeAt(0)));
+                this.encryptionKey = await window.crypto.subtle.importKey(
+                    'raw',
+                    keyBuffer,
+                    { name: 'AES-GCM' },
+                    false,
+                    ['encrypt', 'decrypt']
+                );
+            } else {
+                this.encryptionKey = await window.crypto.subtle.generateKey(
+                    { name: 'AES-GCM', length: 256 },
+                    true,
+                    ['encrypt', 'decrypt']
+                );
+                
+                const keyBuffer = await window.crypto.subtle.exportKey('raw', this.encryptionKey);
+                localStorage.setItem(`${this.cachePrefix}key`, btoa(String.fromCharCode(...new Uint8Array(keyBuffer))));
+            }
+        } catch (error) {
+            console.warn('Encryption key initialization failed:', error);
+        }
     }
 
     async cacheLocationData(location, userPosition) {
-        if (!userPosition || !location) return;
+        if (!userPosition || !location || !location.id) {
+            console.warn('Invalid location data provided for caching');
+            return;
+        }
         
-        const distance = this.calculateDistance(userPosition, location);
-        const distanceFeet = distance * 3.28084;
-        
-        // Only cache if within proximity threshold
-        if (distanceFeet <= this.proximityThreshold) {
-            try {
+        try {
+            const distance = this.calculateDistance(userPosition, location);
+            const distanceFeet = distance * 3.28084;
+            
+            // Only cache if within proximity threshold
+            if (distanceFeet <= this.proximityThreshold) {
+                // Check cache size before adding
+                await this.enforceCacheSize();
+                
                 const cacheData = {
                     location: location,
                     timestamp: Date.now(),
                     userPosition: userPosition,
-                    distance: distanceFeet
+                    distance: distanceFeet,
+                    version: '1.0'
                 };
                 
                 // Encrypt sensitive data
                 const encryptedData = await this.encryptData(JSON.stringify(cacheData));
-                localStorage.setItem(`${this.cachePrefix}location_${location.id}`, encryptedData);
+                const cacheKey = `${this.cachePrefix}location_${location.id}`;
                 
-                console.log(`Cached location ${location.name} (${distanceFeet.toFixed(0)} feet away)`);
-            } catch (error) {
-                console.warn('Failed to cache location data:', error);
+                localStorage.setItem(cacheKey, encryptedData);
+                
+                console.log(`Cached location ${location.name || location.id} (${distanceFeet.toFixed(0)} feet away)`);
+            } else {
+                console.log(`Location ${location.name || location.id} too far (${distanceFeet.toFixed(0)} feet) - not cached`);
             }
+        } catch (error) {
+            console.warn('Failed to cache location data:', error);
         }
     }
 
     async encryptData(data) {
-        if (!window.crypto || !window.crypto.subtle) {
-            return btoa(data); // Fallback to base64
+        if (!window.crypto?.subtle || !this.encryptionKey) {
+            return btoa(encodeURIComponent(data)); // Enhanced fallback with URI encoding
         }
         
         try {
-            const key = await window.crypto.subtle.generateKey(
-                { name: 'AES-GCM', length: 256 },
-                false,
-                ['encrypt']
-            );
-            
             const iv = window.crypto.getRandomValues(new Uint8Array(12));
             const encodedData = new TextEncoder().encode(data);
             
             const encrypted = await window.crypto.subtle.encrypt(
                 { name: 'AES-GCM', iv: iv },
-                key,
+                this.encryptionKey,
                 encodedData
             );
             
-            return btoa(String.fromCharCode(...new Uint8Array(encrypted)));
+            // Combine IV and encrypted data
+            const combined = new Uint8Array(iv.length + encrypted.byteLength);
+            combined.set(iv);
+            combined.set(new Uint8Array(encrypted), iv.length);
+            
+            return btoa(String.fromCharCode(...combined));
         } catch (error) {
             console.warn('Encryption failed, using base64:', error);
-            return btoa(data);
+            return btoa(encodeURIComponent(data));
+        }
+    }
+
+    async decryptData(encryptedData) {
+        if (!window.crypto?.subtle || !this.encryptionKey) {
+            try {
+                return decodeURIComponent(atob(encryptedData));
+            } catch {
+                return atob(encryptedData); // Legacy fallback
+            }
+        }
+        
+        try {
+            const combined = new Uint8Array(atob(encryptedData).split('').map(c => c.charCodeAt(0)));
+            const iv = combined.slice(0, 12);
+            const encrypted = combined.slice(12);
+            
+            const decrypted = await window.crypto.subtle.decrypt(
+                { name: 'AES-GCM', iv: iv },
+                this.encryptionKey,
+                encrypted
+            );
+            
+            return new TextDecoder().decode(decrypted);
+        } catch (error) {
+            console.warn('Decryption failed, trying fallback:', error);
+            try {
+                return decodeURIComponent(atob(encryptedData));
+            } catch {
+                return atob(encryptedData);
+            }
         }
     }
 
     async cleanupExpiredCache() {
         const now = Date.now();
         const keysToRemove = [];
+        let totalSize = 0;
         
         for (let i = 0; i < localStorage.length; i++) {
             const key = localStorage.key(i);
-            if (key && key.startsWith(this.cachePrefix)) {
+            if (key?.startsWith(this.cachePrefix) && key !== `${this.cachePrefix}key`) {
                 try {
-                    const data = JSON.parse(atob(localStorage.getItem(key)));
+                    const encryptedData = localStorage.getItem(key);
+                    totalSize += encryptedData.length * 2; // Approximate size in bytes
+                    
+                    const data = JSON.parse(await this.decryptData(encryptedData));
+                    
+                    // Remove expired entries
                     if (now - data.timestamp > this.maxCacheAge) {
                         keysToRemove.push(key);
                     }
+                    // Remove entries with invalid structure
+                    else if (!data.location || !data.timestamp) {
+                        keysToRemove.push(key);
+                    }
                 } catch (error) {
+                    console.warn(`Corrupted cache entry found: ${key}`, error);
                     keysToRemove.push(key); // Remove corrupted entries
                 }
             }
         }
         
-        keysToRemove.forEach(key => localStorage.removeItem(key));
+        // Remove expired/corrupted entries
+        keysToRemove.forEach(key => {
+            try {
+                localStorage.removeItem(key);
+            } catch (error) {
+                console.warn(`Failed to remove cache key ${key}:`, error);
+            }
+        });
+        
         if (keysToRemove.length > 0) {
-            console.log(`Cleaned up ${keysToRemove.length} expired cache entries`);
+            console.log(`Cleaned up ${keysToRemove.length} expired/corrupted cache entries`);
+        }
+        
+        // Log cache statistics
+        console.log(`Cache size: ${(totalSize / 1024 / 1024).toFixed(2)}MB of ${(this.maxCacheSize / 1024 / 1024)}MB limit`);
+    }
+
+    async enforceCacheSize() {
+        let totalSize = 0;
+        const cacheEntries = [];
+        
+        for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+            if (key?.startsWith(this.cachePrefix) && key !== `${this.cachePrefix}key`) {
+                try {
+                    const data = localStorage.getItem(key);
+                    const size = data.length * 2; // Approximate size
+                    totalSize += size;
+                    
+                    const decryptedData = JSON.parse(await this.decryptData(data));
+                    cacheEntries.push({
+                        key,
+                        timestamp: decryptedData.timestamp,
+                        size
+                    });
+                } catch (error) {
+                    // Remove corrupted entries during size check
+                    localStorage.removeItem(key);
+                }
+            }
+        }
+        
+        if (totalSize > this.maxCacheSize) {
+            // Sort by timestamp (oldest first) and remove until under limit
+            cacheEntries.sort((a, b) => a.timestamp - b.timestamp);
+            
+            let removedCount = 0;
+            for (const entry of cacheEntries) {
+                if (totalSize <= this.maxCacheSize * 0.8) break; // Leave 20% buffer
+                
+                localStorage.removeItem(entry.key);
+                totalSize -= entry.size;
+                removedCount++;
+            }
+            
+            console.log(`Removed ${removedCount} old cache entries to enforce size limit`);
         }
     }
 
     startPeriodicCleanup() {
-        setInterval(() => {
-            this.cleanupExpiredCache();
+        // Clear any existing interval
+        if (this.cleanupInterval) {
+            clearInterval(this.cleanupInterval);
+        }
+        
+        this.cleanupInterval = setInterval(() => {
+            this.cleanupExpiredCache().catch(error => {
+                console.warn('Periodic cache cleanup failed:', error);
+            });
         }, 60 * 60 * 1000); // Cleanup every hour
     }
 
     calculateDistance(pos1, pos2) {
+        // Input validation
+        if (!pos1 || !pos2 || 
+            typeof pos1.lat !== 'number' || typeof pos1.lng !== 'number' ||
+            typeof pos2.lat !== 'number' || typeof pos2.lng !== 'number') {
+            console.warn('Invalid position data for distance calculation');
+            return Infinity;
+        }
+        
         const R = 6371000; // Earth's radius in meters
         const lat1 = pos1.lat * Math.PI / 180;
         const lat2 = pos2.lat * Math.PI / 180;
@@ -646,6 +850,51 @@ class EnterpriseCacheManager {
 
         return R * c;
     }
+
+    // Cleanup method for proper resource management
+    destroy() {
+        if (this.cleanupInterval) {
+            clearInterval(this.cleanupInterval);
+            this.cleanupInterval = null;
+        }
+        this.encryptionKey = null;
+        console.log('EnterpriseCacheManager destroyed');
+    }
+
+    // Utility method to get cache statistics
+    async getCacheStats() {
+        let totalEntries = 0;
+        let totalSize = 0;
+        let oldestEntry = Date.now();
+        let newestEntry = 0;
+        
+        for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+            if (key?.startsWith(this.cachePrefix) && key !== `${this.cachePrefix}key`) {
+                try {
+                    const data = localStorage.getItem(key);
+                    totalSize += data.length * 2;
+                    totalEntries++;
+                    
+                    const decryptedData = JSON.parse(await this.decryptData(data));
+                    oldestEntry = Math.min(oldestEntry, decryptedData.timestamp);
+                    newestEntry = Math.max(newestEntry, decryptedData.timestamp);
+                } catch (error) {
+                    // Count corrupted entries
+                    totalEntries++;
+                }
+            }
+        }
+        
+        return {
+            totalEntries,
+            totalSize,
+            totalSizeMB: (totalSize / 1024 / 1024).toFixed(2),
+            maxSizeMB: (this.maxCacheSize / 1024 / 1024),
+            oldestEntry: oldestEntry === Date.now() ? null : new Date(oldestEntry),
+            newestEntry: newestEntry === 0 ? null : new Date(newestEntry)
+        };
+    }
 }
 
 // ENTERPRISE ENHANCEMENT: Security Manager
@@ -654,52 +903,392 @@ class EnterpriseSecurityManager {
         this.sessionToken = this.generateSecureToken();
         this.auditLog = [];
         this.cspViolations = [];
+        this.maxAuditEntries = 100;
+        this.threatDetection = {
+            suspiciousActivity: [],
+            rateLimiting: new Map(),
+            intrusionAttempts: 0
+        };
+        this.sessionStartTime = Date.now();
+        this.isInitialized = false;
     }
 
     generateSecureToken() {
-        const array = new Uint8Array(32);
-        window.crypto.getRandomValues(array);
-        return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('');
+        try {
+            if (!window.crypto || !window.crypto.getRandomValues) {
+                console.warn('Crypto API not available, using fallback token generation');
+                return this.generateFallbackToken();
+            }
+            
+            const array = new Uint8Array(32);
+            window.crypto.getRandomValues(array);
+            const token = Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('');
+            
+            // Validate token entropy
+            if (this.validateTokenEntropy(token)) {
+                return token;
+            } else {
+                console.warn('Low entropy token detected, regenerating');
+                return this.generateFallbackToken();
+            }
+        } catch (error) {
+            console.error('Secure token generation failed:', error);
+            return this.generateFallbackToken();
+        }
     }
 
-    logSecurityEvent(event, details) {
-        const logEntry = {
-            timestamp: new Date().toISOString(),
-            event: event,
-            details: details,
-            sessionToken: this.sessionToken,
-            userAgent: navigator.userAgent,
-            url: window.location.href
-        };
+    generateFallbackToken() {
+        // Cryptographically weaker but functional fallback
+        const timestamp = Date.now().toString(36);
+        const random1 = Math.random().toString(36).substring(2);
+        const random2 = Math.random().toString(36).substring(2);
+        const random3 = Math.random().toString(36).substring(2);
+        return `${timestamp}-${random1}-${random2}-${random3}`.replace(/[^a-z0-9]/g, '');
+    }
+
+    validateTokenEntropy(token) {
+        // Basic entropy check - ensure token isn't all same characters
+        const uniqueChars = new Set(token).size;
+        return uniqueChars > token.length * 0.5; // At least 50% unique characters
+    }
+
+    logSecurityEvent(event, details = {}) {
+        if (!event || typeof event !== 'string') {
+            console.warn('Invalid security event provided');
+            return;
+        }
+
+        try {
+            const logEntry = {
+                timestamp: new Date().toISOString(),
+                event: event,
+                details: details,
+                sessionToken: this.sessionToken,
+                userAgent: navigator.userAgent || 'Unknown',
+                url: window.location.href,
+                sessionDuration: Date.now() - this.sessionStartTime,
+                severity: this.calculateEventSeverity(event, details)
+            };
+            
+            this.auditLog.push(logEntry);
+            
+            // Enhanced logging based on severity
+            if (logEntry.severity === 'HIGH') {
+                console.error('High Severity Security Event:', logEntry);
+                this.handleHighSeverityEvent(logEntry);
+            } else if (logEntry.severity === 'MEDIUM') {
+                console.warn('Medium Severity Security Event:', logEntry);
+            } else {
+                console.log('Security Event:', logEntry);
+            }
+            
+            // Maintain audit log size with circular buffer
+            if (this.auditLog.length > this.maxAuditEntries) {
+                const removedEntries = this.auditLog.splice(0, this.auditLog.length - this.maxAuditEntries);
+                console.log(`Archived ${removedEntries.length} old audit entries`);
+            }
+
+            // Send to monitoring endpoint if available
+            this.sendToMonitoring(logEntry);
+            
+        } catch (error) {
+            console.error('Failed to log security event:', error);
+        }
+    }
+
+    calculateEventSeverity(event, details) {
+        const highSeverityEvents = [
+            'CSP_VIOLATION', 'XSS_ATTEMPT', 'SQL_INJECTION', 'UNAUTHORIZED_ACCESS',
+            'MULTIPLE_FAILED_ATTEMPTS', 'SUSPICIOUS_ACTIVITY_DETECTED'
+        ];
         
-        this.auditLog.push(logEntry);
-        console.log('Security Event:', logEntry);
+        const mediumSeverityEvents = [
+            'UNUSUAL_NAVIGATION', 'RATE_LIMIT_EXCEEDED', 'INVALID_INPUT',
+            'GEOLOCATION_DENIED', 'NOTIFICATION_BLOCKED'
+        ];
+
+        if (highSeverityEvents.includes(event)) return 'HIGH';
+        if (mediumSeverityEvents.includes(event)) return 'MEDIUM';
+        return 'LOW';
+    }
+
+    handleHighSeverityEvent(logEntry) {
+        this.threatDetection.intrusionAttempts++;
         
-        // Keep only last 100 entries
-        if (this.auditLog.length > 100) {
-            this.auditLog.shift();
+        // Implement progressive response
+        if (this.threatDetection.intrusionAttempts > 5) {
+            this.logSecurityEvent('THREAT_THRESHOLD_EXCEEDED', {
+                attempts: this.threatDetection.intrusionAttempts,
+                timeframe: Date.now() - this.sessionStartTime
+            });
+            
+            // Optional: Implement lockdown procedures
+            this.initiateLockdownProcedures();
+        }
+    }
+
+    initiateLockdownProcedures() {
+        console.warn('Security lockdown procedures initiated');
+        
+        // Disable certain features, clear sensitive data, etc.
+        try {
+            // Clear any cached sensitive data
+            Object.keys(localStorage).forEach(key => {
+                if (key.includes('sensitive') || key.includes('auth')) {
+                    localStorage.removeItem(key);
+                }
+            });
+            
+            // Dispatch security event for application to handle
+            window.dispatchEvent(new CustomEvent('security-lockdown', {
+                detail: { 
+                    reason: 'THREAT_THRESHOLD_EXCEEDED',
+                    timestamp: Date.now(),
+                    sessionToken: this.sessionToken
+                }
+            }));
+            
+        } catch (error) {
+            console.error('Lockdown procedures failed:', error);
         }
     }
 
     monitorCSPViolations() {
-        document.addEventListener('securitypolicyviolation', (e) => {
-            this.cspViolations.push({
-                timestamp: new Date().toISOString(),
-                violatedDirective: e.violatedDirective,
-                blockedURI: e.blockedURI,
-                documentURI: e.documentURI
+        try {
+            document.addEventListener('securitypolicyviolation', (e) => {
+                const violation = {
+                    timestamp: new Date().toISOString(),
+                    violatedDirective: e.violatedDirective || 'unknown',
+                    blockedURI: e.blockedURI || 'unknown',
+                    documentURI: e.documentURI || window.location.href,
+                    originalPolicy: e.originalPolicy || 'unknown',
+                    effectiveDirective: e.effectiveDirective || 'unknown',
+                    sourceFile: e.sourceFile || 'unknown',
+                    lineNumber: e.lineNumber || 0,
+                    columnNumber: e.columnNumber || 0
+                };
+                
+                this.cspViolations.push(violation);
+                
+                // Analyze violation pattern
+                const isKnownPattern = this.analyzeCSPViolation(violation);
+                
+                this.logSecurityEvent('CSP_VIOLATION', {
+                    directive: violation.violatedDirective,
+                    uri: violation.blockedURI,
+                    isKnownPattern: isKnownPattern,
+                    violationCount: this.cspViolations.length
+                });
+                
+                // Keep CSP violations manageable
+                if (this.cspViolations.length > 50) {
+                    this.cspViolations.shift();
+                }
             });
-            
-            this.logSecurityEvent('CSP_VIOLATION', {
-                directive: e.violatedDirective,
-                uri: e.blockedURI
-            });
+        } catch (error) {
+            console.error('Failed to set up CSP monitoring:', error);
+        }
+    }
+
+    analyzeCSPViolation(violation) {
+        // Check for common false positive patterns
+        const commonFalsePositives = [
+            'chrome-extension://',
+            'moz-extension://',
+            'safari-extension://',
+            'about:blank',
+            'data:image/svg+xml'
+        ];
+        
+        return commonFalsePositives.some(pattern => 
+            violation.blockedURI.includes(pattern)
+        );
+    }
+
+    monitorSuspiciousActivity() {
+        // Monitor rapid clicking/interaction patterns
+        let interactionCount = 0;
+        const resetInterval = 10000; // 10 seconds
+        
+        const trackInteraction = () => {
+            interactionCount++;
+            if (interactionCount > 50) { // More than 50 interactions in 10 seconds
+                this.logSecurityEvent('SUSPICIOUS_ACTIVITY_DETECTED', {
+                    type: 'RAPID_INTERACTIONS',
+                    count: interactionCount,
+                    timeframe: resetInterval
+                });
+            }
+        };
+        
+        ['click', 'keydown', 'touchstart'].forEach(eventType => {
+            document.addEventListener(eventType, trackInteraction, { passive: true });
         });
+        
+        setInterval(() => {
+            interactionCount = 0;
+        }, resetInterval);
+    }
+
+    implementRateLimit(action, maxAttempts = 5, timeWindow = 60000) {
+        const now = Date.now();
+        const key = `${action}_${this.sessionToken}`;
+        
+        if (!this.threatDetection.rateLimiting.has(key)) {
+            this.threatDetection.rateLimiting.set(key, []);
+        }
+        
+        const attempts = this.threatDetection.rateLimiting.get(key);
+        
+        // Clean old attempts outside time window
+        const recentAttempts = attempts.filter(timestamp => now - timestamp < timeWindow);
+        this.threatDetection.rateLimiting.set(key, recentAttempts);
+        
+        if (recentAttempts.length >= maxAttempts) {
+            this.logSecurityEvent('RATE_LIMIT_EXCEEDED', {
+                action: action,
+                attempts: recentAttempts.length,
+                timeWindow: timeWindow
+            });
+            return false; // Rate limit exceeded
+        }
+        
+        recentAttempts.push(now);
+        this.threatDetection.rateLimiting.set(key, recentAttempts);
+        return true; // Within rate limit
+    }
+
+    sendToMonitoring(logEntry) {
+        // Optional integration with external monitoring
+        if (typeof window.enterpriseMonitoring !== 'undefined') {
+            try {
+                window.enterpriseMonitoring.sendSecurityEvent(logEntry);
+            } catch (error) {
+                console.warn('Failed to send to external monitoring:', error);
+            }
+        }
+    }
+
+    sanitizeInput(input, type = 'general') {
+        if (typeof input !== 'string') return input;
+        
+        const sanitizers = {
+            general: (str) => str.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ''),
+            url: (str) => encodeURIComponent(str),
+            html: (str) => str.replace(/[<>&"']/g, (match) => {
+                const entities = { '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&#x27;' };
+                return entities[match];
+            })
+        };
+        
+        const sanitizer = sanitizers[type] || sanitizers.general;
+        const sanitized = sanitizer(input);
+        
+        if (sanitized !== input) {
+            this.logSecurityEvent('INPUT_SANITIZED', {
+                type: type,
+                originalLength: input.length,
+                sanitizedLength: sanitized.length
+            });
+        }
+        
+        return sanitized;
     }
 
     init() {
-        this.monitorCSPViolations();
-        this.logSecurityEvent('SESSION_START', { timestamp: Date.now() });
+        try {
+            this.monitorCSPViolations();
+            this.monitorSuspiciousActivity();
+            
+            // Log session initialization
+            this.logSecurityEvent('SESSION_START', { 
+                timestamp: this.sessionStartTime,
+                userAgent: navigator.userAgent || 'Unknown',
+                language: navigator.language || 'Unknown',
+                platform: navigator.platform || 'Unknown',
+                cookieEnabled: navigator.cookieEnabled,
+                onLine: navigator.onLine
+            });
+            
+            // Set up periodic security health checks
+            setInterval(() => {
+                this.performSecurityHealthCheck();
+            }, 300000); // Every 5 minutes
+            
+            // Monitor for page visibility changes
+            document.addEventListener('visibilitychange', () => {
+                this.logSecurityEvent('VISIBILITY_CHANGE', {
+                    hidden: document.hidden,
+                    visibilityState: document.visibilityState
+                });
+            });
+            
+            this.isInitialized = true;
+            console.log('EnterpriseSecurityManager initialized successfully');
+            
+        } catch (error) {
+            console.error('Failed to initialize EnterpriseSecurityManager:', error);
+            this.logSecurityEvent('INITIALIZATION_FAILED', { error: error.message });
+        }
+    }
+
+    performSecurityHealthCheck() {
+        const healthMetrics = {
+            auditLogSize: this.auditLog.length,
+            cspViolationCount: this.cspViolations.length,
+            intrusionAttempts: this.threatDetection.intrusionAttempts,
+            sessionDuration: Date.now() - this.sessionStartTime,
+            memoryUsage: this.estimateMemoryUsage()
+        };
+        
+        this.logSecurityEvent('SECURITY_HEALTH_CHECK', healthMetrics);
+        
+        // Alert if unusual patterns detected
+        if (healthMetrics.intrusionAttempts > 10) {
+            this.logSecurityEvent('HIGH_INTRUSION_ATTEMPTS', {
+                count: healthMetrics.intrusionAttempts
+            });
+        }
+    }
+
+    estimateMemoryUsage() {
+        try {
+            const auditSize = JSON.stringify(this.auditLog).length;
+            const violationsSize = JSON.stringify(this.cspViolations).length;
+            const threatSize = JSON.stringify(this.threatDetection.suspiciousActivity).length;
+            return Math.round((auditSize + violationsSize + threatSize) / 1024); // KB
+        } catch (error) {
+            return 0;
+        }
+    }
+
+    // Method to get security summary for dashboards
+    getSecuritySummary() {
+        return {
+            sessionToken: this.sessionToken,
+            sessionDuration: Date.now() - this.sessionStartTime,
+            totalEvents: this.auditLog.length,
+            cspViolations: this.cspViolations.length,
+            intrusionAttempts: this.threatDetection.intrusionAttempts,
+            isInitialized: this.isInitialized,
+            lastActivity: this.auditLog.length > 0 ? this.auditLog[this.auditLog.length - 1].timestamp : null,
+            memoryUsageKB: this.estimateMemoryUsage()
+        };
+    }
+
+    // Cleanup method for proper resource management
+    destroy() {
+        this.logSecurityEvent('SESSION_END', {
+            duration: Date.now() - this.sessionStartTime,
+            totalEvents: this.auditLog.length
+        });
+        
+        this.auditLog = [];
+        this.cspViolations = [];
+        this.threatDetection = { suspiciousActivity: [], rateLimiting: new Map(), intrusionAttempts: 0 };
+        this.isInitialized = false;
+        
+        console.log('EnterpriseSecurityManager destroyed');
     }
 }
 
@@ -715,49 +1304,396 @@ class EnterprisePerformanceMonitor {
         };
         this.lastFrameTime = performance.now();
         this.frameCount = 0;
+        this.isMonitoring = false;
+        this.intervals = [];
+        this.animationFrameId = null;
+        this.performanceHistory = [];
+        this.maxHistorySize = 60; // Keep 60 seconds of history
+        this.thresholds = {
+            lowFPS: 30,
+            highMemory: 100, // MB
+            networkLatency: 1000, // ms
+            criticalMemory: 200 // MB
+        };
+        this.startTime = performance.now();
     }
 
     startMonitoring() {
-        this.monitorFPS();
-        this.monitorMemory();
-        setInterval(() => this.updateMetrics(), 1000);
+        if (this.isMonitoring) {
+            console.warn('Performance monitoring already active');
+            return;
+        }
+
+        try {
+            this.monitorFPS();
+            this.monitorMemory();
+            this.monitorNetworkPerformance();
+            this.monitorResourceTiming();
+            
+            const updateInterval = setInterval(() => {
+                this.updateMetrics();
+            }, 1000);
+            this.intervals.push(updateInterval);
+            
+            this.isMonitoring = true;
+            console.log('EnterprisePerformanceMonitor started successfully');
+        } catch (error) {
+            console.error('Failed to start performance monitoring:', error);
+        }
     }
 
     monitorFPS() {
         const measureFPS = (currentTime) => {
+            if (!this.isMonitoring) return;
+            
             this.frameCount++;
             if (currentTime - this.lastFrameTime >= 1000) {
-                this.metrics.fps = Math.round((this.frameCount * 1000) / (currentTime - this.lastFrameTime));
+                const calculatedFPS = Math.round((this.frameCount * 1000) / (currentTime - this.lastFrameTime));
+                this.metrics.fps = Math.max(0, Math.min(240, calculatedFPS)); // Cap at reasonable limits
                 this.frameCount = 0;
                 this.lastFrameTime = currentTime;
+                
+                // Detect severe FPS drops
+                if (this.metrics.fps < 15) {
+                    this.logPerformanceAlert('CRITICAL_FPS_DROP', {
+                        fps: this.metrics.fps,
+                        severity: 'HIGH'
+                    });
+                }
             }
-            requestAnimationFrame(measureFPS);
+            this.animationFrameId = requestAnimationFrame(measureFPS);
         };
-        requestAnimationFrame(measureFPS);
+        
+        this.animationFrameId = requestAnimationFrame(measureFPS);
     }
 
     monitorMemory() {
-        if (performance.memory) {
-            setInterval(() => {
-                this.metrics.memory = Math.round(performance.memory.usedJSHeapSize / 1024 / 1024);
-            }, 5000);
+        if (!performance.memory) {
+            console.warn('Memory monitoring not available in this browser');
+            return;
+        }
+
+        const memoryInterval = setInterval(() => {
+            if (!this.isMonitoring) return;
+            
+            try {
+                const memoryInfo = performance.memory;
+                const usedMB = Math.round(memoryInfo.usedJSHeapSize / 1024 / 1024);
+                const totalMB = Math.round(memoryInfo.totalJSHeapSize / 1024 / 1024);
+                const limitMB = Math.round(memoryInfo.jsHeapSizeLimit / 1024 / 1024);
+                
+                this.metrics.memory = usedMB;
+                
+                // Enhanced memory metrics
+                this.metrics.memoryDetails = {
+                    used: usedMB,
+                    total: totalMB,
+                    limit: limitMB,
+                    utilization: Math.round((usedMB / totalMB) * 100)
+                };
+                
+                // Memory leak detection
+                if (usedMB > this.thresholds.criticalMemory) {
+                    this.logPerformanceAlert('CRITICAL_MEMORY_USAGE', {
+                        memory: usedMB,
+                        limit: limitMB,
+                        severity: 'CRITICAL'
+                    });
+                }
+                
+                // Memory growth rate analysis
+                this.analyzeMemoryGrowth(usedMB);
+                
+            } catch (error) {
+                console.warn('Memory monitoring error:', error);
+            }
+        }, 5000);
+        
+        this.intervals.push(memoryInterval);
+    }
+
+    analyzeMemoryGrowth(currentMemory) {
+        const history = this.performanceHistory;
+        if (history.length < 2) return;
+        
+        const recentHistory = history.slice(-5); // Last 5 measurements
+        if (recentHistory.length < 2) return;
+        
+        const growthRate = (currentMemory - recentHistory[0].memory) / recentHistory.length;
+        
+        if (growthRate > 5) { // More than 5MB per measurement period
+            this.logPerformanceAlert('MEMORY_LEAK_SUSPECTED', {
+                growthRate: growthRate.toFixed(2),
+                currentMemory: currentMemory,
+                severity: 'HIGH'
+            });
+        }
+    }
+
+    monitorNetworkPerformance() {
+        if (!('PerformanceObserver' in window)) {
+            console.warn('PerformanceObserver not available for network monitoring');
+            return;
+        }
+
+        try {
+            const networkObserver = new PerformanceObserver((list) => {
+                const entries = list.getEntries();
+                entries.forEach(entry => {
+                    if (entry.entryType === 'navigation' || entry.entryType === 'resource') {
+                        this.processNetworkEntry(entry);
+                    }
+                });
+            });
+            
+            networkObserver.observe({ entryTypes: ['navigation', 'resource'] });
+            
+        } catch (error) {
+            console.warn('Network performance monitoring setup failed:', error);
+        }
+    }
+
+    processNetworkEntry(entry) {
+        this.metrics.networkRequests++;
+        
+        const duration = entry.responseEnd - entry.requestStart;
+        const size = entry.transferSize || entry.encodedBodySize || 0;
+        
+        // Track slow requests
+        if (duration > this.thresholds.networkLatency) {
+            this.logPerformanceAlert('SLOW_NETWORK_REQUEST', {
+                url: entry.name,
+                duration: Math.round(duration),
+                size: Math.round(size / 1024), // KB
+                severity: 'MEDIUM'
+            });
+        }
+        
+        // Update network metrics
+        if (!this.metrics.networkStats) {
+            this.metrics.networkStats = {
+                totalRequests: 0,
+                averageLatency: 0,
+                totalDataTransferred: 0
+            };
+        }
+        
+        this.metrics.networkStats.totalRequests++;
+        this.metrics.networkStats.averageLatency = 
+            (this.metrics.networkStats.averageLatency + duration) / 2;
+        this.metrics.networkStats.totalDataTransferred += size;
+    }
+
+    monitorResourceTiming() {
+        if (!window.PerformanceObserver) return;
+        
+        try {
+            const resourceObserver = new PerformanceObserver((list) => {
+                const entries = list.getEntries();
+                entries.forEach(entry => {
+                    // Monitor for large resources
+                    if (entry.transferSize > 1024 * 1024) { // > 1MB
+                        this.logPerformanceAlert('LARGE_RESOURCE_LOADED', {
+                            resource: entry.name,
+                            size: Math.round(entry.transferSize / 1024 / 1024 * 100) / 100, // MB
+                            duration: Math.round(entry.duration),
+                            severity: 'MEDIUM'
+                        });
+                    }
+                });
+            });
+            
+            resourceObserver.observe({ entryTypes: ['resource'] });
+            
+        } catch (error) {
+            console.warn('Resource timing monitoring failed:', error);
         }
     }
 
     updateMetrics() {
-        // Update location count
-        if (window.gameLocations) {
-            this.metrics.loadedLocations = window.gameLocations.length;
+        if (!this.isMonitoring) return;
+        
+        try {
+            // Update location count with error handling
+            if (window.gameLocations && Array.isArray(window.gameLocations)) {
+                this.metrics.loadedLocations = window.gameLocations.length;
+            } else {
+                this.metrics.loadedLocations = 0;
+            }
+            
+            // Update cache hits from localStorage if available
+            this.updateCacheMetrics();
+            
+            // Add current metrics to history
+            this.addToHistory();
+            
+            // Check performance thresholds
+            this.checkPerformanceThresholds();
+            
+            // Update session metrics
+            this.metrics.sessionDuration = Math.round((performance.now() - this.startTime) / 1000);
+            
+        } catch (error) {
+            console.warn('Error updating metrics:', error);
+        }
+    }
+
+    updateCacheMetrics() {
+        try {
+            let cacheHits = 0;
+            const cachePrefix = 'mnthen-enterprise-';
+            
+            for (let i = 0; i < localStorage.length; i++) {
+                const key = localStorage.key(i);
+                if (key && key.startsWith(cachePrefix)) {
+                    cacheHits++;
+                }
+            }
+            
+            this.metrics.cacheHits = cacheHits;
+        } catch (error) {
+            // Silent fail for cache metrics
+            this.metrics.cacheHits = 0;
+        }
+    }
+
+    addToHistory() {
+        const snapshot = {
+            timestamp: Date.now(),
+            fps: this.metrics.fps,
+            memory: this.metrics.memory,
+            loadedLocations: this.metrics.loadedLocations,
+            networkRequests: this.metrics.networkRequests
+        };
+        
+        this.performanceHistory.push(snapshot);
+        
+        // Maintain history size
+        if (this.performanceHistory.length > this.maxHistorySize) {
+            this.performanceHistory.shift();
+        }
+    }
+
+    checkPerformanceThresholds() {
+        const alerts = [];
+        
+        // FPS threshold check
+        if (this.metrics.fps > 0 && this.metrics.fps < this.thresholds.lowFPS) {
+            alerts.push({ type: 'LOW_FPS', value: this.metrics.fps, threshold: this.thresholds.lowFPS });
         }
         
-        // Log performance data for enterprise monitoring
-        if (this.metrics.fps < 30 || this.metrics.memory > 100) {
-            console.warn('Performance Alert:', this.metrics);
+        // Memory threshold check
+        if (this.metrics.memory > this.thresholds.highMemory) {
+            alerts.push({ type: 'HIGH_MEMORY', value: this.metrics.memory, threshold: this.thresholds.highMemory });
+        }
+        
+        // Log performance alerts
+        if (alerts.length > 0) {
+            console.warn('Performance Alert:', { alerts, metrics: this.metrics });
+            
+            // Dispatch custom event for application handling
+            window.dispatchEvent(new CustomEvent('performance-alert', {
+                detail: { alerts, metrics: this.getMetrics() }
+            }));
+        }
+    }
+
+    logPerformanceAlert(type, details) {
+        const alert = {
+            timestamp: new Date().toISOString(),
+            type: type,
+            details: details,
+            currentMetrics: { ...this.metrics }
+        };
+        
+        console.warn(`Performance Alert [${type}]:`, alert);
+        
+        // Integration with security manager if available
+        if (window.enterpriseSecurityManager) {
+            window.enterpriseSecurityManager.logSecurityEvent('PERFORMANCE_ALERT', alert);
         }
     }
 
     getMetrics() {
-        return this.metrics;
+        return {
+            ...this.metrics,
+            isMonitoring: this.isMonitoring,
+            sessionDuration: Math.round((performance.now() - this.startTime) / 1000),
+            historyLength: this.performanceHistory.length,
+            thresholds: { ...this.thresholds }
+        };
+    }
+
+    // Get performance trends
+    getPerformanceTrends() {
+        if (this.performanceHistory.length < 2) {
+            return { insufficient_data: true };
+        }
+        
+        const recent = this.performanceHistory.slice(-10);
+        const avgFPS = recent.reduce((sum, entry) => sum + entry.fps, 0) / recent.length;
+        const avgMemory = recent.reduce((sum, entry) => sum + entry.memory, 0) / recent.length;
+        
+        return {
+            averageFPS: Math.round(avgFPS * 100) / 100,
+            averageMemory: Math.round(avgMemory * 100) / 100,
+            dataPoints: recent.length,
+            timeSpan: recent.length > 0 ? recent[recent.length - 1].timestamp - recent[0].timestamp : 0
+        };
+    }
+
+    // Method to adjust thresholds
+    updateThresholds(newThresholds) {
+        this.thresholds = { ...this.thresholds, ...newThresholds };
+        console.log('Performance thresholds updated:', this.thresholds);
+    }
+
+    // Export performance data
+    exportPerformanceData() {
+        return {
+            currentMetrics: this.getMetrics(),
+            history: this.performanceHistory,
+            trends: this.getPerformanceTrends(),
+            sessionInfo: {
+                startTime: this.startTime,
+                duration: performance.now() - this.startTime,
+                isActive: this.isMonitoring
+            }
+        };
+    }
+
+    // Cleanup method for proper resource management
+    stopMonitoring() {
+        this.isMonitoring = false;
+        
+        // Clear all intervals
+        this.intervals.forEach(interval => clearInterval(interval));
+        this.intervals = [];
+        
+        // Cancel animation frame
+        if (this.animationFrameId) {
+            cancelAnimationFrame(this.animationFrameId);
+            this.animationFrameId = null;
+        }
+        
+        console.log('EnterprisePerformanceMonitor stopped');
+    }
+
+    // Reset all metrics and history
+    reset() {
+        this.metrics = {
+            fps: 0,
+            memory: 0,
+            loadedLocations: 0,
+            cacheHits: 0,
+            networkRequests: 0
+        };
+        this.performanceHistory = [];
+        this.frameCount = 0;
+        this.lastFrameTime = performance.now();
+        this.startTime = performance.now();
+        
+        console.log('Performance metrics reset');
     }
 }
 
@@ -766,56 +1702,450 @@ class EnterpriseBackgroundSync {
     constructor() {
         this.syncQueue = [];
         this.isOnline = navigator.onLine;
+        this.maxRetries = 3;
+        this.retryDelays = [1000, 5000, 15000]; // Progressive delays in ms
+        this.maxQueueSize = 100;
+        this.syncInProgress = false;
+        this.syncStats = {
+            totalSynced: 0,
+            totalFailed: 0,
+            lastSyncTime: null,
+            queueProcessingTime: 0
+        };
+        this.persistenceKey = 'enterprise-sync-queue';
         this.setupEventListeners();
+        this.loadPersistedQueue();
     }
 
     setupEventListeners() {
+        // Network status monitoring
         window.addEventListener('online', () => {
+            const wasOffline = !this.isOnline;
             this.isOnline = true;
-            this.processSyncQueue();
+            
+            if (wasOffline) {
+                console.log('Network connection restored, processing sync queue');
+                this.logSyncEvent('NETWORK_RESTORED', { queueSize: this.syncQueue.length });
+                setTimeout(() => this.processSyncQueue(), 1000); // Brief delay for connection stability
+            }
         });
 
         window.addEventListener('offline', () => {
             this.isOnline = false;
+            this.logSyncEvent('NETWORK_LOST', { queueSize: this.syncQueue.length });
+            console.warn('Network connection lost, queuing sync operations');
         });
+
+        // Page visibility changes
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden && this.isOnline && this.syncQueue.length > 0) {
+                this.processSyncQueue();
+            }
+        });
+
+        // Before page unload - persist queue
+        window.addEventListener('beforeunload', () => {
+            this.persistQueue();
+        });
+
+        // Periodic sync health check
+        setInterval(() => {
+            this.performHealthCheck();
+        }, 30000); // Every 30 seconds
     }
 
-    addToSyncQueue(data) {
-        this.syncQueue.push({
-            timestamp: Date.now(),
-            data: data,
-            retries: 0
-        });
-
-        if (this.isOnline) {
-            this.processSyncQueue();
+    loadPersistedQueue() {
+        try {
+            const persistedData = localStorage.getItem(this.persistenceKey);
+            if (persistedData) {
+                const { queue, stats } = JSON.parse(persistedData);
+                
+                // Validate and restore queue
+                if (Array.isArray(queue)) {
+                    // Filter out expired items (older than 24 hours)
+                    const now = Date.now();
+                    const validItems = queue.filter(item => 
+                        item.timestamp && (now - item.timestamp) < 24 * 60 * 60 * 1000
+                    );
+                    
+                    this.syncQueue = validItems;
+                    console.log(`Restored ${validItems.length} items from persisted sync queue`);
+                }
+                
+                // Restore stats
+                if (stats) {
+                    this.syncStats = { ...this.syncStats, ...stats };
+                }
+                
+                // Clean up storage
+                localStorage.removeItem(this.persistenceKey);
+            }
+        } catch (error) {
+            console.warn('Failed to load persisted sync queue:', error);
         }
     }
 
+    persistQueue() {
+        try {
+            if (this.syncQueue.length > 0) {
+                const dataToStore = {
+                    queue: this.syncQueue,
+                    stats: this.syncStats,
+                    timestamp: Date.now()
+                };
+                localStorage.setItem(this.persistenceKey, JSON.stringify(dataToStore));
+            }
+        } catch (error) {
+            console.warn('Failed to persist sync queue:', error);
+        }
+    }
+
+    addToSyncQueue(data) {
+        if (!data || typeof data !== 'object') {
+            console.warn('Invalid data provided to sync queue');
+            return false;
+        }
+
+        // Check queue size limit
+        if (this.syncQueue.length >= this.maxQueueSize) {
+            console.warn('Sync queue at maximum capacity, removing oldest item');
+            this.syncQueue.shift();
+        }
+
+        const syncItem = {
+            id: this.generateSyncId(),
+            timestamp: Date.now(),
+            data: data,
+            retries: 0,
+            priority: data.priority || 'normal', // high, normal, low
+            lastAttempt: null,
+            errors: []
+        };
+
+        // Insert based on priority
+        this.insertByPriority(syncItem);
+        
+        this.logSyncEvent('ITEM_QUEUED', { 
+            id: syncItem.id, 
+            type: data.type, 
+            priority: syncItem.priority,
+            queueSize: this.syncQueue.length 
+        });
+
+        // Process immediately if online and not already processing
+        if (this.isOnline && !this.syncInProgress) {
+            // Small delay to allow batching
+            setTimeout(() => this.processSyncQueue(), 100);
+        }
+
+        return syncItem.id;
+    }
+
+    insertByPriority(item) {
+        const priorities = { high: 3, normal: 2, low: 1 };
+        const itemPriority = priorities[item.priority] || 2;
+        
+        let insertIndex = this.syncQueue.length;
+        for (let i = 0; i < this.syncQueue.length; i++) {
+            const queuePriority = priorities[this.syncQueue[i].priority] || 2;
+            if (itemPriority > queuePriority) {
+                insertIndex = i;
+                break;
+            }
+        }
+        
+        this.syncQueue.splice(insertIndex, 0, item);
+    }
+
+    generateSyncId() {
+        return `sync_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    }
+
     async processSyncQueue() {
-        while (this.syncQueue.length > 0 && this.isOnline) {
-            const item = this.syncQueue.shift();
-            try {
-                await this.syncData(item.data);
-                console.log('Background sync completed for:', item.data.type);
-            } catch (error) {
-                item.retries++;
-                if (item.retries < 3) {
-                    this.syncQueue.push(item); // Retry
+        if (this.syncInProgress || !this.isOnline || this.syncQueue.length === 0) {
+            return;
+        }
+
+        this.syncInProgress = true;
+        const startTime = performance.now();
+        let processedCount = 0;
+        let failedCount = 0;
+
+        this.logSyncEvent('QUEUE_PROCESSING_START', { queueSize: this.syncQueue.length });
+
+        try {
+            while (this.syncQueue.length > 0 && this.isOnline) {
+                const item = this.syncQueue.shift();
+                
+                try {
+                    // Check if item should be retried based on delay
+                    if (item.lastAttempt && this.shouldDelayRetry(item)) {
+                        // Re-queue for later
+                        this.syncQueue.push(item);
+                        continue;
+                    }
+
+                    item.lastAttempt = Date.now();
+                    await this.syncData(item.data);
+                    
+                    processedCount++;
+                    this.syncStats.totalSynced++;
+                    this.syncStats.lastSyncTime = Date.now();
+                    
+                    console.log(`Background sync completed for: ${item.data.type} (ID: ${item.id})`);
+                    this.logSyncEvent('SYNC_SUCCESS', { 
+                        id: item.id, 
+                        type: item.data.type,
+                        retries: item.retries 
+                    });
+
+                } catch (error) {
+                    await this.handleSyncError(item, error);
+                    failedCount++;
                 }
-                console.warn('Background sync failed:', error);
+
+                // Yield control periodically to prevent blocking
+                if (processedCount % 5 === 0) {
+                    await new Promise(resolve => setTimeout(resolve, 10));
+                }
+            }
+        } finally {
+            this.syncInProgress = false;
+            const processingTime = performance.now() - startTime;
+            this.syncStats.queueProcessingTime = processingTime;
+
+            this.logSyncEvent('QUEUE_PROCESSING_COMPLETE', {
+                processed: processedCount,
+                failed: failedCount,
+                remaining: this.syncQueue.length,
+                processingTime: Math.round(processingTime)
+            });
+
+            // Persist queue if items remain
+            if (this.syncQueue.length > 0) {
+                this.persistQueue();
             }
         }
     }
 
-    async syncData(data) {
-        // Simulate API call for enterprise data sync
-        return new Promise((resolve) => {
-            setTimeout(resolve, 100);
+    shouldDelayRetry(item) {
+        if (item.retries === 0) return false;
+        
+        const delayIndex = Math.min(item.retries - 1, this.retryDelays.length - 1);
+        const requiredDelay = this.retryDelays[delayIndex];
+        const timeSinceLastAttempt = Date.now() - item.lastAttempt;
+        
+        return timeSinceLastAttempt < requiredDelay;
+    }
+
+    async handleSyncError(item, error) {
+        item.retries++;
+        item.errors.push({
+            timestamp: Date.now(),
+            message: error.message || 'Unknown error',
+            stack: error.stack
+        });
+
+        this.syncStats.totalFailed++;
+
+        if (item.retries < this.maxRetries) {
+            // Re-queue for retry with exponential backoff
+            this.syncQueue.push(item);
+            
+            this.logSyncEvent('SYNC_RETRY_QUEUED', {
+                id: item.id,
+                type: item.data.type,
+                attempt: item.retries,
+                maxRetries: this.maxRetries,
+                nextDelay: this.retryDelays[Math.min(item.retries - 1, this.retryDelays.length - 1)]
+            });
+        } else {
+            // Max retries exceeded
+            this.logSyncEvent('SYNC_FAILED_PERMANENTLY', {
+                id: item.id,
+                type: item.data.type,
+                totalAttempts: item.retries,
+                errors: item.errors
+            });
+            
+            // Optional: Store failed items for manual review
+            this.storeFailed(item);
+        }
+
+        console.warn(`Background sync failed (attempt ${item.retries}/${this.maxRetries}):`, {
+            id: item.id,
+            type: item.data.type,
+            error: error.message
         });
     }
-}
 
+    storeFailed(item) {
+        try {
+            const failedKey = 'enterprise-sync-failed';
+            const existing = JSON.parse(localStorage.getItem(failedKey) || '[]');
+            existing.push({
+                ...item,
+                finalFailureTime: Date.now()
+            });
+            
+            // Keep only last 20 failed items
+            const trimmed = existing.slice(-20);
+            localStorage.setItem(failedKey, JSON.stringify(trimmed));
+        } catch (error) {
+            console.warn('Failed to store failed sync item:', error);
+        }
+    }
+
+    async syncData(data) {
+        // Enhanced simulation with realistic behavior
+        if (!data || typeof data !== 'object') {
+            throw new Error('Invalid sync data provided');
+        }
+
+        // Simulate network conditions
+        const networkDelay = this.simulateNetworkDelay();
+        
+        return new Promise((resolve, reject) => {
+            setTimeout(() => {
+                // Simulate occasional failures (5% chance)
+                if (Math.random() < 0.05) {
+                    reject(new Error(`Sync failed for ${data.type}: Network timeout`));
+                } else {
+                    resolve({
+                        success: true,
+                        syncId: data.id || 'unknown',
+                        timestamp: Date.now()
+                    });
+                }
+            }, networkDelay);
+        });
+    }
+
+    simulateNetworkDelay() {
+        // Simulate realistic network delays based on connection
+        const connection = navigator.connection;
+        if (connection) {
+            const effectiveType = connection.effectiveType;
+            const delays = {
+                'slow-2g': Math.random() * 2000 + 1000,
+                '2g': Math.random() * 1000 + 500,
+                '3g': Math.random() * 500 + 200,
+                '4g': Math.random() * 200 + 50
+            };
+            return delays[effectiveType] || 100;
+        }
+        return Math.random() * 300 + 100; // Default delay
+    }
+
+    logSyncEvent(eventType, details) {
+        const logEntry = {
+            timestamp: new Date().toISOString(),
+            event: eventType,
+            details: details,
+            queueSize: this.syncQueue.length,
+            isOnline: this.isOnline
+        };
+
+        console.log(`[BackgroundSync] ${eventType}:`, logEntry);
+
+        // Integration with security manager
+        if (window.enterpriseSecurityManager) {
+            window.enterpriseSecurityManager.logSecurityEvent('BACKGROUND_SYNC', logEntry);
+        }
+    }
+
+    performHealthCheck() {
+        const healthData = {
+            queueSize: this.syncQueue.length,
+            isOnline: this.isOnline,
+            syncInProgress: this.syncInProgress,
+            stats: this.syncStats,
+            oldestItem: this.syncQueue.length > 0 ? 
+                Date.now() - this.syncQueue[this.syncQueue.length - 1].timestamp : null
+        };
+
+        // Alert if queue is growing too large
+        if (this.syncQueue.length > this.maxQueueSize * 0.8) {
+            this.logSyncEvent('QUEUE_SIZE_WARNING', {
+                currentSize: this.syncQueue.length,
+                maxSize: this.maxQueueSize
+            });
+        }
+
+        // Alert if items are getting too old
+        if (healthData.oldestItem && healthData.oldestItem > 60 * 60 * 1000) { // 1 hour
+            this.logSyncEvent('STALE_QUEUE_ITEMS', {
+                oldestAge: Math.round(healthData.oldestItem / 1000 / 60) // minutes
+            });
+        }
+
+        return healthData;
+    }
+
+    // Public methods for monitoring and control
+    getQueueStatus() {
+        return {
+            size: this.syncQueue.length,
+            isProcessing: this.syncInProgress,
+            isOnline: this.isOnline,
+            stats: { ...this.syncStats },
+            nextItem: this.syncQueue.length > 0 ? {
+                id: this.syncQueue[0].id,
+                type: this.syncQueue[0].data.type,
+                priority: this.syncQueue[0].priority,
+                retries: this.syncQueue[0].retries
+            } : null
+        };
+    }
+
+    // Force process queue (useful for testing/debugging)
+    forceSync() {
+        if (this.syncQueue.length === 0) {
+            console.log('No items in sync queue');
+            return Promise.resolve();
+        }
+
+        console.log('Forcing sync queue processing...');
+        return this.processSyncQueue();
+    }
+
+    // Clear queue (emergency function)
+    clearQueue() {
+        const clearedCount = this.syncQueue.length;
+        this.syncQueue = [];
+        
+        this.logSyncEvent('QUEUE_CLEARED', { itemsCleared: clearedCount });
+        console.log(`Cleared ${clearedCount} items from sync queue`);
+        
+        return clearedCount;
+    }
+
+    // Update configuration
+    updateConfig(config) {
+        if (config.maxRetries !== undefined) {
+            this.maxRetries = Math.max(1, Math.min(10, config.maxRetries));
+        }
+        if (config.maxQueueSize !== undefined) {
+            this.maxQueueSize = Math.max(10, Math.min(1000, config.maxQueueSize));
+        }
+        if (config.retryDelays && Array.isArray(config.retryDelays)) {
+            this.retryDelays = config.retryDelays;
+        }
+        
+        this.logSyncEvent('CONFIG_UPDATED', config);
+    }
+
+    // Cleanup method
+    destroy() {
+        this.persistQueue();
+        this.syncQueue = [];
+        this.syncInProgress = false;
+        
+        // Remove event listeners would go here if we stored references
+        console.log('EnterpriseBackgroundSync destroyed');
+    }
+}
+        
 // Initialize Enterprise Systems
 const enterpriseCacheManager = new EnterpriseCacheManager();
 const enterpriseSecurityManager = new EnterpriseSecurityManager();
