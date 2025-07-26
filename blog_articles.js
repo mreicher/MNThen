@@ -330,7 +330,7 @@ const blogArticles = [
     "keywords": ["saint paul", "st. paul", "gangster", "barker", "karpis", "shooting", "event", "all"]
   },
   {
-    "headline": "Van Meter, Homer V. (1905 - 1934)",
+    "headline": "Ambush of Homer Van Meter (August 23, 1934)",
     "blurb": "Van Meter, an infamous Depression-era gangster, met his violent end in a disputed encounter with St. Paul police on August 23, 1934, near University Ave. and Marion St.",
     "icon": "fa-user",
     "author": "Matt Reicher",
