@@ -336,8 +336,8 @@ const blogArticles = [
     "author": "Matt Reicher",
     "date": "August 21, 2023",
     "image": "https://mnthen.com/images/van_meter_header.jpg",
-    "url": "https://mnthen.com/blog/people/van_meter.html",
-    "keywords": ["saint paul", "st. paul", "gangster", "dillinger", "Dillinger", "shooting", "van meter", "Van Meter", "person", "all"]
+    "url": "https://mnthen.com/blog/event/van_meter.html",
+    "keywords": ["saint paul", "st. paul", "gangster", "dillinger", "Dillinger", "shooting", "van meter", "Van Meter", "event", "all"]
   },
   {
     "headline": "Gramma B's",
