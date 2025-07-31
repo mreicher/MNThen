@@ -4784,20 +4784,51 @@ let motionBuffer = [];
 let activeGlideTime = 400;
 let activePanTime = 800;
 
+// Legacy compatibility variables
+let lastPosition = null;
+let lastUpdateTime = null;
+let stationaryStartTime = null;
+let isStationary = false;
+let stationaryCheckTimeout = null;
+let movementDirection = null;
+let consistentMovementCount = 0;
+let positionBuffer = [];
+let lastCenterTime = 0;
+let lastMapUpdateTime = null;
+let userIconAnimationId = null;
+let userViewportAnimationId = null;
+let activeLocationAnimations = new Set();
+let iconStartPos = null;
+let iconTargetPos = null;
+let iconStartTime = null;
+let currentIconDuration = 400;
+let currentViewportDuration = 800;
+let animationLock = false;
+
 // Performance-optimized animation system
 const AnimationController = {
     activeFrames: new Map(),
     lastFrameTimes: new Map(),
     
     requestFrame(id, callback, maxFPS = 60) {
+        if (!callback || typeof callback !== 'function') {
+            console.warn('AnimationController: Invalid callback provided');
+            return null;
+        }
+        
         this.cancelFrame(id);
         
-        const minInterval = 1000 / maxFPS;
+        const minInterval = Math.max(16, 1000 / Math.min(maxFPS, 60)); // Cap at 60 FPS
         const wrappedCallback = (timestamp) => {
-            const lastTime = this.lastFrameTimes.get(id) || 0;
-            if (timestamp - lastTime >= minInterval) {
-                this.lastFrameTimes.set(id, timestamp);
-                callback(timestamp);
+            try {
+                const lastTime = this.lastFrameTimes.get(id) || 0;
+                if (timestamp - lastTime >= minInterval) {
+                    this.lastFrameTimes.set(id, timestamp);
+                    callback(timestamp);
+                }
+            } catch (error) {
+                console.error('Animation callback error:', error);
+                this.cancelFrame(id);
             }
         };
         
@@ -4815,25 +4846,47 @@ const AnimationController = {
     },
     
     cancelAll() {
-        this.activeFrames.forEach(frameId => cancelAnimationFrame(frameId));
+        this.activeFrames.forEach(frameId => {
+            try {
+                cancelAnimationFrame(frameId);
+            } catch (error) {
+                console.warn('Error canceling animation frame:', error);
+            }
+        });
         this.activeFrames.clear();
         this.lastFrameTimes.clear();
     }
 };
 
-// Throttling system
+// Throttling system with memory cleanup
 const ThrottleManager = {
     lastCalls: new Map(),
+    maxEntries: 100, // Prevent memory leaks
     
     shouldExecute(key, interval) {
-        const now = performance.now();
-        const lastCall = this.lastCalls.get(key) || 0;
-        
-        if (now - lastCall >= interval) {
-            this.lastCalls.set(key, now);
-            return true;
+        try {
+            const now = performance.now();
+            const lastCall = this.lastCalls.get(key) || 0;
+            
+            if (now - lastCall >= interval) {
+                // Cleanup old entries periodically
+                if (this.lastCalls.size > this.maxEntries) {
+                    const cutoff = now - 30000; // Remove entries older than 30 seconds
+                    for (const [k, v] of this.lastCalls.entries()) {
+                        if (v < cutoff) {
+                            this.lastCalls.delete(k);
+                        }
+                    }
+                }
+                
+                this.lastCalls.set(key, now);
+                return true;
+            }
+            return false;
+        } catch (error) {
+            console.warn('ThrottleManager error:', error);
+            return true; // Fail open
         }
-        return false;
     }
 };
 
@@ -4842,62 +4895,66 @@ const ThrottleManager = {
 // ====================================================================
 
 function updateUserLocation(position, forceUpdate = false) {
-    if (!map || !map._loaded || !userMarker) return;
-    
-    if (!validateLocationInput(position)) {
-        console.warn("Invalid location input received:", position);
-        return;
-    }
-
-    // Global throttling
-    if (!forceUpdate && !ThrottleManager.shouldExecute('mainUpdate', 16)) {
-        return;
-    }
-
-    AnimationController.cancelAll();
-
-    const processingTime = Date.now();
-    const deltaTime = lastTrackingUpdate ? Math.max(0, (processingTime - lastTrackingUpdate) / 1000) : 0;
-
-    const incomingPosition = {
-        lat: Number(position.coords.latitude),
-        lng: Number(position.coords.longitude),
-        precision: Math.max(1, Number(position.coords.accuracy) || 20),
-        bearing: position.coords.heading ?? null,
-        timestamp: processingTime,
-        velocity: Math.max(0, Number(position.coords.speed) || 0)
-    };
-
-    const motionProfile = determineMotionProfile(incomingPosition.velocity);
-    activeGlideTime = motionProfile.glideTime;
-    activePanTime = motionProfile.panTime;
-
-    cachLocationDataIfEnabled(incomingPosition);
-
-    if (!currentPosition) {
-        initializeLocationTracking(incomingPosition, motionProfile);
-        return;
-    }
-
-    const displacement = calculateHaversineDistance(currentPosition, incomingPosition);
-
-    configureAdaptiveFiltering(incomingPosition, motionProfile);
-
-    const jumpThreshold = CONFIG?.EXTENDED_DISTANCE_THRESHOLD || 1000;
-    if (displacement > jumpThreshold || forceUpdate) {
-        executePositionJumpProtocol(incomingPosition, motionProfile, processingTime);
-        return;
-    }
-
-    if (processAnchoringLogic(incomingPosition, displacement, forceUpdate, processingTime, motionProfile)) {
-        return;
-    }
-
-    if (!validatePositionQuality(incomingPosition, displacement, deltaTime, forceUpdate)) {
-        return;
-    }
-
     try {
+        if (!map || !map._loaded || !userMarker) {
+            console.warn('Map or userMarker not available');
+            return;
+        }
+        
+        if (!validateLocationInput(position)) {
+            console.warn("Invalid location input received:", position);
+            return;
+        }
+
+        // Global throttling with safety check
+        if (!forceUpdate && !ThrottleManager.shouldExecute('mainUpdate', 16)) {
+            return;
+        }
+
+        AnimationController.cancelAll();
+
+        const processingTime = Date.now();
+        const deltaTime = lastTrackingUpdate ? Math.max(0, (processingTime - lastTrackingUpdate) / 1000) : 0;
+
+        const incomingPosition = {
+            lat: Number(position.coords.latitude),
+            lng: Number(position.coords.longitude),
+            precision: Math.max(1, Number(position.coords.accuracy) || 20),
+            bearing: position.coords.heading ?? null,
+            timestamp: processingTime,
+            velocity: Math.max(0, Number(position.coords.speed) || 0)
+        };
+
+        const motionProfile = determineMotionProfile(incomingPosition.velocity);
+        activeGlideTime = motionProfile.glideTime;
+        activePanTime = motionProfile.panTime;
+
+        // Cache location data safely
+        cachLocationDataIfEnabled(incomingPosition);
+
+        if (!currentPosition) {
+            initializeLocationTracking(incomingPosition, motionProfile);
+            return;
+        }
+
+        const displacement = calculateHaversineDistance(currentPosition, incomingPosition);
+
+        configureAdaptiveFiltering(incomingPosition, motionProfile);
+
+        const jumpThreshold = (typeof CONFIG !== 'undefined' && CONFIG?.EXTENDED_DISTANCE_THRESHOLD) || 1000;
+        if (displacement > jumpThreshold || forceUpdate) {
+            executePositionJumpProtocol(incomingPosition, motionProfile, processingTime);
+            return;
+        }
+
+        if (processAnchoringLogic(incomingPosition, displacement, forceUpdate, processingTime, motionProfile)) {
+            return;
+        }
+
+        if (!validatePositionQuality(incomingPosition, displacement, deltaTime, forceUpdate)) {
+            return;
+        }
+
         const refinedPosition = executePositionRefinement(incomingPosition, deltaTime, motionProfile);
         
         initiateIconGlide(refinedPosition.lat, refinedPosition.lng, motionProfile);
@@ -4908,7 +4965,19 @@ function updateUserLocation(position, forceUpdate = false) {
 
     } catch (error) {
         console.error("Motion tracking error:", error);
-        executeErrorRecoveryProtocol(incomingPosition, motionProfile);
+        try {
+            const motionProfile = determineMotionProfile(0);
+            executeErrorRecoveryProtocol(position?.coords ? {
+                lat: Number(position.coords.latitude),
+                lng: Number(position.coords.longitude),
+                precision: Number(position.coords.accuracy) || 20,
+                bearing: position.coords.heading ?? null,
+                timestamp: Date.now(),
+                velocity: Number(position.coords.speed) || 0
+            } : null, motionProfile);
+        } catch (recoveryError) {
+            console.error("Error recovery failed:", recoveryError);
+        }
     }
 }
 
@@ -4917,406 +4986,533 @@ function updateUserLocation(position, forceUpdate = false) {
 // ====================================================================
 
 function determineMotionProfile(velocityMPS) {
-    if (velocityMPS > 30) return MOTION_PROFILES.SUPERSONIC;
-    if (velocityMPS > 15) return MOTION_PROFILES.VELOCITY;
-    if (velocityMPS > 8) return MOTION_PROFILES.CRUISE;
-    if (velocityMPS > 3) return MOTION_PROFILES.NAVIGATE;
-    if (velocityMPS > 0.5) return MOTION_PROFILES.DRIFT;
+    const velocity = Number(velocityMPS) || 0;
+    if (velocity > 30) return MOTION_PROFILES.SUPERSONIC;
+    if (velocity > 15) return MOTION_PROFILES.VELOCITY;
+    if (velocity > 8) return MOTION_PROFILES.CRUISE;
+    if (velocity > 3) return MOTION_PROFILES.NAVIGATE;
+    if (velocity > 0.5) return MOTION_PROFILES.DRIFT;
     return MOTION_PROFILES.ANCHOR;
 }
 
 function validateLocationInput(position) {
-    return position?.coords?.latitude !== undefined && 
-           position?.coords?.longitude !== undefined &&
-           typeof position.coords.latitude === 'number' && 
-           typeof position.coords.longitude === 'number' &&
-           Math.abs(position.coords.latitude) <= 90 &&
-           Math.abs(position.coords.longitude) <= 180;
+    try {
+        return position?.coords?.latitude !== undefined && 
+               position?.coords?.longitude !== undefined &&
+               typeof position.coords.latitude === 'number' && 
+               typeof position.coords.longitude === 'number' &&
+               isFinite(position.coords.latitude) &&
+               isFinite(position.coords.longitude) &&
+               Math.abs(position.coords.latitude) <= 90 &&
+               Math.abs(position.coords.longitude) <= 180;
+    } catch (error) {
+        console.warn('Location validation error:', error);
+        return false;
+    }
 }
 
 function calculateHaversineDistance(pos1, pos2) {
-    if (!pos1 || !pos2 || 
-        typeof pos1.lat !== 'number' || typeof pos1.lng !== 'number' || 
-        typeof pos2.lat !== 'number' || typeof pos2.lng !== 'number') {
+    try {
+        if (!pos1 || !pos2 || 
+            typeof pos1.lat !== 'number' || typeof pos1.lng !== 'number' || 
+            typeof pos2.lat !== 'number' || typeof pos2.lng !== 'number' ||
+            !isFinite(pos1.lat) || !isFinite(pos1.lng) ||
+            !isFinite(pos2.lat) || !isFinite(pos2.lng)) {
+            return Infinity;
+        }
+        
+        const EARTH_RADIUS = 6371000;
+        const lat1Rad = pos1.lat * Math.PI / 180;
+        const lat2Rad = pos2.lat * Math.PI / 180;
+        const deltaLatRad = (pos2.lat - pos1.lat) * Math.PI / 180;
+        const deltaLngRad = (pos2.lng - pos1.lng) * Math.PI / 180;
+        
+        const haversineA = Math.sin(deltaLatRad/2) * Math.sin(deltaLatRad/2) +
+                           Math.cos(lat1Rad) * Math.cos(lat2Rad) *
+                           Math.sin(deltaLngRad/2) * Math.sin(deltaLngRad/2);
+        const haversineC = 2 * Math.atan2(Math.sqrt(haversineA), Math.sqrt(1-haversineA));
+        
+        const result = EARTH_RADIUS * haversineC;
+        return isFinite(result) ? result : Infinity;
+    } catch (error) {
+        console.warn('Distance calculation error:', error);
         return Infinity;
     }
-    
-    const EARTH_RADIUS = 6371000;
-    const lat1Rad = pos1.lat * Math.PI / 180;
-    const lat2Rad = pos2.lat * Math.PI / 180;
-    const deltaLatRad = (pos2.lat - pos1.lat) * Math.PI / 180;
-    const deltaLngRad = (pos2.lng - pos1.lng) * Math.PI / 180;
-    
-    const haversineA = Math.sin(deltaLatRad/2) * Math.sin(deltaLatRad/2) +
-                       Math.cos(lat1Rad) * Math.cos(lat2Rad) *
-                       Math.sin(deltaLngRad/2) * Math.sin(deltaLngRad/2);
-    const haversineC = 2 * Math.atan2(Math.sqrt(haversineA), Math.sqrt(1-haversineA));
-    
-    return EARTH_RADIUS * haversineC;
 }
 
 function cachLocationDataIfEnabled(position) {
-    if (gameLocations?.length > 0 && enterpriseCacheManager?.cacheLocationData) {
-        gameLocations.forEach(location => {
-            try {
-                enterpriseCacheManager.cacheLocationData(location, position);
-            } catch (e) {
-                console.warn("Location caching failed:", e);
-            }
-        });
+    try {
+        if (typeof gameLocations !== 'undefined' && gameLocations?.length > 0 && 
+            typeof enterpriseCacheManager !== 'undefined' && enterpriseCacheManager?.cacheLocationData) {
+            gameLocations.forEach(location => {
+                try {
+                    enterpriseCacheManager.cacheLocationData(location, position);
+                } catch (e) {
+                    console.warn("Location caching failed:", e);
+                }
+            });
+        }
+    } catch (error) {
+        console.warn("Cache manager error:", error);
     }
 }
 
 function initializeLocationTracking(position, motionProfile) {
-    currentPosition = { ...position };
-    userMarker.setLatLng([position.lat, position.lng]);
-    
-    if (enhancedKalmanFilter?.reset) {
-        enhancedKalmanFilter.reset(position);
+    try {
+        currentPosition = { ...position };
+        lastPosition = { ...position }; // Legacy compatibility
+        userMarker.setLatLng([position.lat, position.lng]);
+        
+        if (typeof enhancedKalmanFilter !== 'undefined' && enhancedKalmanFilter?.reset) {
+            enhancedKalmanFilter.reset(position);
+        }
+        
+        lastTrackingUpdate = position.timestamp;
+        lastUpdateTime = position.timestamp; // Legacy compatibility
+        anchorStartTime = position.timestamp;
+        stationaryStartTime = position.timestamp; // Legacy compatibility
+        motionBuffer = [position];
+        positionBuffer = [position]; // Legacy compatibility
+        
+        const optimalZoom = (typeof calculateIntelligentZoom !== 'undefined' && calculateIntelligentZoom?.(position.velocity, Infinity)) || map.getZoom();
+        map.setView([position.lat, position.lng], optimalZoom, { animate: false });
+        
+        lastViewportCenter = position.timestamp;
+        lastCenterTime = position.timestamp; // Legacy compatibility
+        
+        if (typeof updateDistanceBox !== 'undefined') updateDistanceBox();
+        if (typeof updateAccuracyIndicator !== 'undefined') updateAccuracyIndicator(position.precision);
+    } catch (error) {
+        console.error('Initialization error:', error);
     }
-    
-    lastTrackingUpdate = position.timestamp;
-    anchorStartTime = position.timestamp;
-    motionBuffer = [position];
-    
-    const optimalZoom = calculateIntelligentZoom?.(position.velocity, Infinity) || map.getZoom();
-    map.setView([position.lat, position.lng], optimalZoom, { animate: false });
-    
-    lastViewportCenter = position.timestamp;
-    
-    updateDistanceBox?.();
-    updateAccuracyIndicator?.(position.precision);
 }
 
 function configureAdaptiveFiltering(position, motionProfile) {
-    if (!enhancedKalmanFilter) return;
-    
-    const velocityFactor = Math.min(1, Math.max(0.1, position.velocity / 20));
-    const baseProcessNoise = CONFIG?.BASE_PROCESS_NOISE || 0.01;
-    
-    switch (motionProfile.trackingPrecision) {
-        case 'aggressive':
-            enhancedKalmanFilter.q = baseProcessNoise * velocityFactor * 1.4;
-            enhancedKalmanFilter.r = position.precision / (250 * (1 + velocityFactor * 2));
-            break;
-        case 'high':
-            enhancedKalmanFilter.q = baseProcessNoise * velocityFactor * 1.1;
-            enhancedKalmanFilter.r = position.precision / (200 * (1 + velocityFactor * 1.5));
-            break;
-        case 'balanced':
-            enhancedKalmanFilter.q = baseProcessNoise * velocityFactor * 0.9;
-            enhancedKalmanFilter.r = position.precision / (150 * (1 + velocityFactor));
-            break;
-        case 'smooth':
-            enhancedKalmanFilter.q = baseProcessNoise * velocityFactor * 0.7;
-            enhancedKalmanFilter.r = position.precision / (120 * (1 + velocityFactor * 0.8));
-            break;
-        case 'gentle':
-            enhancedKalmanFilter.q = baseProcessNoise * velocityFactor * 0.5;
-            enhancedKalmanFilter.r = position.precision / (100 * (1 + velocityFactor * 0.6));
-            break;
-        case 'ultra_smooth':
-            enhancedKalmanFilter.q = baseProcessNoise * velocityFactor * 0.3;
-            enhancedKalmanFilter.r = position.precision / (80 * (1 + velocityFactor * 0.4));
-            break;
+    try {
+        if (typeof enhancedKalmanFilter === 'undefined' || !enhancedKalmanFilter) return;
+        
+        const velocityFactor = Math.min(1, Math.max(0.1, position.velocity / 20));
+        const baseProcessNoise = (typeof CONFIG !== 'undefined' && CONFIG?.BASE_PROCESS_NOISE) || 0.01;
+        
+        switch (motionProfile.trackingPrecision) {
+            case 'aggressive':
+                enhancedKalmanFilter.q = baseProcessNoise * velocityFactor * 1.4;
+                enhancedKalmanFilter.r = position.precision / (250 * (1 + velocityFactor * 2));
+                break;
+            case 'high':
+                enhancedKalmanFilter.q = baseProcessNoise * velocityFactor * 1.1;
+                enhancedKalmanFilter.r = position.precision / (200 * (1 + velocityFactor * 1.5));
+                break;
+            case 'balanced':
+                enhancedKalmanFilter.q = baseProcessNoise * velocityFactor * 0.9;
+                enhancedKalmanFilter.r = position.precision / (150 * (1 + velocityFactor));
+                break;
+            case 'smooth':
+                enhancedKalmanFilter.q = baseProcessNoise * velocityFactor * 0.7;
+                enhancedKalmanFilter.r = position.precision / (120 * (1 + velocityFactor * 0.8));
+                break;
+            case 'gentle':
+                enhancedKalmanFilter.q = baseProcessNoise * velocityFactor * 0.5;
+                enhancedKalmanFilter.r = position.precision / (100 * (1 + velocityFactor * 0.6));
+                break;
+            case 'ultra_smooth':
+                enhancedKalmanFilter.q = baseProcessNoise * velocityFactor * 0.3;
+                enhancedKalmanFilter.r = position.precision / (80 * (1 + velocityFactor * 0.4));
+                break;
+        }
+    } catch (error) {
+        console.warn('Kalman filter configuration error:', error);
     }
 }
 
 function executePositionJumpProtocol(position, motionProfile, timestamp) {
-    trajectoryVector = null;
-    movementConsistency = 0;
-    anchoredState = false;
-    anchorStartTime = null;
-    
-    if (anchorValidationTimeout) {
-        clearTimeout(anchorValidationTimeout);
-        anchorValidationTimeout = null;
-    }
-    
-    const jumpPosition = { ...position };
-    userMarker.setLatLng([jumpPosition.lat, jumpPosition.lng]);
-    
-    if (enhancedKalmanFilter?.reset) {
-        enhancedKalmanFilter.reset(jumpPosition);
-    }
-    
-    currentPosition = jumpPosition;
-    motionBuffer = [jumpPosition];
-    
-    const optimalZoom = calculateIntelligentZoom?.(position.velocity, Infinity) || map.getZoom();
-    map.setView([jumpPosition.lat, jumpPosition.lng], optimalZoom, { animate: false });
-    
-    lastTrackingUpdate = timestamp;
-    lastViewportCenter = timestamp;
-    
-    if (isSignificantMovement?.(jumpPosition)) {
-        resetInactivityTimer?.(false);
-    }
-    
-    updateDistanceBox?.();
-}
-
-function processAnchoringLogic(position, displacement, forceUpdate, timestamp, motionProfile) {
-    const microDisplacement = (CONFIG?.MICRO_MOVEMENT_THRESHOLD || 4) * 0.7;
-    
-    if (displacement < microDisplacement && !forceUpdate && position.velocity < 0.3) {
-        if (!anchoredState) {
-            anchorStartTime = anchorStartTime || timestamp;
-            const anchorThreshold = (CONFIG?.STATIONARY_TIME_THRESHOLD || 3000) * 0.9;
-            
-            if (timestamp - anchorStartTime >= anchorThreshold) {
-                anchoredState = true;
-                
-                if (enhancedKalmanFilter) {
-                    enhancedKalmanFilter.r = Math.min(position.precision, currentPosition.precision) / 500;
-                    enhancedKalmanFilter.q = (CONFIG?.BASE_PROCESS_NOISE || 0.01) * 0.001;
-                    
-                    const anchoredPosition = enhancedKalmanFilter.update({
-                        ...position,
-                        precision: Math.min(currentPosition.precision, position.precision),
-                        velocity: 0
-                    });
-                    
-                    initiateIconGlide(anchoredPosition.lat, anchoredPosition.lng, motionProfile);
-                    currentPosition = { ...anchoredPosition };
-                    motionBuffer = [anchoredPosition];
-                }
-                
-                updateDistanceBox?.();
-                return true;
-            }
-        } else {
-            if (position.precision < currentPosition.precision * 0.85) {
-                if (enhancedKalmanFilter) {
-                    enhancedKalmanFilter.r = position.precision / 800;
-                    enhancedKalmanFilter.q = (CONFIG?.BASE_PROCESS_NOISE || 0.01) * 0.0005;
-                    
-                    const refinedPosition = enhancedKalmanFilter.update({
-                        ...position,
-                        velocity: 0
-                    });
-                    
-                    const refinedDisplacement = calculateHaversineDistance(currentPosition, refinedPosition);
-                    if (refinedDisplacement < microDisplacement / 5) {
-                        initiateIconGlide(refinedPosition.lat, refinedPosition.lng, motionProfile);
-                        currentPosition = { ...refinedPosition };
-                        updateDistanceBox?.();
-                    }
-                }
-            }
-            return true;
-        }
-    } else {
+    try {
+        trajectoryVector = null;
+        movementConsistency = 0;
         anchoredState = false;
         anchorStartTime = null;
+        
+        // Legacy compatibility
+        movementDirection = null;
+        consistentMovementCount = 0;
+        isStationary = false;
+        stationaryStartTime = null;
+        
         if (anchorValidationTimeout) {
             clearTimeout(anchorValidationTimeout);
             anchorValidationTimeout = null;
         }
+        
+        if (stationaryCheckTimeout) {
+            clearTimeout(stationaryCheckTimeout);
+            stationaryCheckTimeout = null;
+        }
+        
+        const jumpPosition = { ...position };
+        userMarker.setLatLng([jumpPosition.lat, jumpPosition.lng]);
+        
+        if (typeof enhancedKalmanFilter !== 'undefined' && enhancedKalmanFilter?.reset) {
+            enhancedKalmanFilter.reset(jumpPosition);
+        }
+        
+        currentPosition = jumpPosition;
+        lastPosition = jumpPosition; // Legacy compatibility
+        motionBuffer = [jumpPosition];
+        positionBuffer = [jumpPosition]; // Legacy compatibility
+        
+        const optimalZoom = (typeof calculateIntelligentZoom !== 'undefined' && calculateIntelligentZoom?.(position.velocity, Infinity)) || map.getZoom();
+        map.setView([jumpPosition.lat, jumpPosition.lng], optimalZoom, { animate: false });
+        
+        lastTrackingUpdate = timestamp;
+        lastUpdateTime = timestamp; // Legacy compatibility
+        lastViewportCenter = timestamp;
+        lastCenterTime = timestamp; // Legacy compatibility
+        
+        if (typeof isSignificantMovement !== 'undefined' && isSignificantMovement?.(jumpPosition)) {
+            if (typeof resetInactivityTimer !== 'undefined') resetInactivityTimer?.(false);
+        }
+        
+        if (typeof updateDistanceBox !== 'undefined') updateDistanceBox();
+    } catch (error) {
+        console.error('Position jump protocol error:', error);
     }
-    
-    return false;
+}
+
+function processAnchoringLogic(position, displacement, forceUpdate, timestamp, motionProfile) {
+    try {
+        const microDisplacement = ((typeof CONFIG !== 'undefined' && CONFIG?.MICRO_MOVEMENT_THRESHOLD) || 4) * 0.7;
+        
+        if (displacement < microDisplacement && !forceUpdate && position.velocity < 0.3) {
+            if (!anchoredState) {
+                anchorStartTime = anchorStartTime || timestamp;
+                const anchorThreshold = ((typeof CONFIG !== 'undefined' && CONFIG?.STATIONARY_TIME_THRESHOLD) || 3000) * 0.9;
+                
+                if (timestamp - anchorStartTime >= anchorThreshold) {
+                    anchoredState = true;
+                    isStationary = true; // Legacy compatibility
+                    
+                    if (typeof enhancedKalmanFilter !== 'undefined' && enhancedKalmanFilter) {
+                        enhancedKalmanFilter.r = Math.min(position.precision, currentPosition.precision) / 500;
+                        enhancedKalmanFilter.q = ((typeof CONFIG !== 'undefined' && CONFIG?.BASE_PROCESS_NOISE) || 0.01) * 0.001;
+                        
+                        const anchoredPosition = enhancedKalmanFilter.update({
+                            ...position,
+                            precision: Math.min(currentPosition.precision, position.precision),
+                            velocity: 0
+                        });
+                        
+                        initiateIconGlide(anchoredPosition.lat, anchoredPosition.lng, motionProfile);
+                        currentPosition = { ...anchoredPosition };
+                        lastPosition = { ...anchoredPosition }; // Legacy compatibility
+                        motionBuffer = [anchoredPosition];
+                        positionBuffer = [anchoredPosition]; // Legacy compatibility
+                    }
+                    
+                    if (typeof updateDistanceBox !== 'undefined') updateDistanceBox();
+                    return true;
+                }
+            } else {
+                if (position.precision < currentPosition.precision * 0.85) {
+                    if (typeof enhancedKalmanFilter !== 'undefined' && enhancedKalmanFilter) {
+                        enhancedKalmanFilter.r = position.precision / 800;
+                        enhancedKalmanFilter.q = ((typeof CONFIG !== 'undefined' && CONFIG?.BASE_PROCESS_NOISE) || 0.01) * 0.0005;
+                        
+                        const refinedPosition = enhancedKalmanFilter.update({
+                            ...position,
+                            velocity: 0
+                        });
+                        
+                        const refinedDisplacement = calculateHaversineDistance(currentPosition, refinedPosition);
+                        if (refinedDisplacement < microDisplacement / 5) {
+                            initiateIconGlide(refinedPosition.lat, refinedPosition.lng, motionProfile);
+                            currentPosition = { ...refinedPosition };
+                            lastPosition = { ...refinedPosition }; // Legacy compatibility
+                            if (typeof updateDistanceBox !== 'undefined') updateDistanceBox();
+                        }
+                    }
+                }
+                return true;
+            }
+        } else {
+            anchoredState = false;
+            anchorStartTime = null;
+            isStationary = false; // Legacy compatibility
+            stationaryStartTime = null; // Legacy compatibility
+            
+            if (anchorValidationTimeout) {
+                clearTimeout(anchorValidationTimeout);
+                anchorValidationTimeout = null;
+            }
+            
+            if (stationaryCheckTimeout) {
+                clearTimeout(stationaryCheckTimeout);
+                stationaryCheckTimeout = null;
+            }
+        }
+        
+        return false;
+    } catch (error) {
+        console.error('Anchoring logic error:', error);
+        return false;
+    }
 }
 
 function validatePositionQuality(position, displacement, deltaTime, forceUpdate) {
-    if (forceUpdate) return true;
-    
-    const maxPrecisionThreshold = position.velocity > 20 ? 200 : 120;
-    const minDisplacementThreshold = position.velocity > 20 ? 0.8 : 1.5;
-    const maxVelocityThreshold = (CONFIG?.MAX_SPEED || 100) * (position.velocity > 30 ? 3 : 2.2);
-    
-    if (position.precision > maxPrecisionThreshold) return false;
-    if (displacement < minDisplacementThreshold) return false;
-    if (deltaTime > 0 && displacement / deltaTime > maxVelocityThreshold) return false;
-    
-    return true;
+    try {
+        if (forceUpdate) return true;
+        
+        const maxPrecisionThreshold = position.velocity > 20 ? 200 : 120;
+        const minDisplacementThreshold = position.velocity > 20 ? 0.8 : 1.5;
+        const maxVelocityThreshold = ((typeof CONFIG !== 'undefined' && CONFIG?.MAX_SPEED) || 100) * (position.velocity > 30 ? 3 : 2.2);
+        
+        if (position.precision > maxPrecisionThreshold) return false;
+        if (displacement < minDisplacementThreshold) return false;
+        if (deltaTime > 0 && displacement / deltaTime > maxVelocityThreshold) return false;
+        
+        return true;
+    } catch (error) {
+        console.warn('Position quality validation error:', error);
+        return true; // Fail open
+    }
 }
 
 function executePositionRefinement(position, deltaTime, motionProfile) {
-    const filteredPosition = enhancedKalmanFilter?.update ? 
-        enhancedKalmanFilter.update(position) : { ...position };
+    try {
+        const filteredPosition = (typeof enhancedKalmanFilter !== 'undefined' && enhancedKalmanFilter?.update) ? 
+            enhancedKalmanFilter.update(position) : { ...position };
 
-    updatePositionBuffer?.(filteredPosition);
-    
-    const refinedPosition = calculateFinalPosition?.() || filteredPosition;
-    
-    const predictedPosition = calculateEnhancedVelocityFilter?.(
-        refinedPosition, currentPosition, deltaTime, position.velocity
-    ) || refinedPosition;
+        if (typeof updatePositionBuffer !== 'undefined') updatePositionBuffer?.(filteredPosition);
+        
+        const refinedPosition = (typeof calculateFinalPosition !== 'undefined' && calculateFinalPosition?.()) || filteredPosition;
+        
+        const predictedPosition = (typeof calculateEnhancedVelocityFilter !== 'undefined' && calculateEnhancedVelocityFilter?.(
+            refinedPosition, currentPosition, deltaTime, position.velocity
+        )) || refinedPosition;
 
-    let responsiveness = motionProfile.responsiveness;
-    
-    if (position.precision > 60 && position.velocity < 4) {
-        responsiveness *= 0.5;
-    } else if (position.precision < 8 && position.velocity > 12) {
-        responsiveness *= 1.3;
+        let responsiveness = motionProfile.responsiveness;
+        
+        if (position.precision > 60 && position.velocity < 4) {
+            responsiveness *= 0.5;
+        } else if (position.precision < 8 && position.velocity > 12) {
+            responsiveness *= 1.3;
+        }
+        
+        if (anchoredState) {
+            responsiveness = 0.03;
+        }
+        
+        responsiveness = Math.max(0.03, Math.min(0.98, responsiveness));
+        
+        return {
+            lat: currentPosition.lat * (1 - responsiveness) + predictedPosition.lat * responsiveness,
+            lng: currentPosition.lng * (1 - responsiveness) + predictedPosition.lng * responsiveness,
+            precision: predictedPosition.precision,
+            bearing: predictedPosition.bearing,
+            timestamp: position.timestamp,
+            velocity: predictedPosition.velocity
+        };
+    } catch (error) {
+        console.error('Position refinement error:', error);
+        return { ...position };
     }
-    
-    if (anchoredState) {
-        responsiveness = 0.03;
-    }
-    
-    responsiveness = Math.max(0.03, Math.min(0.98, responsiveness));
-    
-    return {
-        lat: currentPosition.lat * (1 - responsiveness) + predictedPosition.lat * responsiveness,
-        lng: currentPosition.lng * (1 - responsiveness) + predictedPosition.lng * responsiveness,
-        precision: predictedPosition.precision,
-        bearing: predictedPosition.bearing,
-        timestamp: position.timestamp,
-        velocity: predictedPosition.velocity
-    };
 }
 
 function scheduleIntelligentViewportUpdate(position, motionProfile, timestamp) {
-    if (!ThrottleManager.shouldExecute('viewport', motionProfile.throttleMs * 2)) {
-        return;
+    try {
+        if (!ThrottleManager.shouldExecute('viewport', motionProfile.throttleMs * 2)) {
+            return;
+        }
+        
+        AnimationController.requestFrame('viewport', (ts) => {
+            executeIntelligentViewport(position, motionProfile, timestamp);
+        }, motionProfile.maxFPS / 2);
+    } catch (error) {
+        console.warn('Viewport update scheduling error:', error);
     }
-    
-    AnimationController.requestFrame('viewport', () => {
-        executeIntelligentViewport(position, motionProfile, timestamp);
-    }, motionProfile.maxFPS / 2);
 }
 
 function executeIntelligentViewport(position, motionProfile, timestamp) {
-    if (!followUser || isMapInteracting) return;
-    
-    const mapDimensions = map.getSize();
-    const boundaryThreshold = motionProfile.viewBoundary;
-    const boundaryMargin = boundaryThreshold * Math.min(mapDimensions.x, mapDimensions.y);
-    
-    const iconScreenPos = map.latLngToContainerPoint([position.lat, position.lng]);
-    const screenCenter = { x: mapDimensions.x / 2, y: mapDimensions.y / 2 };
-    
-    const centerDistance = Math.sqrt(
-        Math.pow(iconScreenPos.x - screenCenter.x, 2) + 
-        Math.pow(iconScreenPos.y - screenCenter.y, 2)
-    );
-    
-    const requiresCentering = centerDistance > boundaryMargin ||
-        iconScreenPos.x < boundaryMargin || iconScreenPos.x > mapDimensions.x - boundaryMargin ||
-        iconScreenPos.y < boundaryMargin || iconScreenPos.y > mapDimensions.y - boundaryMargin;
-    
-    const centeringInterval = motionProfile.updateCycle * 1.8;
-    const timeSinceLastCenter = timestamp - lastViewportCenter;
-    
-    const shouldExecuteCenter = requiresCentering || 
-        (timeSinceLastCenter > centeringInterval && shouldCenterBasedOnTrajectory(position, motionProfile));
-    
-    if (shouldExecuteCenter) {
-        const optimalCenter = calculateTrajectoryCenter(position, motionProfile);
-        const panDuration = activePanTime / 1000;
+    try {
+        if (typeof followUser === 'undefined' || !followUser || 
+            typeof isMapInteracting !== 'undefined' && isMapInteracting) return;
         
-        map.panTo(optimalCenter, {
-            animate: true,
-            duration: panDuration,
-            easeLinearity: position.velocity > 20 ? 0.6 : 0.35
-        });
+        const mapDimensions = map.getSize();
+        const boundaryThreshold = motionProfile.viewBoundary;
+        const boundaryMargin = boundaryThreshold * Math.min(mapDimensions.x, mapDimensions.y);
         
-        lastViewportCenter = timestamp;
+        const iconScreenPos = map.latLngToContainerPoint([position.lat, position.lng]);
+        const screenCenter = { x: mapDimensions.x / 2, y: mapDimensions.y / 2 };
+        
+        const centerDistance = Math.sqrt(
+            Math.pow(iconScreenPos.x - screenCenter.x, 2) + 
+            Math.pow(iconScreenPos.y - screenCenter.y, 2)
+        );
+        
+        const requiresCentering = centerDistance > boundaryMargin ||
+            iconScreenPos.x < boundaryMargin || iconScreenPos.x > mapDimensions.x - boundaryMargin ||
+            iconScreenPos.y < boundaryMargin || iconScreenPos.y > mapDimensions.y - boundaryMargin;
+        
+        const centeringInterval = motionProfile.updateCycle * 1.8;
+        const timeSinceLastCenter = timestamp - lastViewportCenter;
+        
+        const shouldExecuteCenter = requiresCentering || 
+            (timeSinceLastCenter > centeringInterval && shouldCenterBasedOnTrajectory(position, motionProfile));
+        
+        if (shouldExecuteCenter) {
+            const optimalCenter = calculateTrajectoryCenter(position, motionProfile);
+            const panDuration = activePanTime / 1000;
+            
+            map.panTo(optimalCenter, {
+                animate: true,
+                duration: panDuration,
+                easeLinearity: position.velocity > 20 ? 0.6 : 0.35
+            });
+            
+            lastViewportCenter = timestamp;
+            lastCenterTime = timestamp; // Legacy compatibility
+        }
+    } catch (error) {
+        console.error('Viewport execution error:', error);
     }
 }
 
 function shouldCenterBasedOnTrajectory(position, motionProfile) {
-    trackTrajectoryVector(position);
-    
-    const requiredConsistency = position.velocity > 20 ? 2 : 
-                               position.velocity > 8 ? 3 : 4;
-    
-    return movementConsistency >= requiredConsistency && position.velocity > 0.3;
+    try {
+        trackTrajectoryVector(position);
+        
+        const requiredConsistency = position.velocity > 20 ? 2 : 
+                                   position.velocity > 8 ? 3 : 4;
+        
+        return movementConsistency >= requiredConsistency && position.velocity > 0.3;
+    } catch (error) {
+        console.warn('Trajectory centering check error:', error);
+        return false;
+    }
 }
 
 function calculateTrajectoryCenter(position, motionProfile) {
-    if (position.velocity < 0.3 || !trajectoryVector) {
+    try {
+        if (position.velocity < 0.3 || !trajectoryVector) {
+            return [position.lat, position.lng];
+        }
+        
+        const predictionDistance = motionProfile.motionPrediction * 3;
+        const travelDistance = position.velocity * predictionDistance;
+        
+        const latOffset = (travelDistance * Math.sin(trajectoryVector)) / 111000;
+        const lngOffset = (travelDistance * Math.cos(trajectoryVector)) / 
+                         (111000 * Math.cos(position.lat * Math.PI / 180));
+        
+        const centeringOffset = motionProfile.centeringForce * 0.35;
+        
+        const resultLat = position.lat + latOffset * centeringOffset;
+        const resultLng = position.lng + lngOffset * centeringOffset;
+        
+        return [
+            isFinite(resultLat) ? resultLat : position.lat,
+            isFinite(resultLng) ? resultLng : position.lng
+        ];
+    } catch (error) {
+        console.warn('Trajectory center calculation error:', error);
         return [position.lat, position.lng];
     }
-    
-    const predictionDistance = motionProfile.motionPrediction * 3;
-    const travelDistance = position.velocity * predictionDistance;
-    
-    const latOffset = (travelDistance * Math.sin(trajectoryVector)) / 111000;
-    const lngOffset = (travelDistance * Math.cos(trajectoryVector)) / 
-                     (111000 * Math.cos(position.lat * Math.PI / 180));
-    
-    const centeringOffset = motionProfile.centeringForce * 0.35;
-    
-    return [
-        position.lat + latOffset * centeringOffset,
-        position.lng + lngOffset * centeringOffset
-    ];
 }
 
 function trackTrajectoryVector(position) {
-    if (!currentPosition) return;
-    
-    const latDelta = position.lat - currentPosition.lat;
-    const lngDelta = position.lng - currentPosition.lng;
-    const currentVector = Math.atan2(latDelta, lngDelta);
-    const currentVelocity = position.velocity;
-    
-    if (trajectoryVector === null) {
-        trajectoryVector = currentVector;
-        movementConsistency = 1;
-        return;
-    }
-    
-    const vectorDifference = Math.abs(currentVector - trajectoryVector);
-    const normalizedDifference = Math.min(vectorDifference, 2 * Math.PI - vectorDifference);
-    
-    const isDramaticTurn = normalizedDifference > Math.PI * 0.8;
-    if (isDramaticTurn && currentVelocity > 12) {
-        trajectoryVector = currentVector;
-        movementConsistency = 1;
-        return;
-    }
-    
-    const toleranceAngle = currentVelocity > 20 ? Math.PI / 2.2 : Math.PI / 2.8;
-    
-    if (normalizedDifference < toleranceAngle) {
-        movementConsistency++;
-    } else {
-        trajectoryVector = currentVector;
-        movementConsistency = 1;
-    }
+    try {
+        if (!currentPosition) return;
+        
+        const latDelta = position.lat - currentPosition.lat;
+        const lngDelta = position.lng - currentPosition.lng;
+        const currentVector = Math.atan2(latDelta, lngDelta);
+        const currentVelocity = position.velocity;
+        
+        if (trajectoryVector === null) {
+            trajectoryVector = currentVector;
+            movementConsistency = 1;
+            movementDirection = currentVector; // Legacy compatibility
+            consistentMovementCount = 1; // Legacy compatibility
+            return;
+        }
+        
+        const vectorDifference = Math.abs(currentVector - trajectoryVector);
+        const normalizedDifference = Math.min(vectorDifference, 2 * Math.PI - vectorDifference);
+        
+        const isDramaticTurn = normalizedDifference > Math.PI * 0.8;
+        if (isDramaticTurn && currentVelocity > 12) {
+            trajectoryVector = currentVector;
+            movementConsistency = 1;
+            movementDirection = currentVector; // Legacy compatibility
+            consistentMovementCount = 1; // Legacy compatibility
+            return;
+        }
+        
+        const toleranceAngle = currentVelocity > 20 ? Math.PI /const toleranceAngle = currentVelocity > 20 ? Math.PI / 2.2 : Math.PI / 2.8;
+       
+       if (normalizedDifference < toleranceAngle) {
+           movementConsistency++;
+           consistentMovementCount++; // Legacy compatibility
+       } else {
+           trajectoryVector = currentVector;
+           movementConsistency = 1;
+           movementDirection = currentVector; // Legacy compatibility
+           consistentMovementCount = 1; // Legacy compatibility
+       }
+   } catch (error) {
+       console.warn('Trajectory vector tracking error:', error);
+   }
 }
 
 function orchestrateAdaptiveZoom(position, displacement, timestamp, motionProfile) {
-    const zoomInterval = motionProfile.updateCycle * 2.5;
-    const shouldAdjustZoom = !lastZoomAdjustment || 
-        timestamp - lastZoomAdjustment > zoomInterval || 
-        displacement > (position.velocity > 20 ? 35 : 25);
-        
-    if (!shouldAdjustZoom || !ThrottleManager.shouldExecute('zoom', zoomInterval)) return;
-    
-    checkProximityForZoom?.();
-    
-    if (findClosestLocationDistance && calculateIntelligentZoom) {
-        const nearestDistance = findClosestLocationDistance(position);
-        const optimalZoom = calculateIntelligentZoom(position.velocity, nearestDistance);
-        
-        if (optimalZoom && map.getZoom && map.setZoom) {
-            const currentZoom = map.getZoom();
-            const zoomDelta = Math.abs(currentZoom - optimalZoom);
-            const minZoomThreshold = position.velocity > 25 ? 0.25 : 0.6;
-            
-            if (zoomDelta >= minZoomThreshold) {
-                const zoomTransitionTime = position.velocity > 25 ? 0.5 : 0.9;
-                map.setZoom(optimalZoom, { 
-                    animate: true, 
-                    duration: zoomTransitionTime 
-                });
-            }
-        }
-    }
-    
-    lastZoomAdjustment = timestamp;
+   try {
+       const zoomInterval = motionProfile.updateCycle * 2.5;
+       const shouldAdjustZoom = !lastZoomAdjustment || 
+           timestamp - lastZoomAdjustment > zoomInterval || 
+           displacement > (position.velocity > 20 ? 35 : 25);
+           
+       if (!shouldAdjustZoom || !ThrottleManager.shouldExecute('zoom', zoomInterval)) return;
+       
+       if (typeof checkProximityForZoom !== 'undefined') checkProximityForZoom?.();
+       
+       if (typeof findClosestLocationDistance !== 'undefined' && typeof calculateIntelligentZoom !== 'undefined' &&
+           findClosestLocationDistance && calculateIntelligentZoom) {
+           const nearestDistance = findClosestLocationDistance(position);
+           const optimalZoom = calculateIntelligentZoom(position.velocity, nearestDistance);
+           
+           if (optimalZoom && map.getZoom && map.setZoom) {
+               const currentZoom = map.getZoom();
+               const zoomDelta = Math.abs(currentZoom - optimalZoom);
+               const minZoomThreshold = position.velocity > 25 ? 0.25 : 0.6;
+               
+               if (zoomDelta >= minZoomThreshold) {
+                   const zoomTransitionTime = position.velocity > 25 ? 0.5 : 0.9;
+                   map.setZoom(optimalZoom, { 
+                       animate: true, 
+                       duration: zoomTransitionTime 
+                   });
+               }
+           }
+       }
+       
+       lastZoomAdjustment = timestamp;
+       lastMapUpdateTime = timestamp; // Legacy compatibility
+   } catch (error) {
+       console.warn('Adaptive zoom error:', error);
+   }
 }
 
 function commitTrackingState(processedPosition, timestamp) {
-    previousPosition = currentPosition;
-    currentPosition = { ...processedPosition };
-    lastTrackingUpdate = timestamp;
-    updateDistanceBox?.();
+   try {
+       previousPosition = currentPosition;
+       currentPosition = { ...processedPosition };
+       lastPosition = { ...processedPosition }; // Legacy compatibility
+       lastTrackingUpdate = timestamp;
+       lastUpdateTime = timestamp; // Legacy compatibility
+       
+       if (typeof updateDistanceBox !== 'undefined') updateDistanceBox();
+   } catch (error) {
+       console.error('State commit error:', error);
+   }
 }
 
 // ====================================================================
@@ -5324,38 +5520,387 @@ function commitTrackingState(processedPosition, timestamp) {
 // ====================================================================
 
 function initiateIconGlide(lat, lng, motionProfile) {
-    const glideOrigin = userMarker.getLatLng();
-    const glideDestination = L.latLng(lat, lng);
-    const glideInitTime = performance.now();
-    
-    function executeIconGlideStep(timestamp) {
-        const elapsedTime = timestamp - glideInitTime;
-        const progress = Math.min(elapsedTime / activeGlideTime, 1);
-        
-        const currentVelocity = currentPosition?.velocity || 0;
-        let easedProgress;
-        
-        if (currentVelocity > 25) {
-            easedProgress = easeOutQuadratic(progress);
-        } else if (currentVelocity > 10) {
-            easedProgress = easeOutCubic(progress);
-        } else if (currentVelocity > 3) {
-            easedProgress = easeOutQuartic(progress);
-        } else {
-            easedProgress = easeOutQuintic(progress);
-        }
-        
-        const interpolatedLat = glideOrigin.lat + (glideDestination.lat - glideOrigin.lat) * easedProgress;
-        const interpolatedLng = glideOrigin.lng + (glideDestination.lng - glideOrigin.lng) * easedProgress;
-        
-        userMarker.setLatLng([interpolatedLat, interpolatedLng]);
-        
-        if (progress < 1) {
-            AnimationController.requestFrame('iconGlide', executeIconGlideStep, motionProfile.maxFPS);
-        }
-    }
-    
-    AnimationController.requestFrame('iconGlide', executeIconGlideStep, motionProfile.maxFPS);
+   try {
+       if (!isFinite(lat) || !isFinite(lng)) {
+           console.warn('Invalid coordinates for icon glide:', lat, lng);
+           return;
+       }
+       
+       const glideOrigin = userMarker.getLatLng();
+       const glideDestination = L.latLng(lat, lng);
+       const glideInitTime = performance.now();
+       
+       function executeIconGlideStep(timestamp) {
+           try {
+               const elapsedTime = timestamp - glideInitTime;
+               const progress = Math.min(elapsedTime / activeGlideTime, 1);
+               
+               const currentVelocity = currentPosition?.velocity || 0;
+               let easedProgress;
+               
+               if (currentVelocity > 25) {
+                   easedProgress = easeOutQuadratic(progress);
+               } else if (currentVelocity > 10) {
+                   easedProgress = easeOutCubic(progress);
+               } else if (currentVelocity > 3) {
+                   easedProgress = easeOutQuartic(progress);
+               } else {
+                   easedProgress = easeOutQuintic(progress);
+               }
+               
+               const interpolatedLat = glideOrigin.lat + (glideDestination.lat - glideOrigin.lat) * easedProgress;
+               const interpolatedLng = glideOrigin.lng + (glideDestination.lng - glideOrigin.lng) * easedProgress;
+               
+               if (isFinite(interpolatedLat) && isFinite(interpolatedLng)) {
+                   userMarker.setLatLng([interpolatedLat, interpolatedLng]);
+               }
+               
+               if (progress < 1) {
+                   AnimationController.requestFrame('iconGlide', executeIconGlideStep, motionProfile.maxFPS);
+               }
+           } catch (error) {
+               console.error('Icon glide step error:', error);
+           }
+       }
+       
+       AnimationController.requestFrame('iconGlide', executeIconGlideStep, motionProfile.maxFPS);
+       
+       // Legacy compatibility
+       smoothGlideUserIconTo(lat, lng);
+       
+   } catch (error) {
+       console.error('Icon glide initiation error:', error);
+   }
+}
+
+// ====================================================================
+//  LEGACY COMPATIBILITY FUNCTIONS
+// ====================================================================
+
+function calculateDistance(pos1, pos2) {
+   return calculateHaversineDistance(pos1, pos2);
+}
+
+function initializeFirstPosition(newPosition, speedConfig) {
+   try {
+       const motionProfile = determineMotionProfile(newPosition.speedMPS || 0);
+       const position = {
+           lat: newPosition.lat,
+           lng: newPosition.lng,
+           precision: newPosition.accuracy,
+           bearing: newPosition.heading,
+           timestamp: newPosition.timestamp,
+           velocity: newPosition.speedMPS || 0
+       };
+       
+       initializeLocationTracking(position, motionProfile);
+   } catch (error) {
+       console.error('Legacy initialization error:', error);
+   }
+}
+
+function configureKalmanFilter(newPosition, speedConfig) {
+   try {
+       const motionProfile = determineMotionProfile(newPosition.speedMPS || 0);
+       const position = {
+           lat: newPosition.lat,
+           lng: newPosition.lng,
+           precision: newPosition.accuracy,
+           bearing: newPosition.heading,
+           timestamp: newPosition.timestamp,
+           velocity: newPosition.speedMPS || 0
+       };
+       
+       configureAdaptiveFiltering(position, motionProfile);
+   } catch (error) {
+       console.error('Legacy Kalman filter configuration error:', error);
+   }
+}
+
+function handleMajorLocationJump(newPosition, speedConfig, currentTime) {
+   try {
+       const motionProfile = determineMotionProfile(newPosition.speedMPS || 0);
+       const position = {
+           lat: newPosition.lat,
+           lng: newPosition.lng,
+           precision: newPosition.accuracy,
+           bearing: newPosition.heading,
+           timestamp: currentTime,
+           velocity: newPosition.speedMPS || 0
+       };
+       
+       executePositionJumpProtocol(position, motionProfile, currentTime);
+   } catch (error) {
+       console.error('Legacy location jump error:', error);
+   }
+}
+
+function handleStationaryDetection(newPosition, distance, forceUpdate, currentTime, speedConfig) {
+   try {
+       const motionProfile = determineMotionProfile(newPosition.speedMPS || 0);
+       const position = {
+           lat: newPosition.lat,
+           lng: newPosition.lng,
+           precision: newPosition.accuracy,
+           bearing: newPosition.heading,
+           timestamp: currentTime,
+           velocity: newPosition.speedMPS || 0
+       };
+       
+       return processAnchoringLogic(position, distance, forceUpdate, currentTime, motionProfile);
+   } catch (error) {
+       console.error('Legacy stationary detection error:', error);
+       return false;
+   }
+}
+
+function validatePositionData(newPosition, distance, timeDelta, forceUpdate) {
+   try {
+       const position = {
+           lat: newPosition.lat,
+           lng: newPosition.lng,
+           precision: newPosition.accuracy,
+           bearing: newPosition.heading,
+           timestamp: newPosition.timestamp,
+           velocity: newPosition.speedMPS || 0
+       };
+       
+       return validatePositionQuality(position, distance, timeDelta, forceUpdate);
+   } catch (error) {
+       console.error('Legacy position validation error:', error);
+       return true;
+   }
+}
+
+function processPosition(newPosition, timeDelta, speedConfig) {
+   try {
+       const motionProfile = determineMotionProfile(newPosition.speedMPS || 0);
+       const position = {
+           lat: newPosition.lat,
+           lng: newPosition.lng,
+           precision: newPosition.accuracy,
+           bearing: newPosition.heading,
+           timestamp: newPosition.timestamp,
+           velocity: newPosition.speedMPS || 0
+       };
+       
+       return executePositionRefinement(position, timeDelta, motionProfile);
+   } catch (error) {
+       console.error('Legacy position processing error:', error);
+       return { ...newPosition };
+   }
+}
+
+function scheduleSmartViewportUpdate(position, speedConfig, currentTime) {
+   try {
+       const motionProfile = determineMotionProfile(position.speedMPS || 0);
+       const positionObj = {
+           lat: position.lat,
+           lng: position.lng,
+           precision: position.accuracy,
+           bearing: position.heading,
+           timestamp: currentTime,
+           velocity: position.speedMPS || 0
+       };
+       
+       scheduleIntelligentViewportUpdate(positionObj, motionProfile, currentTime);
+   } catch (error) {
+       console.error('Legacy viewport scheduling error:', error);
+   }
+}
+
+function updateSmartViewport(position, speedConfig, currentTime) {
+   try {
+       const motionProfile = determineMotionProfile(position.speedMPS || 0);
+       const positionObj = {
+           lat: position.lat,
+           lng: position.lng,
+           precision: position.accuracy,
+           bearing: position.heading,
+           timestamp: currentTime,
+           velocity: position.speedMPS || 0
+       };
+       
+       executeIntelligentViewport(positionObj, motionProfile, currentTime);
+   } catch (error) {
+       console.error('Legacy viewport update error:', error);
+   }
+}
+
+function shouldCenterBasedOnMovement(position, speedConfig) {
+   try {
+       const motionProfile = determineMotionProfile(position.speedMPS || 0);
+       const positionObj = {
+           lat: position.lat,
+           lng: position.lng,
+           precision: position.accuracy,
+           bearing: position.heading,
+           timestamp: position.timestamp,
+           velocity: position.speedMPS || 0
+       };
+       
+       return shouldCenterBasedOnTrajectory(positionObj, motionProfile);
+   } catch (error) {
+       console.error('Legacy movement centering error:', error);
+       return false;
+   }
+}
+
+function calculateOptimalCenter(position, speedConfig) {
+   try {
+       const motionProfile = determineMotionProfile(position.speedMPS || 0);
+       const positionObj = {
+           lat: position.lat,
+           lng: position.lng,
+           precision: position.accuracy,
+           bearing: position.heading,
+           timestamp: position.timestamp,
+           velocity: position.speedMPS || 0
+       };
+       
+       return calculateTrajectoryCenter(positionObj, motionProfile);
+   } catch (error) {
+       console.error('Legacy optimal center calculation error:', error);
+       return [position.lat, position.lng];
+   }
+}
+
+function trackMovementDirection(position) {
+   try {
+       const positionObj = {
+           lat: position.lat,
+           lng: position.lng,
+           precision: position.accuracy,
+           bearing: position.heading,
+           timestamp: position.timestamp,
+           velocity: position.speedMPS || 0
+       };
+       
+       trackTrajectoryVector(positionObj);
+   } catch (error) {
+       console.error('Legacy movement direction tracking error:', error);
+   }
+}
+
+function handleIntelligentZoom(position, distance, currentTime, speedConfig) {
+   try {
+       const motionProfile = determineMotionProfile(position.speedMPS || 0);
+       const positionObj = {
+           lat: position.lat,
+           lng: position.lng,
+           precision: position.accuracy,
+           bearing: position.heading,
+           timestamp: currentTime,
+           velocity: position.speedMPS || 0
+       };
+       
+       orchestrateAdaptiveZoom(positionObj, distance, currentTime, motionProfile);
+   } catch (error) {
+       console.error('Legacy intelligent zoom error:', error);
+   }
+}
+
+function updateGlobalState(processedPosition, currentTime) {
+   try {
+       commitTrackingState(processedPosition, currentTime);
+   } catch (error) {
+       console.error('Legacy global state update error:', error);
+   }
+}
+
+function smoothGlideUserIconTo(lat, lng) {
+   try {
+       if (!isFinite(lat) || !isFinite(lng)) {
+           console.warn('Invalid coordinates for smooth glide:', lat, lng);
+           return;
+       }
+       
+       if (userIconAnimationId) {
+           cancelAnimationFrame(userIconAnimationId);
+           activeLocationAnimations.delete(userIconAnimationId);
+       }
+       
+       iconStartPos = userMarker.getLatLng();
+       iconTargetPos = L.latLng(lat, lng);
+       iconStartTime = performance.now();
+       
+       userIconAnimationId = requestAnimationFrame(userIconGlideStep);
+       activeLocationAnimations.add(userIconAnimationId);
+   } catch (error) {
+       console.error('Smooth glide error:', error);
+   }
+}
+
+function userIconGlideStep(timestamp) {
+   try {
+       const elapsed = timestamp - iconStartTime;
+       const progress = Math.min(elapsed / currentIconDuration, 1);
+       
+       const currentSpeed = lastPosition?.speedMPS || currentPosition?.velocity || 0;
+       let eased;
+       
+       if (currentSpeed > 20) {
+           eased = easeOutQuadratic(progress);
+       } else if (currentSpeed > 8) {
+           eased = easeOutCubic(progress);
+       } else {
+           eased = easeOutQuartic(progress);
+       }
+       
+       const currentLat = iconStartPos.lat + (iconTargetPos.lat - iconStartPos.lat) * eased;
+       const currentLng = iconStartPos.lng + (iconTargetPos.lng - iconStartPos.lng) * eased;
+       
+       if (isFinite(currentLat) && isFinite(currentLng)) {
+           userMarker.setLatLng([currentLat, currentLng]);
+       }
+       
+       if (progress < 1) {
+           userIconAnimationId = requestAnimationFrame(userIconGlideStep);
+       } else {
+           activeLocationAnimations.delete(userIconAnimationId);
+           userIconAnimationId = null;
+       }
+   } catch (error) {
+       console.error('User icon glide step error:', error);
+       activeLocationAnimations.delete(userIconAnimationId);
+       userIconAnimationId = null;
+   }
+}
+
+function cancelAllLocationAnimations() {
+   try {
+       if (animationLock) return;
+       animationLock = true;
+       
+       AnimationController.cancelAll();
+       
+       activeLocationAnimations.forEach(id => {
+           try {
+               cancelAnimationFrame(id);
+           } catch (error) {
+               console.warn('Error canceling animation:', error);
+           }
+       });
+       activeLocationAnimations.clear();
+       
+       [userIconAnimationId, userViewportAnimationId].forEach(id => {
+           if (id) {
+               try {
+                   cancelAnimationFrame(id);
+               } catch (error) {
+                   console.warn('Error canceling specific animation:', error);
+               }
+           }
+       });
+       
+       userIconAnimationId = null;
+       userViewportAnimationId = null;
+       
+       setTimeout(() => { animationLock = false; }, 30);
+   } catch (error) {
+       console.error('Cancel all animations error:', error);
+       animationLock = false;
+   }
 }
 
 // ====================================================================
@@ -5363,19 +5908,28 @@ function initiateIconGlide(lat, lng, motionProfile) {
 // ====================================================================
 
 function easeOutQuadratic(t) {
-    return 1 - (1 - t) * (1 - t);
+   return 1 - (1 - t) * (1 - t);
 }
 
 function easeOutCubic(t) {
-    return 1 - Math.pow(1 - t, 3);
+   return 1 - Math.pow(1 - t, 3);
 }
 
 function easeOutQuartic(t) {
-    return 1 - Math.pow(1 - t, 4);
+   return 1 - Math.pow(1 - t, 4);
 }
 
 function easeOutQuintic(t) {
-    return 1 - Math.pow(1 - t, 5);
+   return 1 - Math.pow(1 - t, 5);
+}
+
+// Legacy compatibility
+function easeOutQuad(t) {
+   return easeOutQuadratic(t);
+}
+
+function easeOutQuart(t) {
+   return easeOutQuartic(t);
 }
 
 // ====================================================================
@@ -5383,525 +5937,95 @@ function easeOutQuintic(t) {
 // ====================================================================
 
 function executeErrorRecoveryProtocol(position, motionProfile) {
-    console.warn("Executing motion tracking error recovery");
-    
-    AnimationController.cancelAll();
-    
-    if (anchorValidationTimeout) {
-        clearTimeout(anchorValidationTimeout);
-        anchorValidationTimeout = null;
-    }
-    
-    if (enhancedKalmanFilter && position) {
-        enhancedKalmanFilter.r = position.precision / 40;
-        const recoveryPosition = enhancedKalmanFilter.update ? 
-            enhancedKalmanFilter.update(position) : position;
-        
-        activeGlideTime = motionProfile.glideTime;
-        initiateIconGlide(recoveryPosition.lat, recoveryPosition.lng, motionProfile);
-        currentPosition = { ...recoveryPosition };
-        motionBuffer = [recoveryPosition];
-    }
-    
-    updateDistanceBox?.();
+   try {
+       console.warn("Executing motion tracking error recovery");
+       
+       AnimationController.cancelAll();
+       cancelAllLocationAnimations();
+       
+       if (anchorValidationTimeout) {
+           clearTimeout(anchorValidationTimeout);
+           anchorValidationTimeout = null;
+       }
+       
+       if (stationaryCheckTimeout) {
+           clearTimeout(stationaryCheckTimeout);
+           stationaryCheckTimeout = null;
+       }
+       
+       if (typeof enhancedKalmanFilter !== 'undefined' && enhancedKalmanFilter && position) {
+           enhancedKalmanFilter.r = position.precision / 40;
+           const recoveryPosition = enhancedKalmanFilter.update ? 
+               enhancedKalmanFilter.update(position) : position;
+           
+           activeGlideTime = motionProfile.glideTime;
+           currentIconDuration = motionProfile.glideTime; // Legacy compatibility
+           initiateIconGlide(recoveryPosition.lat, recoveryPosition.lng, motionProfile);
+           currentPosition = { ...recoveryPosition };
+           lastPosition = { ...recoveryPosition }; // Legacy compatibility
+           motionBuffer = [recoveryPosition];
+           positionBuffer = [recoveryPosition]; // Legacy compatibility
+       }
+       
+       if (typeof updateDistanceBox !== 'undefined') updateDistanceBox();
+   } catch (error) {
+       console.error('Error recovery protocol failed:', error);
+   }
 }
-        
-function calculateDistance(pos1, pos2) {
-    if (!pos1 || !pos2 || 
-        typeof pos1.lat !== 'number' || typeof pos1.lng !== 'number' || 
-        typeof pos2.lat !== 'number' || typeof pos2.lng !== 'number') {
-        return Infinity;
-    }
-    
-    const R = 6371000; // Earth's radius in meters
-    const lat1 = pos1.lat * Math.PI / 180;
-    const lat2 = pos2.lat * Math.PI / 180;
-    const deltaLat = (pos2.lat - pos1.lat) * Math.PI / 180;
-    const deltaLng = (pos2.lng - pos1.lng) * Math.PI / 180;
-    
-    const a = Math.sin(deltaLat/2) * Math.sin(deltaLat/2) +
-              Math.cos(lat1) * Math.cos(lat2) *
-              Math.sin(deltaLng/2) * Math.sin(deltaLng/2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-    
-    return R * c;
-}
-
-function initializeFirstPosition(newPosition, speedConfig) {
-    lastPosition = { ...newPosition };
-    userMarker.setLatLng([newPosition.lat, newPosition.lng]);
-    
-    if (enhancedKalmanFilter?.reset) {
-        enhancedKalmanFilter.reset(newPosition);
-    }
-    
-    lastUpdateTime = newPosition.timestamp;
-    stationaryStartTime = newPosition.timestamp;
-    positionBuffer = [newPosition];
-    
-    // Center immediately on first position
-    const zoom = calculateIntelligentZoom?.(newPosition.speedMPS, Infinity) || map.getZoom();
-    map.setView([newPosition.lat, newPosition.lng], zoom, { animate: false });
-    
-    lastCenterTime = newPosition.timestamp;
-    
-    updateDistanceBox?.();
-    updateAccuracyIndicator?.(newPosition.accuracy);
-}
-
-function configureKalmanFilter(newPosition, speedConfig) {
-    if (!enhancedKalmanFilter) return;
-    
-    const speedFactor = Math.min(1, Math.max(0.1, newPosition.speedMPS / 15));
-    const baseNoise = CONFIG?.BASE_PROCESS_NOISE || 0.01;
-    
-    if (newPosition.speedMPS > 15) {
-        enhancedKalmanFilter.q = baseNoise * speedFactor * 1.3;
-        enhancedKalmanFilter.r = newPosition.accuracy / (200 * (1 + speedFactor * 1.5));
-    } else if (newPosition.speedMPS > 5) {
-        enhancedKalmanFilter.q = baseNoise * speedFactor * 1.0;
-        enhancedKalmanFilter.r = newPosition.accuracy / (150 * (1 + speedFactor));
-    } else {
-        enhancedKalmanFilter.q = baseNoise * speedFactor * 0.6;
-        enhancedKalmanFilter.r = newPosition.accuracy / (100 * (1 + speedFactor * 0.5));
-    }
-}
-
-function handleMajorLocationJump(newPosition, speedConfig, currentTime) {
-    // Reset all tracking state
-    movementDirection = null;
-    consistentMovementCount = 0;
-    isStationary = false;
-    stationaryStartTime = null;
-    
-    if (stationaryCheckTimeout) {
-        clearTimeout(stationaryCheckTimeout);
-        stationaryCheckTimeout = null;
-    }
-    
-    // Immediate position update
-    const jumpPosition = { ...newPosition };
-    userMarker.setLatLng([jumpPosition.lat, jumpPosition.lng]);
-    
-    // Reset filters and buffers
-    if (enhancedKalmanFilter?.reset) {
-        enhancedKalmanFilter.reset(jumpPosition);
-    }
-    
-    lastPosition = jumpPosition;
-    positionBuffer = [jumpPosition];
-    
-    // Immediate center and zoom
-    const zoom = calculateIntelligentZoom?.(newPosition.speedMPS, Infinity) || map.getZoom();
-    map.setView([jumpPosition.lat, jumpPosition.lng], zoom, { animate: false });
-    
-    lastUpdateTime = currentTime;
-    lastCenterTime = currentTime;
-    
-    if (isSignificantMovement?.(jumpPosition)) {
-        resetInactivityTimer?.(false);
-    }
-    
-    updateDistanceBox?.();
-}
-
-function handleStationaryDetection(newPosition, distance, forceUpdate, currentTime, speedConfig) {
-    const microThreshold = (CONFIG?.MICRO_MOVEMENT_THRESHOLD || 4) * 0.6;
-    
-    if (distance < microThreshold && !forceUpdate && newPosition.speedMPS < 0.5) {
-        if (!isStationary) {
-            stationaryStartTime = stationaryStartTime || currentTime;
-            const stationaryTime = (CONFIG?.STATIONARY_TIME_THRESHOLD || 3000) * 0.8;
-            
-            if (currentTime - stationaryStartTime >= stationaryTime) {
-                isStationary = true;
-                
-                if (enhancedKalmanFilter) {
-                    // Ultra-precise stationary filtering
-                    enhancedKalmanFilter.r = Math.min(newPosition.accuracy, lastPosition.accuracy) / 400;
-                    enhancedKalmanFilter.q = (CONFIG?.BASE_PROCESS_NOISE || 0.01) * 0.003;
-                    
-                    const stationaryPosition = enhancedKalmanFilter.update({
-                        ...newPosition,
-                        accuracy: Math.min(lastPosition.accuracy, newPosition.accuracy),
-                        speedMPS: 0
-                    });
-                    
-                    smoothGlideUserIconTo(stationaryPosition.lat, stationaryPosition.lng);
-                    lastPosition = { ...stationaryPosition };
-                    positionBuffer = [stationaryPosition];
-                }
-                
-                updateDistanceBox?.();
-                return true;
-            }
-        } else {
-            // Refine stationary position if accuracy improves
-            if (newPosition.accuracy < lastPosition.accuracy * 0.9) {
-                if (enhancedKalmanFilter) {
-                    enhancedKalmanFilter.r = newPosition.accuracy / 600;
-                    enhancedKalmanFilter.q = (CONFIG?.BASE_PROCESS_NOISE || 0.01) * 0.002;
-                    
-                    const refinedPosition = enhancedKalmanFilter.update({
-                        ...newPosition,
-                        speedMPS: 0
-                    });
-                    
-                    const refinedDistance = calculateDistance(lastPosition, refinedPosition);
-                    if (refinedDistance < microThreshold / 4) {
-                        smoothGlideUserIconTo(refinedPosition.lat, refinedPosition.lng);
-                        lastPosition = { ...refinedPosition };
-                        updateDistanceBox?.();
-                    }
-                }
-            }
-            return true;
-        }
-    } else {
-        // Clear stationary state
-        isStationary = false;
-        stationaryStartTime = null;
-        if (stationaryCheckTimeout) {
-            clearTimeout(stationaryCheckTimeout);
-            stationaryCheckTimeout = null;
-        }
-    }
-    
-    return false;
-}
-
-function validatePositionData(newPosition, distance, timeDelta, forceUpdate) {
-    if (forceUpdate) return true;
-    
-    const maxAccuracy = newPosition.speedMPS > 15 ? 150 : 100;
-    const minDistance = newPosition.speedMPS > 15 ? 1 : 2;
-    const maxSpeed = (CONFIG?.MAX_SPEED || 100) * (newPosition.speedMPS > 25 ? 2.5 : 2);
-    
-    if (newPosition.accuracy > maxAccuracy) return false;
-    if (distance < minDistance) return false;
-    if (timeDelta > 0 && distance / timeDelta > maxSpeed) return false;
-    
-    return true;
-}
-
-function processPosition(newPosition, timeDelta, speedConfig) {
-    // Apply Kalman filter
-    const filteredPosition = enhancedKalmanFilter?.update ? 
-        enhancedKalmanFilter.update(newPosition) : { ...newPosition };
-
-    // Update position buffer
-    updatePositionBuffer?.(filteredPosition);
-    
-    // Calculate final position
-    const finalPosition = calculateFinalPosition?.() || filteredPosition;
-    
-    // Enhanced velocity prediction
-    const predictedPosition = calculateEnhancedVelocityFilter?.(
-        finalPosition, lastPosition, timeDelta, newPosition.speedMPS
-    ) || finalPosition;
-
-    // Dynamic smoothing
-    let smoothingFactor = speedConfig.smoothing;
-    
-    // Adjust for accuracy and speed
-    if (newPosition.accuracy > 50 && newPosition.speedMPS < 5) {
-        smoothingFactor *= 0.6;
-    } else if (newPosition.accuracy < 10 && newPosition.speedMPS > 10) {
-        smoothingFactor *= 1.2;
-    }
-    
-    if (isStationary) {
-        smoothingFactor = 0.05;
-    }
-    
-    smoothingFactor = Math.max(0.05, Math.min(0.95, smoothingFactor));
-    
-    return {
-        lat: lastPosition.lat * (1 - smoothingFactor) + predictedPosition.lat * smoothingFactor,
-        lng: lastPosition.lng * (1 - smoothingFactor) + predictedPosition.lng * smoothingFactor,
-        accuracy: predictedPosition.accuracy,
-        heading: predictedPosition.heading,
-        timestamp: newPosition.timestamp,
-        speedMPS: predictedPosition.speedMPS
-    };
-}
-
-function scheduleSmartViewportUpdate(position, speedConfig, currentTime) {
-    if (userViewportAnimationId) {
-        cancelAnimationFrame(userViewportAnimationId);
-        activeLocationAnimations.delete(userViewportAnimationId);
-    }
-    
-    userViewportAnimationId = requestAnimationFrame(() => {
-        activeLocationAnimations.add(userViewportAnimationId);
-        updateSmartViewport(position, speedConfig, currentTime);
-    });
-}
-
-function updateSmartViewport(position, speedConfig, currentTime) {
-    if (!followUser || isMapInteracting) return;
-    
-    const mapSize = map.getSize();
-    const centerThreshold = speedConfig.centerThreshold;
-    const margin = centerThreshold * Math.min(mapSize.x, mapSize.y);
-    
-    // Get current icon position in screen coordinates
-    const iconPoint = map.latLngToContainerPoint([position.lat, position.lng]);
-    const centerPoint = { x: mapSize.x / 2, y: mapSize.y / 2 };
-    
-    // Calculate distance from center
-    const distanceFromCenter = Math.sqrt(
-        Math.pow(iconPoint.x - centerPoint.x, 2) + 
-        Math.pow(iconPoint.y - centerPoint.y, 2)
-    );
-    
-    // Check if icon is too far from center or approaching edges
-    const needsCentering = distanceFromCenter > margin ||
-        iconPoint.x < margin || iconPoint.x > mapSize.x - margin ||
-        iconPoint.y < margin || iconPoint.y > mapSize.y - margin;
-    
-    // Speed-aware centering intervals
-    const centerInterval = speedConfig.updateInterval * 1.5;
-    const timeSinceLastCenter = currentTime - lastCenterTime;
-    
-    const shouldCenter = needsCentering || 
-        (timeSinceLastCenter > centerInterval && shouldCenterBasedOnMovement(position, speedConfig));
-    
-    if (shouldCenter) {
-        const targetCenter = calculateOptimalCenter(position, speedConfig);
-        const panDuration = currentViewportDuration / 1000;
-        
-        map.panTo(targetCenter, {
-            animate: true,
-            duration: panDuration,
-            easeLinearity: position.speedMPS > 15 ? 0.5 : 0.3
-        });
-        
-        lastCenterTime = currentTime;
-    }
-    
-    activeLocationAnimations.delete(userViewportAnimationId);
-    userViewportAnimationId = null;
-}
-
-function shouldCenterBasedOnMovement(position, speedConfig) {
-    trackMovementDirection(position);
-    
-    const requiredConsistency = position.speedMPS > 15 ? 2 : 
-                               position.speedMPS > 5 ? 3 : 4;
-    
-    return consistentMovementCount >= requiredConsistency && position.speedMPS > 0.5;
-}
-
-function calculateOptimalCenter(position, speedConfig) {
-    if (position.speedMPS < 0.5 || !movementDirection) {
-        return [position.lat, position.lng];
-    }
-    
-    // Predict future position based on speed and movement
-    const predictionTime = speedConfig.predictionFactor * 2;
-    const distance = position.speedMPS * predictionTime;
-    
-    // Convert to lat/lng offset
-    const latOffset = (distance * Math.sin(movementDirection)) / 111000;
-    const lngOffset = (distance * Math.cos(movementDirection)) / 
-                     (111000 * Math.cos(position.lat * Math.PI / 180));
-    
-    // Offset from center to keep movement direction visible
-    const offsetFactor = 0.3;
-    
-    return [
-        position.lat + latOffset * offsetFactor,
-        position.lng + lngOffset * offsetFactor
-    ];
-}
-
-function trackMovementDirection(position) {
-    if (!lastPosition) return;
-    
-    const latDiff = position.lat - lastPosition.lat;
-    const lngDiff = position.lng - lastPosition.lng;
-    const currentDirection = Math.atan2(latDiff, lngDiff);
-    const currentSpeed = position.speedMPS;
-    
-    if (movementDirection === null) {
-        movementDirection = currentDirection;
-        consistentMovementCount = 1;
-        return;
-    }
-    
-    const angleDiff = Math.abs(currentDirection - movementDirection);
-    const normalizedDiff = Math.min(angleDiff, 2 * Math.PI - angleDiff);
-    
-    // Detect sharp turns at high speeds
-    const isSharpTurn = normalizedDiff > Math.PI * 0.75;
-    if (isSharpTurn && currentSpeed > 10) {
-        movementDirection = currentDirection;
-        consistentMovementCount = 1;
-        return;
-    }
-    
-    const toleranceAngle = currentSpeed > 15 ? Math.PI / 2.5 : Math.PI / 3;
-    
-    if (normalizedDiff < toleranceAngle) {
-        consistentMovementCount++;
-    } else {
-        movementDirection = currentDirection;
-        consistentMovementCount = 1;
-    }
-}
-
-function handleIntelligentZoom(position, distance, currentTime, speedConfig) {
-    const zoomInterval = speedConfig.updateInterval * 2;
-    const shouldUpdateZoom = !lastMapUpdateTime || 
-        currentTime - lastMapUpdateTime > zoomInterval || 
-        distance > (position.speedMPS > 15 ? 30 : 20);
-        
-    if (!shouldUpdateZoom) return;
-    
-    checkProximityForZoom?.();
-    
-    if (findClosestLocationDistance && calculateIntelligentZoom) {
-        const closestDistance = findClosestLocationDistance(position);
-        const targetZoom = calculateIntelligentZoom(position.speedMPS, closestDistance);
-        
-        if (targetZoom && map.getZoom && map.setZoom) {
-            const currentZoom = map.getZoom();
-            const zoomDiff = Math.abs(currentZoom - targetZoom);
-            const minZoomChange = position.speedMPS > 20 ? 0.3 : 0.7;
-            
-            if (zoomDiff >= minZoomChange) {
-                const zoomDuration = position.speedMPS > 20 ? 0.6 : 1.0;
-                map.setZoom(targetZoom, { 
-                    animate: true, 
-                    duration: zoomDuration 
-                });
-            }
-        }
-    }
-    
-    lastMapUpdateTime = currentTime;
-}
-
-function updateGlobalState(processedPosition, currentTime) {
-    lastPosition = { ...processedPosition };
-    lastUpdateTime = currentTime;
-    updateDistanceBox?.();
-}
-
-// ====================================================================
-//  ANIMATION FUNCTIONS
-// ====================================================================
-
-function smoothGlideUserIconTo(lat, lng) {
-    if (userIconAnimationId) {
-        cancelAnimationFrame(userIconAnimationId);
-        activeLocationAnimations.delete(userIconAnimationId);
-    }
-    
-    iconStartPos = userMarker.getLatLng();
-    iconTargetPos = L.latLng(lat, lng);
-    iconStartTime = performance.now();
-    
-    userIconAnimationId = requestAnimationFrame(userIconGlideStep);
-    activeLocationAnimations.add(userIconAnimationId);
-}
-
-function userIconGlideStep(timestamp) {
-    const elapsed = timestamp - iconStartTime;
-    const progress = Math.min(elapsed / currentIconDuration, 1);
-    
-    // Speed-adaptive easing
-    const currentSpeed = lastPosition?.speedMPS || 0;
-    let eased;
-    
-    if (currentSpeed > 20) {
-        eased = easeOutQuad(progress);
-    } else if (currentSpeed > 8) {
-        eased = easeOutCubic(progress);
-    } else {
-        eased = easeOutQuart(progress);
-    }
-    
-    const currentLat = iconStartPos.lat + (iconTargetPos.lat - iconStartPos.lat) * eased;
-    const currentLng = iconStartPos.lng + (iconTargetPos.lng - iconStartPos.lng) * eased;
-    
-    userMarker.setLatLng([currentLat, currentLng]);
-    
-    if (progress < 1) {
-        userIconAnimationId = requestAnimationFrame(userIconGlideStep);
-    } else {
-        activeLocationAnimations.delete(userIconAnimationId);
-        userIconAnimationId = null;
-    }
-}
-
-function cancelAllLocationAnimations() {
-    if (animationLock) return;
-    animationLock = true;
-    
-    activeLocationAnimations.forEach(id => {
-        cancelAnimationFrame(id);
-    });
-    activeLocationAnimations.clear();
-    
-    [userIconAnimationId, userViewportAnimationId].forEach(id => {
-        if (id) {
-            cancelAnimationFrame(id);
-        }
-    });
-    
-    userIconAnimationId = null;
-    userViewportAnimationId = null;
-    
-    setTimeout(() => { animationLock = false; }, 30);
-}
-
-// ====================================================================
-//  EASING FUNCTIONS
-// ====================================================================
-
-function easeOutQuad(t) {
-    return 1 - (1 - t) * (1 - t);
-}
-
-function easeOutCubic(t) {
-    return 1 - Math.pow(1 - t, 3);
-}
-
-function easeOutQuart(t) {
-    return 1 - Math.pow(1 - t, 4);
-}
-
-// ====================================================================
-//  ERROR HANDLING
-// ====================================================================
 
 function handleLocationError(newPosition, speedConfig) {
-    console.warn("Handling location error, falling back to basic positioning");
-    
-    cancelAllLocationAnimations();
-    
-    if (stationaryCheckTimeout) {
-        clearTimeout(stationaryCheckTimeout);
-        stationaryCheckTimeout = null;
-    }
-    
-    // Fallback positioning
-    if (enhancedKalmanFilter && newPosition) {
-        enhancedKalmanFilter.r = newPosition.accuracy / 30;
-        const fallbackPosition = enhancedKalmanFilter.update ? 
-            enhancedKalmanFilter.update(newPosition) : newPosition;
-        
-        currentIconDuration = speedConfig.iconDuration;
-        smoothGlideUserIconTo(fallbackPosition.lat, fallbackPosition.lng);
-        lastPosition = { ...fallbackPosition };
-        positionBuffer = [fallbackPosition];
-    }
-    
-    updateDistanceBox?.();
+   try {
+       console.warn("Handling location error, falling back to basic positioning");
+       
+       const motionProfile = determineMotionProfile(newPosition?.speedMPS || 0);
+       const position = newPosition ? {
+           lat: newPosition.lat,
+           lng: newPosition.lng,
+           precision: newPosition.accuracy || 50,
+           bearing: newPosition.heading,
+           timestamp: newPosition.timestamp || Date.now(),
+           velocity: newPosition.speedMPS || 0
+       } : null;
+       
+       executeErrorRecoveryProtocol(position, motionProfile);
+   } catch (error) {
+       console.error('Location error handling failed:', error);
+   }
 }
-        
+
+// ====================================================================
+//  INITIALIZATION AND CLEANUP
+// ====================================================================
+
+// Initialize throttle manager cleanup
+if (typeof window !== 'undefined') {
+   // Clean up throttle manager every 5 minutes
+   setInterval(() => {
+       try {
+           const now = performance.now();
+           const cutoff = now - 300000; // 5 minutes
+           for (const [key, value] of ThrottleManager.lastCalls.entries()) {
+               if (value < cutoff) {
+                   ThrottleManager.lastCalls.delete(key);
+               }
+           }
+       } catch (error) {
+           console.warn('Throttle cleanup error:', error);
+       }
+   }, 300000);
+   
+   // Cleanup on page unload
+   window.addEventListener('beforeunload', () => {
+       try {
+           AnimationController.cancelAll();
+           cancelAllLocationAnimations();
+           ThrottleManager.lastCalls.clear();
+       } catch (error) {
+           console.warn('Cleanup error:', error);
+       }
+   });
+}
+/*        
 // Calculate distance between two points using Haversine formula
 function calculateDistance(pos1, pos2) {
     if (!pos1 || !pos2 || 
@@ -5924,7 +6048,7 @@ function calculateDistance(pos1, pos2) {
 
     return R * c;
 }
-
+*/
 function getGeolocationOptions(retryNumber) {
     return {
         enableHighAccuracy: retryNumber < 2,
