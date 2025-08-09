@@ -28,17 +28,17 @@ let lastCacheSizeUpdate = 0;
 // Track in-flight requests to avoid duplicates
 const inFlightRequests = new Map();
 
-// NEW: Position smoothing for reducing marker jumpiness
+// Position smoothing for reducing marker jumpiness
 const positionBuffer = [];
 const MAX_POSITION_BUFFER_SIZE = 5;
 const POSITION_SMOOTHING_FACTOR = 0.3; // Lower = more smoothing
 const MAX_POSITION_AGE = 10000; // 10 seconds
 
-// NEW: Geolocation response caching to reduce jitter
+// Geolocation response caching to reduce jitter
 const geolocationCache = new Map();
 const GEOLOCATION_CACHE_TTL = 5000; // 5 seconds
 
-// IMPROVED: More efficient cache quota enforcement
+// More efficient cache quota enforcement
 async function enforceCacheQuota(cacheName) {
   const limit = CACHE_LIMITS[cacheName];
   if (!limit) return;
@@ -113,7 +113,7 @@ async function enforceCacheQuota(cacheName) {
   }
 }
 
-// NEW: Position smoothing function
+// Position smoothing function
 function smoothPosition(newPosition) {
   const now = Date.now();
   
@@ -178,7 +178,7 @@ function smoothPosition(newPosition) {
   };
 }
 
-// NEW: Intercept and smooth geolocation requests
+// Intercept and smooth geolocation requests
 async function handleGeolocationRequest(request) {
   const url = new URL(request.url);
   const cacheKey = url.pathname + url.search;
@@ -233,7 +233,7 @@ async function handleGeolocationRequest(request) {
   }
 }
 
-// IMPROVED: Cache-first with request deduplication
+// Cache-first with request deduplication
 async function cacheFirst(req, cacheName) {
   const url = req.url;
   
@@ -242,7 +242,7 @@ async function cacheFirst(req, cacheName) {
     return inFlightRequests.get(url);
   }
   
-  // NEW: Intercept geolocation requests for smoothing
+  // Intercept geolocation requests for smoothing
   if (url.includes('geolocation') || url.includes('location')) {
     return handleGeolocationRequest(req);
   }
@@ -300,7 +300,7 @@ async function cacheFirst(req, cacheName) {
   }
 }
 
-// IMPROVED: Map tile caching with preloading
+// Map tile caching with preloading
 async function staleWhileRevalidate(req, cacheName) {
   const cache = await caches.open(cacheName);
   const cached = await cache.match(req);
@@ -329,7 +329,7 @@ async function staleWhileRevalidate(req, cacheName) {
               cacheSizes[cacheName] = (cacheSizes[cacheName] || 0) + size;
             }
             
-            // NEW: Preload adjacent tiles for smoother panning
+            // Preload adjacent tiles for smoother panning
             preloadAdjacentTiles(req.url, cacheName);
           } catch (e) {
             console.warn('Background tile update failed:', e);
@@ -369,7 +369,7 @@ async function staleWhileRevalidate(req, cacheName) {
   }
 }
 
-// NEW: Preload adjacent tiles for smoother map panning
+// Preload adjacent tiles for smoother map panning
 async function preloadAdjacentTiles(tileUrl, cacheName) {
   try {
     const url = new URL(tileUrl);
@@ -441,6 +441,26 @@ async function networkFirstForAudioRange(req) {
   }
 }
 
+// Intercept fetch requests to apply smoothing and preloading
+self.addEventListener('fetch', (event) => {
+  const url = event.request.url;
+  
+  // Handle geolocation requests for position smoothing
+  if (url.includes('geolocation') || url.includes('location')) {
+    event.respondWith(handleGeolocationRequest(event.request));
+    return;
+  }
+  
+  // Handle map tile requests for preloading
+  if (url.includes('/tiles/') || url.includes('.png') || url.includes('.jpg')) {
+    event.respondWith(staleWhileRevalidate(event.request, CACHE_VERSIONS.TILES));
+    return;
+  }
+  
+  // Let other requests pass through normally
+  event.respondWith(fetch(event.request));
+});
+
 // Enhanced performance monitoring
 self.addEventListener('message', (event) => {
   if (event.data && event.data.type === 'GET_CACHE_STATS') {
@@ -470,7 +490,7 @@ self.addEventListener('message', (event) => {
     event.ports[0].postMessage({ success: true });
   }
   
-  // NEW: Clear position buffer on request
+  // Clear position buffer on request
   if (event.data && event.data.type === 'CLEAR_POSITION_BUFFER') {
     positionBuffer.length = 0;
     geolocationCache.clear();
@@ -482,7 +502,7 @@ self.addEventListener('message', (event) => {
 self.addEventListener('error', (event) => {
   console.error('Service Worker Error:', event.error, {
     cacheHits: cacheHitCount,
-    cacheMisses: cacheMissCount,
+    cacheMisses: cacheMisses,
     activeBackgroundUpdates: activeBackgroundUpdates,
     positionBufferSize: positionBuffer.length
   });
@@ -491,7 +511,7 @@ self.addEventListener('error', (event) => {
 self.addEventListener('unhandledrejection', (event) => {
   console.error('Service Worker Unhandled Promise Rejection:', event.reason, {
     cacheHits: cacheHitCount,
-    cacheMisses: cacheMissCount,
+    cacheMisses: cacheMisses,
     activeBackgroundUpdates: activeBackgroundUpdates,
     positionBufferSize: positionBuffer.length
   });
