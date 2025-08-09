@@ -1,5 +1,5 @@
 // sw.js – Minnesota Then Service Worker 
-// Version: 3.3.0 (Optimized)
+// Version: 3.4.0 (With Position Smoothing)
 const CACHE_VERSIONS = {
   STATIC:  'mnthen-static-v5',
   IMAGES:  'mnthen-images-v5',
@@ -9,8 +9,8 @@ const CACHE_VERSIONS = {
 };
 const CACHE_LIMITS = {
   [CACHE_VERSIONS.IMAGES]:  100 * 1024 * 1024,
-  [CACHE_VERSIONS.AUDIO]:   200 * 1024 * 1024,  // Increased for better audio caching
-  [CACHE_VERSIONS.TILES]:   150 * 1024 * 1024,  // More tiles for smoother map experience
+  [CACHE_VERSIONS.AUDIO]:   200 * 1024 * 1024,
+  [CACHE_VERSIONS.TILES]:   150 * 1024 * 1024,
   [CACHE_VERSIONS.RUNTIME]:  50 * 1024 * 1024
 };
 
@@ -22,18 +22,27 @@ const MAX_CONCURRENT_BACKGROUND_UPDATES = 3;
 
 // Track cache sizes to avoid recalculating
 const cacheSizes = {};
-const CACHE_SIZE_UPDATE_INTERVAL = 60000; // Update cache sizes every minute
+const CACHE_SIZE_UPDATE_INTERVAL = 60000;
 let lastCacheSizeUpdate = 0;
 
 // Track in-flight requests to avoid duplicates
 const inFlightRequests = new Map();
+
+// NEW: Position smoothing for reducing marker jumpiness
+const positionBuffer = [];
+const MAX_POSITION_BUFFER_SIZE = 5;
+const POSITION_SMOOTHING_FACTOR = 0.3; // Lower = more smoothing
+const MAX_POSITION_AGE = 10000; // 10 seconds
+
+// NEW: Geolocation response caching to reduce jitter
+const geolocationCache = new Map();
+const GEOLOCATION_CACHE_TTL = 5000; // 5 seconds
 
 // IMPROVED: More efficient cache quota enforcement
 async function enforceCacheQuota(cacheName) {
   const limit = CACHE_LIMITS[cacheName];
   if (!limit) return;
   
-  // Skip if we recently updated cache sizes
   const now = Date.now();
   if (now - lastCacheSizeUpdate < CACHE_SIZE_UPDATE_INTERVAL) {
     return;
@@ -44,11 +53,9 @@ async function enforceCacheQuota(cacheName) {
     const keys = await cache.keys();
     let totalSize = cacheSizes[cacheName] || 0;
     
-    // If we don't have a cached size, calculate it
     if (totalSize === 0) {
       const items = [];
       
-      // Calculate sizes more efficiently with batching
       for (let i = 0; i < keys.length; i += 10) {
         const batch = keys.slice(i, i + 10);
         const batchPromises = batch.map(async (key) => {
@@ -60,7 +67,6 @@ async function enforceCacheQuota(cacheName) {
             }
             return null;
           } catch (e) {
-            // Remove corrupted entries
             await cache.delete(key);
             return null;
           }
@@ -75,10 +81,8 @@ async function enforceCacheQuota(cacheName) {
       lastCacheSizeUpdate = now;
     }
     
-    // Only enforce if we're over the limit
     if (totalSize <= limit) return;
     
-    // Sort by last accessed (if available) or by size
     const items = [];
     for (const key of keys) {
       try {
@@ -96,10 +100,8 @@ async function enforceCacheQuota(cacheName) {
       }
     }
     
-    // Sort by last accessed (oldest first) for better LRU
     items.sort((a, b) => a.lastAccessed - b.lastAccessed);
     
-    // Evict until under limit
     while (totalSize > limit && items.length > 0) {
       const item = items.shift();
       await cache.delete(item.key);
@@ -108,6 +110,126 @@ async function enforceCacheQuota(cacheName) {
     }
   } catch (error) {
     console.error('Cache quota enforcement failed:', error);
+  }
+}
+
+// NEW: Position smoothing function
+function smoothPosition(newPosition) {
+  const now = Date.now();
+  
+  // Add new position to buffer
+  positionBuffer.push({
+    ...newPosition,
+    timestamp: now
+  });
+  
+  // Remove old positions
+  while (positionBuffer.length > 0 && 
+         now - positionBuffer[0].timestamp > MAX_POSITION_AGE) {
+    positionBuffer.shift();
+  }
+  
+  // Remove excess positions if buffer is too large
+  while (positionBuffer.length > MAX_POSITION_BUFFER_SIZE) {
+    positionBuffer.shift();
+  }
+  
+  // If we don't have enough positions, return the new one
+  if (positionBuffer.length < 2) {
+    return newPosition;
+  }
+  
+  // Calculate weighted average for smoothing
+  let totalWeight = 0;
+  let smoothedLat = 0;
+  let smoothedLng = 0;
+  let smoothedAccuracy = 0;
+  
+  // More recent positions get higher weight
+  for (let i = 0; i < positionBuffer.length; i++) {
+    const position = positionBuffer[i];
+    const age = now - position.timestamp;
+    const weight = Math.exp(-age / 5000); // Decay over 5 seconds
+    
+    smoothedLat += position.lat * weight;
+    smoothedLng += position.lng * weight;
+    smoothedAccuracy += position.accuracy * weight;
+    totalWeight += weight;
+  }
+  
+  if (totalWeight > 0) {
+    smoothedLat /= totalWeight;
+    smoothedLng /= totalWeight;
+    smoothedAccuracy /= totalWeight;
+  }
+  
+  // Apply additional smoothing factor
+  const mostRecent = positionBuffer[positionBuffer.length - 1];
+  const finalLat = mostRecent.lat * (1 - POSITION_SMOOTHING_FACTOR) + smoothedLat * POSITION_SMOOTHING_FACTOR;
+  const finalLng = mostRecent.lng * (1 - POSITION_SMOOTHING_FACTOR) + smoothedLng * POSITION_SMOOTHING_FACTOR;
+  
+  return {
+    lat: finalLat,
+    lng: finalLng,
+    accuracy: Math.min(mostRecent.accuracy, smoothedAccuracy),
+    timestamp: now,
+    speed: mostRecent.speed,
+    heading: mostRecent.heading
+  };
+}
+
+// NEW: Intercept and smooth geolocation requests
+async function handleGeolocationRequest(request) {
+  const url = new URL(request.url);
+  const cacheKey = url.pathname + url.search;
+  
+  // Check if we have a recent cached response
+  const cached = geolocationCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < GEOLOCATION_CACHE_TTL) {
+    return new Response(JSON.stringify(cached.position), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+  
+  // Fetch fresh position
+  try {
+    const response = await fetch(request);
+    if (!response.ok) {
+      return response;
+    }
+    
+    const positionData = await response.json();
+    
+    // Smooth the position
+    const smoothedPosition = smoothPosition(positionData.coords || positionData);
+    
+    // Create smoothed response
+    const smoothedResponse = {
+      ...positionData,
+      coords: smoothedPosition
+    };
+    
+    // Cache the smoothed position
+    geolocationCache.set(cacheKey, {
+      position: smoothedResponse,
+      timestamp: Date.now()
+    });
+    
+    // Clean up old cache entries
+    if (geolocationCache.size > 20) {
+      const oldestKey = geolocationCache.keys().next().value;
+      geolocationCache.delete(oldestKey);
+    }
+    
+    return new Response(JSON.stringify(smoothedResponse), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    console.error('Geolocation request failed:', error);
+    return new Response('{"error": "Location unavailable"}', {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
   }
 }
 
@@ -120,6 +242,11 @@ async function cacheFirst(req, cacheName) {
     return inFlightRequests.get(url);
   }
   
+  // NEW: Intercept geolocation requests for smoothing
+  if (url.includes('geolocation') || url.includes('location')) {
+    return handleGeolocationRequest(req);
+  }
+  
   try {
     const cache = await caches.open(cacheName);
     const hit = await cache.match(req);
@@ -127,7 +254,6 @@ async function cacheFirst(req, cacheName) {
     if (hit) {
       cacheHitCount++;
       
-      // Update last accessed time
       const response = hit.clone();
       response.headers.set('sw-last-accessed', Date.now().toString());
       await cache.put(req, response);
@@ -137,24 +263,20 @@ async function cacheFirst(req, cacheName) {
     
     cacheMissCount++;
     
-    // Create in-flight promise
     const fetchPromise = fetch(req).then(async (resp) => {
       if (resp.ok && resp.status < 400) {
         try {
-          // Add last accessed header
           const responseClone = resp.clone();
           responseClone.headers.set('sw-last-accessed', Date.now().toString());
           
           await cache.put(req, responseClone);
           
-          // Update cache size estimate
           const contentLength = resp.headers.get('content-length');
           if (contentLength) {
             const size = parseInt(contentLength, 10);
             cacheSizes[cacheName] = (cacheSizes[cacheName] || 0) + size;
           }
           
-          // Only enforce quota periodically
           if (Date.now() - lastCacheSizeUpdate > CACHE_SIZE_UPDATE_INTERVAL) {
             enforceCacheQuota(cacheName);
           }
@@ -173,22 +295,19 @@ async function cacheFirst(req, cacheName) {
     console.error('Cache-first strategy failed:', error);
     inFlightRequests.delete(url);
     
-    // Try cache one more time as fallback
     const fallback = await caches.match(req);
     return fallback || new Response('Resource unavailable', { status: 503 });
   }
 }
 
-// IMPROVED: Map tile caching with throttled background updates
+// IMPROVED: Map tile caching with preloading
 async function staleWhileRevalidate(req, cacheName) {
   const cache = await caches.open(cacheName);
   const cached = await cache.match(req);
   
-  // Always return cached immediately if available
   if (cached) {
     cacheHitCount++;
     
-    // Update last accessed time
     const response = cached.clone();
     response.headers.set('sw-last-accessed', Date.now().toString());
     await cache.put(req, response);
@@ -197,7 +316,6 @@ async function staleWhileRevalidate(req, cacheName) {
     if (activeBackgroundUpdates < MAX_CONCURRENT_BACKGROUND_UPDATES) {
       activeBackgroundUpdates++;
       
-      // Don't await - run in background
       fetch(req).then(async (resp) => {
         if (resp.ok && resp.status < 400) {
           try {
@@ -205,12 +323,14 @@ async function staleWhileRevalidate(req, cacheName) {
             responseClone.headers.set('sw-last-accessed', Date.now().toString());
             await cache.put(req, responseClone);
             
-            // Update cache size estimate
             const contentLength = resp.headers.get('content-length');
             if (contentLength) {
               const size = parseInt(contentLength, 10);
               cacheSizes[cacheName] = (cacheSizes[cacheName] || 0) + size;
             }
+            
+            // NEW: Preload adjacent tiles for smoother panning
+            preloadAdjacentTiles(req.url, cacheName);
           } catch (e) {
             console.warn('Background tile update failed:', e);
           }
@@ -234,16 +354,61 @@ async function staleWhileRevalidate(req, cacheName) {
       responseClone.headers.set('sw-last-accessed', Date.now().toString());
       await cache.put(req, responseClone);
       
-      // Update cache size estimate
       const contentLength = resp.headers.get('content-length');
       if (contentLength) {
         const size = parseInt(contentLength, 10);
         cacheSizes[cacheName] = (cacheSizes[cacheName] || 0) + size;
       }
+      
+      // Preload adjacent tiles for new tiles too
+      preloadAdjacentTiles(req.url, cacheName);
     }
     return resp;
   } catch (error) {
     return new Response('Tile unavailable', { status: 503 });
+  }
+}
+
+// NEW: Preload adjacent tiles for smoother map panning
+async function preloadAdjacentTiles(tileUrl, cacheName) {
+  try {
+    const url = new URL(tileUrl);
+    const pathParts = url.pathname.split('/');
+    const z = parseInt(pathParts[pathParts.length - 3]);
+    const x = parseInt(pathParts[pathParts.length - 2]);
+    const y = parseInt(pathParts[pathParts.length - 1]);
+    
+    // Preload adjacent tiles (8 surrounding tiles)
+    const adjacentTiles = [
+      [z, x - 1, y - 1], [z, x, y - 1], [z, x + 1, y - 1],
+      [z, x - 1, y],                   [z, x + 1, y],
+      [z, x - 1, y + 1], [z, x, y + 1], [z, x + 1, y + 1]
+    ];
+    
+    // Only preload if we have capacity
+    if (activeBackgroundUpdates < MAX_CONCURRENT_BACKGROUND_UPDATES - 1) {
+      adjacentTiles.forEach(([z, x, y]) => {
+        const adjacentUrl = `${url.origin}/${z}/${x}/${y}.png`;
+        
+        // Check if already cached
+        caches.open(cacheName).then(cache => {
+          cache.match(adjacentUrl).then(cached => {
+            if (!cached) {
+              // Preload in background
+              fetch(adjacentUrl).then(resp => {
+                if (resp.ok) {
+                  cache.put(adjacentUrl, resp);
+                }
+              }).catch(() => {
+                // Silent fail
+              });
+            }
+          });
+        });
+      });
+    }
+  } catch (error) {
+    console.warn('Failed to preload adjacent tiles:', error);
   }
 }
 
@@ -252,13 +417,11 @@ async function networkFirstForAudioRange(req) {
   try {
     const resp = await fetch(req);
     if (resp.ok) {
-      // Only cache full file on first request, not every range request
       const cache = await caches.open(CACHE_VERSIONS.AUDIO);
       const fullReq = new Request(req.url, { method: 'GET' });
       const cached = await cache.match(fullReq);
       
       if (!cached) {
-        // Only fetch and cache full file if not already cached
         try {
           const fullResp = await fetch(fullReq);
           if (fullResp.ok) {
@@ -273,13 +436,12 @@ async function networkFirstForAudioRange(req) {
     return resp;
   } catch (error) {
     console.warn('Audio range request failed:', error);
-    // Better fallback - try to serve cached full file
     const cached = await caches.match(new Request(req.url));
     return cached || new Response('Audio unavailable', { status: 503 });
   }
 }
 
-// ADD: Enhanced performance monitoring
+// Enhanced performance monitoring
 self.addEventListener('message', (event) => {
   if (event.data && event.data.type === 'GET_CACHE_STATS') {
     event.ports[0].postMessage({
@@ -287,7 +449,8 @@ self.addEventListener('message', (event) => {
       cacheMisses: cacheMissCount,
       hitRate: cacheHitCount / (cacheHitCount + cacheMissCount) * 100,
       activeBackgroundUpdates: activeBackgroundUpdates,
-      cacheSizes: cacheSizes
+      cacheSizes: cacheSizes,
+      positionBufferSize: positionBuffer.length
     });
   }
   
@@ -300,21 +463,28 @@ self.addEventListener('message', (event) => {
   }
   
   if (event.data && event.data.type === 'RESET_CACHE_SIZES') {
-    // Reset cache size tracking
     for (const key in cacheSizes) {
       cacheSizes[key] = 0;
     }
     lastCacheSizeUpdate = 0;
     event.ports[0].postMessage({ success: true });
   }
+  
+  // NEW: Clear position buffer on request
+  if (event.data && event.data.type === 'CLEAR_POSITION_BUFFER') {
+    positionBuffer.length = 0;
+    geolocationCache.clear();
+    event.ports[0].postMessage({ success: true });
+  }
 });
 
-// ADD: Better error logging with performance metrics
+// Better error logging
 self.addEventListener('error', (event) => {
   console.error('Service Worker Error:', event.error, {
     cacheHits: cacheHitCount,
     cacheMisses: cacheMissCount,
-    activeBackgroundUpdates: activeBackgroundUpdates
+    activeBackgroundUpdates: activeBackgroundUpdates,
+    positionBufferSize: positionBuffer.length
   });
 });
 
@@ -322,25 +492,23 @@ self.addEventListener('unhandledrejection', (event) => {
   console.error('Service Worker Unhandled Promise Rejection:', event.reason, {
     cacheHits: cacheHitCount,
     cacheMisses: cacheMissCount,
-    activeBackgroundUpdates: activeBackgroundUpdates
+    activeBackgroundUpdates: activeBackgroundUpdates,
+    positionBufferSize: positionBuffer.length
   });
 });
 
-// ADD: Cache cleanup on activation
+// Cache cleanup on activation
 self.addEventListener('activate', (event) => {
   event.waitUntil(
     caches.keys().then(cacheNames => {
       return Promise.all(
         cacheNames.map(cacheName => {
-          // Delete old versions
           if (!Object.values(CACHE_VERSIONS).includes(cacheName)) {
             console.log('Deleting old cache:', cacheName);
             return caches.delete(cacheName);
           }
           
-          // Reset cache size tracking for current versions
           cacheSizes[cacheName] = 0;
-          
           return Promise.resolve();
         })
       );
@@ -348,4 +516,4 @@ self.addEventListener('activate', (event) => {
   );
 });
 
-console.log('Service Worker 3.3.0: Optimized for performance with CORS-compatible audio handling');
+console.log('Service Worker 3.4.0: With position smoothing and tile preloading');
