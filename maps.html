@@ -2818,7 +2818,11 @@ function calculatePredictedPosition(position, speedMPS, heading, timeDelta, lead
 
 let isUpdating = false;
 let transportationMode = 'stationary';
-let centeringTimeout = null;
+let animationFrame = null;
+let targetPosition = null;
+let positionBuffer = [];
+let velocityBuffer = [];
+let lastVelocity = { lat: 0, lng: 0 };
 
 function updateUserLocation(position, forceUpdate = false) {
     // Basic validation
@@ -2839,119 +2843,331 @@ function updateUserLocation(position, forceUpdate = false) {
         lng: position.coords.longitude,
         accuracy: position.coords.accuracy || 20,
         speed: position.coords.speed || 0,
+        heading: position.coords.heading || null,
         timestamp: currentTime
     };
     
     // First position - just set it
     if (!lastPosition) {
         setInitialPosition(newPosition);
+        lastPosition = newPosition;
+        positionBuffer = [newPosition];
+        velocityBuffer = [{ lat: 0, lng: 0 }];
         isUpdating = false;
         return;
     }
     
-    // Calculate distance moved
+    // Calculate distance moved and current velocity
     const distance = calculateDistance(lastPosition, newPosition);
-    const speedMPH = newPosition.speed * 2.23694;
+    const currentVelocity = timeDelta > 0 ? {
+        lat: (newPosition.lat - lastPosition.lat) / timeDelta,
+        lng: (newPosition.lng - lastPosition.lng) / timeDelta
+    } : { lat: 0, lng: 0 };
     
-    // Simple transportation mode detection
-    updateTransportationMode(speedMPH);
+    // Update transportation mode
+    const speedMPH = (newPosition.speed || 0) * 2.23694;
+    updateTransportationMode(speedMPH, distance, timeDelta);
     
-    // Skip micro-movements based on GPS accuracy
-    const movementThreshold = Math.max(3, newPosition.accuracy * 0.4);
+    // Dynamic movement threshold based on accuracy and transportation mode
+    const baseThreshold = Math.max(2, newPosition.accuracy * 0.3);
+    const modeMultiplier = getMovementThresholdMultiplier(transportationMode);
+    const movementThreshold = baseThreshold * modeMultiplier;
+    
+    // Skip micro-movements
     if (distance < movementThreshold && !forceUpdate) {
         isUpdating = false;
         return;
     }
     
-    // Skip obviously bad GPS readings
-    if (!isValidMovement(distance, timeDelta) && !forceUpdate) {
+    // Enhanced movement validation
+    if (!isValidMovement(distance, timeDelta, newPosition.speed, newPosition.accuracy) && !forceUpdate) {
         console.warn("Invalid movement detected, skipping");
         isUpdating = false;
         return;
     }
-
+    
     // Handle large distance jumps (teleportation/GPS jumps)
     if (distance > CONFIG.EXTENDED_DISTANCE_THRESHOLD || forceUpdate) {
-        if (stationaryCheckTimeout) {
-            clearTimeout(stationaryCheckTimeout);
-            stationaryCheckTimeout = null;
-        }
-        isStationary = false;
-        stationaryStartTime = null;
-        
-        const transitionPosition = {
-            lat: newPosition.lat,
-            lng: newPosition.lng,
-            accuracy: newPosition.accuracy,
-            heading: newPosition.heading,
-            timestamp: currentTime,
-            speedMPS: newPosition.speedMPS
-        };
-        
-        userMarker.setLatLng([transitionPosition.lat, transitionPosition.lng], { animate: false });
-        lastPosition = transitionPosition;
-        positionBuffer = [transitionPosition];
-        lastVelocity = { lat: 0, lng: 0 };
-        
-        const intelligentZoom = calculateIntelligentZoom(newPosition.speedMPS, Infinity);
-        if (intelligentZoom) {
-            map.setZoom(intelligentZoom, { animate: false });
-        }
-        
-        // FIXED: Simple immediate centering for large jumps
-        map.setView([transitionPosition.lat, transitionPosition.lng], map.getZoom(), { 
-            animate: false, 
-            duration: 0,
-            noMoveStart: true
-        });
-        
-        lastUpdateTime = currentTime;
-        lastUpdateTimestamp = currentTime;
-        if (isSignificantMovement(transitionPosition)) {
-            resetInactivityTimer(false);
-        }
-        
+        handleTeleportation(newPosition, currentTime);
         isUpdating = false;
         return;
     }
     
-    // Position smoothing
-    const smoothedPosition = applyExponentialSmoothing(newPosition, lastPosition);
+    // Update position buffer for smoothing
+    positionBuffer.push(newPosition);
+    velocityBuffer.push(currentVelocity);
     
-    // Update marker position with smoothed data
-    const speedMPS = smoothedPosition.speed || smoothedPosition.speedMPS || 0;
-    updateMarkerPosition(smoothedPosition, speedMPS);
-    
-    // FIXED: Simple direct centering when following user
-    if (followUser && !isMapInteracting) {
-        if (centeringTimeout) {
-            clearTimeout(centeringTimeout);
-        }
-        
-        centeringTimeout = setTimeout(() => {
-            const normalizedLng = normalizeLongitude(smoothedPosition.lng);
-            map.setView([smoothedPosition.lat, normalizedLng], map.getZoom(), {
-                animate: true,
-                duration: 0.3
-            });
-        }, 50);
+    // Keep buffer size manageable
+    const bufferSize = getOptimalBufferSize(transportationMode);
+    if (positionBuffer.length > bufferSize) {
+        positionBuffer = positionBuffer.slice(-bufferSize);
+        velocityBuffer = velocityBuffer.slice(-bufferSize);
     }
     
-    // Check proximity to marker location
+    // Apply advanced position smoothing
+    const smoothedPosition = applyAdvancedSmoothing(newPosition, lastPosition, lastVelocity, timeDelta);
+    
+    // Update velocity for next iteration
+    lastVelocity = {
+        lat: (smoothedPosition.lat - lastPosition.lat) / timeDelta,
+        lng: (smoothedPosition.lng - lastPosition.lng) / timeDelta
+    };
+    
+    // Update marker with smooth animation
+    updateMarkerPosition(smoothedPosition, smoothedPosition.speed || 0);
+    
+    // Smooth map centering when following user
+    if (followUser && !isMapInteracting) {
+        smoothCenterOnUser(smoothedPosition);
+    }
+    
+    // Intelligent zoom adjustment
+    adjustZoomBasedOnMovement(smoothedPosition, distance, timeDelta);
+    
+    // Check proximity to markers
     checkProximityForZoom();
     
-    // Update state with smoothed position
+    // Update state
     lastPosition = smoothedPosition;
     lastUpdateTime = currentTime;
     
-    // Update UI
+    // Update UI elements
     updateDistanceBox();
     updateAccuracyIndicator(newPosition.accuracy);
+    updateSpeedIndicator(speedMPH);
     
     // Cache position
     localStorage.setItem('lastPos', JSON.stringify(newPosition));
     
     isUpdating = false;
+}
+
+// Enhanced smoothing with Kalman-like filtering
+function applyAdvancedSmoothing(newPosition, lastPosition, velocity, timeDelta) {
+    if (!lastPosition || timeDelta <= 0) return newPosition;
+    
+    // Calculate prediction based on last velocity
+    const predicted = {
+        lat: lastPosition.lat + (velocity.lat * timeDelta),
+        lng: lastPosition.lng + (velocity.lng * timeDelta)
+    };
+    
+    // Dynamic smoothing factors
+    const accuracyFactor = Math.min(newPosition.accuracy / 15, 1);
+    const speedFactor = Math.min((newPosition.speed || 0) / 10, 1);
+    const confidenceFactor = 1 - accuracyFactor;
+    
+    // Base smoothing factor varies by transportation mode
+    let baseSmoothingFactor;
+    switch (transportationMode) {
+        case 'stationary': baseSmoothingFactor = 0.1; break;
+        case 'walking': baseSmoothingFactor = 0.3; break;
+        case 'cycling': baseSmoothingFactor = 0.5; break;
+        case 'driving': baseSmoothingFactor = 0.7; break;
+        case 'highway': baseSmoothingFactor = 0.8; break;
+        default: baseSmoothingFactor = 0.5;
+    }
+    
+    // Adjust smoothing based on accuracy and speed
+    const finalSmoothingFactor = baseSmoothingFactor * (0.5 + confidenceFactor * 0.5) * (0.7 + speedFactor * 0.3);
+    
+    // Triple blend: predicted, last, and new positions
+    const predictionWeight = Math.min(speedFactor * 0.3, 0.2);
+    const lastWeight = 1 - finalSmoothingFactor - predictionWeight;
+    const newWeight = finalSmoothingFactor;
+    
+    return {
+        ...newPosition,
+        lat: (predicted.lat * predictionWeight) + (lastPosition.lat * lastWeight) + (newPosition.lat * newWeight),
+        lng: (predicted.lng * predictionWeight) + (lastPosition.lng * lastWeight) + (newPosition.lng * newWeight)
+    };
+}
+
+// Smooth map centering with requestAnimationFrame
+function smoothCenterOnUser(position, duration = 400) {
+    if (animationFrame) {
+        cancelAnimationFrame(animationFrame);
+    }
+    
+    const startPos = map.getCenter();
+    const startTime = performance.now();
+    const targetLat = position.lat;
+    const targetLng = normalizeLongitude(position.lng);
+    
+    // Calculate the shortest path for longitude (handling 180/-180 boundary)
+    let lngDiff = targetLng - startPos.lng;
+    if (lngDiff > 180) lngDiff -= 360;
+    if (lngDiff < -180) lngDiff += 360;
+    
+    function animate(currentTime) {
+        const elapsed = currentTime - startTime;
+        const progress = Math.min(elapsed / duration, 1);
+        
+        // Smooth easing function
+        const easeOut = 1 - Math.pow(1 - progress, 2.5);
+        
+        const currentLat = startPos.lat + (targetLat - startPos.lat) * easeOut;
+        const currentLng = startPos.lng + lngDiff * easeOut;
+        
+        map.setView([currentLat, normalizeLongitude(currentLng)], map.getZoom(), {
+            animate: false,
+            duration: 0
+        });
+        
+        if (progress < 1 && followUser && !isMapInteracting) {
+            animationFrame = requestAnimationFrame(animate);
+        }
+    }
+    
+    animationFrame = requestAnimationFrame(animate);
+}
+
+// Handle teleportation events
+function handleTeleportation(newPosition, currentTime) {
+    // Cancel any ongoing animations
+    if (animationFrame) {
+        cancelAnimationFrame(animationFrame);
+        animationFrame = null;
+    }
+    
+    // Clear stationary state
+    if (stationaryCheckTimeout) {
+        clearTimeout(stationaryCheckTimeout);
+        stationaryCheckTimeout = null;
+    }
+    isStationary = false;
+    stationaryStartTime = null;
+    
+    // Reset buffers and state
+    positionBuffer = [newPosition];
+    velocityBuffer = [{ lat: 0, lng: 0 }];
+    lastVelocity = { lat: 0, lng: 0 };
+    
+    // Immediate marker update
+    userMarker.setLatLng([newPosition.lat, newPosition.lng], { animate: false });
+    
+    // Intelligent zoom for teleportation
+    const intelligentZoom = calculateIntelligentZoom(newPosition.speed || 0, Infinity);
+    if (intelligentZoom) {
+        map.setZoom(intelligentZoom, { animate: false });
+    }
+    
+    // Immediate map centering for teleportation
+    map.setView([newPosition.lat, normalizeLongitude(newPosition.lng)], map.getZoom(), { 
+        animate: false, 
+        duration: 0
+    });
+    
+    // Update state
+    lastPosition = newPosition;
+    lastUpdateTime = currentTime;
+    lastUpdateTimestamp = currentTime;
+    
+    if (isSignificantMovement(newPosition)) {
+        resetInactivityTimer(false);
+    }
+}
+
+// Enhanced movement validation
+function isValidMovement(distance, timeDelta, speed, accuracy) {
+    if (timeDelta <= 0 || timeDelta > 30) return false; // Skip if too much time has passed
+    
+    const maxSpeed = getMaxSpeedForMode(transportationMode);
+    const calculatedSpeed = distance / timeDelta;
+    
+    // More lenient validation for high-accuracy readings
+    const accuracyMultiplier = accuracy <= 5 ? 3 : (accuracy <= 15 ? 2 : (accuracy <= 50 ? 1.5 : 1));
+    let adjustedMaxSpeed = maxSpeed * accuracyMultiplier;
+    
+    // Allow faster speeds if GPS reports high speed (with some tolerance)
+    const reportedSpeedMPS = (speed || 0);
+    if (reportedSpeedMPS > 0) {
+        adjustedMaxSpeed = Math.max(adjustedMaxSpeed, reportedSpeedMPS * 1.8);
+    }
+    
+    return calculatedSpeed <= adjustedMaxSpeed;
+}
+
+// Transportation mode specific helpers
+function getMaxSpeedForMode(mode) {
+    switch (mode) {
+        case 'stationary': return 1;   // ~2 mph
+        case 'walking': return 4;      // ~9 mph  
+        case 'cycling': return 18;     // ~40 mph
+        case 'driving': return 50;     // ~110 mph
+        case 'highway': return 80;     // ~180 mph
+        default: return 50;
+    }
+}
+
+function getMovementThresholdMultiplier(mode) {
+    switch (mode) {
+        case 'stationary': return 0.5;
+        case 'walking': return 0.7;
+        case 'cycling': return 1.0;
+        case 'driving': return 1.2;
+        case 'highway': return 1.5;
+        default: return 1.0;
+    }
+}
+
+function getOptimalBufferSize(mode) {
+    switch (mode) {
+        case 'stationary': return 3;
+        case 'walking': return 5;
+        case 'cycling': return 7;
+        case 'driving': return 10;
+        case 'highway': return 8;
+        default: return 5;
+    }
+}
+
+// Intelligent zoom adjustment based on movement
+function adjustZoomBasedOnMovement(position, distance, timeDelta) {
+    if (!followUser || isMapInteracting) return;
+    
+    const speed = distance / timeDelta;
+    const currentZoom = map.getZoom();
+    const optimalZoom = calculateIntelligentZoom(speed, distance);
+    
+    if (optimalZoom && Math.abs(currentZoom - optimalZoom) > 0.5) {
+        map.setZoom(optimalZoom, { animate: true });
+    }
+}
+
+// Enhanced transportation mode detection with hysteresis
+function updateTransportationMode(speedMPH, distance, timeDelta) {
+    const prevMode = transportationMode;
+    let newMode = transportationMode;
+    
+    // Calculate acceleration for better mode detection
+    const acceleration = timeDelta > 0 ? Math.abs(speedMPH - (lastSpeed || 0)) / timeDelta : 0;
+    lastSpeed = speedMPH;
+    
+    // Use hysteresis to prevent mode flickering
+    if (speedMPH < 0.5 && distance < 3) {
+        newMode = 'stationary';
+    } else if (speedMPH < 8 && prevMode !== 'cycling' && prevMode !== 'driving') {
+        newMode = 'walking';
+    } else if (speedMPH < 25 && (prevMode === 'walking' || prevMode === 'cycling' || acceleration < 5)) {
+        newMode = 'cycling';
+    } else if (speedMPH < 55) {
+        newMode = 'driving';
+    } else {
+        newMode = 'highway';
+    }
+    
+    // Only change mode if it's been consistent for a few readings
+    if (newMode !== transportationMode) {
+        modeChangeCounter = (modeChangeCounter || 0) + 1;
+        if (modeChangeCounter >= 2) {  // Require 2 consistent readings
+            transportationMode = newMode;
+            modeChangeCounter = 0;
+            console.log(`Transportation mode changed to: ${transportationMode}`);
+        }
+    } else {
+        modeChangeCounter = 0;
+    }
 }
 
 // Simple helper function to normalize longitude values
@@ -2973,27 +3189,6 @@ function setInitialPosition(position) {
     
     updateDistanceBox();
     updateAccuracyIndicator(position.accuracy);
-}
-
-function updateTransportationMode(speedMPH) {
-    if (speedMPH < 1) {
-        transportationMode = 'stationary';
-    } else if (speedMPH < 8) {
-        transportationMode = 'walking';
-    } else if (speedMPH < 25) {
-        transportationMode = 'cycling';
-    } else {
-        transportationMode = 'driving';
-    }
-}
-
-function isValidMovement(distance, timeDelta) {
-    if (timeDelta <= 0) return true;
-    
-    const impliedSpeed = distance / timeDelta; // m/s
-    const maxReasonableSpeed = 50; // ~100 mph max
-    
-    return impliedSpeed <= maxReasonableSpeed;
 }
 
 // Initialize with cached position if available
