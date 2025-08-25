@@ -1,5 +1,5 @@
 // sw.js – Minnesota Then Service Worker
-// Version: 3.5.0 (With Enhanced Image Caching)
+// Version: 3.5.0 (With Enhanced Image Caching & CORS Proxy for Audio)
 const CACHE_VERSIONS = {
   STATIC:  'mnthen-static-v5',
   IMAGES:  'mnthen-images-v5',
@@ -7,31 +7,41 @@ const CACHE_VERSIONS = {
   TILES:   'mnthen-tiles-v5',
   RUNTIME: 'mnthen-runtime-v5'
 };
+
 const CACHE_LIMITS = {
   [CACHE_VERSIONS.IMAGES]:  100 * 1024 * 1024,
   [CACHE_VERSIONS.AUDIO]:   200 * 1024 * 1024,
   [CACHE_VERSIONS.TILES]:   150 * 1024 * 1024,
-  [CACHE_VERSIONS.RUNTIME]:  50 * 1024 * 1024
+  [CACHE_VERSIONS.RUNTIME]: 50 * 1024 * 1024
 };
+
 // Performance tracking
 let cacheHitCount = 0;
 let cacheMissCount = 0;
 let activeBackgroundUpdates = 0;
 const MAX_CONCURRENT_BACKGROUND_UPDATES = 3;
+
 // Track cache sizes to avoid recalculating
 const cacheSizes = {};
 const CACHE_SIZE_UPDATE_INTERVAL = 60000;
 let lastCacheSizeUpdate = 0;
+
 // Track in-flight requests to avoid duplicates
 const inFlightRequests = new Map();
+
 // Position smoothing for reducing marker jumpiness
 const positionBuffer = [];
 const MAX_POSITION_BUFFER_SIZE = 5;
 const POSITION_SMOOTHING_FACTOR = 0.3; // Lower = more smoothing
 const MAX_POSITION_AGE = 10000; // 10 seconds
+
 // Geolocation response caching to reduce jitter
 const geolocationCache = new Map();
 const GEOLOCATION_CACHE_TTL = 5000; // 5 seconds
+
+// CORS PROXY CONFIGURATION
+const CORS_PROXY_URL = 'https://cors-anywhere.herokuapp.com/';
+
 // More efficient cache quota enforcement
 async function enforceCacheQuota(cacheName) {
   const limit = CACHE_LIMITS[cacheName];
@@ -106,6 +116,7 @@ async function enforceCacheQuota(cacheName) {
     console.error('Cache quota enforcement failed:', error);
   }
 }
+
 // Position smoothing function
 function smoothPosition(newPosition) {
   const now = Date.now();
@@ -170,6 +181,7 @@ function smoothPosition(newPosition) {
     heading: mostRecent.heading
   };
 }
+
 // Intercept and smooth geolocation requests
 async function handleGeolocationRequest(request) {
   const url = new URL(request.url);
@@ -224,6 +236,7 @@ async function handleGeolocationRequest(request) {
     });
   }
 }
+
 // Cache-first with request deduplication
 async function cacheFirst(req, cacheName) {
   const url = req.url;
@@ -290,6 +303,7 @@ async function cacheFirst(req, cacheName) {
     return fallback || new Response('Resource unavailable', { status: 503 });
   }
 }
+
 // Map tile caching with preloading
 async function staleWhileRevalidate(req, cacheName) {
   const cache = await caches.open(cacheName);
@@ -358,6 +372,7 @@ async function staleWhileRevalidate(req, cacheName) {
     return new Response('Tile unavailable', { status: 503 });
   }
 }
+
 // Preload adjacent tiles for smoother map panning
 async function preloadAdjacentTiles(tileUrl, cacheName) {
   try {
@@ -400,10 +415,21 @@ async function preloadAdjacentTiles(tileUrl, cacheName) {
     console.warn('Failed to preload adjacent tiles:', error);
   }
 }
-// Audio range handling (preserved for CORS compatibility)
+
+// Audio range handling with CORS proxy
 async function networkFirstForAudioRange(req) {
   try {
-    const resp = await fetch(req);
+    // Route audio requests through CORS proxy
+    const proxyUrl = CORS_PROXY_URL + encodeURIComponent(req.url);
+    const proxyRequest = new Request(proxyUrl, {
+      method: req.method,
+      headers: req.headers,
+      body: req.body,
+      mode: 'cors', // Enable CORS for proxy
+      credentials: 'omit'
+    });
+    
+    const resp = await fetch(proxyRequest);
     if (resp.ok) {
       const cache = await caches.open(CACHE_VERSIONS.AUDIO);
       const fullReq = new Request(req.url, { method: 'GET' });
@@ -428,6 +454,7 @@ async function networkFirstForAudioRange(req) {
     return cached || new Response('Audio unavailable', { status: 503 });
   }
 }
+
 // Intercept fetch requests to apply caching strategies
 self.addEventListener('fetch', (event) => {
   const url = event.request.url;
@@ -437,37 +464,38 @@ self.addEventListener('fetch', (event) => {
     event.respondWith(handleGeolocationRequest(event.request));
     return;
   }
-  
+
   // Handle map tile requests for preloading
   if (url.includes('/tiles/') || url.includes('.png') || url.includes('.jpg')) {
     event.respondWith(staleWhileRevalidate(event.request, CACHE_VERSIONS.TILES));
     return;
   }
-  
+
   // Handle image requests (jpg, jpeg, png, gif, svg, webp)
   if (url.match(/\.(jpg|jpeg|png|gif|svg|webp)$/i)) {
     event.respondWith(cacheFirst(event.request, CACHE_VERSIONS.IMAGES));
     return;
   }
-  
+
   // Handle static assets (CSS, JS)
   if (url.match(/\.(css|js)$/i)) {
     event.respondWith(cacheFirst(event.request, CACHE_VERSIONS.STATIC));
     return;
   }
-  
-  // Handle audio range requests
+
+  // Handle audio requests with CORS proxy
   if (url.includes('audio') || url.includes('.mp3') || url.includes('.wav')) {
     event.respondWith(networkFirstForAudioRange(event.request));
     return;
   }
-  
+
   // For all other requests, use network-first with fallback to cache
   event.respondWith(
     fetch(event.request)
       .catch(() => caches.match(event.request))
   );
 });
+
 // Enhanced performance monitoring
 self.addEventListener('message', (event) => {
   if (event.data && event.data.type === 'GET_CACHE_STATS') {
@@ -504,6 +532,7 @@ self.addEventListener('message', (event) => {
     event.ports[0].postMessage({ success: true });
   }
 });
+
 // Better error logging
 self.addEventListener('error', (event) => {
   console.error('Service Worker Error:', event.error, {
@@ -521,6 +550,7 @@ self.addEventListener('unhandledrejection', (event) => {
     positionBufferSize: positionBuffer.length
   });
 });
+
 // Cache cleanup on activation
 self.addEventListener('activate', (event) => {
   event.waitUntil(
@@ -542,6 +572,7 @@ self.addEventListener('activate', (event) => {
   // Take control of all open clients immediately
   return self.clients.claim();
 });
+
 // Install event - cache critical resources
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -555,4 +586,4 @@ self.addEventListener('install', (event) => {
     })
   );
 });
-console.log('Service Worker 3.5.0: With enhanced image caching and path resolution');
+console.log('Service Worker 3.5.0: With enhanced image caching and CORS proxy for audio');
