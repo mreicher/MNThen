@@ -2286,22 +2286,62 @@ function throttle(func, limit) {
 }
 
 /**
- * Center‑on‑user routine (Leaflet style).
- *
- * @param {{lat:number,lng:number}} position   Current GPS fix.
- * @param {Object|null}          speedTier    Optional speed‑tier object:
- *                                            { panDuration: number (sec),
- *                                              easeLinearity: number (0‑1) }.
- * @param {number}               speedMPH=0   Raw speed (mph). Ignored if speedTier provided.
+ * @typedef {Object} SpeedTier
+ * @property {number} maxSpeed                Upper bound of the speed bucket (mph).
+ * @property {number} microMovementThreshold  Distance (m) below which a movement is considered “micro”.
+ * @property {number} minDistanceThreshold    Minimum distance (m) required to trigger a map update.
+ * @property {number} maxAccuracy             Maximum acceptable GPS accuracy (m) for this tier.
+ * @property {number} maxSpeedThreshold       Upper speed (mph) that still qualifies for this tier.
+ * @property {number} mapUpdateInterval       Minimum time (ms) between map updates.
+ * @property {number} mapUpdateDistance       Minimum distance (m) between map updates.
+ * @property {number} panDuration             Desired pan animation length (seconds).
+ * @property {number} easeLinearity           Leaflet `easeLinearity` (0‑1).
+ * @property {number} zoomThreshold           Ratio of current‑zoom‑error that triggers a zoom animation.
+ * @property {number} zoomDuration            Zoom animation length (seconds).
+ * @property {number} targetZoom              Preferred zoom level for this speed bucket.
  */
-/* -------------------------------------------------------------
-   1️⃣  getEnhancedSpeedTier – returns the tier object with fixed zoom levels
-   ------------------------------------------------------------- */
+
+/**
+ * Returns the speed‑tier configuration that best matches the supplied speed.
+ *
+ * The function is completely self‑contained – it builds the tier list
+ * on the first call, then caches the result for each integer‑mph bucket
+ * to avoid re‑scanning the array on every GPS fix.
+ *
+ * @param {number|string} speedMPH  Raw speed (may be a string, NaN, null, etc.).
+ * @returns {SpeedTier}            A shallow copy of the matching tier.
+ */
 function getEnhancedSpeedTier(speedMPH) {
-    const mph = Math.max(0, Number(speedMPH) || 0);
+    // -----------------------------------------------------------------
+    // 1️⃣  Normalise the incoming speed.
+    // -----------------------------------------------------------------
+    // `parseFloat` gracefully handles numbers, numeric strings, and returns NaN for non‑numeric.
+    // `Math.max(0, …)` forces negative values to 0.
+    const mph = Math.max(0, parseFloat(speedMPH) || 0);
+    const bucket = Math.floor(mph); // integer bucket used for memoisation
+
+    // -----------------------------------------------------------------
+    // 2️⃣  Simple in‑function memo cache (static variable via closure).
+    // -----------------------------------------------------------------
+    // The cache lives on the function object itself – it survives across calls
+    // without polluting the global scope.
+    if (!getEnhancedSpeedTier._cache) {
+        getEnhancedSpeedTier._cache = new Map();
+    }
+    const cache = getEnhancedSpeedTier._cache;
+
+    if (cache.has(bucket)) {
+        // Return a fresh copy so callers can mutate the result safely.
+        return { ...cache.get(bucket) };
+    }
+
+    // -----------------------------------------------------------------
+    // 3️⃣  Tier definitions – kept inside the function so the signature
+    //     and side‑effects stay local.
+    // -----------------------------------------------------------------
     const tiers = [
         {
-            // 0-1 mph: Stationary/very slow - ALWAYS zoom 17
+            // 0‑1 mph – essentially stationary
             maxSpeed: 1,
             microMovementThreshold: 1.0,
             minDistanceThreshold:   0.8,
@@ -2316,7 +2356,7 @@ function getEnhancedSpeedTier(speedMPH) {
             targetZoom:             17
         },
         {
-            // 1-4 mph: Walking - ALWAYS zoom 17
+            // 1‑4 mph – walking
             maxSpeed: 4,
             microMovementThreshold: 1.0,
             minDistanceThreshold:   1.5,
@@ -2331,7 +2371,7 @@ function getEnhancedSpeedTier(speedMPH) {
             targetZoom:             17
         },
         {
-            // 4-15 mph: Biking/brisk walk - ALWAYS zoom 17
+            // 4‑15 mph – biking / brisk walk
             maxSpeed: 15,
             microMovementThreshold: 2.0,
             minDistanceThreshold:   3.0,
@@ -2346,7 +2386,7 @@ function getEnhancedSpeedTier(speedMPH) {
             targetZoom:             17
         },
         {
-            // 15-40 mph: Moderate vehicle speed - zoom out to 16
+            // 15‑40 mph – moderate vehicle speed
             maxSpeed: 40,
             microMovementThreshold: 3.0,
             minDistanceThreshold:   5.0,
@@ -2361,7 +2401,7 @@ function getEnhancedSpeedTier(speedMPH) {
             targetZoom:             16
         },
         {
-            // 40-70 mph: Fast vehicle/highway - zoom out to 15
+            // 40‑70 mph – fast vehicle / highway
             maxSpeed: 70,
             microMovementThreshold: 5.0,
             minDistanceThreshold:   8.0,
@@ -2376,7 +2416,7 @@ function getEnhancedSpeedTier(speedMPH) {
             targetZoom:             15
         },
         {
-            // 70+ mph: High-speed travel - zoom out to 14
+            // 70+ mph – high‑speed travel
             maxSpeed: Infinity,
             microMovementThreshold: 8.0,
             minDistanceThreshold:   12.0,
@@ -2391,7 +2431,20 @@ function getEnhancedSpeedTier(speedMPH) {
             targetZoom:             14
         }
     ];
+
+    // -----------------------------------------------------------------
+    // 4️⃣  Locate the proper tier.
+    // -----------------------------------------------------------------
     const tier = tiers.find(t => mph < t.maxSpeed) || tiers[tiers.length - 1];
+
+    // -----------------------------------------------------------------
+    // 5️⃣  Store a copy in the cache for future calls.
+    // -----------------------------------------------------------------
+    cache.set(bucket, tier);
+
+    // -----------------------------------------------------------------
+    // 6️⃣  Return a shallow copy (prevents accidental mutation of the cached object).
+    // -----------------------------------------------------------------
     return { ...tier };
 }
 
@@ -2558,42 +2611,81 @@ function centerUserIcon(position, speedTier = null, speedMPH = 0, options = {}) 
 /* -------------------------------------------------------------
    3️⃣  updateUserLocation – complete location tracking with zoom control
    ------------------------------------------------------------- */
+
+/* Helper: weighted average of the last N positions. */
+function weightedAverage(buffer) {
+    const weighted = buffer.reduce((acc, pos, i) => {
+        // Weight grows linearly: newest gets highest weight.
+        const w = (i + 1) / buffer.length;
+        acc.lat += pos.lat * w;
+        acc.lng += pos.lng * w;
+        acc.wSum += w;
+        return acc;
+    }, { lat: 0, lng: 0, wSum: 0 });
+
+    return {
+        lat: weighted.lat / weighted.wSum,
+        lng: weighted.lng / weighted.wSum
+    };
+}
+
+/* Main location‑update routine.*/
 function updateUserLocation(position, forceUpdate = false) {
+    // -----------------------------------------------------------------
+    // 0️⃣  Guard – make sure we have latitude & longitude.
+    // -----------------------------------------------------------------
     if (!position?.coords?.latitude || !position?.coords?.longitude) {
-        console.warn("Invalid position data received:", position);
+        console.warn('Invalid position data received:', position);
         return;
     }
-    
-    // Initialize interaction state
+
+    // -----------------------------------------------------------------
+    // 1️⃣  Initialise global interaction state (once per page load).
+    // -----------------------------------------------------------------
     if (!window.mapInteractionState) {
         window.mapInteractionState = {
             isUserInteracting: false,
             lastInteractionTime: 0,
             inactivityTimer: null,
-            INACTIVITY_TIMEOUT: 15000,  // Shorter timeout for better UX
+            INACTIVITY_TIMEOUT: 15000,
             hasUserInteracted: false,
             lastGestureTime: 0,
             gestureDebounce: 100,
             lastProcessedPosition: null,
-            minUpdateInterval: 30,      // More responsive updates
+            minUpdateInterval: 30,
             isAnimating: false,
             lastAnimationEnd: 0,
             lastSpeedTier: null,
-            smoothingBuffer: []
+            smoothingBuffer: [],          // holds the last 3 positions
+            isIconVisible: true,         // matches centerUserIcon expectations
+            hideTimerId: null             // matches centerUserIcon expectations
         };
-        
+
+        // -----------------------------------------------------------------
+        // Interaction detection – attach once we have a map instance.
+        // -----------------------------------------------------------------
         if (map) {
-            // Setup interaction detection
-            ['dragstart', 'zoomstart', 'movestart'].forEach(event => {
-                map.on(event, () => {
+            const startEvents = ['dragstart', 'zoomstart', 'movestart'];
+            const endEvents   = ['dragend',   'zoomend',   'moveend'];
+
+            startEvents.forEach(ev => {
+                map.on(ev, () => {
+                    const now = Date.now();
+                    // Debounce rapid gesture starts.
+                    if (now - window.mapInteractionState.lastGestureTime <
+                        window.mapInteractionState.gestureDebounce) {
+                        return;
+                    }
+                    window.mapInteractionState.lastGestureTime = now;
                     window.mapInteractionState.isUserInteracting = true;
-                    window.mapInteractionState.lastInteractionTime = Date.now();
+                    window.mapInteractionState.lastInteractionTime = now;
                     window.mapInteractionState.hasUserInteracted = true;
                 });
             });
-            
-            ['dragend', 'zoomend', 'moveend'].forEach(event => {
-                map.on(event, () => {
+
+            endEvents.forEach(ev => {
+                map.on(ev, () => {
+                    // Small timeout prevents flicker when gestures fire back‑to‑back.
                     setTimeout(() => {
                         window.mapInteractionState.isUserInteracting = false;
                     }, 100);
@@ -2601,170 +2693,200 @@ function updateUserLocation(position, forceUpdate = false) {
             });
         }
     }
-    
+
+    // -----------------------------------------------------------------
+    // 2️⃣  Local shortcuts – improves readability.
+    // -----------------------------------------------------------------
     const state = window.mapInteractionState;
-    const currentTime = Date.now();
-    
-    // Throttle for performance but allow more frequent updates
-    if (state.lastProcessedPosition && currentTime - state.lastProcessedPosition < state.minUpdateInterval) {
+    const now   = Date.now();
+
+    // Throttle updates – still allow a burst when the user is moving fast.
+    if (state.lastProcessedPosition &&
+        now - state.lastProcessedPosition < state.minUpdateInterval) {
         return;
     }
-    state.lastProcessedPosition = currentTime;
-    
-    const newPosition = {
-        lat: position.coords.latitude,
-        lng: position.coords.longitude,
-        accuracy: position.coords.accuracy || 20,
-        heading: position.coords.heading ?? null,
-        timestamp: currentTime,
-        speedMPS: position.coords.speed || 0
+    state.lastProcessedPosition = now;
+
+    // -----------------------------------------------------------------
+    // 3️⃣  Normalise the incoming GPS payload.
+    // -----------------------------------------------------------------
+    const pos = {
+        lat:       position.coords.latitude,
+        lng:       position.coords.longitude,
+        accuracy:  position.coords.accuracy ?? 20,
+        heading:   position.coords.heading ?? null,
+        timestamp: now,
+        speedMPS:  position.coords.speed ?? 0
     };
-    
-    const speedMPH = newPosition.speedMPS * 2.23694;
-    const speedTier = getEnhancedSpeedTier(speedMPH);
-    
-    // Handle first position - always center immediately
+    const speedMPH  = pos.speedMPS * 2.23694;
+    const speedTier = getEnhancedSpeedTier(speedMPH);   // your existing tier function
+
+    // -----------------------------------------------------------------
+    // 4️⃣  First‑fix handling – centre instantly and seed buffers.
+    // -----------------------------------------------------------------
     if (!lastPosition) {
-        lastPosition = newPosition;
-        const gpsLatLng = [newPosition.lat, newPosition.lng];
-        
-        // Set initial view with default zoom (let speed tiers adjust later)
-        const initialZoom = map.getZoom() || 17;
-        map.setView(gpsLatLng, initialZoom);
-        userMarker.setLatLng(gpsLatLng);
-        
-        if (typeof lastUpdateTime !== 'undefined') lastUpdateTime = currentTime;
-        if (typeof positionBuffer !== 'undefined') positionBuffer = [newPosition];
-        
-        // Initialize smoothing buffer
-        state.smoothingBuffer = [newPosition, newPosition, newPosition];
-        
+        lastPosition = pos;
+        const gpsLatLng = [pos.lat, pos.lng];
+
+        // Seed smoothing buffer with three identical entries – gives a stable start.
+        state.smoothingBuffer = [pos, pos, pos];
+
+        // Use centerUserIcon to handle initial positioning with proper options.
+        centerUserIcon(pos, speedTier, speedMPH, {
+            moveMarkerOnInteraction: false,   // marker stays stationary
+            autoCenterAfterInactivity: true
+        });
+
+        // UI hooks (optional – keep them guarded as before).
         if (typeof updateDistanceBox === 'function') updateDistanceBox();
-        if (typeof updateAccuracyIndicator === 'function') updateAccuracyIndicator(newPosition.accuracy);
-        
-        console.log("📍 Initial position set:", gpsLatLng);
+        if (typeof updateAccuracyIndicator === 'function')
+            updateAccuracyIndicator(pos.accuracy);
+
+        console.log('📍 Initial position set:', gpsLatLng);
         return;
     }
-    
-    // Calculate distance from last position
+
+    // -----------------------------------------------------------------
+    // 5️⃣  Compute distance from previous fix (meters, using equirectangular approx).
+    // -----------------------------------------------------------------
     const lastLat = lastPosition.lat;
     const lastLng = lastPosition.lng;
     const distance = Math.sqrt(
-        Math.pow((newPosition.lat - lastLat) * 111320, 2) + 
-        Math.pow((newPosition.lng - lastLng) * 111320 * Math.cos(newPosition.lat * Math.PI / 180), 2)
+        Math.pow((pos.lat - lastLat) * 111320, 2) +
+        Math.pow((pos.lng - lastLng) * 111320 *
+                 Math.cos(pos.lat * Math.PI / 180), 2)
     );
-    
-    const timeDelta = (currentTime - (lastUpdateTime || currentTime)) / 1000;
-    
-    // Handle teleportation/large jumps - always update immediately
+
+    const timeDelta = (now - (lastUpdateTime || now)) / 1000; // seconds
+
+    // -----------------------------------------------------------------
+    // 6️⃣  Teleport / large‑jump handling – immediate centre & reset smoothing.
+    // -----------------------------------------------------------------
     if (distance > 100 || forceUpdate) {
-        console.log("🚀 Large position change detected:", distance.toFixed(1) + "m - immediate update");
-        
-        // Stop any animations and center immediately
-        if (map._panAnim) map._panAnim.stop();
-        
-        // Reset smoothing buffer
-        state.smoothingBuffer = [newPosition, newPosition, newPosition];
-        
-        centerUserIcon(newPosition, speedTier, speedMPH);
-        lastPosition = newPosition;
-        
-        if (typeof lastUpdateTime !== 'undefined') lastUpdateTime = currentTime;
-        if (typeof positionBuffer !== 'undefined') positionBuffer = [newPosition];
+        console.log('🚀 Large position change detected:', distance.toFixed(1) + ' m – immediate update');
+
+        // Stop any ongoing pan animation safely.
+        if (map._panAnim?.stop) map._panAnim.stop();
+
+        // Reset smoothing buffer to the new point.
+        state.smoothingBuffer = [pos, pos, pos];
+
+        centerUserIcon(pos, speedTier, speedMPH, {
+            moveMarkerOnInteraction: false,
+            autoCenterAfterInactivity: true
+        });
+
+        lastPosition = pos;
+        lastUpdateTime = now;
+
         if (typeof updateDistanceBox === 'function') updateDistanceBox();
         return;
     }
-    
-    // Filter out bad positions but be more permissive for always-centering
+
+    // -----------------------------------------------------------------
+    // 7️⃣  Filtering – discard wildly inaccurate or impossible points.
+    // -----------------------------------------------------------------
     if (!forceUpdate && (
-        newPosition.accuracy > speedTier.maxAccuracy ||
+        pos.accuracy > speedTier.maxAccuracy ||
         distance < speedTier.microMovementThreshold ||
-        (timeDelta > 0 && distance / timeDelta > speedTier.maxSpeedThreshold * 1.5) // More lenient speed check
+        (timeDelta > 0 && distance / timeDelta > speedTier.maxSpeedThreshold * 1.5)
     )) {
-        return;
+        return; // silently ignore
     }
-    
+
+    // -----------------------------------------------------------------
+    // 8️⃣  Smoothing buffer – keep the last three positions.
+    // -----------------------------------------------------------------
     try {
-        // Update smoothing buffer (keep last 3 positions)
-        state.smoothingBuffer.push(newPosition);
-        if (state.smoothingBuffer.length > 3) {
-            state.smoothingBuffer.shift();
-        }
-        
-        // Calculate smoothed position using buffer average
-        const bufferAvg = state.smoothingBuffer.reduce((acc, pos, idx) => {
-            const weight = (idx + 1) / state.smoothingBuffer.length; // Recent positions have more weight
-            return {
-                lat: acc.lat + pos.lat * weight,
-                lng: acc.lng + pos.lng * weight
-            };
-        }, { lat: 0, lng: 0 });
-        
-        const totalWeight = state.smoothingBuffer.reduce((sum, _, idx) => sum + (idx + 1) / state.smoothingBuffer.length, 0);
-        const smoothedPosition = {
-            lat: bufferAvg.lat / totalWeight,
-            lng: bufferAvg.lng / totalWeight,
-            accuracy: newPosition.accuracy,
-            heading: newPosition.heading,
-            timestamp: newPosition.timestamp,
-            speedMPS: newPosition.speedMPS
+        state.smoothingBuffer.push(pos);
+        if (state.smoothingBuffer.length > 3) state.smoothingBuffer.shift();
+
+        // Weighted average (newest gets highest weight).
+        const avg = weightedAverage(state.smoothingBuffer);
+
+        const smoothed = {
+            lat:       avg.lat,
+            lng:       avg.lng,
+            accuracy:  pos.accuracy,
+            heading:   pos.heading,
+            timestamp: pos.timestamp,
+            speedMPS:  pos.speedMPS
         };
-        
-        // ALWAYS center the user icon - this is the core requirement
-        centerUserIcon(smoothedPosition, speedTier, speedMPH);
-        
-        // Handle zoom changes based on speed tiers (only when user isn't interacting)
-        if (!state.isUserInteracting && currentTime - state.lastInteractionTime > 2000) {
-            const currentZoom = map.getZoom();
-            
-            // Only change zoom if speed tier changed significantly
-            if (!state.lastSpeedTier || Math.abs(state.lastSpeedTier.targetZoom - speedTier.targetZoom) >= 1) {
-                console.log("🔍 Speed-based zoom adjustment:", currentZoom, "→", speedTier.targetZoom, `(${speedMPH.toFixed(1)} mph)`);
-                
+
+        // -----------------------------------------------------------------
+        // 9️⃣  Use centerUserIcon for all positioning logic.
+        // -----------------------------------------------------------------
+        centerUserIcon(smoothed, speedTier, speedMPH, {
+            moveMarkerOnInteraction: false,      // marker stays stationary during normal operation
+            autoCenterAfterInactivity: true,     // recenter after inactivity
+            deadZoneM: speedTier.microMovementThreshold // speed‑appropriate dead zone
+        });
+
+        // -----------------------------------------------------------------
+        // 10️⃣  Speed‑based zoom – only when the user isn’t actively interacting.
+        // -----------------------------------------------------------------
+        if (!state.isUserInteracting && now - state.lastInteractionTime > 2000) {
+            const curZoom = map.getZoom();
+
+            if (!state.lastSpeedTier ||
+                Math.abs(state.lastSpeedTier.targetZoom - speedTier.targetZoom) >= 1) {
+
+                console.log(
+                    '🔍 Speed‑based zoom adjustment:',
+                    curZoom, '→', speedTier.targetZoom,
+                    `(${speedMPH.toFixed(1)} mph)`
+                );
+
                 map.setZoom(speedTier.targetZoom, {
                     animate: true,
                     duration: speedTier.zoomDuration
                 });
-                
+
                 state.lastSpeedTier = speedTier;
             }
         }
-        
-        // Update references
-        lastPosition = smoothedPosition;
-        if (typeof lastUpdateTime !== 'undefined') lastUpdateTime = currentTime;
+
+        // -----------------------------------------------------------------
+        // 11️⃣  Update global references & UI hooks.
+        // -----------------------------------------------------------------
+        lastPosition = smoothed;
+        lastUpdateTime = now;
+
         if (typeof positionBuffer !== 'undefined') {
-            positionBuffer.push(newPosition);
+            positionBuffer.push(pos);
             if (positionBuffer.length > 10) positionBuffer.shift();
         }
-        
-        // Call additional update functions if they exist
+
         if (typeof updateDistanceBox === 'function') updateDistanceBox();
         if (typeof checkProximityForZoom === 'function') checkProximityForZoom();
-        
+
         if (distance > 0.5) {
-            console.log(`📍 Position updated: ${distance.toFixed(1)}m, ${speedMPH.toFixed(1)}mph`);
+            console.log(`📍 Position updated: ${distance.toFixed(1)} m, ${speedMPH.toFixed(1)} mph`);
         }
-        
-    } catch (error) {
-        console.error("Location update error:", error);
-        
-        // Fallback - always center even if there's an error
-        if (map._panAnim) map._panAnim.stop();
-        centerUserIcon(newPosition, speedTier, speedMPH);
-        lastPosition = newPosition;
+
+    } catch (err) {
+        // -----------------------------------------------------------------
+        // 12️⃣  Fallback – centre even if something went wrong.
+        // -----------------------------------------------------------------
+        console.error('Location update error:', err);
+        if (map._panAnim?.stop) map._panAnim.stop();
+
+        centerUserIcon(pos, speedTier, speedMPH, {
+            moveMarkerOnInteraction: false,
+            autoCenterAfterInactivity: true
+        });
+
+        lastPosition = pos;
         if (typeof updateDistanceBox === 'function') updateDistanceBox();
     }
 }
 
-        
 /* ==============================================================
-   1️⃣  Animation handlers – keep the map from drifting while it
-       animates (pan or zoom).  Works the same on desktop and mobile.
+   2️⃣  Animation handlers – track when Leaflet finishes any move/zoom
    ============================================================== */
 function setupAnimationHandlers() {
     const state = window.mapInteractionState;
-    if (!state) return;
+    if (!state || !map) return;               // safety guard
 
     // One‑liner to record the end of any animation
     const onAnimEnd = () => {
@@ -2779,14 +2901,15 @@ function setupAnimationHandlers() {
 }
 
 /* ==============================================================
-   2️⃣  Interaction handlers – touch, mouse‑drag, and wheel zoom.
-       Optimized for mobile: all listeners are *passive* (so the
-       browser can scroll smoothly) and we keep the logic tiny.
+   3️⃣  Interaction handlers – touch, mouse‑drag, and wheel zoom.
+        Optimized for mobile: all listeners are *passive* and
+        the logic stays tiny.
    ============================================================== */
 function setupInteractionHandlers() {
     const state = window.mapInteractionState;
-    const container = map.getContainer(); // the <div> that Leaflet renders into
-    if (!state) return;
+    if (!state || !map) return;               // safety guard
+
+    const container = map.getContainer();      // the <div> Leaflet renders into
 
     /* ---------- Shared helpers ---------- */
     const startInteraction = () => {
@@ -2795,25 +2918,24 @@ function setupInteractionHandlers() {
         state.hasUserInteracted = true;
         // `followUser` is a global flag used elsewhere in your code.
         window.followUser = false;
-        clearInactivityTimer(); // defined elsewhere in your app
+
+        // If the helper isn’t defined yet, just skip it.
+        if (typeof clearInactivityTimer === 'function') clearInactivityTimer();
     };
 
     const endInteraction = () => {
         state.isUserInteracting = false;
         state.lastGestureTime = Date.now(); // mainly for touch gestures
-        startInactivityTimer(); // defined elsewhere in your app
+
+        if (typeof startInactivityTimer === 'function') startInactivityTimer();
     };
 
     /* ---------- Touch handling (mobile primary) ---------- */
     // Touch start – user begins dragging/panning
-    container.addEventListener(
-        'touchstart',
-        startInteraction,
-        { passive: true }
-    );
+    container.addEventListener('touchstart', startInteraction, { passive: true });
 
-    // Touch end – fires for each finger lifted; we only care when
-    // the last finger goes up (e.touches length === 0).
+    // Touch end – fires for each finger lifted; we only care when the
+    // last finger goes up (e.touches length === 0).
     container.addEventListener(
         'touchend',
         e => {
@@ -2825,12 +2947,13 @@ function setupInteractionHandlers() {
     /* ---------- Mouse handling (desktop testing only) ---------- */
     // mousedown / mouseup are cheap; they won’t fire on most touch‑only browsers.
     map.on('mousedown', startInteraction);
-    map.on('mouseup', endInteraction);
+    map.on('mouseup',   endInteraction);
 
     /* ---------- Wheel handling (pinch‑to‑zoom on mobile browsers
                  often ends up as a wheel event) ---------- */
     // Debounce the wheel so a rapid scroll doesn’t hammer the timer.
     let wheelDebounce = null;
+
     container.addEventListener(
         'wheel',
         e => {
@@ -2844,7 +2967,9 @@ function setupInteractionHandlers() {
 
             // Reset the inactivity timer after the user stops scrolling.
             clearTimeout(wheelDebounce);
-            wheelDebounce = setTimeout(startInactivityTimer, 250);
+            wheelDebounce = setTimeout(() => {
+                if (typeof startInactivityTimer === 'function') startInactivityTimer();
+            }, 250);
         },
         { passive: true }
     );
@@ -2854,9 +2979,12 @@ function setupInteractionHandlers() {
    1️⃣  clearInactivityTimer – cancel any pending timeout
    ------------------------------------------------------------- */
 function clearInactivityTimer() {
+    // Grab the timer reference from the shared state (if it exists)
     const { inactivityTimer } = window.mapInteractionState || {};
+
     if (inactivityTimer) {
         clearTimeout(inactivityTimer);
+        // Reset the reference so we know there’s no active timer
         window.mapInteractionState.inactivityTimer = null;
     }
 }
@@ -2867,14 +2995,20 @@ function clearInactivityTimer() {
    ------------------------------------------------------------- */
 function startInactivityTimer() {
     const state = window.mapInteractionState;
-    if (!state || !state.hasUserInteracted) return; // nothing to schedule
 
-    // If a timer is already running, reset it (debounce)
+    // Bail out early if we don’t have a state object or the user never interacted.
+    if (!state || !state.hasUserInteracted) return;
+
+    // -----------------------------------------------------------------
+    // Debounce: if a timer is already running, cancel it before starting a new one.
+    // -----------------------------------------------------------------
     clearInactivityTimer();
 
+    // -----------------------------------------------------------------
+    // Schedule the auto‑re‑center.
+    // -----------------------------------------------------------------
     state.inactivityTimer = setTimeout(() => {
-        // Only re‑center if we still have a valid position and the user
-        // isn’t actively interacting at the moment the timeout fires.
+        // Only act if we still have a known position and the user isn’t currently interacting.
         if (window.lastPosition && !state.isUserInteracting) {
             console.log('🔄 Auto‑recentering after inactivity');
 
@@ -2882,7 +3016,7 @@ function startInactivityTimer() {
             const speedMPH = (window.lastPosition.speedMPS || 0) * 2.23694;
             const speedTier = getEnhancedSpeedTier(speedMPH);
 
-            // Fly back to the last known location using the speed‑based zoom.
+            // Fly back to the last known location using the speed‑based zoom level.
             map.flyTo(gpsLatLng, speedTier.targetZoom, {
                 animate: true,
                 duration: 1.5,
@@ -2895,10 +3029,10 @@ function startInactivityTimer() {
                 state.lastSpeedTier = speedTier;
                 window.followUser = true;
                 console.log('✅ Following resumed');
-            }, 1600); // slightly longer than the fly duration
+            }, 1600); // a hair longer than the fly duration to ensure completion
         }
 
-        // Clean up the timer reference.
+        // Clean up the timer reference so subsequent calls know there’s no pending timeout.
         state.inactivityTimer = null;
     }, state.INACTIVITY_TIMEOUT);
 }
@@ -2907,123 +3041,71 @@ function startInactivityTimer() {
    Helper: pick a base value from a threshold table
    ------------------------------------------------------------- */
 function pickBase(value, table) {
-    // `table` is an array of [threshold, base] sorted ascending.
-    // Returns the base for the highest threshold < value.
     for (let i = table.length - 1; i >= 0; i--) {
         if (value >= table[i][0]) return table[i][1];
     }
-    // Fallback – should never happen because the first entry is 0.
     return table[0][1];
 }
 
 /* -------------------------------------------------------------
-   1️⃣  Ultra‑smoothing factor
+   Ultra‑smoothing factor (simplified)
    ------------------------------------------------------------- */
-function calculateUltraSmoothingFactor(speedMPH, speedFactor, distance, timeDelta) {
+function calculateUltraSmoothingFactor(speedMPH) {
     const baseTable = [
-        [0,   0.2],
-        [1,   0.4],
-        [4,   0.6],
-        [15,  0.7],
-        [40,  0.8],
-        [70,  0.85]
+        [0, 0.2], [1, 0.4], [4, 0.6], [15, 0.7], [40, 0.8], [70, 0.85]
     ];
-    const baseFactor = pickBase(speedMPH, baseTable);
-
-    // Small tweaks based on how far we moved and how long the sample took.
-    const distanceAdj = Math.min(0.1, distance * 0.01);
-    const timeAdj     = timeDelta > 0 ? Math.min(0.05, (timeDelta - 0.5) * 0.1) : 0;
-
-    const finalFactor = Math.min(0.9, Math.max(0.1, baseFactor + distanceAdj + timeAdj));
-    return { factor: finalFactor };
+    return { factor: pickBase(speedMPH, baseTable) };
 }
 
 /* -------------------------------------------------------------
-   2️⃣  Ultra‑smooth animation duration (seconds)
+   Ultra‑smooth animation duration (simplified)
    ------------------------------------------------------------- */
-function calculateUltraSmoothAnimationDuration(speedMPH, speedFactor, distance, timeDelta) {
+function calculateUltraSmoothAnimationDuration(speedMPH) {
     const durTable = [
-        [0,   0.8],
-        [1,   0.6],
-        [4,   0.4],
-        [15,  0.3],
-        [40,  0.2],
-        [70,  0.15]
+        [0, 0.8], [1, 0.6], [4, 0.4], [15, 0.3], [40, 0.2], [70, 0.15]
     ];
-    const baseDur = pickBase(speedMPH, durTable);
-    return Math.max(0.05, baseDur);
+    return Math.max(0.05, pickBase(speedMPH, durTable));
 }
 
 /* -------------------------------------------------------------
-   3️⃣  Ultra‑smooth look‑ahead factor
-   ------------------------------------------------------------- */
-function calculateUltraSmoothLookAheadFactor(speedMPH, speedFactor, distance) {
-    const lookAheadTable = [
-        [0,   0.02],
-        [1,   0.05],
-        [4,   0.15],
-        [15,  0.25],
-        [40,  0.4],
-        [70,  0.6]
-    ];
-    const baseLookAhead = pickBase(speedMPH, lookAheadTable);
-    // Add a distance‑based bump, capped at 0.7.
-    return Math.min(0.7, baseLookAhead + distance * 0.005);
-}
-        
-/* -------------------------------------------------------------
-   1️⃣  updatePositionBuffer – push a fresh fix and keep a fixed
-       max size (5).  Very cheap on mobile because it mutates the
-       existing array instead of allocating a new one each call.
+   updatePositionBuffer – push a fresh fix and keep a fixed max size
    ------------------------------------------------------------- */
 function updatePositionBuffer(newPosition) {
-    // Lazily create the shared buffer the first time we get a fix.
     if (!window.positionBuffer) window.positionBuffer = [];
-
+    
     const buf = window.positionBuffer;
     buf.push(newPosition);
-
-    // Keep only the newest N entries (N = 5).  splice is O(N) but N is tiny.
-    const MAX_SIZE = 5;
-    if (buf.length > MAX_SIZE) buf.splice(0, buf.length - MAX_SIZE);
+    
+    // Keep only the newest 5 entries
+    if (buf.length > 5) buf.splice(0, buf.length - 5);
 }
 
 /* -------------------------------------------------------------
-   2️⃣  calculateFinalPosition – weighted average of the buffered
-       fixes.  The weighting scheme mirrors your original code:
-       • newer samples get a higher time weight (0.8ⁿ)
-       • more accurate samples get a higher accuracy weight (1/accuracy)
-       • the best (lowest) accuracy is also returned.
+   calculateFinalPosition – weighted average of the buffered fixes
    ------------------------------------------------------------- */
 function calculateFinalPosition() {
     const buf = window.positionBuffer;
     if (!buf || buf.length === 0) return null;
-    if (buf.length === 1) return { ...buf[0] }; // shallow copy for safety
-
-    const result = buf.reduce(
-        (acc, pos, idx) => {
-            const age = buf.length - idx - 1;                     // 0 = newest
-            const accWeight = Math.max(0.1, 1 / Math.max(pos.accuracy, 5));
-            const timeWeight = Math.pow(0.8, age);
-            const weight = accWeight * timeWeight;
-
-            acc.weightedLat += pos.lat * weight;
-            acc.weightedLng += pos.lng * weight;
-            acc.totalWeight += weight;
-            acc.totalSpeed += pos.speedMPS || 0;
-
-            if (pos.accuracy < acc.bestAccuracy) acc.bestAccuracy = pos.accuracy;
-            return acc;
-        },
-        {
-            weightedLat: 0,
-            weightedLng: 0,
-            totalWeight: 0,
-            totalSpeed: 0,
-            bestAccuracy: Infinity
-        }
-    );
-
+    if (buf.length === 1) return { ...buf[0] };
+    
+    const result = buf.reduce((acc, pos, idx) => {
+        const age = buf.length - idx - 1;
+        const accWeight = Math.max(0.1, 1 / Math.max(pos.accuracy, 5));
+        const timeWeight = Math.pow(0.8, age);
+        const weight = accWeight * timeWeight;
+        
+        acc.weightedLat += pos.lat * weight;
+        acc.weightedLng += pos.lng * weight;
+        acc.totalWeight += weight;
+        acc.totalSpeed += pos.speedMPS || 0;
+        
+        if (pos.accuracy < acc.bestAccuracy) acc.bestAccuracy = pos.accuracy;
+        return acc;
+    }, {
+        weightedLat: 0, weightedLng: 0, totalWeight: 0, 
+        totalSpeed: 0, bestAccuracy: Infinity
+    });
+    
     return {
         lat: result.weightedLat / result.totalWeight,
         lng: result.weightedLng / result.totalWeight,
@@ -3032,74 +3114,36 @@ function calculateFinalPosition() {
         timestamp: Date.now()
     };
 }
-        
+
 /* -------------------------------------------------------------
-   Small utility – clamp a value between min and max
+   clamp – utility function
    ------------------------------------------------------------- */
 const clamp = (val, min, max) => Math.min(Math.max(val, min), max);
 
 /* -------------------------------------------------------------
-   1️⃣  Enhanced velocity filter (prediction + smoothing)
+   calculateEnhancedVelocityFilter (simplified)
    ------------------------------------------------------------- */
-function calculateEnhancedVelocityFilter(
-    currentPosition,
-    previousPosition,
-    timeDelta,          // seconds
-    currentSpeedMPS     // meters‑per‑second
-) {
-    // -----------------------------------------------------------------
-    // Guard clauses – nothing to do if we lack a prior fix or Δt ≤ 0
-    // -----------------------------------------------------------------
+function calculateEnhancedVelocityFilter(currentPosition, previousPosition, timeDelta, currentSpeedMPS) {
     if (!previousPosition || timeDelta <= 0) return currentPosition;
-
+    
     const { lat: curLat, lng: curLng, accuracy, speedMPS, timestamp } = currentPosition;
     const { lat: prevLat, lng: prevLng } = previousPosition;
-
-    const MPH_PER_MPS = 2.23694;
-    const speedMPH = currentSpeedMPS * MPH_PER_MPS;
-    const distance = calculateDistance(previousPosition, currentPosition);
-
-    // Discard obviously noisy fixes (tiny movement or near‑standstill)
+    
+    const speedMPH = (currentSpeedMPS || 0) * 2.23694;
+    const distance = Math.sqrt(
+        Math.pow((curLat - prevLat) * 111320, 2) + 
+        Math.pow((curLng - prevLng) * 111320 * Math.cos(curLat * Math.PI / 180), 2)
+    );
+    
+    // Discard tiny movements
     if (distance < 0.5 || speedMPH < 0.5) return currentPosition;
-
-    // -----------------------------------------------------------------
-    // 1️⃣  Raw velocity (deg / sec) between the two fixes
-    // -----------------------------------------------------------------
-    const velLat = (curLat - prevLat) / timeDelta;
-    const velLng = (curLng - prevLng) / timeDelta;
-
-    // Initialise the velocity cache on the very first call
-    if (!lastVelocity) {
-        lastVelocity = { lat: velLat, lng: velLng };
-        return currentPosition;
-    }
-
-    // -----------------------------------------------------------------
-    // 2️⃣  Low‑pass filter on the velocity itself
-    // -----------------------------------------------------------------
-    const velocityAlpha = clamp(speedMPH * 0.02, 0.2, 0.8);
-    const smoothedVelLat = lastVelocity.lat * (1 - velocityAlpha) + velLat * velocityAlpha;
-    const smoothedVelLng = lastVelocity.lng * (1 - velocityAlpha) + velLng * velocityAlpha;
-
-    // Cache for the next iteration
-    lastVelocity = { lat: smoothedVelLat, lng: smoothedVelLng };
-
-    // -----------------------------------------------------------------
-    // 3️⃣  Predict a short‑term future point (half Δt, capped at 0.2 s)
-    // -----------------------------------------------------------------
-    const predTime = Math.min(timeDelta * 0.5, 0.2);
-    const predLat = curLat + smoothedVelLat * predTime;
-    const predLng = curLng + smoothedVelLng * predTime;
-
-    // Weight the prediction by speed – faster motion gets a larger pull.
-    const predWeight = clamp(speedMPH * 0.008, 0, 0.3);
-
-    // -----------------------------------------------------------------
-    // 4️⃣  Blend the raw fix with the prediction
-    // -----------------------------------------------------------------
+    
+    // Simple smoothing without complex prediction
+    const smoothingFactor = clamp(speedMPH * 0.02, 0.2, 0.8);
+    
     return {
-        lat: curLat * (1 - predWeight) + predLat * predWeight,
-        lng: curLng * (1 - predWeight) + predLng * predWeight,
+        lat: prevLat + (curLat - prevLat) * smoothingFactor,
+        lng: prevLng + (curLng - prevLng) * smoothingFactor,
         accuracy,
         speedMPS,
         timestamp
@@ -3107,53 +3151,26 @@ function calculateEnhancedVelocityFilter(
 }
 
 /* -------------------------------------------------------------
-   2️⃣  Exponential smoothing of the *position* itself
+   applyExponentialSmoothing (simplified)
    ------------------------------------------------------------- */
 function applyExponentialSmoothing(currentPosition, previousPosition) {
-    // -----------------------------------------------------------------
-    // Guard – first call just seeds the cache
-    // -----------------------------------------------------------------
-    if (!previousPosition || !lastSmoothedPosition) {
-        lastSmoothedPosition = currentPosition;
+    if (!previousPosition || !window.lastSmoothedPosition) {
+        window.lastSmoothedPosition = currentPosition;
         return currentPosition;
     }
-
-    const {
-        lat: curLat,
-        lng: curLng,
-        accuracy,
-        speedMPS,
-        timestamp
-    } = currentPosition;
-
-    const distance = calculateDistance(lastSmoothedPosition, currentPosition);
-    const speedMPH = speedMPS * 2.23694;
-    const timeDelta = (timestamp - previousPosition.timestamp) / 1000; // seconds
-
-    // Normalise speed to a 0‑1 factor (capped at 1) – used by the ultra‑smoothing helper
-    const speedFactor = Math.min(1, speedMPH / 50);
-
-    // Pull the ultra‑smoothing factor (already clamps internally)
-    const { factor: alpha } = calculateUltraSmoothingFactor(
-        speedMPH,
-        speedFactor,
-        distance,
-        timeDelta
-    );
-
-    // -----------------------------------------------------------------
-    // Blend the cached smoothed point with the new raw fix
-    // -----------------------------------------------------------------
+    
+    const speedMPH = (currentPosition.speedMPS || 0) * 2.23694;
+    const { factor: alpha } = calculateUltraSmoothingFactor(speedMPH);
+    
     const smoothed = {
-        lat: lastSmoothedPosition.lat * (1 - alpha) + curLat * alpha,
-        lng: lastSmoothedPosition.lng * (1 - alpha) + curLng * alpha,
-        accuracy,
-        speedMPS,
-        timestamp
+        lat: window.lastSmoothedPosition.lat * (1 - alpha) + currentPosition.lat * alpha,
+        lng: window.lastSmoothedPosition.lng * (1 - alpha) + currentPosition.lng * alpha,
+        accuracy: currentPosition.accuracy,
+        speedMPS: currentPosition.speedMPS,
+        timestamp: currentPosition.timestamp
     };
-
-    // Cache for the next frame
-    lastSmoothedPosition = smoothed;
+    
+    window.lastSmoothedPosition = smoothed;
     return smoothed;
 }
         
