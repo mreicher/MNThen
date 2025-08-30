@@ -1546,13 +1546,132 @@ function initMap() {
     });
 }
 
-// FIXED updateUserLocation function
+function predictNextPosition(currentPos, previousPos, speedMPS, heading) {
+    if (!previousPos || speedMPS < 1) return currentPos;
+    
+    const timeDelta = (currentPos.timestamp - previousPos.timestamp) / 1000;
+    if (timeDelta <= 0) return currentPos;
+    
+    // Calculate movement vector
+    const distance = speedMPS * timeDelta;
+    const bearing = heading !== null ? heading * Math.PI / 180 : 
+        Math.atan2(currentPos.lng - previousPos.lng, currentPos.lat - previousPos.lat);
+    
+    // Predict next position
+    const earthRadius = 6371000;
+    const angularDistance = distance / earthRadius;
+    
+    const lat1 = currentPos.lat * Math.PI / 180;
+    const lng1 = currentPos.lng * Math.PI / 180;
+    
+    const predLat = Math.asin(Math.sin(lat1) * Math.cos(angularDistance) + 
+        Math.cos(lat1) * Math.sin(angularDistance) * Math.cos(bearing));
+    
+    const predLng = lng1 + Math.atan2(Math.sin(bearing) * Math.sin(angularDistance) * Math.cos(lat1),
+        Math.cos(angularDistance) - Math.sin(lat1) * Math.sin(predLat));
+    
+    return {
+        lat: predLat * 180 / Math.PI,
+        lng: predLng * 180 / Math.PI,
+        accuracy: currentPos.accuracy,
+        speedMPS: speedMPS,
+        heading: heading,
+        timestamp: currentPos.timestamp + timeDelta * 1000,
+        isPredicted: true
+    };
+}
+
+function manageMapTransitions(targetPosition, targetZoom, options = {}) {
+    const {
+        duration = 1.0,
+        easeLinearity = 0.25,
+        maxZoomChange = 2
+    } = options;
+    
+    const currentZoom = map.getZoom();
+    const zoomDifference = Math.abs(targetZoom - currentZoom);
+    
+    if (zoomDifference > maxZoomChange) {
+        // Staged transition: zoom first, then pan
+        const intermediateZoom = currentZoom + Math.sign(targetZoom - currentZoom) * maxZoomChange;
+        
+        map.flyTo(targetPosition, intermediateZoom, {
+            duration: duration * 0.6,
+            easeLinearity: easeLinearity
+        });
+        
+        setTimeout(() => {
+            map.flyTo(targetPosition, targetZoom, {
+                duration: duration * 0.4,
+                easeLinearity: easeLinearity
+            });
+        }, duration * 600 * 0.6);
+    } else {
+        // Single smooth transition
+        map.flyTo(targetPosition, targetZoom, {
+            duration: duration,
+            easeLinearity: easeLinearity
+        });
+    }
+}
+
+function checkMapEdges(userPos) {
+    if (!map || !userPos) return false;
+    
+    const mapContainer = map.getContainer();
+    const mapRect = mapContainer.getBoundingClientRect();
+    const userPixel = map.latLngToContainerPoint(userPos);
+    
+    const edgeThreshold = {
+        horizontal: mapRect.width * 0.25,
+        vertical: mapRect.height * 0.25
+    };
+    
+    const isNearEdge = 
+        userPixel.x < edgeThreshold.horizontal ||
+        userPixel.x > mapRect.width - edgeThreshold.horizontal ||
+        userPixel.y < edgeThreshold.vertical ||
+        userPixel.y > mapRect.height - edgeThreshold.vertical;
+    
+    return isNearEdge;
+}
+
+function handleAccuracyBasedPositioning(position, speedTier) {
+    const accuracy = position.coords.accuracy;
+    const speedMPH = (position.coords.speed || 0) * 2.23694;
+    
+    // Adjust behavior based on accuracy
+    if (accuracy > 30) {
+        // Low accuracy - more smoothing, less frequent updates
+        return {
+            smoothingFactor: 0.9,
+            updateInterval: Math.max(1000, speedTier.mapUpdateInterval * 2),
+            deadZone: speedTier.microMovementThreshold * 2
+        };
+    } else if (accuracy > 15) {
+        // Medium accuracy - balanced behavior
+        return {
+            smoothingFactor: 0.7,
+            updateInterval: speedTier.mapUpdateInterval,
+            deadZone: speedTier.microMovementThreshold
+        };
+    } else {
+        // High accuracy - responsive behavior
+        return {
+            smoothingFactor: 0.5,
+            updateInterval: Math.max(50, speedTier.mapUpdateInterval * 0.7),
+            deadZone: speedTier.microMovementThreshold * 0.5
+        };
+    }
+}
+
+// updateUserLocation function
 function updateUserLocation(position, forceUpdate = false) {
-    const now = Date.now();  // Added missing declaration
+    const now = Date.now();
     
     if (!window.mapInteractionState) {
         window.mapInteractionState = {
-            isUserInteracting: false,  // Fixed typo here too
+            isUserInteracting: false,
             lastInteractionTime: 0,
             hasUserInteracted: false,
             isAnimating: false,
@@ -1578,12 +1697,15 @@ function updateUserLocation(position, forceUpdate = false) {
     const speedMPH = pos.speedMPS * 2.23694;
     const speedTier = getEnhancedSpeedTier(speedMPH);
 
+    // **NEW: Get accuracy-based parameters**
+    const accuracyParams = handleAccuracyBasedPositioning(position, speedTier);
+
     // First fix handling
     if (!window.lastPosition) {
         window.lastPosition = pos;
         const gpsLatLng = [pos.lat, pos.lng];
         
-        window.map.setView(gpsLatLng, speedTier.targetZoom);  // Use speed-appropriate zoom
+        window.map.setView(gpsLatLng, speedTier.targetZoom);
         window.userMarker.setLatLng(gpsLatLng);
         
         window.lastUpdateTime = now;
@@ -1599,6 +1721,11 @@ function updateUserLocation(position, forceUpdate = false) {
             updateAccuracyIndicator(pos.accuracy);
             
         console.log('Initial position set:', gpsLatLng);
+        return;
+    }
+    
+    // **NEW: Apply accuracy-based throttling**
+    if (!forceUpdate && now - (window.lastUpdateTime || 0) < accuracyParams.updateInterval) {
         return;
     }
     
@@ -1623,11 +1750,11 @@ function updateUserLocation(position, forceUpdate = false) {
             window.userMarker.setLatLng([pos.lat, pos.lng]);
         }
         
-        centerUserIcon(pos, speedTier, speedMPH, {
-            moveMarkerOnInteraction: false,
-            autoCenterAfterInactivity: true,
-            panDuration: 0.2,
-            easeLinearity: 0.25
+        // **CHANGED: Use manageMapTransitions instead of centerUserIcon for large jumps**
+        manageMapTransitions([pos.lat, pos.lng], speedTier.targetZoom, {
+            duration: 0.2,
+            easeLinearity: 0.25,
+            maxZoomChange: 2
         });
         
         window.lastPosition = pos;
@@ -1636,10 +1763,10 @@ function updateUserLocation(position, forceUpdate = false) {
         return;
     }
     
-    // Quality filtering
+    // **CHANGED: Quality filtering now uses accuracy-adjusted dead zone**
     if (!forceUpdate && (
         pos.accuracy > speedTier.maxAccuracy ||
-        distance < speedTier.microMovementThreshold ||
+        distance < accuracyParams.deadZone ||
         (timeDelta > 0 && distance / timeDelta > speedTier.maxSpeedThreshold * 1.5)
     )) {
         return;
@@ -1661,7 +1788,7 @@ function updateUserLocation(position, forceUpdate = false) {
             };
         }, { lat: 0, lng: 0, totalWeight: 0 });
         
-        const smoothed = {
+        let smoothed = {
             lat: avg.lat / avg.totalWeight,
             lng: avg.lng / avg.totalWeight,
             accuracy: pos.accuracy,
@@ -1669,20 +1796,58 @@ function updateUserLocation(position, forceUpdate = false) {
             timestamp: pos.timestamp
         };
         
+        // **NEW: Apply additional accuracy-based smoothing**
+        if (accuracyParams.smoothingFactor > 0.6) {
+            smoothed = {
+                lat: window.lastPosition.lat * (1 - accuracyParams.smoothingFactor) + smoothed.lat * accuracyParams.smoothingFactor,
+                lng: window.lastPosition.lng * (1 - accuracyParams.smoothingFactor) + smoothed.lng * accuracyParams.smoothingFactor,
+                accuracy: smoothed.accuracy,
+                speedMPS: smoothed.speedMPS,
+                timestamp: smoothed.timestamp
+            };
+        }
+
+        // **NEW: Get predicted position**
+        const predicted = predictNextPosition(smoothed, window.lastPosition, pos.speedMPS, pos.heading);
+        
+        // **NEW: Blend prediction for high-speed movement**
+        if (speedMPH > 10 && predicted.isPredicted) {
+            smoothed = {
+                lat: smoothed.lat * 0.8 + predicted.lat * 0.2,
+                lng: smoothed.lng * 0.8 + predicted.lng * 0.2,
+                accuracy: smoothed.accuracy,
+                speedMPS: smoothed.speedMPS,
+                timestamp: smoothed.timestamp
+            };
+        }
+        
         // Google Maps-like positioning
         if (window.userMarker) {
             window.userMarker.setLatLng([smoothed.lat, smoothed.lng]);
         }
         
+        // **NEW: Check if near map edges**
+        const nearEdge = checkMapEdges([smoothed.lat, smoothed.lng]);
+        
+        // **CHANGED: Center with edge detection**
         if (!state.isUserInteracting) {
-            centerUserIcon(smoothed, speedTier, speedMPH, {
-                moveMarkerOnInteraction: false,
-                autoCenterAfterInactivity: true,
-                deadZoneM: speedTier.microMovementThreshold
-            });
+            if (nearEdge) {
+                // Force recentering when near edge
+                manageMapTransitions([smoothed.lat, smoothed.lng], window.map.getZoom(), {
+                    duration: 0.6,
+                    easeLinearity: 0.2,
+                    maxZoomChange: 1
+                });
+            } else {
+                centerUserIcon(smoothed, speedTier, speedMPH, {
+                    moveMarkerOnInteraction: false,
+                    autoCenterAfterInactivity: true,
+                    deadZoneM: accuracyParams.deadZone
+                });
+            }
         }
         
-        // Speed-based zoom
+        // **CHANGED: Speed-based zoom uses manageMapTransitions**
         if (!state.isUserInteracting && now - state.lastInteractionTime > 2000) {
             const targetZoom = speedTier.targetZoom;
             
@@ -1692,9 +1857,10 @@ function updateUserLocation(position, forceUpdate = false) {
                 console.log('Speed-based zoom adjustment:', window.map.getZoom(), 
                            '→', targetZoom, `(${speedMPH.toFixed(1)} mph)`);
                 
-                window.map.setZoom(targetZoom, {
-                    animate: true,
-                    duration: speedTier.zoomDuration
+                manageMapTransitions([smoothed.lat, smoothed.lng], targetZoom, {
+                    duration: speedTier.zoomDuration || 1.0,
+                    easeLinearity: 0.25,
+                    maxZoomChange: 2
                 });
                 state.lastSpeedTier = speedTier;
             }
@@ -1724,11 +1890,11 @@ function updateUserLocation(position, forceUpdate = false) {
             window.userMarker.setLatLng([pos.lat, pos.lng]);
         }
         
-        centerUserIcon(pos, speedTier, speedMPH, {
-            moveMarkerOnInteraction: false,
-            autoCenterAfterInactivity: true,
-            panDuration: 0.3,
-            easeLinearity: 0.2
+        // **CHANGED: Error fallback uses manageMapTransitions**
+        manageMapTransitions([pos.lat, pos.lng], speedTier.targetZoom, {
+            duration: 0.3,
+            easeLinearity: 0.2,
+            maxZoomChange: 1
         });
         
         window.lastPosition = pos;
