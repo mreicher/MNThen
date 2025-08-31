@@ -2495,6 +2495,7 @@ function initializeMapState() {
             minUpdateInterval: 50,
             smoothingBuffer: [],
             lastSpeedTier: null,
+            currentDevicePosition: null,
             
             // Centering control
             pendingCenter: null,
@@ -2571,6 +2572,7 @@ function centerUserIcon(position, speedTier = null, speedMPH = 0, options = {}) 
     // This ensures the icon is always at the correct GPS location
     // -----------------------------------------------------------------
     window.userMarker.setLatLng(targetLatLng);
+    state.currentDevicePosition = targetLatLng;
 
     // -----------------------------------------------------------------
     // Dead-zone check for map movement (not marker movement)
@@ -2674,7 +2676,7 @@ function weightedAverage(buffer) {
 }
 
 /* --------------------------------------------------------------
-   Helper functions (copy‑paste the definitions you already have)
+   Helper functions
 ----------------------------------------------------------------*/
 function predictNextPosition(currentPos, previousPos, speedMPS, heading) {
     if (!previousPos || speedMPS < 1) return currentPos;
@@ -2768,7 +2770,7 @@ function handleAccuracyBasedPositioning(position, speedTier) {
 }
 
 /* --------------------------------------------------------------
-   Main location‑update routine – now using the helpers above
+   Main location‑update routine – modified to always update marker position
 ----------------------------------------------------------------*/
 function updateUserLocation(position, forceUpdate = false) {
     const now = Date.now();
@@ -2812,7 +2814,15 @@ function updateUserLocation(position, forceUpdate = false) {
             INACTIVITY_TIMEOUT: 15000,
             smoothingBuffer: [],
             lastSpeedTier: null,
-            lastSignificantMovement: now
+            lastSignificantMovement: now,
+            currentDevicePosition: null,
+            recenterTimer: null,
+            pendingCenter: null,
+            forceCenterNext: false,
+            centeringDisabled: false,
+            gestureDebounce: 100,
+            lastGestureTime: 0,
+            lastAnimationEnd: 0
         };
         
         if (typeof setupInteractionHandlers === 'function') {
@@ -2828,6 +2838,17 @@ function updateUserLocation(position, forceUpdate = false) {
     // Throttle updates
     if (!forceUpdate && state.lastProcessedPosition && 
         (now - state.lastProcessedPosition) < state.minUpdateInterval) {
+        // Still update marker position even during throttling
+        const pos = {
+            lat: position.coords.latitude,
+            lng: position.coords.longitude,
+            accuracy: position.coords.accuracy ?? 20,
+            heading: position.coords.heading ?? null,
+            timestamp: now,
+            speedMPS: position.coords.speed ?? 0
+        };
+        window.userMarker.setLatLng([pos.lat, pos.lng]);
+        state.currentDevicePosition = L.latLng(pos.lat, pos.lng);
         return;
     }
     
@@ -2859,6 +2880,7 @@ function updateUserLocation(position, forceUpdate = false) {
         
         window.map.setView(gpsLatLng, speedTier.targetZoom);
         window.userMarker.setLatLng(gpsLatLng);
+        state.currentDevicePosition = L.latLng(pos.lat, pos.lng);
         
         window.lastUpdateTime = now;
         window.positionBuffer = [pos];
@@ -2889,8 +2911,11 @@ function updateUserLocation(position, forceUpdate = false) {
         }
 
         state.smoothingBuffer = [pos, pos, pos];
+        // ALWAYS update marker to device position
         window.userMarker.setLatLng([pos.lat, pos.lng]);
+        state.currentDevicePosition = L.latLng(pos.lat, pos.lng);
 
+        // Only center map if large jump - this overrides interaction state
         window.map.setView([pos.lat, pos.lng], speedTier.targetZoom, {
             animate: distance < 1000,
             duration: distance < 1000 ? 0.5 : 0
@@ -2903,12 +2928,16 @@ function updateUserLocation(position, forceUpdate = false) {
         return;
     }
 
-    /* ----- quality filtering ----- */
+    // ALWAYS update marker to device position regardless of filtering
+    window.userMarker.setLatLng([pos.lat, pos.lng]);
+    state.currentDevicePosition = L.latLng(pos.lat, pos.lng);
+
+    /* ----- quality filtering for map updates only ----- */
     if (!forceUpdate &&
         (pos.accuracy > speedTier.maxAccuracy ||
          distance < speedTier.microMovementThreshold ||
          (timeDelta > 0 && distance / timeDelta > speedTier.maxSpeedThreshold * 1.5))) {
-        return;
+        return; // Skip map updates but marker is already updated
     }
 
     /* ----- accuracy-based throttling parameters ----- */
@@ -2949,8 +2978,11 @@ function updateUserLocation(position, forceUpdate = false) {
             heading: pos.heading
         };
 
+        // Update marker again with smoothed position
         window.userMarker.setLatLng([smoothed.lat, smoothed.lng]);
+        state.currentDevicePosition = L.latLng(smoothed.lat, smoothed.lng);
 
+        // Handle map centering only when not interacting
         if (!state.isUserInteracting) {
             const currentCenter = window.map.getCenter();
             const distanceFromCenter = window.map.distance(currentCenter, [smoothed.lat, smoothed.lng]);
@@ -2964,6 +2996,7 @@ function updateUserLocation(position, forceUpdate = false) {
             }
         }
 
+        // Handle speed-based zoom only when not interacting
         if (!state.isUserInteracting && now - state.lastInteractionTime > 2000) {
             const currentZoom = window.map.getZoom();
             const targetZoom = speedTier.targetZoom;
@@ -3004,17 +3037,22 @@ function updateUserLocation(position, forceUpdate = false) {
     } catch (err) {
         console.error('Location update error:', err);
         
-        if (window.map._panAnim && typeof window.map._panAnim.stop === 'function') {
-            window.map._panAnim.stop();
-        }
-
+        // Fallback: Always ensure marker shows device location
         window.userMarker.setLatLng([pos.lat, pos.lng]);
+        state.currentDevicePosition = L.latLng(pos.lat, pos.lng);
 
-        window.map.panTo([pos.lat, pos.lng], {
-            animate: true,
-            duration: 0.3,
-            easeLinearity: 0.2
-        });
+        // Try to center map only if not interacting
+        if (!state.isUserInteracting) {
+            if (window.map._panAnim && typeof window.map._panAnim.stop === 'function') {
+                window.map._panAnim.stop();
+            }
+
+            window.map.panTo([pos.lat, pos.lng], {
+                animate: true,
+                duration: 0.3,
+                easeLinearity: 0.2
+            });
+        }
 
         window.lastPosition = pos;
         if (typeof updateDistanceBox === 'function') updateDistanceBox();
@@ -3112,243 +3150,248 @@ function setupInteractionHandlers() {
     map.on('dragend zoomend moveend', () => {
         // Delay to allow animations to complete
         setTimeout(endInteraction, 100);
-    });
+        });
 
-    // -----------------------------------------------------------------
-    // Wheel/scroll handling with debouncing
-    // -----------------------------------------------------------------
-    let wheelTimeout = null;
-    
-    container.addEventListener('wheel', (e) => {
-        startInteraction();
-        
-        // Debounce wheel end detection
-        clearTimeout(wheelTimeout);
-        wheelTimeout = setTimeout(() => {
-            if (!state.isUserInteracting) return;
-            endInteraction();
-        }, 300);
-        
-    }, { passive: true });
+   // -----------------------------------------------------------------
+   // Wheel/scroll handling with debouncing
+   // -----------------------------------------------------------------
+   let wheelTimeout = null;
+   
+   container.addEventListener('wheel', (e) => {
+       startInteraction();
+       
+       // Debounce wheel end detection
+       clearTimeout(wheelTimeout);
+       wheelTimeout = setTimeout(() => {
+           if (!state.isUserInteracting) return;
+           endInteraction();
+       }, 300);
+       
+   }, { passive: true });
 
-    // -----------------------------------------------------------------
-    // Keyboard handling (arrow keys, +/- zoom)
-    // -----------------------------------------------------------------
-    document.addEventListener('keydown', (e) => {
-        if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', '+', '-', '='].includes(e.key)) {
-            if (document.activeElement === document.body || 
-                container.contains(document.activeElement)) {
-                startInteraction();
-                setTimeout(endInteraction, 500);
-            }
-        }
-    }, { passive: true });
+   // -----------------------------------------------------------------
+   // Keyboard handling (arrow keys, +/- zoom)
+   // -----------------------------------------------------------------
+   document.addEventListener('keydown', (e) => {
+       if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', '+', '-', '='].includes(e.key)) {
+           if (document.activeElement === document.body || 
+               container.contains(document.activeElement)) {
+               startInteraction();
+               setTimeout(endInteraction, 500);
+           }
+       }
+   }, { passive: true });
 }
 
 /* -------------------------------------------------------------
-   Inactivity timer management
-   ------------------------------------------------------------- */
+  Inactivity timer management
+  ------------------------------------------------------------- */
 function clearInactivityTimer() {
-    const state = window.mapInteractionState;
-    if (!state) return;
-    
-    if (state.inactivityTimer) {
-        clearTimeout(state.inactivityTimer);
-        state.inactivityTimer = null;
-    }
+   const state = window.mapInteractionState;
+   if (!state) return;
+   
+   if (state.inactivityTimer) {
+       clearTimeout(state.inactivityTimer);
+       state.inactivityTimer = null;
+   }
 }
 
 function startInactivityTimer() {
-    const state = window.mapInteractionState;
-    if (!state || !state.hasUserInteracted || state.isUserInteracting) {
-        return;
-    }
+   const state = window.mapInteractionState;
+   if (!state || !state.hasUserInteracted || state.isUserInteracting) {
+       return;
+   }
 
-    clearInactivityTimer();
+   clearInactivityTimer();
 
-    state.inactivityTimer = setTimeout(() => {
-        // Re-enable automatic centering after inactivity
-        if (window.lastPosition && !state.isUserInteracting && window.userMarker) {
-            console.log('🔄 Auto-recentering after inactivity');
-            
-            // Get speed-appropriate settings
-            const speedMPH = (window.lastPosition.speedMPS || 0) * 2.23694;
-            const speedTier = getEnhancedSpeedTier(speedMPH);
-            
-            // Force recenter with smooth animation
-            centerUserIcon(window.lastPosition, speedTier, speedMPH, {
-                forceCenter: true,
-                panDuration: 1.2,
-                easeLinearity: 0.25
-            });
-            
-            // Reset interaction state
-            state.hasUserInteracted = false;
-            state.forceCenterNext = true;
-            
-            // Re-enable follow mode
-            if (typeof window.followUser !== 'undefined') {
-                window.followUser = true;
-            }
-            
-            console.log('✅ Auto-centering resumed');
-        }
-        
-        state.inactivityTimer = null;
-    }, state.INACTIVITY_TIMEOUT);
+   state.inactivityTimer = setTimeout(() => {
+       // Re-enable automatic centering after inactivity
+       if (state.currentDevicePosition && !state.isUserInteracting && window.userMarker) {
+           console.log('🔄 Auto-recentering after inactivity');
+           
+           // Get speed-appropriate settings
+           const speedMPH = (window.lastPosition?.speedMPS || 0) * 2.23694;
+           const speedTier = getEnhancedSpeedTier(speedMPH);
+           
+           // Use current device position for recentering
+           const devicePos = {
+               lat: state.currentDevicePosition.lat,
+               lng: state.currentDevicePosition.lng
+           };
+           
+           // Force recenter with smooth animation
+           centerUserIcon(devicePos, speedTier, speedMPH, {
+               forceCenter: true,
+               panDuration: 1.2,
+               easeLinearity: 0.25
+           });
+           
+           // Reset interaction state
+           state.hasUserInteracted = false;
+           state.forceCenterNext = true;
+           
+           // Re-enable follow mode
+           if (typeof window.followUser !== 'undefined') {
+               window.followUser = true;
+           }
+           
+           console.log('✅ Auto-centering resumed');
+       }
+       
+       state.inactivityTimer = null;
+   }, state.INACTIVITY_TIMEOUT);
 }
 
 /* -------------------------------------------------------------
-   Utility functions for enhanced smoothing and filtering
-   ------------------------------------------------------------- */
+  Utility functions for enhanced smoothing and filtering
+  ------------------------------------------------------------- */
 const clamp = (val, min, max) => Math.min(Math.max(val, min), max);
 
 function calculateUltraSmoothingFactor(speedMPH) {
-    // Higher speeds need less smoothing to maintain responsiveness
-    const baseTable = [
-        [0, 0.3],    // Very slow - more smoothing
-        [1, 0.5],    // Walking - moderate smoothing  
-        [4, 0.7],    // Biking - less smoothing
-        [15, 0.8],   // Moderate speed - minimal smoothing
-        [40, 0.85],  // Highway - very little smoothing
-        [70, 0.9]    // High speed - least smoothing
-    ];
-    
-    for (let i = baseTable.length - 1; i >= 0; i--) {
-        if (speedMPH >= baseTable[i][0]) {
-            return { factor: baseTable[i][1] };
-        }
-    }
-    return { factor: baseTable[0][1] };
+   // Higher speeds need less smoothing to maintain responsiveness
+   const baseTable = [
+       [0, 0.3],    // Very slow - more smoothing
+       [1, 0.5],    // Walking - moderate smoothing  
+       [4, 0.7],    // Biking - less smoothing
+       [15, 0.8],   // Moderate speed - minimal smoothing
+       [40, 0.85],  // Highway - very little smoothing
+       [70, 0.9]    // High speed - least smoothing
+   ];
+   
+   for (let i = baseTable.length - 1; i >= 0; i--) {
+       if (speedMPH >= baseTable[i][0]) {
+           return { factor: baseTable[i][1] };
+       }
+   }
+   return { factor: baseTable[0][1] };
 }
 
 function updatePositionBuffer(newPosition) {
-    if (!window.positionBuffer) window.positionBuffer = [];
-    
-    const buf = window.positionBuffer;
-    buf.push(newPosition);
-    
-    // Keep buffer size manageable
-    if (buf.length > 5) buf.splice(0, buf.length - 5);
+   if (!window.positionBuffer) window.positionBuffer = [];
+   
+   const buf = window.positionBuffer;
+   buf.push(newPosition);
+   
+   // Keep buffer size manageable
+   if (buf.length > 5) buf.splice(0, buf.length - 5);
 }
 
 function calculateFinalPosition() {
-    const buf = window.positionBuffer;
-    if (!buf || buf.length === 0) return null;
-    if (buf.length === 1) return { ...buf[0] };
-    
-    const result = buf.reduce((acc, pos, idx) => {
-        const age = buf.length - idx - 1;
-        const accWeight = Math.max(0.1, 1 / Math.max(pos.accuracy, 5));
-        const timeWeight = Math.pow(0.8, age);
-        const weight = accWeight * timeWeight;
-        
-        acc.weightedLat += pos.lat * weight;
-        acc.weightedLng += pos.lng * weight;
-        acc.totalWeight += weight;
-        acc.totalSpeed += pos.speedMPS || 0;
-        
-        if (pos.accuracy < acc.bestAccuracy) acc.bestAccuracy = pos.accuracy;
-        return acc;
-    }, {
-        weightedLat: 0, weightedLng: 0, totalWeight: 0, 
-        totalSpeed: 0, bestAccuracy: Infinity
-    });
-    
-    return {
-        lat: result.weightedLat / result.totalWeight,
-        lng: result.weightedLng / result.totalWeight,
-        accuracy: result.bestAccuracy,
-        speedMPS: result.totalSpeed / buf.length,
-        timestamp: Date.now()
-    };
+   const buf = window.positionBuffer;
+   if (!buf || buf.length === 0) return null;
+   if (buf.length === 1) return { ...buf[0] };
+   
+   const result = buf.reduce((acc, pos, idx) => {
+       const age = buf.length - idx - 1;
+       const accWeight = Math.max(0.1, 1 / Math.max(pos.accuracy, 5));
+       const timeWeight = Math.pow(0.8, age);
+       const weight = accWeight * timeWeight;
+       
+       acc.weightedLat += pos.lat * weight;
+       acc.weightedLng += pos.lng * weight;
+       acc.totalWeight += weight;
+       acc.totalSpeed += pos.speedMPS || 0;
+       
+       if (pos.accuracy < acc.bestAccuracy) acc.bestAccuracy = pos.accuracy;
+       return acc;
+   }, {
+       weightedLat: 0, weightedLng: 0, totalWeight: 0, 
+       totalSpeed: 0, bestAccuracy: Infinity
+   });
+   
+   return {
+       lat: result.weightedLat / result.totalWeight,
+       lng: result.weightedLng / result.totalWeight,
+       accuracy: result.bestAccuracy,
+       speedMPS: result.totalSpeed / buf.length,
+       timestamp: Date.now()
+   };
 }
 
 /* -------------------------------------------------------------
-   Stationary state handling
-   ------------------------------------------------------------- */
+  Stationary state handling
+  ------------------------------------------------------------- */
+let isStationary = false;
+let stationaryStartTime = null;
+let stationaryCount = 0;
+let stationaryCheckTimeout = null;
+
+const CONFIG = {
+   MAX_STATIONARY_CHECKS: 10,
+   STATIONARY_CHECK_INTERVAL: 2000
+};
+
 function checkStationaryState(currentPosition) {
-    if (!isStationary || !currentPosition) return;
-    
-    stationaryCount++;
-    console.log("🔍 Stationary check #" + stationaryCount);
-    
-    if (stationaryCount >= CONFIG.MAX_STATIONARY_CHECKS) {
-        console.log("⏰ Max stationary checks reached, forcing update");
-        isStationary = false;
-        stationaryStartTime = null;
-        stationaryCount = 0;
-        
-        // Force center when exiting stationary state
-        const speedTier = getEnhancedSpeedTier(0);
-        centerUserIcon(currentPosition, speedTier, 0, { forceCenter: true });
-        
-        lastPosition = currentPosition;
-        if (typeof updateDistanceBox === 'function') updateDistanceBox();
-        return;
-    }
-    
-    if (stationaryCheckTimeout) {
-        clearTimeout(stationaryCheckTimeout);
-    }
-    
-    stationaryCheckTimeout = setTimeout(() => {
-        checkStationaryState(currentPosition);
-    }, CONFIG.STATIONARY_CHECK_INTERVAL);
+   if (!isStationary || !currentPosition) return;
+   
+   stationaryCount++;
+   console.log("🔍 Stationary check #" + stationaryCount);
+   
+   if (stationaryCount >= CONFIG.MAX_STATIONARY_CHECKS) {
+       console.log("⏰ Max stationary checks reached, forcing update");
+       isStationary = false;
+       stationaryStartTime = null;
+       stationaryCount = 0;
+       
+       // Force center when exiting stationary state
+       const speedTier = getEnhancedSpeedTier(0);
+       centerUserIcon(currentPosition, speedTier, 0, { forceCenter: true });
+       
+       window.lastPosition = currentPosition;
+       if (typeof updateDistanceBox === 'function') updateDistanceBox();
+       return;
+   }
+   
+   if (stationaryCheckTimeout) {
+       clearTimeout(stationaryCheckTimeout);
+   }
+   
+   stationaryCheckTimeout = setTimeout(() => {
+       checkStationaryState(currentPosition);
+   }, CONFIG.STATIONARY_CHECK_INTERVAL);
 }
 
 /* -------------------------------------------------------------
-   Initialize everything when DOM is ready
-   ------------------------------------------------------------- */
+  Initialize everything when DOM is ready
+  ------------------------------------------------------------- */
 function initializeGoogleMapsLikeBehavior() {
-    if (typeof window.map !== 'undefined' && window.map) {
-        setupAnimationHandlers();
-        setupInteractionHandlers();
-        console.log('🗺️  Google Maps-like behavior initialized');
-    }
+   if (typeof window.map !== 'undefined' && window.map) {
+       setupAnimationHandlers();
+       setupInteractionHandlers();
+       console.log('🗺️  Google Maps-like behavior initialized');
+       console.log('📍 User icon will always show device location');
+       console.log('🎯 Map centering respects user interaction state');
+   }
 }
 
 // Auto-initialize if map exists, otherwise wait for it
 if (typeof window.map !== 'undefined' && window.map) {
-    initializeGoogleMapsLikeBehavior();
+   initializeGoogleMapsLikeBehavior();
 } else {
-    // Wait for map to be available
-    const checkForMap = setInterval(() => {
-        if (typeof window.map !== 'undefined' && window.map) {
-            clearInterval(checkForMap);
-            initializeGoogleMapsLikeBehavior();
-        }
-    }, 100);
-}
-
-function calculateIntelligentZoom(speedMPS, closestDistance) {
-   const speedMPH = speedMPS * 2.23694;
-   const baseZoom = getSpeedBasedZoom(speedMPS);
-   
-   if (closestDistance < 50) {
-       return Math.min(baseZoom + 1, 18);
-   } else if (closestDistance > 500) {
-       return Math.max(baseZoom - 1, 10);
-   }
-   
-   return baseZoom;
+   // Wait for map to be available
+   const checkForMap = setInterval(() => {
+       if (typeof window.map !== 'undefined' && window.map) {
+           clearInterval(checkForMap);
+           initializeGoogleMapsLikeBehavior();
+       }
+   }, 100);
 }
 
 // Helper function to find closest location distance
 function findClosestLocationDistance(position) {
-    if (!gameLocations || gameLocations.length === 0) return Infinity;
-    
-    let closestDistance = Infinity;
-    for (const loc of gameLocations) {
-        if (loc && loc.lat && loc.lng) {
-            const dist = calculateDistance(position, loc);
-            if (dist < closestDistance) {
-                closestDistance = dist;
-            }
-        }
-    }
-    
-    return closestDistance * 3.28084; // Convert to feet
+   if (!gameLocations || gameLocations.length === 0) return Infinity;
+   
+   let closestDistance = Infinity;
+   for (const loc of gameLocations) {
+       if (loc && loc.lat && loc.lng) {
+           const dist = calculateDistance(position, loc);
+           if (dist < closestDistance) {
+               closestDistance = dist;
+           }
+       }
+   }
+   
+   return closestDistance * 3.28084; // Convert to feet
 }
 
 function updateDistanceBox() {
