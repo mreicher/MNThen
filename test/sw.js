@@ -560,7 +560,7 @@ self.addEventListener('activate', (event) => {
   // Take control of all open clients immediately
   return self.clients.claim();
 });
-// Install event - cache critical resources
+// Install event - cache critical resources with error handling
 self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(CACHE_VERSIONS.STATIC).then(cache => {
@@ -569,7 +569,11 @@ self.addEventListener('install', (event) => {
         '/index.html',
         '/placeholder.svg',
         '/manifest.json'
-      ]);
+      ]).catch(error => {
+        console.warn('Some resources failed to cache during install:', error);
+        // Continue with installation even if some resources fail
+        return Promise.resolve();
+      });
     })
   );
 });
