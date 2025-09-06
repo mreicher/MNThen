@@ -30,10 +30,9 @@ async function cacheFirst(request) {
     // Not in cache - fetch and cache
     const response = await fetch(request);
     
-    if (response.ok && response.status < 400) {
-      // Clone before caching
-      cache.put(request, response.clone());
-    }
+    if (response.ok && response.status === 200) {
+    cache.put(request, response.clone());
+  }
     
     return response;
   } catch (error) {
@@ -164,3 +163,4 @@ self.addEventListener('unhandledrejection', (event) => {
 });
 
 console.log('Service Worker 4.0.0: Loaded successfully');
+
