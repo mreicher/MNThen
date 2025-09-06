@@ -1,576 +1,166 @@
 // sw.js – Minnesota Then Service Worker
-// Version: 3.5.0 (With Enhanced Image Caching & CORS Proxy for Audio)
-const CACHE_VERSIONS = {
-  STATIC:  'mnthen-static-v5',
-  IMAGES:  'mnthen-images-v5',
-  AUDIO:   'mnthen-audio-v6',
-  TILES:   'mnthen-tiles-v5',
-  RUNTIME: 'mnthen-runtime-v5'
-};
-const CACHE_LIMITS = {
-  [CACHE_VERSIONS.IMAGES]:  100 * 1024 * 1024,
-  [CACHE_VERSIONS.AUDIO]:   200 * 1024 * 1024,
-  [CACHE_VERSIONS.TILES]:   150 * 1024 * 1024,
-  [CACHE_VERSIONS.RUNTIME]: 50 * 1024 * 1024
-};
-// Performance tracking
-let cacheHitCount = 0;
-let cacheMissCount = 0;
-let activeBackgroundUpdates = 0;
-const MAX_CONCURRENT_BACKGROUND_UPDATES = 3;
-// Track cache sizes to avoid recalculating
-const cacheSizes = {};
-const CACHE_SIZE_UPDATE_INTERVAL = 60000;
-let lastCacheSizeUpdate = 0;
-// Track in-flight requests to avoid duplicates
-const inFlightRequests = new Map();
-// Position smoothing for reducing marker jumpiness
-const positionBuffer = [];
-const MAX_POSITION_BUFFER_SIZE = 5;
-const POSITION_SMOOTHING_FACTOR = 0.3; // Lower = more smoothing
-const MAX_POSITION_AGE = 10000; // 10 seconds
-// Geolocation response caching to reduce jitter
-const geolocationCache = new Map();
-const GEOLOCATION_CACHE_TTL = 5000; // 5 seconds
-// CORS PROXY CONFIGURATION
-const CORS_PROXY_URL = 'https://cors-anywhere.herokuapp.com/';
-// More efficient cache quota enforcement
-async function enforceCacheQuota(cacheName) {
-  const limit = CACHE_LIMITS[cacheName];
-  if (!limit) return;
-  
-  const now = Date.now();
-  if (now - lastCacheSizeUpdate < CACHE_SIZE_UPDATE_INTERVAL) {
-    return;
-  }
-  
+// Version: 4.0.0 (Rewritten for reliability)
+
+const CACHE_NAME = 'mnthen-v4';
+const RUNTIME_CACHE = 'mnthen-runtime-v4';
+
+// Critical resources to cache on install
+const STATIC_RESOURCES = [
+  '/',
+  '/index.html',
+  '/manifest.json'
+];
+
+// Resources that should NEVER be cached (always fetch fresh)
+const NEVER_CACHE = [
+  '/locations_main.js',  // Your locations array - always fresh
+  '/manifest.json'       // Manifest should always be fresh
+];
+
+// Simple cache-first strategy with fallback
+async function cacheFirst(request) {
   try {
-    const cache = await caches.open(cacheName);
-    const keys = await cache.keys();
-    let totalSize = cacheSizes[cacheName] || 0;
+    const cache = await caches.open(CACHE_NAME);
+    const cached = await cache.match(request);
     
-    if (totalSize === 0) {
-      const items = [];
-      
-      for (let i = 0; i < keys.length; i += 10) {
-        const batch = keys.slice(i, i + 10);
-        const batchPromises = batch.map(async (key) => {
-          try {
-            const response = await cache.match(key);
-            if (response) {
-              const blob = await response.blob();
-              return { key, size: blob.size };
-            }
-            return null;
-          } catch (e) {
-            await cache.delete(key);
-            return null;
-          }
-        });
-        
-        const batchResults = await Promise.all(batchPromises);
-        items.push(...batchResults.filter(item => item !== null));
-      }
-      
-      totalSize = items.reduce((sum, item) => sum + item.size, 0);
-      cacheSizes[cacheName] = totalSize;
-      lastCacheSizeUpdate = now;
+    if (cached) {
+      return cached;
     }
     
-    if (totalSize <= limit) return;
-    
-    const items = [];
-    for (const key of keys) {
-      try {
-        const response = await cache.match(key);
-        if (response) {
-          const blob = await response.blob();
-          items.push({ 
-            key, 
-            size: blob.size,
-            lastAccessed: response.headers.get('sw-last-accessed') || Date.now()
-          });
-        }
-      } catch (e) {
-        await cache.delete(key);
-      }
-    }
-    
-    items.sort((a, b) => a.lastAccessed - b.lastAccessed);
-    
-    while (totalSize > limit && items.length > 0) {
-      const item = items.shift();
-      await cache.delete(item.key);
-      totalSize -= item.size;
-      cacheSizes[cacheName] = totalSize;
-    }
-  } catch (error) {
-    console.error('Cache quota enforcement failed:', error);
-  }
-}
-// Position smoothing function
-function smoothPosition(newPosition) {
-  const now = Date.now();
-  
-  // Add new position to buffer
-  positionBuffer.push({
-    ...newPosition,
-    timestamp: now
-  });
-  
-  // Remove old positions
-  while (positionBuffer.length > 0 && 
-         now - positionBuffer[0].timestamp > MAX_POSITION_AGE) {
-    positionBuffer.shift();
-  }
-  
-  // Remove excess positions if buffer is too large
-  while (positionBuffer.length > MAX_POSITION_BUFFER_SIZE) {
-    positionBuffer.shift();
-  }
-  
-  // If we don't have enough positions, return the new one
-  if (positionBuffer.length < 2) {
-    return newPosition;
-  }
-  
-  // Calculate weighted average for smoothing
-  let totalWeight = 0;
-  let smoothedLat = 0;
-  let smoothedLng = 0;
-  let smoothedAccuracy = 0;
-  
-  // More recent positions get higher weight
-  for (let i = 0; i < positionBuffer.length; i++) {
-    const position = positionBuffer[i];
-    const age = now - position.timestamp;
-    const weight = Math.exp(-age / 5000); // Decay over 5 seconds
-    
-    smoothedLat += position.lat * weight;
-    smoothedLng += position.lng * weight;
-    smoothedAccuracy += position.accuracy * weight;
-    totalWeight += weight;
-  }
-  
-  if (totalWeight > 0) {
-    smoothedLat /= totalWeight;
-    smoothedLng /= totalWeight;
-    smoothedAccuracy /= totalWeight;
-  }
-  
-  // Apply additional smoothing factor
-  const mostRecent = positionBuffer[positionBuffer.length - 1];
-  const finalLat = mostRecent.lat * (1 - POSITION_SMOOTHING_FACTOR) + smoothedLat * POSITION_SMOOTHING_FACTOR;
-  const finalLng = mostRecent.lng * (1 - POSITION_SMOOTHING_FACTOR) + smoothedLng * POSITION_SMOOTHING_FACTOR;
-  
-  return {
-    lat: finalLat,
-    lng: finalLng,
-    accuracy: Math.min(mostRecent.accuracy, smoothedAccuracy),
-    timestamp: now,
-    speed: mostRecent.speed,
-    heading: mostRecent.heading
-  };
-}
-// Intercept and smooth geolocation requests
-async function handleGeolocationRequest(request) {
-  const url = new URL(request.url);
-  const cacheKey = url.pathname + url.search;
-  
-  // Check if we have a recent cached response
-  const cached = geolocationCache.get(cacheKey);
-  if (cached && Date.now() - cached.timestamp < GEOLOCATION_CACHE_TTL) {
-    return new Response(JSON.stringify(cached.position), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  }
-  
-  // Fetch fresh position
-  try {
+    // Not in cache - fetch and cache
     const response = await fetch(request);
-    if (!response.ok) {
-      return response;
+    
+    if (response.ok && response.status < 400) {
+      // Clone before caching
+      cache.put(request, response.clone());
     }
     
-    const positionData = await response.json();
-    
-    // Smooth the position
-    const smoothedPosition = smoothPosition(positionData.coords || positionData);
-    
-    // Create smoothed response
-    const smoothedResponse = {
-      ...positionData,
-      coords: smoothedPosition
-    };
-    
-    // Cache the smoothed position
-    geolocationCache.set(cacheKey, {
-      position: smoothedResponse,
-      timestamp: Date.now()
-    });
-    
-    // Clean up old cache entries
-    if (geolocationCache.size > 20) {
-      const oldestKey = geolocationCache.keys().next().value;
-      geolocationCache.delete(oldestKey);
-    }
-    
-    return new Response(JSON.stringify(smoothedResponse), {
-      headers: { 'Content-Type': 'application/json' }
-    });
+    return response;
   } catch (error) {
-    console.error('Geolocation request failed:', error);
-    return new Response('{"error": "Location unavailable"}', {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' }
-    });
-  }
-}
-// Cache-first with request deduplication
-async function cacheFirst(req, cacheName) {
-  const url = req.url;
-  
-  // Check for in-flight request
-  if (inFlightRequests.has(url)) {
-    return inFlightRequests.get(url);
-  }
-  
-  // Intercept geolocation requests for smoothing
-  if (url.includes('geolocation') || url.includes('location')) {
-    return handleGeolocationRequest(req);
-  }
-  
-  try {
-    const cache = await caches.open(cacheName);
-    const hit = await cache.match(req);
-    
-    if (hit) {
-      cacheHitCount++;
-      
-      const response = hit.clone();
-      response.headers.set('sw-last-accessed', Date.now().toString());
-      await cache.put(req, response);
-      
-      return hit;
-    }
-    
-    cacheMissCount++;
-    
-    const fetchPromise = fetch(req).then(async (resp) => {
-      if (resp.ok && resp.status < 400) {
-        try {
-          const responseClone = resp.clone();
-          responseClone.headers.set('sw-last-accessed', Date.now().toString());
-          
-          await cache.put(req, responseClone);
-          
-          const contentLength = resp.headers.get('content-length');
-          if (contentLength) {
-            const size = parseInt(contentLength, 10);
-            cacheSizes[cacheName] = (cacheSizes[cacheName] || 0) + size;
-          }
-          
-          if (Date.now() - lastCacheSizeUpdate > CACHE_SIZE_UPDATE_INTERVAL) {
-            enforceCacheQuota(cacheName);
-          }
-        } catch (e) {
-          console.warn('Failed to cache response:', e);
-        }
-      }
-      return resp;
-    }).finally(() => {
-      inFlightRequests.delete(url);
-    });
-    
-    inFlightRequests.set(url, fetchPromise);
-    return fetchPromise;
-  } catch (error) {
-    console.error('Cache-first strategy failed:', error);
-    inFlightRequests.delete(url);
-    
-    const fallback = await caches.match(req);
+    console.error('Cache-first failed:', error);
+    // Try to return cached version as fallback
+    const cache = await caches.open(CACHE_NAME);
+    const fallback = await cache.match(request);
     return fallback || new Response('Resource unavailable', { status: 503 });
   }
 }
-// Map tile caching with preloading
-async function staleWhileRevalidate(req, cacheName) {
-  const cache = await caches.open(cacheName);
-  const cached = await cache.match(req);
-  
-  if (cached) {
-    cacheHitCount++;
-    
-    const response = cached.clone();
-    response.headers.set('sw-last-accessed', Date.now().toString());
-    await cache.put(req, response);
-    
-    // Background update with throttling
-    if (activeBackgroundUpdates < MAX_CONCURRENT_BACKGROUND_UPDATES) {
-      activeBackgroundUpdates++;
-      
-      fetch(req).then(async (resp) => {
-        if (resp.ok && resp.status < 400) {
-          try {
-            const responseClone = resp.clone();
-            responseClone.headers.set('sw-last-accessed', Date.now().toString());
-            await cache.put(req, responseClone);
-            
-            const contentLength = resp.headers.get('content-length');
-            if (contentLength) {
-              const size = parseInt(contentLength, 10);
-              cacheSizes[cacheName] = (cacheSizes[cacheName] || 0) + size;
-            }
-            
-            // Preload adjacent tiles for smoother panning
-            preloadAdjacentTiles(req.url, cacheName);
-          } catch (e) {
-            console.warn('Background tile update failed:', e);
-          }
-        }
-      }).catch(() => {
-        // Silent fail for background updates
-      }).finally(() => {
-        activeBackgroundUpdates--;
-      });
-    }
-    
-    return cached;
-  }
-  
-  // No cache - fetch fresh
-  cacheMissCount++;
+
+// Network-first strategy (for dynamic content)
+async function networkFirst(request) {
   try {
-    const resp = await fetch(req);
-    if (resp.ok && resp.status < 400) {
-      const responseClone = resp.clone();
-      responseClone.headers.set('sw-last-accessed', Date.now().toString());
-      await cache.put(req, responseClone);
-      
-      const contentLength = resp.headers.get('content-length');
-      if (contentLength) {
-        const size = parseInt(contentLength, 10);
-        cacheSizes[cacheName] = (cacheSizes[cacheName] || 0) + size;
-      }
-      
-      // Preload adjacent tiles for new tiles too
-      preloadAdjacentTiles(req.url, cacheName);
+    const response = await fetch(request);
+    
+    // Cache successful responses
+    if (response.ok && response.status < 400) {
+      const cache = await caches.open(RUNTIME_CACHE);
+      cache.put(request, response.clone());
     }
-    return resp;
+    
+    return response;
   } catch (error) {
-    return new Response('Tile unavailable', { status: 503 });
+    // Network failed - try cache
+    const cache = await caches.open(RUNTIME_CACHE);
+    const cached = await cache.match(request);
+    return cached || new Response('Resource unavailable', { status: 503 });
   }
 }
-// Preload adjacent tiles for smoother map panning
-async function preloadAdjacentTiles(tileUrl, cacheName) {
-  try {
-    const url = new URL(tileUrl);
-    const pathParts = url.pathname.split('/');
-    const z = parseInt(pathParts[pathParts.length - 3]);
-    const x = parseInt(pathParts[pathParts.length - 2]);
-    const y = parseInt(pathParts[pathParts.length - 1]);
-    
-    // Preload adjacent tiles (8 surrounding tiles)
-    const adjacentTiles = [
-      [z, x - 1, y - 1], [z, x, y - 1], [z, x + 1, y - 1],
-      [z, x - 1, y],                   [z, x + 1, y],
-      [z, x - 1, y + 1], [z, x, y + 1], [z, x + 1, y + 1]
-    ];
-    
-    // Only preload if we have capacity
-    if (activeBackgroundUpdates < MAX_CONCURRENT_BACKGROUND_UPDATES - 1) {
-      adjacentTiles.forEach(([z, x, y]) => {
-        const adjacentUrl = `${url.origin}/${z}/${x}/${y}.png`;
-        
-        // Check if already cached
-        caches.open(cacheName).then(cache => {
-          cache.match(adjacentUrl).then(cached => {
-            if (!cached) {
-              // Preload in background
-              fetch(adjacentUrl).then(resp => {
-                if (resp.ok) {
-                  cache.put(adjacentUrl, resp);
-                }
-              }).catch(() => {
-                // Silent fail
-              });
-            }
-          });
-        });
-      });
-    }
-  } catch (error) {
-    console.warn('Failed to preload adjacent tiles:', error);
-  }
+
+// Check if URL should never be cached
+function shouldNeverCache(url) {
+  return NEVER_CACHE.some(pattern => url.includes(pattern));
 }
-// Audio range handling with CORS proxy
-async function networkFirstForAudioRange(req) {
-  try {
-    // Route audio requests through CORS proxy
-    const proxyUrl = CORS_PROXY_URL + encodeURIComponent(req.url);
-    const proxyRequest = new Request(proxyUrl, {
-      method: req.method,
-      headers: req.headers,
-      body: req.body,
-      mode: 'cors', // Enable CORS for proxy
-      credentials: 'omit'
-    });
-    
-    const resp = await fetch(proxyRequest);
-    if (resp.ok) {
-      const cache = await caches.open(CACHE_VERSIONS.AUDIO);
-      const fullReq = new Request(req.url, { method: 'GET' });
-      const cached = await cache.match(fullReq);
-      
-      if (!cached) {
-        try {
-          const fullResp = await fetch(fullReq);
-          if (fullResp.ok) {
-            cache.put(fullReq, fullResp.clone());
-            enforceCacheQuota(CACHE_VERSIONS.AUDIO);
-          }
-        } catch (e) {
-          console.warn('Failed to cache full audio file:', e);
-        }
-      }
-    }
-    return resp;
-  } catch (error) {
-    console.warn('Audio range request failed:', error);
-    const cached = await caches.match(new Request(req.url));
-    return cached || new Response('Audio unavailable', { status: 503 });
-  }
-}
-// Intercept fetch requests to apply caching strategies
+
+// Main fetch handler
 self.addEventListener('fetch', (event) => {
   const url = event.request.url;
   
-  // EXCLUDE MANIFEST.JSON FROM SERVICE WORKER INTERCEPTION
-  if (url.endsWith('/manifest.json')) {
+  // Skip non-GET requests
+  if (event.request.method !== 'GET') {
+    return;
+  }
+  
+  // Never cache certain files - always fetch fresh
+  if (shouldNeverCache(url)) {
     event.respondWith(fetch(event.request));
     return;
   }
   
-  // Handle geolocation requests for position smoothing
-  if (url.includes('geolocation') || url.includes('location')) {
-    event.respondWith(handleGeolocationRequest(event.request));
-    return;
+  // Handle different resource types
+  if (url.match(/\.(css|js|png|jpg|jpeg|gif|svg|webp|ico)$/i)) {
+    // Static assets - cache first
+    event.respondWith(cacheFirst(event.request));
+  } else if (url.includes('/api/') || url.includes('geolocation')) {
+    // API calls - network first
+    event.respondWith(networkFirst(event.request));
+  } else {
+    // Everything else - cache first with network fallback
+    event.respondWith(cacheFirst(event.request));
   }
+});
+
+// Install event - cache critical resources
+self.addEventListener('install', (event) => {
+  console.log('Service Worker 4.0.0: Installing...');
   
-  // Handle map tile requests for preloading
-  if (url.includes('/tiles/') || url.includes('.png') || url.includes('.jpg')) {
-    event.respondWith(staleWhileRevalidate(event.request, CACHE_VERSIONS.TILES));
-    return;
-  }
-  
-  // Handle image requests (jpg, jpeg, png, gif, svg, webp)
-  if (url.match(/\.(jpg|jpeg|png|gif|svg|webp)$/i)) {
-    event.respondWith(cacheFirst(event.request, CACHE_VERSIONS.IMAGES));
-    return;
-  }
-  
-  // Handle static assets (CSS, JS)
-  if (url.match(/\.(css|js)$/i)) {
-    event.respondWith(cacheFirst(event.request, CACHE_VERSIONS.STATIC));
-    return;
-  }
-  
-  // Handle audio requests with CORS proxy
-  if (url.includes('audio') || url.includes('.mp3') || url.includes('.wav')) {
-    event.respondWith(networkFirstForAudioRange(event.request));
-    return;
-  }
-  
-  // For all other requests, use network-first with fallback to cache
-  event.respondWith(
-    fetch(event.request)
-      .catch(() => caches.match(event.request))
+  event.waitUntil(
+    caches.open(CACHE_NAME).then(cache => {
+      console.log('Caching static resources');
+      return cache.addAll(STATIC_RESOURCES).catch(error => {
+        console.error('Failed to cache some static resources:', error);
+        // Don't fail the install if some resources fail to cache
+        return Promise.resolve();
+      });
+    })
   );
-});
-// Enhanced performance monitoring
-self.addEventListener('message', (event) => {
-  if (event.data && event.data.type === 'GET_CACHE_STATS') {
-    event.ports[0].postMessage({
-      cacheHits: cacheHitCount,
-      cacheMisses: cacheMissCount,
-      hitRate: cacheHitCount / (cacheHitCount + cacheMissCount) * 100,
-      activeBackgroundUpdates: activeBackgroundUpdates,
-      cacheSizes: cacheSizes,
-      positionBufferSize: positionBuffer.length
-    });
-  }
   
-  if (event.data && event.data.type === 'CLEAR_CACHE') {
-    const cacheName = event.data.cacheName;
-    caches.delete(cacheName).then(() => {
-      cacheSizes[cacheName] = 0;
-      event.ports[0].postMessage({ success: true });
-    });
-  }
-  
-  if (event.data && event.data.type === 'RESET_CACHE_SIZES') {
-    for (const key in cacheSizes) {
-      cacheSizes[key] = 0;
-    }
-    lastCacheSizeUpdate = 0;
-    event.ports[0].postMessage({ success: true });
-  }
-  
-  // Clear position buffer on request
-  if (event.data && event.data.type === 'CLEAR_POSITION_BUFFER') {
-    positionBuffer.length = 0;
-    geolocationCache.clear();
-    event.ports[0].postMessage({ success: true });
-  }
+  // Skip waiting - activate immediately
+  self.skipWaiting();
 });
-// Better error logging
-self.addEventListener('error', (event) => {
-  console.error('Service Worker Error:', event.error, {
-    cacheHits: cacheHitCount,
-    cacheMisses: cacheMissCount,
-    activeBackgroundUpdates: activeBackgroundUpdates,
-    positionBufferSize: positionBuffer.length
-  });
-});
-self.addEventListener('unhandledrejection', (event) => {
-  console.error('Service Worker Unhandled Promise Rejection:', event.reason, {
-    cacheHits: cacheHitCount,
-    cacheMisses: cacheMissCount,
-    activeBackgroundUpdates: activeBackgroundUpdates,
-    positionBufferSize: positionBuffer.length
-  });
-});
-// Cache cleanup on activation
+
+// Activate event - clean up old caches
 self.addEventListener('activate', (event) => {
+  console.log('Service Worker 4.0.0: Activating...');
+  
   event.waitUntil(
     caches.keys().then(cacheNames => {
       return Promise.all(
         cacheNames.map(cacheName => {
-          if (!Object.values(CACHE_VERSIONS).includes(cacheName)) {
+          // Delete old caches
+          if (cacheName !== CACHE_NAME && cacheName !== RUNTIME_CACHE) {
             console.log('Deleting old cache:', cacheName);
             return caches.delete(cacheName);
           }
-          
-          cacheSizes[cacheName] = 0;
-          return Promise.resolve();
         })
       );
+    }).then(() => {
+      // Take control of all clients immediately
+      return self.clients.claim();
     })
   );
+});
+
+// Handle messages from main thread
+self.addEventListener('message', (event) => {
+  if (event.data && event.data.type === 'SKIP_WAITING') {
+    self.skipWaiting();
+  }
   
-  // Take control of all open clients immediately
-  return self.clients.claim();
+  if (event.data && event.data.type === 'CLEAR_CACHE') {
+    caches.keys().then(names => {
+      return Promise.all(names.map(name => caches.delete(name)));
+    }).then(() => {
+      event.ports[0].postMessage({ success: true });
+    });
+  }
 });
-// Install event - cache critical resources
-self.addEventListener('install', (event) => {
-  event.waitUntil(
-    caches.open(CACHE_VERSIONS.STATIC).then(cache => {
-      return cache.addAll([
-        '/',
-        '/index.html',
-        '/placeholder.svg',
-        '/manifest.json'
-      ]);
-    })
-  );
+
+// Error handling
+self.addEventListener('error', (event) => {
+  console.error('Service Worker Error:', event.error);
 });
-console.log('Service Worker 3.5.0: With enhanced image caching and manifest exclusion');
+
+self.addEventListener('unhandledrejection', (event) => {
+  console.error('Service Worker Unhandled Promise Rejection:', event.reason);
+});
+
+console.log('Service Worker 4.0.0: Loaded successfully');
