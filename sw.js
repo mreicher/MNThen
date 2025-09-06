@@ -1,5 +1,5 @@
 // sw.js – Minnesota Then Service Worker
-// Version: 4.0.0 (Rewritten for reliability)
+// Version: 4.1.0 (Error-free with audio support)
 
 const CACHE_NAME = 'mnthen-v4';
 const RUNTIME_CACHE = 'mnthen-runtime-v4';
@@ -17,6 +17,10 @@ const NEVER_CACHE = [
   '/manifest.json'       // Manifest should always be fresh
 ];
 
+// Audio file extensions (for special handling)
+const AUDIO_EXTENSIONS = /\.(mp3|wav|ogg|m4a|aac|flac|weba)$/i;
+const VIDEO_EXTENSIONS = /\.(mp4|webm|mov|avi|mpeg|mkv)$/i;
+
 // Simple cache-first strategy with fallback
 async function cacheFirst(request) {
   try {
@@ -30,9 +34,10 @@ async function cacheFirst(request) {
     // Not in cache - fetch and cache
     const response = await fetch(request);
     
-    if (response.ok && response.status === 200) {
-    cache.put(request, response.clone());
-  }
+    // Only cache successful full responses (avoid 206 partial content)
+    if (response.status === 200) {
+      cache.put(request, response.clone());
+    }
     
     return response;
   } catch (error) {
@@ -49,11 +54,11 @@ async function networkFirst(request) {
   try {
     const response = await fetch(request);
     
-    // Cache successful responses
-   if (response.status === 200) {  // Only cache full 200 responses
-  const cache = await caches.open(RUNTIME_CACHE);
-  cache.put(request, response.clone());
-}
+    // Cache successful full responses only
+    if (response.status === 200) {
+      const cache = await caches.open(RUNTIME_CACHE);
+      cache.put(request, response.clone());
+    }
     
     return response;
   } catch (error) {
@@ -64,42 +69,89 @@ async function networkFirst(request) {
   }
 }
 
+// Special handler for audio files
+async function handleAudioRequest(request) {
+  try {
+    // For range requests (audio streaming), bypass cache completely
+    if (request.headers.has('range')) {
+      return fetch(request);
+    }
+    
+    // Try cache first for full audio requests
+    const cache = await caches.open(CACHE_NAME);
+    const cached = await cache.match(request);
+    
+    if (cached) {
+      return cached;
+    }
+    
+    // Not in cache - fetch with CORS awareness
+    const response = await fetch(request, {
+      mode: 'cors',
+      credentials: 'same-origin'
+    });
+    
+    // Cache successful full audio responses
+    if (response.status === 200) {
+      cache.put(request, response.clone());
+    }
+    
+    return response;
+  } catch (error) {
+    console.error('Audio request failed:', error);
+    // Fallback to direct fetch for audio
+    return fetch(request);
+  }
+}
+
 // Check if URL should never be cached
 function shouldNeverCache(url) {
   return NEVER_CACHE.some(pattern => url.includes(pattern));
 }
 
+// Check if URL is audio/video
+function isMediaFile(url) {
+  return AUDIO_EXTENSIONS.test(url) || VIDEO_EXTENSIONS.test(url);
+}
+
 // Main fetch handler
 self.addEventListener('fetch', (event) => {
   const url = event.request.url;
+  const request = event.request;
   
   // Skip non-GET requests
-  if (event.request.method !== 'GET') {
+  if (request.method !== 'GET') {
+    return;
+  }
+  
+  // Special handling for audio/video files
+  if (isMediaFile(url)) {
+    event.respondWith(handleAudioRequest(request));
     return;
   }
   
   // Never cache certain files - always fetch fresh
   if (shouldNeverCache(url)) {
-    event.respondWith(fetch(event.request));
+    event.respondWith(fetch(request));
     return;
   }
   
   // Handle different resource types
   if (url.match(/\.(css|js|png|jpg|jpeg|gif|svg|webp|ico)$/i)) {
     // Static assets - cache first
-    event.respondWith(cacheFirst(event.request));
+    event.respondWith(cacheFirst(request));
   } else if (url.includes('/api/') || url.includes('geolocation')) {
     // API calls - network first
-    event.respondWith(networkFirst(event.request));
+    event.respondWith(networkFirst(request));
   } else {
     // Everything else - cache first with network fallback
-    event.respondWith(cacheFirst(event.request));
+    event.respondWith(cacheFirst(request));
   }
 });
 
 // Install event - cache critical resources
 self.addEventListener('install', (event) => {
-  console.log('Service Worker 4.0.0: Installing...');
+  console.log('Service Worker 4.1.0: Installing...');
   
   event.waitUntil(
     caches.open(CACHE_NAME).then(cache => {
@@ -118,7 +170,7 @@ self.addEventListener('install', (event) => {
 
 // Activate event - clean up old caches
 self.addEventListener('activate', (event) => {
-  console.log('Service Worker 4.0.0: Activating...');
+  console.log('Service Worker 4.1.0: Activating...');
   
   event.waitUntil(
     caches.keys().then(cacheNames => {
@@ -162,4 +214,4 @@ self.addEventListener('unhandledrejection', (event) => {
   console.error('Service Worker Unhandled Promise Rejection:', event.reason);
 });
 
-console.log('Service Worker 4.0.0: Loaded successfully');
+console.log('Service Worker 4.1.0: Loaded successfully with audio support');
