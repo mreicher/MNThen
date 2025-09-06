@@ -50,10 +50,10 @@ async function networkFirst(request) {
     const response = await fetch(request);
     
     // Cache successful responses
-    if (response.ok && response.status < 400) {
-      const cache = await caches.open(RUNTIME_CACHE);
-      cache.put(request, response.clone());
-    }
+   if (response.status === 200) {  // Only cache full 200 responses
+  const cache = await caches.open(RUNTIME_CACHE);
+  cache.put(request, response.clone());
+}
     
     return response;
   } catch (error) {
@@ -163,4 +163,3 @@ self.addEventListener('unhandledrejection', (event) => {
 });
 
 console.log('Service Worker 4.0.0: Loaded successfully');
-
