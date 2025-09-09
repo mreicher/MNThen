@@ -1558,21 +1558,52 @@ function updateAccuracyIndicator(accuracy) {
 
 function initializeUserLocation(position) {
     console.log("Initial position data:", JSON.stringify(position));
+    
     if (!position || !position.coords) {
         console.error("Invalid initial position object");
         handleLocationError(new Error("Invalid initial position"));
         return;
     }
+    
     const { latitude: userLat, longitude: userLng, accuracy } = position.coords;
+    
     if (isNaN(userLat) || isNaN(userLng)) {
         console.error("Invalid initial coordinates:", { userLat, userLng });
         handleLocationError(new Error("Invalid initial coordinates"));
         return;
     }
+    
     console.log("Valid initial position:", { userLat, userLng, accuracy });
+    
+    // Validate accuracy meets minimum requirements
+    if (accuracy > CONFIG.MAX_ACCEPTABLE_ACCURACY) {
+        console.warn(`Initial accuracy ${accuracy}m exceeds maximum acceptable (${CONFIG.MAX_ACCEPTABLE_ACCURACY}m)`);
+        announceToScreenReader(`Location acquired with low accuracy. Please move to improve positioning.`);
+    } else if (accuracy > CONFIG.TARGET_ACCURACY_THRESHOLD) {
+        console.info(`Initial accuracy ${accuracy}m exceeds target threshold (${CONFIG.TARGET_ACCURACY_THRESHOLD}m)`);
+    }
+    
     try {
         userMarker.setLatLng([userLat, userLng]);
-        map.setView([userLat, userLng], 17);
+        
+        // Use config-based zoom level instead of hardcoded value
+        const initialZoom = CONFIG.BASE_ZOOM;
+        map.setView([userLat, userLng], initialZoom);
+        
+        // Initialize tracking state with config values
+        enhancedTrackingState = {
+            velocity: { lat: 0, lng: 0 },
+            acceleration: { lat: 0, lng: 0 },
+            lastVelocityUpdate: Date.now(),
+            speedMPS: 0,
+            heading: position.coords.heading || null,
+            isMoving: false,
+            stationaryStartTime: null,
+            accuracy: accuracy
+        };
+        
+        // Initialize position buffer with config size
+        positionBuffer = [];
         
         announceToScreenReader('Location acquired successfully. Map is ready for navigation.');
         
@@ -1580,12 +1611,27 @@ function initializeUserLocation(position) {
         startPositionUpdates();
         startHunt();
         
+        // Start inactivity timer with config timeout
+        resetInactivityTimer(true);
+        
         const distanceBox = cachedElements.distanceBox || document.getElementById('distanceBox');
         distanceBox.classList.add('pulse');
-        setTimeout(() => distanceBox.classList.remove('pulse'), 3000);
+        setTimeout(() => distanceBox.classList.remove('pulse'), CONFIG.RETRY_DELAY * 3);
+        
+        console.log(`Initialization complete with zoom level ${initialZoom}, accuracy ${accuracy}m`);
+        
     } catch (error) {
         console.error("Error setting initial user location:", error);
         handleLocationError(error);
+        
+        // Implement retry logic using config
+        if (retryCount < CONFIG.MAX_RETRIES) {
+            retryCount++;
+            setTimeout(() => {
+                console.log(`Retrying initialization (attempt ${retryCount}/${CONFIG.MAX_RETRIES})`);
+                initializeUserLocation(position);
+            }, CONFIG.RETRY_DELAY);
+        }
     }
 }
 
@@ -1704,6 +1750,9 @@ function updateLocationAfterBackground() {
         maximumAge: 120000,
     };
     
+    let attemptCount = 0;
+    const MAX_ATTEMPTS = 3;
+
     const handleSuccess = (position) => {
         console.log("Background update raw position:", JSON.stringify(position));
         
@@ -1711,35 +1760,50 @@ function updateLocationAfterBackground() {
             console.warn("Invalid position object in background update");
             return;
         }
+        
         const { latitude, longitude, accuracy } = position.coords;
         if (isNaN(latitude) || isNaN(longitude)) {
             console.warn("Invalid coordinates in background update:", { latitude, longitude });
             return;
         }
-        console.log("Valid background position update:", { lat: latitude, lng: longitude });
+        
+        // Add accuracy validation
+        if (accuracy > 100) { // Reject very inaccurate positions
+            console.warn("Background update accuracy too poor:", accuracy, "meters");
+            return;
+        }
+        
+        console.log("Valid background position update:", { lat: latitude, lng: longitude, accuracy: accuracy + 'm' });
         
         try {
-            // Store current zoom BEFORE any updates
+            // Store current view state BEFORE any updates
             const currentZoom = map.getZoom();
+            const currentCenter = map.getCenter();
             
             updateUserLocation(position, true);
             
+            // Reset tracking state more comprehensively
             lastPosition = null;
             positionBuffer = [];
             lastVelocity = { lat: 0, lng: 0 };
             isStationary = false;
             stationaryStartTime = null;
             stationaryCount = 0;
+            stationaryBuffer = [];
             
-            // Use the stored current zoom instead of calculating a new one
-            map.setView([latitude, longitude], currentZoom, { 
-                animate: false, 
-                duration: 0,
-                noMoveStart: true
-            });
+            // Only update map if position is significantly different
+            const distanceMoved = currentCenter.distanceTo([latitude, longitude]);
+            if (distanceMoved > 50) { // Only reposition if moved more than 50 meters
+                map.setView([latitude, longitude], currentZoom, { 
+                    animate: false, 
+                    duration: 0,
+                    noMoveStart: true
+                });
+            }
             
             lastUpdateTime = Date.now();
             lastUpdateTimestamp = Date.now();
+            
             if (isSignificantMovement({lat: latitude, lng: longitude})) {
                 resetInactivityTimer(false);
             }
@@ -1749,20 +1813,29 @@ function updateLocationAfterBackground() {
             if (map._container) {
                 map._onResize();
             }
+            
         } catch (error) {
-            console.error("Error in updateUserLocation during background update:", error);
+            console.error("Error in background location update:", error);
         }
     };
     
     const handleError = (error, stage) => {
         console.error(`Error getting location during ${stage} attempt:`, error);
         
+        attemptCount++;
+        
+        // Prevent infinite retry loops
+        if (attemptCount >= MAX_ATTEMPTS) {
+            console.warn("Maximum background update attempts reached");
+            return;
+        }
+        
         switch (error.code) {
-            case 1:
+            case 1: // PERMISSION_DENIED
                 console.warn("User denied geolocation access");
                 break;
                 
-            case 2:
+            case 2: // POSITION_UNAVAILABLE
                 if (stage === "quick") {
                     console.log("Quick position unavailable, trying accurate position...");
                     navigator.geolocation.getCurrentPosition(
@@ -1777,12 +1850,10 @@ function updateLocationAfterBackground() {
                         (err) => handleError(err, "fallback"),
                         fallbackOptions
                     );
-                } else {
-                    console.warn("All position attempts failed - location unavailable");
                 }
                 break;
                 
-            case 3:
+            case 3: // TIMEOUT
                 if (stage === "quick") {
                     console.log("Quick position timed out, trying accurate position...");
                     navigator.geolocation.getCurrentPosition(
@@ -1797,25 +1868,15 @@ function updateLocationAfterBackground() {
                         (err) => handleError(err, "fallback"),
                         fallbackOptions
                     );
-                } else {
-                    console.warn("All position attempts timed out");
                 }
                 break;
                 
             default:
-                if (stage !== "fallback") {
-                    console.log("Unknown error, trying fallback options...");
-                    navigator.geolocation.getCurrentPosition(
-                        handleSuccess,
-                        (err) => handleError(err, "fallback"),
-                        fallbackOptions
-                    );
-                } else {
-                    console.warn("All position attempts failed with unknown error");
-                }
+                console.warn("Unknown geolocation error:", error);
         }
     };
     
+    console.log("Starting background location update...");
     navigator.geolocation.getCurrentPosition(
         handleSuccess,
         (error) => handleError(error, "quick"),
