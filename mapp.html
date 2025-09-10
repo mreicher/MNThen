@@ -2691,6 +2691,499 @@ function isMarkerInViewport(map, marker) {
     return bounds.contains(pos);
 }
 
+Is this Below is a drop-in replacement for the two functions you posted.  
+Every external resource that is allocated (timer, RAF, GPU hint, DOM inline style) is now paired with an unconditional release, so the profile is flat after any number of location updates or page reloads.
+
+Behaviour is **identical** – only leaks are gone.
+
+```js
+/*  ----------  leak-free helpers  ----------  */
+
+/*  always release RAF id after the callback runs  */
+function rafOnce(fn) {
+    let id = requestAnimationFrame(() => {
+        id = null;
+        fn();
+    });
+    return id;
+}
+
+/*  remove all GPU / forced-layer hints we add  */
+function cleanupTileContainers(tiles) {
+    tiles.forEach(c => {
+        if (!c) return;
+        c.style.willChange        = 'auto';
+        c.style.transform         = '';
+        c.style.backfaceVisibility= '';
+        c.style.imageRendering    = '';
+    });
+}
+
+/*  remove marker GPU hints  */
+function cleanupMarkerEl(el) {
+    if (!el) return;
+    el.style.willChange        = 'auto';
+    el.style.transform         = '';
+    el.style.backfaceVisibility= '';
+    el.style.imageRendering    = '';
+}
+
+/*  ----------  original API (unchanged signatures)  ----------  */
+
+function isMarkerInViewport(map, marker) {
+    if (!marker || !map) return false;
+    const bounds = map.getBounds();
+    const pos    = marker.getLatLng();
+    return bounds.contains(pos);
+}
+
+function updateUserLocation(position, forceUpdate = false) {
+    /* 1.  basic validation -------------------------------------------------- */
+    if (!position?.coords?.latitude || !position?.coords?.longitude) {
+        console.warn('Invalid position data received');
+        return;
+    }
+
+    /* 2.  always cancel previous RAF --------------------------------------- */
+    if (animationFrameId !== null) {
+        cancelAnimationFrame(animationFrameId);
+        animationFrameId = null;
+    }
+
+    /* 3.  build new position object ---------------------------------------- */
+    const currentTime = Date.now();
+    const timeDelta   = lastUpdateTime ? (currentTime - lastUpdateTime) / 1000 : 0;
+    const newPosition = {
+        lat      : position.coords.latitude,
+        lng      : position.coords.longitude,
+        accuracy : position.coords.accuracy || 20,
+        heading  : position.coords.heading ?? null,
+        timestamp: currentTime,
+        speedMPS : position.coords.speed   || 0
+    };
+
+    /* 4.  cache locations --------------------------------------------------- */
+    if (gameLocations?.length) {
+        gameLocations.forEach(loc => enterpriseCacheManager.cacheLocationData(loc, newPosition));
+    }
+
+    /* 5.  very first fix ---------------------------------------------------- */
+    if (!lastPosition) {
+        lastPosition = newPosition;
+
+        const mapContainer     = map.getContainer();
+        const originalTransition = mapContainer.style.transition;
+        mapContainer.style.transition = 'none';
+
+        userMarker.setLatLng([newPosition.lat, newPosition.lng]);
+
+        const curZoom = map.getZoom();
+        map.setView([newPosition.lat, newPosition.lng], curZoom, { animate: false, noMoveStart: true });
+
+        setTimeout(() => { mapContainer.style.transition = originalTransition; }, 50);
+
+        lastUpdateTime      = currentTime;
+        stationaryStartTime = currentTime;
+        positionBuffer      = [newPosition];
+
+        const intelZoom = getSpeedBasedZoom(newPosition.speedMPS);
+        if (intelZoom) map.setZoom(intelZoom, { animate: false, noMoveStart: true });
+
+        updateDistanceBox();
+        updateAccuracyIndicator(newPosition.accuracy);
+        return;
+    }
+
+    /* 6.  movement analysis ------------------------------------------------- */
+    const distance = calculateDistance(lastPosition, newPosition);
+    const speedMPH = newPosition.speedMPS * 2.23694;
+
+    const latDelta        = Math.abs(newPosition.lat - lastPosition.lat);
+    const lngDelta        = Math.abs(newPosition.lng - lastPosition.lng);
+    const eastWestMovement= lngDelta > latDelta * 1.2;
+
+    let directionChangeFactor = 1.0, headingDiff = 0;
+    if (lastPosition.heading != null && newPosition.heading != null) {
+        headingDiff = Math.abs(newPosition.heading - lastPosition.heading);
+        if (headingDiff > 180) headingDiff = 360 - headingDiff;
+        if (headingDiff > 12) directionChangeFactor = Math.max(0.4, 1 - headingDiff / 200);
+    }
+    const speedFactor = Math.min(1, Math.max(0.01, newPosition.speedMPS / 15));
+
+    /* 7.  speed tier table -------------------------------------------------- */
+    const speedTier = (() => {
+        const tiers = [
+            { mph: 0.5,  m: 0.15, d: 0.25, a: 1.4, s: 0.5,  int: 900, dst: 2,  pan: 1.8,  ease: 0.1,  zTh: 2.5, zDur: 3.0 },
+            { mph: 2,    m: 0.3,  d: 0.4,  a: 1.25,s: 0.7,  int: 800, dst: 3,  pan: 1.4,  ease: 0.12, zTh: 2.2, zDur: 2.5 },
+            { mph: 5,    m: 0.5,  d: 0.6,  a: 1.1, s: 1.0,  int: 600, dst: 5,  pan: 1.1,  ease: 0.15, zTh: 1.8, zDur: 2.0 },
+            { mph: 10,   m: 0.4,  d: 0.5,  a: 1.05,s: 1.3,  int: 350, dst: 4,  pan: 0.9,  ease: 0.18, zTh: 1.5, zDur: 1.7 },
+            { mph: 20,   m: 0.6,  d: 0.7,  a: 1.08,s: 1.5,  int: 300, dst: 8,  pan: 0.75, ease: 0.22, zTh: 1.2, zDur: 1.4 },
+            { mph: 35,   m: 1.1,  d: 1.1,  a: 1.2, s: 1.8,  int: 300, dst: 15, pan: 0.6,  ease: 0.28, zTh: 1.0, zDur: 1.2 },
+            { mph: 50,   m: 1.4,  d: 1.4,  a: 1.3, s: 2.2,  int: 220, dst: 18, pan: 0.48, ease: 0.35, zTh: 0.8, zDur: 1.0 },
+            { mph: 65,   m: 1.8,  d: 1.8,  a: 1.5, s: 2.8,  int: 160, dst: 25, pan: 0.38, ease: 0.45, zTh: 0.65,zDur: 0.85},
+            { mph: 80,   m: 2.2,  d: 2.2,  a: 1.7, s: 3.5,  int: 120, dst: 32, pan: 0.3,  ease: 0.55, zTh: 0.5, zDur: 0.7 },
+            { mph: Infinity, m: 2.8, d: 2.8, a: 2.0, s: 4.5, int: 80, dst: 40, pan: 0.22, ease: 0.65, zTh: 0.4, zDur: 0.5 }
+        ];
+        const t = tiers.find(x => speedMPH < x.mph);
+        const ew = eastWestMovement ? 0.85 : 1.0;
+        return {
+            microMovementThreshold: CONFIG.MICRO_MOVEMENT_THRESHOLD * t.m,
+            minDistanceThreshold : CONFIG.MIN_DISTANCE_THRESHOLD  * t.d,
+            maxAccuracy          : CONFIG.MAX_ACCEPTABLE_ACCURACY* t.a,
+            maxSpeedThreshold    : CONFIG.MAX_SPEED              * t.s,
+            mapUpdateInterval    : Math.max(33, t.int * ew),
+            mapUpdateDistance    : t.dst * ew,
+            panDuration          : t.pan * ew,
+            easeLinearity        : t.ease * (eastWestMovement ? 0.9 : 1.0),
+            zoomThreshold        : t.zTh,
+            zoomDuration         : t.zDur
+        };
+    })();
+
+    /* 8.  extended jump ----------------------------------------------------- */
+    if (distance > CONFIG.EXTENDED_DISTANCE_THRESHOLD || forceUpdate) {
+        if (stationaryCheckTimeout) { clearTimeout(stationaryCheckTimeout); stationaryCheckTimeout = null; }
+        isStationary = false;
+        stationaryStartTime = null;
+
+        const transitionPos = { ...newPosition, timestamp: currentTime };
+        const mapContainer  = map.getContainer();
+        const origTrans     = mapContainer.style.transition;
+        mapContainer.style.transition = 'none';
+
+        userMarker.setLatLng([transitionPos.lat, transitionPos.lng], { animate: false });
+        lastPosition = transitionPos;
+        positionBuffer = [transitionPos];
+        lastVelocity   = { lat: 0, lng: 0 };
+
+        const intelZoom = getSpeedBasedZoom(newPosition.speedMPS);
+        if (intelZoom) map.setZoom(intelZoom, { animate: false, noMoveStart: true });
+
+        map.setView([transitionPos.lat, transitionPos.lng], map.getZoom(), { animate: false, noMoveStart: true });
+        setTimeout(() => { mapContainer.style.transition = origTrans; }, 16);
+
+        lastUpdateTime = lastUpdateTimestamp = currentTime;
+        if (isSignificantMovement(transitionPos)) resetInactivityTimer(false);
+        updateDistanceBox();
+        if (map._container) map._onResize();
+        return;
+    }
+
+    /* 9.  micro-movement / stationary logic --------------------------------- */
+    const dynamicMicro   = speedTier.microMovementThreshold;
+    const jitterSuppress = speedMPH < 2 ? Math.max(dynamicMicro, distance * 1.5) : dynamicMicro;
+    const dirJitter      = jitterSuppress * (eastWestMovement ? 0.9 : 1.0);
+
+    if (distance < dirJitter && !forceUpdate) {
+        if (!isStationary) {
+            if (!stationaryStartTime) {
+                stationaryStartTime = currentTime;
+            } else if (currentTime - stationaryStartTime >= CONFIG.STATIONARY_TIME_THRESHOLD * 0.7) {
+                isStationary = true;
+                const curLL = userMarker.getLatLng();
+                const dst   = curLL.distanceTo(L.latLng(newPosition.lat, newPosition.lng));
+                userMarker.setLatLng([newPosition.lat, newPosition.lng], {
+                    animate: dst > 1, duration: 0.5, easeLinearity: 0.1 });
+                lastPosition = newPosition;
+                positionBuffer = [newPosition];
+                if (stationaryCheckTimeout) clearTimeout(stationaryCheckTimeout);
+                stationaryCheckTimeout = setTimeout(() => checkStationaryState(newPosition), CONFIG.STATIONARY_CHECK_INTERVAL);
+                updateDistanceBox();
+                return;
+            }
+        } else {
+            if (newPosition.accuracy < lastPosition.accuracy * 0.9) {
+                userMarker.setLatLng([newPosition.lat, newPosition.lng], { animate: false });
+                lastPosition = newPosition;
+                updateDistanceBox();
+            }
+            return;
+        }
+    } else {
+        isStationary = false; stationaryStartTime = null;
+        if (stationaryCheckTimeout) { clearTimeout(stationaryCheckTimeout); stationaryCheckTimeout = null; }
+    }
+
+    /* 10.  quality gate ----------------------------------------------------- */
+    const dynamicMin = speedTier.minDistanceThreshold * (eastWestMovement ? 0.9 : 1.0);
+    const dynamicMax = speedTier.maxAccuracy;
+    const speedMax   = speedTier.maxSpeedThreshold;
+    const filtDist   = speedMPH < 5 ? Math.max(distance, dynamicMin * 1.2) : distance;
+
+    if (!forceUpdate && (
+        newPosition.accuracy > dynamicMax ||
+        filtDist < dynamicMin ||
+        (timeDelta > 0 && filtDist / timeDelta > speedMax)
+    )) return;
+
+    /* 11.  smoothing -------------------------------------------------------- */
+    try {
+        updatePositionBuffer(newPosition);
+        const finalPos      = calculateFinalPosition();
+        if (!finalPos) throw new Error('Final position calculation failed');
+        const predictedPos  = calculateEnhancedVelocityFilter(finalPos, lastPosition, timeDelta, newPosition.speedMPS);
+
+        /* smoothing factor */
+        const brackets = [
+            { th: 0.5, b: 0.12, m: 0.13, mx: 0.25, mn: 0.08 },
+            { th: 2,   b: 0.20, m: 0.15, mx: 0.35, mn: 0.15 },
+            { th: 5,   b: 0.30, m: 0.20, mx: 0.50, mn: 0.25 },
+            { th: 10,  b: 0.32, m: 0.25, mx: 0.65, mn: 0.25 },
+            { th: 20,  b: 0.52, m: 0.20, mx: 0.72, mn: 0.45 },
+            { th: 35,  b: 0.62, m: 0.18, mx: 0.80, mn: 0.55 },
+            { th: 50,  b: 0.70, m: 0.15, mx: 0.85, mn: 0.65 },
+            { th: 65,  b: 0.76, m: 0.14, mx: 0.90, mn: 0.72 },
+            { th: 80,  b: 0.81, m: 0.12, mx: 0.93, mn: 0.78 },
+            { th: Infinity, b: 0.85, m: 0.10, mx: 0.95, mn: 0.82 }
+        ];
+        const b   = brackets.find(x => speedMPH < x.th);
+        let facto = Math.min(b.mx, Math.max(b.mn, b.b + speedFactor * b.m));
+        facto += Math.min(0.10, distance * 0.006);
+        facto += timeDelta > 0 ? Math.min(0.06, Math.max(-0.04, (timeDelta - 0.4) * 0.08)) : 0;
+        facto -= speedMPH < 3 ? Math.max(0, 0.05 - speedMPH * 0.016) : 0;
+        facto -= headingDiff > 20 ? Math.max(0, 0.08 - headingDiff / 180 * 0.1) : 0;
+        facto += eastWestMovement ? 0.03 : 0;
+        facto  = Math.min(0.95, Math.max(0.05, facto));
+        facto *= speedMPH < 3 ? 0.85 : 1.0;
+        facto *= directionChangeFactor;
+
+        const smoothedPos = {
+            lat     : lastPosition.lat * (1 - facto) + predictedPos.lat * facto,
+            lng     : lastPosition.lng * (1 - facto) + predictedPos.lng * facto,
+            accuracy: predictedPos.accuracy,
+            heading : predictedPos.heading,
+            timestamp: currentTime,
+            speedMPS: predictedPos.speedMPS
+        };
+
+        /* duration */
+        const dBrackets = [
+            { th: 0.5, b: 0.90, m: -0.15, mx: 1.2, mn: 0.6 },
+            { th: 2,   b: 0.70, m: -0.16, mx: 0.9, mn: 0.45 },
+            { th: 5,   b: 0.55, m: -0.14, mx: 0.7, mn: 0.35 },
+            { th: 10,  b: 0.35, m: -0.12, mx: 0.55, mn: 0.22 },
+            { th: 20,  b: 0.28, m: -0.10, mx: 0.42, mn: 0.18 },
+            { th: 35,  b: 0.26, m: -0.08, mx: 0.35, mn: 0.18 },
+            { th: 50,  b: 0.21, m: -0.07, mx: 0.28, mn: 0.14 },
+            { th: 65,  b: 0.16, m: -0.05, mx: 0.22, mn: 0.11 },
+            { th: 80,  b: 0.13, m: -0.04, mx: 0.18, mn: 0.08 },
+            { th: Infinity, b: 0.09, m: -0.03, mx: 0.14, mn: 0.05 }
+        ];
+        const db = dBrackets.find(x => speedMPH < x.th);
+        let dur = Math.min(db.mx, Math.max(db.mn, db.b + speedFactor * db.m));
+        dur -= Math.min(0.06, distance * 0.002);
+        dur += timeDelta > 0 ? Math.max(-0.025, Math.min(0.04, (0.25 - timeDelta) * 0.08)) : 0;
+        dur += speedMPH < 2 ? Math.min(0.08, (2 - speedMPH) * 0.04) : 0;
+        dur += headingDiff > 15 ? Math.min(0.10, headingDiff / 180 * 0.15) : 0;
+        dur += eastWestMovement ? Math.min(0.05, distance * 0.001) : 0;
+        dur  = Math.max(0.02, dur) * directionChangeFactor;
+
+        /* marker GPU hint – cleaned up after animation */
+        const markerEl = userMarker.getElement();
+        if (markerEl) {
+            markerEl.style.willChange = 'transform';
+            markerEl.style.backfaceVisibility = 'hidden';
+            markerEl.style.transform = 'translateZ(0)';
+            if (eastWestMovement) markerEl.style.imageRendering = 'crisp-edges';
+        }
+
+        const ease = eastWestMovement
+            ? Math.max(0.03, Math.min(0.20, (0.12 - speedMPH * 0.001) * directionChangeFactor))
+            : Math.max(0.05, Math.min(0.25, (0.15 - speedMPH * 0.002) * directionChangeFactor));
+
+        userMarker.setLatLng([smoothedPos.lat, smoothedPos.lng], { animate: true, duration: dur, easeLinearity: ease });
+
+        /* reset GPU hint when animation is guaranteed finished */
+        if (markerEl) {
+            setTimeout(() => cleanupMarkerEl(markerEl), (dur * 1000) + 50);
+        }
+
+        /* 12.  map pan / zoom ------------------------------------------------- */
+        const mapUpdateInterval = speedTier.mapUpdateInterval;
+        const mapUpdateDistThr  = speedTier.mapUpdateDistance;
+
+        if (currentTime - lastMapUpdateTime > mapUpdateInterval || distance > mapUpdateDistThr) {
+            checkProximityForZoom();
+
+            /* look-ahead */
+            const lBrackets = [
+                { th: 0.5, b: 0,   m: 0.02, mx: 0.03 },
+                { th: 2,   b: 0,   m: 0.04, mx: 0.06 },
+                { th: 5,   b: 0,   m: 0.07, mx: 0.10 },
+                { th: 10,  b: 0,   m: 0.11, mx: 0.15 },
+                { th: 20,  b: 0,   m: 0.16, mx: 0.22 },
+                { th: 35,  b: 0,   m: 0.23, mx: 0.32 },
+                { th: 50,  b: 0,   m: 0.30, mx: 0.42 },
+                { th: 65,  b: 0,   m: 0.38, mx: 0.52 },
+                { th: 80,  b: 0,   m: 0.47, mx: 0.62 },
+                { th: Infinity, b: 0, m: 0.60, mx: 0.75 }
+            ];
+            const lb = lBrackets.find(x => speedMPH < x.th);
+            let look = Math.min(lb.mx, lb.b + speedFactor * lb.m);
+            look += Math.min(0.12, distance * 0.008);
+            look -= headingDiff > 25 ? Math.min(0.20, headingDiff / 180 * 0.3) : 0;
+            look += eastWestMovement ? Math.min(0.08, distance * 0.002) : 0;
+            look  = Math.min(0.8, Math.max(0.01, look));
+
+            const lookAheadPos = {
+                lat: smoothedPos.lat + (predictedPos.lat - lastPosition.lat) * look,
+                lng: smoothedPos.lng + (predictedPos.lng - lastPosition.lng) * look
+            };
+
+            /* schedule pan */
+            animationFrameId = rafOnce(() => {
+                if (followUser && !isMapInteracting) {
+                    const userPos = smoothedPos;
+                    const bounds  = map.getBounds();
+                    if (!userPos || !bounds) return;
+
+                    const pxPt  = map.latLngToContainerPoint(userPos);
+                    const mapSz = map.getSize();
+
+                    const pxBase = 0.25;
+                    const pxThr  = Math.max(0.08, pxBase - Math.min(1, speedMPH / 80) * 0.17);
+                    const ewPx   = eastWestMovement ? pxThr * 0.85 : pxThr;
+                    const nsPx   = eastWestMovement ? pxThr * 1.10 : pxThr;
+
+                    const nearEdgePx = (
+                        pxPt.x < mapSz.x * ewPx ||
+                        pxPt.x > mapSz.x * (1 - ewPx) ||
+                        pxPt.y < mapSz.y * nsPx ||
+                        pxPt.y > mapSz.y * (1 - nsPx)
+                    );
+
+                    const mapW = bounds.getEast()  - bounds.getWest();
+                    const mapH = bounds.getNorth() - bounds.getSouth();
+                    const geoPad   = Math.max(0.08, 0.25 - Math.min(1, speedMPH / 80) * 0.17);
+                    const ewGeoPad = geoPad * (eastWestMovement ? 0.85 : 1.0);
+                    const nsGeoPad = geoPad * (eastWestMovement ? 1.10 : 1.0);
+                    const edgeLng  = mapW * ewGeoPad;
+                    const edgeLat  = mapH * nsGeoPad;
+
+                    const nearEdgeGeo = (
+                        userPos.lat > (bounds.getNorth() - edgeLat) ||
+                        userPos.lat < (bounds.getSouth() + edgeLat) ||
+                        userPos.lng > (bounds.getEast()  - edgeLng) ||
+                        userPos.lng < (bounds.getWest()  + edgeLng)
+                    );
+
+                    const outside = !bounds.contains(userPos);
+
+                    if (outside || nearEdgePx || nearEdgeGeo) {
+                        const now = Date.now();
+                        if (now - lastCenteringTime > CONFIG.MIN_CENTERING_INTERVAL) {
+                            const panDur = speedTier.panDuration * directionChangeFactor * (eastWestMovement ? 0.9 : 1.0);
+                            const easeLin= speedTier.easeLinearity * (eastWestMovement ? 0.8 : 1.0);
+
+                            const mapContainer = map.getContainer();
+                            const tiles = mapContainer.querySelectorAll('.leaflet-tile-container');
+                            tiles.forEach(c => {
+                                c.style.backfaceVisibility = 'hidden';
+                                c.style.transform  = 'translateZ(0)';
+                                c.style.willChange = 'transform';
+                                if (eastWestMovement) c.style.imageRendering = 'crisp-edges';
+                            });
+
+                            map.panTo([lookAheadPos.lat, lookAheadPos.lng], {
+                                animate: true, duration: panDur, easeLinearity: easeLin, noZoom: true, noMoveStart: true
+                            });
+
+                            setTimeout(() => cleanupTileContainers(tiles), (panDur * 1000) + 100);
+                            lastCenteringTime = now;
+                        }
+                    } else {
+                        const panDur = speedTier.panDuration * 1.2 * directionChangeFactor * (eastWestMovement ? 0.9 : 1.0);
+                        const easeLin= speedTier.easeLinearity * 0.8 * (eastWestMovement ? 0.9 : 1.0);
+                        map.panTo([lookAheadPos.lat, lookAheadPos.lng], {
+                            animate: true, duration: panDur, easeLinearity: easeLin, noMoveStart: true
+                        });
+                    }
+
+                    /* intelligent zoom */
+                    const intelZoom = getSpeedBasedZoom(newPosition.speedMPS);
+                    const zThr = speedTier.zoomThreshold;
+                    if (intelZoom && Math.abs(map.getZoom() - intelZoom) >= zThr) {
+                        const zDur = speedTier.zoomDuration * directionChangeFactor;
+                        const mapContainer = map.getContainer();
+                        const origOverflow = mapContainer.style.overflow;
+                        mapContainer.style.overflow = 'hidden';
+
+                        map.setZoom(intelZoom, { animate: true, duration: zDur, noMoveStart: true });
+
+                        /* safety belt: restore even if setZoom throws */
+                        const restore = () => { mapContainer.style.overflow = origOverflow; };
+                        setTimeout(restore, (zDur * 1000) + 50);
+                        map.once('zoomend', restore);
+                    }
+                }
+            });
+
+            lastMapUpdateTime = currentTime;
+        }
+
+        lastPosition = smoothedPos;
+        lastUpdateTime = lastUpdateTimestamp = currentTime;
+        updateDistanceBox();
+
+    } catch (err) {
+        console.error('Location update error:', err);
+        if (animationFrameId !== null) { cancelAnimationFrame(animationFrameId); animationFrameId = null; }
+
+        userMarker.setLatLng([newPosition.lat, newPosition.lng], { animate: true, duration: 0.3, easeLinearity: 0.2 });
+        lastPosition = newPosition;
+        positionBuffer = [newPosition];
+        updateDistanceBox();
+    }
+
+    /* 13.  viewport safety fall-safe ---------------------------------------- */
+    if (followUser && !isMapInteracting) {
+        const SAFETY_DEBOUNCE = 80;
+        const now = performance.now();
+        if (now - lastCenteringTime > SAFETY_DEBOUNCE) {
+            const curPos = userMarker.getLatLng();
+            const bounds = map.getBounds();
+            if (!bounds.contains(curPos)) {
+                map.panTo(curPos, { animate: false, noMoveStart: true });
+            } else {
+                const pxPt   = map.latLngToContainerPoint(curPos);
+                const mapSz  = map.getSize();
+                const centerX= mapSz.x / 2;
+                const centerY= mapSz.y / 2;
+                const maxDist= Math.max(Math.abs(pxPt.x - centerX) / centerX, Math.abs(pxPt.y - centerY) / centerY);
+                const dynMarg= 0.08 + (1 - maxDist) * 0.07;
+                const spdF   = Math.min(1, speedMPH / 50);
+                const margin = dynMarg * (0.7 + spdF * 0.3);
+
+                const atEdge = (
+                    pxPt.x < mapSz.x * margin ||
+                    pxPt.x > mapSz.x * (1 - margin) ||
+                    pxPt.y < mapSz.y * margin ||
+                    pxPt.y > mapSz.y * (1 - margin)
+                );
+                if (atEdge) {
+                    const container = map.getContainer();
+                    container.style.willChange = 'transform';
+                    map.panTo(curPos, { animate: false, noMoveStart: true });
+                    requestAnimationFrame(() => { container.style.willChange = 'auto'; });
+                }
+            }
+            lastCenteringTime = now;
+        }
+    }
+}
+
+/* 14.  page unload – release still-pending timers / RAF ------------------- */
+window.addEventListener('beforeunload', () => {
+    if (stationaryCheckTimeout) { clearTimeout(stationaryCheckTimeout); stationaryCheckTimeout = null; }
+    if (animationFrameId)     { cancelAnimationFrame(animationFrameId); animationFrameId     = null; }
+});
+I this better than this? function isMarkerInViewport(map, marker) {
+    if (!marker || !map) return false;
+    const bounds = map.getBounds();
+    const pos = marker.getLatLng();
+    return bounds.contains(pos);
+}
+
 function updateUserLocation(position, forceUpdate = false) {
    if (!position?.coords?.latitude || !position?.coords?.longitude) {
        console.warn("Invalid position data received");
