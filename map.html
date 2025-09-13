@@ -1461,12 +1461,11 @@ function initMap() {
     
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         minZoom: 7,
-        maxZoom: 19,
-        maxNativeZoom: 19,
+        maxZoom: 17,
         attribution: '',
         updateWhenIdle: true,
         updateWhenZooming: false,
-        keepBuffer: 256,
+        keepBuffer: 2,
         className: 'map-tiles'
     }).addTo(map);
     
@@ -2671,6 +2670,12 @@ function updateUserLocation(position, forceUpdate = false) {
     if (!position?.coords?.latitude || !position?.coords?.longitude) {
         console.warn('Invalid position data received'); return;
     }
+
+    /* guarantee accuracy indicator on very first fix */
+    if (!lastPosition && position.coords.accuracy != null) {
+        updateAccuracyIndicator(position.coords.accuracy);
+    }
+    
     if (animationFrameId !== null) { cancelAnimationFrame(animationFrameId); animationFrameId = null; }
 
     const nowMs   = performance.now();
@@ -2690,6 +2695,21 @@ function updateUserLocation(position, forceUpdate = false) {
         gameLocations.forEach(l => enterpriseCacheManager.cacheLocationData(l, newPos));
     }
 
+    // Skip all automatic behavior during user interaction
+    if (isMapInteracting) {
+        // Only update marker position during interaction
+        if (lastPosition) {
+            const distance = calculateDistance(lastPosition, newPos);
+            if (distance > CONFIG.EXTENDED_DISTANCE_THRESHOLD || forceUpdate) {
+                userMarker.setLatLng([newPos.lat, newPos.lng], { animate: false });
+                lastPosition = newPos;
+                positionBuffer = [newPos];
+                updateDistanceBox();
+            }
+        }
+        return;
+    }
+
     /* first-fix block */
     if (!lastPosition) {
         lastPosition = newPos;
@@ -2699,8 +2719,11 @@ function updateUserLocation(position, forceUpdate = false) {
         map.setView([newPos.lat, newPos.lng], map.getZoom(), { animate: false, noMoveStart: true });
         setTimeout(() => { mc.style.transition = ot; }, 50);
         lastUpdateTime = nowDate; stationaryStartTime = nowDate; positionBuffer = [newPos];
-        const iz = getSpeedBasedZoom(newPos.speedMPS);
-        if (iz) map.setZoom(iz, { animate: false, noMoveStart: true });
+        // Only set zoom on first fix if no user interaction has occurred
+        if (!userHasInteracted) {
+            const iz = getSpeedBasedZoom(newPos.speedMPS);
+            if (iz) map.setZoom(iz, { animate: false, noMoveStart: true });
+        }
         updateDistanceBox(); updateAccuracyIndicator(newPos.accuracy); return;
     }
 
@@ -2725,7 +2748,16 @@ function updateUserLocation(position, forceUpdate = false) {
         if (headDiff > 20) smooth *= 0.85;
         else if (headDiff > 12) smooth *= (1 - (headDiff - 12) / 80 * 0.15);
         const ewPanMult = ew ? 0.75 + 0.15 * (1 - norm) : 1;
-        const panDur = 2.3 * Math.exp(-norm * 2.5) * ewPanMult * dirFactor;
+        
+        // Enhanced smoothness for driving speeds
+        let panDur = 2.3 * Math.exp(-norm * 2.5) * ewPanMult * dirFactor;
+        
+        // Add extra smoothness for speeds above walking (> 3 mph)
+        if (speedMPH > 3) {
+            const drivingBoost = Math.min(0.8, (speedMPH - 3) / 30); // Scales from 0 to 0.8
+            panDur = panDur * (1 - drivingBoost) + 1.2 * drivingBoost * dirFactor;
+        }
+        
         return { smooth, panDur };
     }
     const curve = getTimingCurve(speedMPH, dirChangeFactor, eastWest, headingDiff);
@@ -2738,8 +2770,13 @@ function updateUserLocation(position, forceUpdate = false) {
         mc.style.transition = 'none';
         userMarker.setLatLng([newPos.lat, newPos.lng], { animate: false });
         lastPosition = newPos; positionBuffer = [newPos]; lastVelocity = { lat: 0, lng: 0 };
-        const iz = getSpeedBasedZoom(newPos.speedMPS);
-        if (iz) map.setZoom(iz, { animate: false, noMoveStart: true });
+        
+        // Only auto-zoom if user hasn't interacted recently
+        if (!userHasInteracted && (nowDate - lastUserInteractionTime > CONFIG.USER_INTERACTION_TIMEOUT || 5000)) {
+            const iz = getSpeedBasedZoom(newPos.speedMPS);
+            if (iz) map.setZoom(iz, { animate: false, noMoveStart: true });
+        }
+        
         map.setView([newPos.lat, newPos.lng], map.getZoom(), { animate: false, noMoveStart: true });
         setTimeout(() => { mc.style.transition = ot; }, 16);
         lastUpdateTime = nowDate; lastUpdateTimestamp = nowDate;
@@ -2847,8 +2884,9 @@ function updateUserLocation(position, forceUpdate = false) {
 
         const needCenter = isOutsideBounds || isNearEdgePixel || isNearEdgeGeo;
         const canPan     = nowMs - lastCenteringTime > CONFIG.MIN_CENTERING_INTERVAL;
+        const timeSinceInteraction = nowDate - (lastUserInteractionTime || 0);
 
-        if (followUser && !isMapInteracting && needCenter && canPan) {
+        if (followUser && needCenter && canPan && timeSinceInteraction > 1000) {
             map.getContainer().style.willChange = 'transform';
             map.panTo(userPos, {                      
                 animate: true,
@@ -2869,13 +2907,23 @@ function updateUserLocation(position, forceUpdate = false) {
                 easeLinearity: 0.15
         });
         
-        /* intelligent zoom */
-        if (nowDate - lastMapUpdateTime > 200 || distance > 15) {
+        /* intelligent zoom - only if user hasn't interacted recently */
+        const timeSinceLastInteraction = nowDate - (lastUserInteractionTime || 0);
+        const interactionCooldown = userHasInteracted ? 10000 : 5000; // 10s if user has interacted, 5s otherwise
+        
+        if (timeSinceLastInteraction > interactionCooldown && 
+            (nowDate - lastMapUpdateTime > 2000 || distance > 50)) { // Increased thresholds
+            
             checkProximityForZoom();
-            const iz = getSpeedBasedZoom(newPos.speedMPS);
-            if (iz && Math.abs(map.getZoom() - iz) >= 0.8 * curve.smooth) {
-                map.setZoom(iz, { animate: true, duration: curve.panDur * 0.8, noMoveStart: true });
+            
+            // Only do speed-based zoom if moving significantly
+            if (newPos.speedMPS > 2) { // Only zoom when moving faster than walking
+                const iz = getSpeedBasedZoom(newPos.speedMPS);
+                if (iz && Math.abs(map.getZoom() - iz) >= 1.0) { // Higher threshold
+                    map.setZoom(iz, { animate: true, duration: curve.panDur * 1.2, noMoveStart: true });
+                }
             }
+            
             lastMapUpdateTime = nowDate;
         }
 
@@ -2890,9 +2938,10 @@ function updateUserLocation(position, forceUpdate = false) {
         lastPosition = newPos; positionBuffer = [newPos]; updateDistanceBox();
     }
 
-    /* viewport failsafe */
-    if (followUser && !isMapInteracting) {
-        const SAFETY_DEBOUNCE = 80;
+    /* viewport failsafe - only if not recently interacted */
+    const timeSinceInteraction = nowDate - (lastUserInteractionTime || 0);
+    if (followUser && timeSinceInteraction > 1000) {
+        const SAFETY_DEBOUNCE = 200; // Increased debounce
         if (nowMs - lastCenteringTime > SAFETY_DEBOUNCE) {
             const mPos = userMarker.getLatLng();
             if (!map.getBounds().contains(mPos)) {
@@ -4589,12 +4638,15 @@ function createMarkersOnly() {
         
         const locationMarker = L.marker([location.lat, location.lng], {
             icon: L.divIcon({
-                className: 'custom-pin-icon',
-                html: `<div class="pin-head" style="background-color: ${markerColor};"></div>`,
-                iconSize: [30, 30],
-                iconAnchor: [15, 30],
-            })
-        });
+            className: 'custom-pin-icon',
+            html: `<div class="pin-head" style="background-color: ${markerColor};"></div>`,
+            iconSize: [30, 30],
+            iconAnchor: [15, 30],
+        }),
+            riseOnHover: false,
+            bubblingMouseEvents: false
+    });
+        
         const popupContent = `
             <div class="popup-content">
                 <img loading="lazy" src="${location.image}" alt="${location.name}" class="location-image">
@@ -5919,6 +5971,7 @@ function setupEventListeners() {
     }
 }
 
+// Rest of the code remains identical...
 document.addEventListener('DOMContentLoaded', () => {
     console.log('DOM loaded, initializing application...');
     
