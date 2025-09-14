@@ -2855,8 +2855,9 @@ function throttle(func, limit) {
   };
 }
 
-/*  continuous curve + original full edge-detection  +  centre-lock  */
+/*  continuous curve + original full edge-detection  (no extra cooldowns)  */
 function updateUserLocation(position, forceUpdate = false) {
+    /* ----------  0.  safety  ---------- */
     if (!position?.coords?.latitude || !position?.coords?.longitude) {
         console.warn('Invalid position data received'); return;
     }
@@ -2879,7 +2880,20 @@ function updateUserLocation(position, forceUpdate = false) {
         gameLocations.forEach(l => enterpriseCacheManager.cacheLocationData(l, newPos));
     }
 
-    /* first-fix block */
+    /* ----------  1.  pinch/pan/zoom guard  ---------- */
+    if (isMapInteracting) {
+        if (lastPosition) {
+            const distance = calculateDistance(lastPosition, newPos);
+            if (distance > CONFIG.EXTENDED_DISTANCE_THRESHOLD || forceUpdate) {
+                userMarker.setLatLng([newPos.lat, newPos.lng], { animate: false });
+                lastPosition = newPos; positionBuffer = [newPos];
+                updateDistanceBox();
+            }
+        }
+        return;
+    }
+
+    /* ----------  2.  first-fix block  ---------- */
     if (!lastPosition) {
         lastPosition = newPos;
         const mc = map.getContainer(); const ot = mc.style.transition;
@@ -2893,7 +2907,7 @@ function updateUserLocation(position, forceUpdate = false) {
         updateDistanceBox(); updateAccuracyIndicator(newPos.accuracy); return;
     }
 
-    /* speed / direction / east-west */
+    /* ----------  3.  speed / direction / east-west  ---------- */
     const distance = calculateDistance(lastPosition, newPos);
     const speedMPH = newPos.speedMPS * 2.23694;
     const latDelta = Math.abs(newPos.lat - lastPosition.lat);
@@ -2907,7 +2921,7 @@ function updateUserLocation(position, forceUpdate = false) {
         if (headingDiff > 12) dirChangeFactor = Math.max(0.4, 1 - headingDiff / 200);
     }
 
-    /* continuous curve – ONLY drives timing / smoothing */
+    /* ----------  4.  continuous curve  ---------- */
     function getTimingCurve(speedMPH, dirFactor, ew, headDiff) {
         const norm = Math.min(1, speedMPH / 85);
         let smooth = 0.08 + 0.87 * (1 - Math.exp(-norm * 3));
@@ -2917,13 +2931,13 @@ function updateUserLocation(position, forceUpdate = false) {
         let panDur = 2.3 * Math.exp(-norm * 2.5) * ewPanMult * dirFactor;
         if (speedMPH > 3) {
             const drivingBoost = Math.min(0.8, (speedMPH - 3) / 30);
-            panDur = panDur + (1.2 * drivingBoost * dirFactor);   // ← keeps smoothness
+            panDur = panDur + (1.2 * drivingBoost * dirFactor);
         }
         return { smooth, panDur };
     }
     const curve = getTimingCurve(speedMPH, dirChangeFactor, eastWest, headingDiff);
 
-    /* extended-distance cut-through – keep snap, but lock to centre */
+    /* ----------  5.  extended-distance cut-through  ---------- */
     if (distance > CONFIG.EXTENDED_DISTANCE_THRESHOLD || forceUpdate) {
         if (stationaryCheckTimeout) { clearTimeout(stationaryCheckTimeout); stationaryCheckTimeout = null; }
         isStationary = false; stationaryStartTime = null;
@@ -2934,13 +2948,17 @@ function updateUserLocation(position, forceUpdate = false) {
         const iz = getSpeedBasedZoom(newPos.speedMPS);
         if (iz) map.setZoom(iz, { animate: false, noMoveStart: true });
         map.setView([newPos.lat, newPos.lng], map.getZoom(), { animate: false, noMoveStart: true });
+        /* ----  guarantee sprite is inside viewport  ---- */
+        if (!map.getBounds().contains(userMarker.getLatLng())) {
+            map.panTo(userMarker.getLatLng(), { animate: false, noMoveStart: true });
+        }
         setTimeout(() => { mc.style.transition = ot; }, 16);
         lastUpdateTime = nowDate; lastUpdateTimestamp = nowDate;
         if (isSignificantMovement(newPos)) resetInactivityTimer(false);
         updateDistanceBox(); if (map._container) map._onResize(); return;
     }
 
-    /* stationary / micro-movement */
+    /* ----------  6.  stationary / micro-movement  ---------- */
     const origMicro = [0.15, 0.18, 0.25, 0.32, 0.38, 0.42, 0.45, 0.52, 0.58, 0.68, 0.85, 1.1, 1.35, 1.65, 1.95, 2.25, 2.6];
     const br = Math.min(origMicro.length - 1, Math.floor(Math.min(1, speedMPH / 85) * (origMicro.length - 1)));
     const microThreshold = CONFIG.MICRO_MOVEMENT_THRESHOLD * origMicro[br] * (eastWest ? 0.9 : 1);
@@ -2975,7 +2993,7 @@ function updateUserLocation(position, forceUpdate = false) {
         if (stationaryCheckTimeout) { clearTimeout(stationaryCheckTimeout); stationaryCheckTimeout = null; }
     }
 
-    /* quality gates (original table via curve) */
+    /* ----------  7.  quality gates (original table via curve)  ---------- */
     const origMin = [0.25, 0.28, 0.35, 0.42, 0.48, 0.52, 0.55, 0.62, 0.68, 0.78, 0.95, 1.2, 1.45, 1.75, 2.05, 2.35, 2.7];
     const minDist = CONFIG.MIN_DISTANCE_THRESHOLD * origMin[br] * (eastWest ? 0.9 : 1);
     const maxAcc  = CONFIG.MAX_ACCEPTABLE_ACCURACY * (2.0 - 0.7 * Math.min(1, speedMPH / 85)) * (eastWest ? 1.1 : 1);
@@ -2989,7 +3007,7 @@ function updateUserLocation(position, forceUpdate = false) {
         return;
     }
 
-    /* buffer + velocity filter */
+    /* ----------  8.  buffer + velocity filter  ---------- */
     try {
         updatePositionBuffer(newPos);
         const finalPos = calculateFinalPosition();
@@ -3002,9 +3020,43 @@ function updateUserLocation(position, forceUpdate = false) {
         const lookAheadLng = predictedPos.lng + (predictedPos.lng - lastPosition.lng) * lookAheadFactor;
         const lookAhead = L.latLng(lookAheadLat, lookAheadLng);
 
-        /* ----------  NEW:  lock map centre to smoothed position  ---------- */
-        const userPos = predictedPos;   // already smoothed
-        if (followUser && !isMapInteracting) {
+        /* ----------  9.  comprehensive edge detection  (unchanged)  ---------- */
+        const userPos   = predictedPos;
+        const bounds    = map.getBounds();
+        const userPixel = map.latLngToContainerPoint(userPos);
+        const mapSize   = map.getSize();
+        const speedNorm = Math.min(1, speedMPH / 80);
+
+        const pixelBase     = 0.25;
+        const pixelAdaptive = Math.max(0.08, pixelBase - speedNorm * 0.17);
+        const ewPixelThresh = eastWest ? pixelAdaptive * 0.85 : pixelAdaptive;
+        const nsPixelThresh = eastWest ? pixelAdaptive * 1.1  : pixelAdaptive;
+
+        const isNearEdgePixel =
+            userPixel.x < mapSize.x * ewPixelThresh ||
+            userPixel.x > mapSize.x * (1 - ewPixelThresh) ||
+            userPixel.y < mapSize.y * nsPixelThresh ||
+            userPixel.y > mapSize.y * (1 - nsPixelThresh);
+
+        const mapW = bounds.getEast() - bounds.getWest();
+        const mapH = bounds.getNorth() - bounds.getSouth();
+        const geoBase     = 0.25;
+        const geoAdaptive = Math.max(0.08, geoBase - speedNorm * 0.17);
+        const edgeLng = mapW * geoAdaptive * (eastWest ? 0.85 : 1);
+        const edgeLat = mapH * geoAdaptive * (eastWest ? 1.1  : 1);
+
+        const isNearEdgeGeo =
+            userPos.lat > (bounds.getNorth() - edgeLat) ||
+            userPos.lat < (bounds.getSouth() + edgeLat) ||
+            userPos.lng > (bounds.getEast()  - edgeLng) ||
+            userPos.lng < (bounds.getWest()  + edgeLng);
+
+        const isOutsideBounds = !bounds.contains(userPos);
+        const needCenter = isOutsideBounds || isNearEdgePixel || isNearEdgeGeo;
+        const canPan     = nowMs - lastCenteringTime > CONFIG.MIN_CENTERING_INTERVAL;
+
+        /* ----------  10.  auto-pan / zoom  (NO extra cooldown)  ---------- */
+        if (followUser && !isMapInteracting && needCenter && canPan) {
             map.getContainer().style.willChange = 'transform';
             map.panTo(userPos, {
                 animate: true,
@@ -3018,14 +3070,12 @@ function updateUserLocation(position, forceUpdate = false) {
             lastCenteringTime = nowMs;
         }
 
-        /* ---------- marker : keep lookahead for smooth animation ---------- */
         userMarker.setLatLng([userPos.lat, userPos.lng], {
             animate: true,
             duration: curve.panDur,
             easeLinearity: 0.15
         });
 
-        /* intelligent zoom */
         if (nowDate - lastMapUpdateTime > 200 || distance > 15) {
             checkProximityForZoom();
             const iz = getSpeedBasedZoom(newPos.speedMPS);
