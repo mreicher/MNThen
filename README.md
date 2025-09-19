@@ -10,7 +10,7 @@ Minnesota Then is an innovative "Museum Without Walls" concept that transforms t
 
 - **Interactive Map Interface**: Navigate through historical points of interest using an optimized Leaflet.js map
 - **Location-Based Content**: Unlock historical information when physically near points of interest (within 20 feet)
-- **Audio Tours**: Listen to narrated historical information about each location
+- **Audio Docent**: Listen to narrated historical information about each location
 - **Responsive Design**: Optimized for all devices with special attention to mobile experience
 - **Advanced Geolocation**: Sophisticated position tracking with Kalman filtering and adaptive smoothing
 - **Offline Capability**: Core functionality works with limited connectivity
