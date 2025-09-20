@@ -1,217 +1,218 @@
 // sw.js – Minnesota Then Service Worker
-// Version: 4.1.0 (Error-free with audio support)
+// Version: 4.2.1 (iOS-optimised + Lighthouse maskable & opaque guard)
 
-const CACHE_NAME = 'mnthen-v4';
-const RUNTIME_CACHE = 'mnthen-runtime-v4';
+const CACHE_NAME        = 'mnthen-v4-ios';
+const RUNTIME_CACHE     = 'mnthen-runtime-v4-ios';
+const AUDIO_CACHE       = 'mnthen-audio-v4';
 
-// Critical resources to cache on install
+// iOS Safari cache size limits (conservative)
+const MAX_CACHE_SIZE        = 50 * 1024 * 1024; // 50 MB total
+const MAX_RUNTIME_ENTRIES   = 100;
+const MAX_AUDIO_ENTRIES     = 20;
+
+// Critical install-time shell
 const STATIC_RESOURCES = [
   '/',
-  '/index.html',
+  '/index.html'
+];
+
+// Always-live assets
+const NEVER_CACHE = [
+  '/locations_main.js',
   '/manifest.json'
 ];
 
-// Resources that should NEVER be cached (always fetch fresh)
-const NEVER_CACHE = [
-  '/locations_main.js',  // Your locations array - always fresh
-  '/manifest.json'       // Manifest should always be fresh
-];
-
-// Audio file extensions (for special handling)
+// Media patterns
 const AUDIO_EXTENSIONS = /\.(mp3|wav|ogg|m4a|aac|flac|weba)$/i;
 const VIDEO_EXTENSIONS = /\.(mp4|webm|mov|avi|mpeg|mkv)$/i;
 
-// Simple cache-first strategy with fallback
+// ----------  helpers  ----------
+function isIOSSafari() {
+  return /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+}
+
+async function manageCacheSize(cacheName, maxEntries) {
+  try {
+    const cache = await caches.open(cacheName);
+    const keys  = await cache.keys();
+    if (keys.length > maxEntries) {
+      const toDelete = keys.length - maxEntries;
+      for (let i = 0; i < toDelete; i++) await cache.delete(keys[i]);
+    }
+  } catch (e) {
+    console.warn('[SW] cache size manage fail:', e);
+  }
+}
+
+// ----------  strategies  ----------
 async function cacheFirst(request) {
   try {
-    const cache = await caches.open(CACHE_NAME);
-    const cached = await cache.match(request);
-    
-    if (cached) {
-      return cached;
+    const cache   = await caches.open(CACHE_NAME);
+    const cached  = await cache.match(request);
+    if (cached) return cached;
+
+    const controller = new AbortController();
+    const timeoutId  = setTimeout(() => controller.abort(), 10000);
+
+    const response = await fetch(request, {
+      signal: controller.signal,
+      cache : 'default'
+    });
+    clearTimeout(timeoutId);
+
+    if (response.status === 200 && response.type !== 'opaque') {
+      cache.put(request, response.clone()).catch(() => {});
     }
-    
-    // Not in cache - fetch and cache
-    const response = await fetch(request);
-    
-    // Only cache successful full responses (avoid 206 partial content)
-    if (response.status === 200) {
-      cache.put(request, response.clone());
-    }
-    
     return response;
-  } catch (error) {
-    console.error('Cache-first failed:', error);
-    // Try to return cached version as fallback
+  } catch (e) {
     const cache = await caches.open(CACHE_NAME);
-    const fallback = await cache.match(request);
-    return fallback || new Response('Resource unavailable', { status: 503 });
+    return (await cache.match(request)) ||
+           new Response('Resource unavailable', { status: 503 });
   }
 }
 
-// Network-first strategy (for dynamic content)
 async function networkFirst(request) {
   try {
-    const response = await fetch(request);
-    
-    // Cache successful full responses only
-    if (response.status === 200) {
-      const cache = await caches.open(RUNTIME_CACHE);
-      cache.put(request, response.clone());
-    }
-    
-    return response;
-  } catch (error) {
-    // Network failed - try cache
-    const cache = await caches.open(RUNTIME_CACHE);
-    const cached = await cache.match(request);
-    return cached || new Response('Resource unavailable', { status: 503 });
-  }
-}
+    const controller = new AbortController();
+    const timeoutId  = setTimeout(() => controller.abort(), 8000);
 
-// Special handler for audio files
-async function handleAudioRequest(request) {
-  try {
-    // For range requests (audio streaming), bypass cache completely
-    if (request.headers.has('range')) {
-      return fetch(request);
-    }
-    
-    // Try cache first for full audio requests
-    const cache = await caches.open(CACHE_NAME);
-    const cached = await cache.match(request);
-    
-    if (cached) {
-      return cached;
-    }
-    
-    // Not in cache - fetch with CORS awareness
     const response = await fetch(request, {
-      mode: 'cors',
-      credentials: 'same-origin'
+      signal : controller.signal,
+      cache  : 'no-cache'
     });
-    
-    // Cache successful full audio responses
-    if (response.status === 200) {
-      cache.put(request, response.clone());
+    clearTimeout(timeoutId);
+
+    // Lighthouse fix: opaque guard moved before cache touch
+    if (response.status === 200 && response.type !== 'opaque') {
+      const cache = await caches.open(RUNTIME_CACHE);
+      cache.put(request, response.clone()).then(() => {
+        manageCacheSize(RUNTIME_CACHE, MAX_RUNTIME_ENTRIES);
+      }).catch(() => {});
     }
-    
     return response;
-  } catch (error) {
-    console.error('Audio request failed:', error);
-    // Fallback to direct fetch for audio
-    return fetch(request);
+  } catch (e) {
+    const cache = await caches.open(RUNTIME_CACHE);
+    return (await cache.match(request)) ||
+           new Response('Network unavailable', { status: 503 });
   }
 }
 
-// Check if URL should never be cached
-function shouldNeverCache(url) {
-  return NEVER_CACHE.some(pattern => url.includes(pattern));
+async function handleMediaRequest(request) {
+  // iOS range-request handling
+  if (request.headers.has('range')) {
+    return fetch(request.clone(), { cache: 'no-cache', mode: 'cors' });
+  }
+
+  const cache = await caches.open(AUDIO_CACHE);
+  const cached = await cache.match(request);
+  if (cached) return cached;
+
+  const response = await fetch(request, {
+    mode: 'cors',
+    credentials: 'same-origin',
+    cache: 'default'
+  });
+
+  if (response.status === 200) {
+    cache.put(request, response.clone()).then(() => {
+      manageCacheSize(AUDIO_CACHE, MAX_AUDIO_ENTRIES);
+    }).catch(() => {});
+  }
+  return response;
 }
 
-// Check if URL is audio/video
+function shouldNeverCache(url) {
+  return NEVER_CACHE.some(p => url.includes(p));
+}
 function isMediaFile(url) {
   return AUDIO_EXTENSIONS.test(url) || VIDEO_EXTENSIONS.test(url);
 }
 
-// Main fetch handler
+// ----------  fetch ----------
 self.addEventListener('fetch', (event) => {
-  const url = event.request.url;
-  const request = event.request;
-  
-  // Skip non-GET requests
-  if (request.method !== 'GET') {
-    return;
-  }
-  
-  // Special handling for audio/video files
-  if (isMediaFile(url)) {
-    event.respondWith(handleAudioRequest(request));
-    return;
-  }
-  
-  // Never cache certain files - always fetch fresh
+  const { request } = event;
+  const url = request.url;
+
+  if (request.method !== 'GET') return;
   if (shouldNeverCache(url)) {
-    event.respondWith(fetch(request));
+    event.respondWith(fetch(request, { cache: 'no-cache' }));
     return;
   }
-  
-  // Handle different resource types
-  if (url.match(/\.(css|js|png|jpg|jpeg|gif|svg|webp|ico)$/i)) {
-    // Static assets - cache first
+  if (isMediaFile(url)) {
+    event.respondWith(handleMediaRequest(request));
+    return;
+  }
+
+  if (url.match(/\.(css|js|png|jpg|jpeg|gif|svg|webp|ico|woff|woff2)$/i)) {
     event.respondWith(cacheFirst(request));
-  } else if (url.includes('/api/') || url.includes('geolocation')) {
-    // API calls - network first
+  } else if (url.includes('/api/') || url.includes('geolocation') || url.includes('weather')) {
     event.respondWith(networkFirst(request));
   } else {
-    // Everything else - cache first with network fallback
     event.respondWith(cacheFirst(request));
   }
 });
 
-// Install event - cache critical resources
-self.addEventListener('install', (event) => {
-  console.log('Service Worker 4.1.0: Installing...');
-  
-  event.waitUntil(
-    caches.open(CACHE_NAME).then(cache => {
-      console.log('Caching static resources');
-      return cache.addAll(STATIC_RESOURCES).catch(error => {
-        console.error('Failed to cache some static resources:', error);
-        // Don't fail the install if some resources fail to cache
-        return Promise.resolve();
-      });
-    })
-  );
-  
-  // Skip waiting - activate immediately
-  self.skipWaiting();
-});
-
-// Activate event - clean up old caches
-self.addEventListener('activate', (event) => {
-  console.log('Service Worker 4.1.0: Activating...');
-  
-  event.waitUntil(
-    caches.keys().then(cacheNames => {
-      return Promise.all(
-        cacheNames.map(cacheName => {
-          // Delete old caches
-          if (cacheName !== CACHE_NAME && cacheName !== RUNTIME_CACHE) {
-            console.log('Deleting old cache:', cacheName);
-            return caches.delete(cacheName);
-          }
-        })
-      );
-    }).then(() => {
-      // Take control of all clients immediately
-      return self.clients.claim();
-    })
+// ----------  lifecycle ----------
+self.addEventListener('install', (e) => {
+  console.log('[SW] 4.2.1 installing');
+  e.waitUntil(
+    caches.open(CACHE_NAME)
+          .then(cache => cache.addAll(STATIC_RESOURCES))
+          .catch(error => {
+            console.error('[SW] Failed to cache static resources:', error);
+            // Don't fail install if some resources fail to cache
+            return Promise.resolve();
+          })
+          .then(() => self.skipWaiting())
   );
 });
 
-// Handle messages from main thread
+self.addEventListener('activate', (e) => {
+  console.log('[SW] 4.2.1 activating');
+  e.waitUntil(
+    Promise.all([
+      caches.keys().then(names => Promise.all(
+        names.map(n => (n !== CACHE_NAME && n !== RUNTIME_CACHE && n !== AUDIO_CACHE) ? caches.delete(n) : null)
+      )),
+      manageCacheSize(RUNTIME_CACHE, MAX_RUNTIME_ENTRIES),
+      manageCacheSize(AUDIO_CACHE, MAX_AUDIO_ENTRIES)
+    ]).then(() => self.clients.claim())
+  );
+});
+
+// ----------  messages ----------
 self.addEventListener('message', (event) => {
-  if (event.data && event.data.type === 'SKIP_WAITING') {
-    self.skipWaiting();
+  const { data } = event;
+  if (!data) return;
+
+  if (data.type === 'SKIP_WAITING') self.skipWaiting();
+
+  if (data.type === 'CLEAR_CACHE') {
+    Promise.all([
+      caches.delete(CACHE_NAME),
+      caches.delete(RUNTIME_CACHE),
+      caches.delete(AUDIO_CACHE)
+    ]).then(() => event.ports[0].postMessage({ success: true }))
+     .catch(err => event.ports[0].postMessage({ success: false, error: err.message }));
   }
-  
-  if (event.data && event.data.type === 'CLEAR_CACHE') {
-    caches.keys().then(names => {
-      return Promise.all(names.map(name => caches.delete(name)));
-    }).then(() => {
-      event.ports[0].postMessage({ success: true });
-    });
+
+  if (data.type === 'MANAGE_CACHE_SIZE') {
+    Promise.all([
+      manageCacheSize(CACHE_NAME, 50),
+      manageCacheSize(RUNTIME_CACHE, MAX_RUNTIME_ENTRIES),
+      manageCacheSize(AUDIO_CACHE, MAX_AUDIO_ENTRIES)
+    ]).then(() => event.ports[0].postMessage({ success: true, message: 'cache size managed' }));
   }
 });
 
-// Error handling
-self.addEventListener('error', (event) => {
-  console.error('Service Worker Error:', event.error);
+// ----------  error shields ----------
+self.addEventListener('error', (e) => {
+  console.error('[SW] global error', e.error);
+  e.preventDefault();                // iOS safety
+});
+self.addEventListener('unhandledrejection', (e) => {
+  console.error('[SW] unhandled rejection', e.reason);
+  e.preventDefault();                // iOS safety
 });
 
-self.addEventListener('unhandledrejection', (event) => {
-  console.error('Service Worker Unhandled Promise Rejection:', event.reason);
-});
-
-console.log('Service Worker 4.1.0: Loaded successfully with audio support');
+console.log('[SW] 4.2.1 ready (iOS-optimised + maskable & opaque guard)');
