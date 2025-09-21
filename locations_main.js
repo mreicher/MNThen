@@ -34,7 +34,8 @@ const locations = [
         today: "Cherokee Regional Park",
         link: "https://mnthen.com/blog/people/eyedea_larsen.html",
         imageSource: "Image of 'Eyedea' Larsen via Heavy Blog is Heavy",
-        additionalInfo: "Eyedea's music often delved into philosophy, psychology, and social issues, reflecting his thoughtful and introspective nature."
+        additionalInfo: "Eyedea's music often delved into philosophy, psychology, and social issues, reflecting his thoughtful and introspective nature.",
+        difficulty: 2
     },
 
     {
@@ -52,7 +53,8 @@ const locations = [
         today: "Reconcilliation Park",
         link: "https://mnthen.com/blog/event/dakota_conflict.html",
         imageSource: "The Dakota 38 Memorial via Library of Congress",
-        additionalInfo: "After the U.S.-Dakota War, 2,000 Dakota were captured; President Lincoln commuted the sentences of all but 39 of the 303 condemned to die."
+        additionalInfo: "After the U.S.-Dakota War, 2,000 Dakota were captured; President Lincoln commuted the sentences of all but 39 of the 303 condemned to die.",
+        difficulty: 1
     },
 
     {
@@ -70,7 +72,8 @@ const locations = [
         today: "Upper Swede Hollow Park",
         link: "https://mnthen.com/blog/place/stp_hamm_mansion.html",
         imageSource: "The Hamm Mansion via 1889 Victorian House Restoration",
-        additionalInfo: "In 1976, the site of the Theodore Hamm Mansion became Upper Swede Hollow Park, honoring the family's contributions to St. Paul."
+        additionalInfo: "In 1976, the site of the Theodore Hamm Mansion became Upper Swede Hollow Park, honoring the family's contributions to St. Paul.",
+        difficulty: 1
     },
 
     {
@@ -88,7 +91,8 @@ const locations = [
         today: "Downtown Minneapolis",
         link: "https://www.mnopedia.org/structure/father-louis-hennepin-suspension-bridge",
         imageSource: "First suspension bridge in Minneapolis, (c. 1858) via MNopedia",
-        additionalInfo: "The original bridge was a suspension bridge, a relatively new and innovative design at the time."
+        additionalInfo: "The original bridge was a suspension bridge, a relatively new and innovative design at the time.",
+        difficulty: 1
     },
 
     {
@@ -106,7 +110,8 @@ const locations = [
         today: "St. Paul's North End",
         link: "https://www.mnopedia.org/structure/minnesota-s-third-state-capitol",
         imageSource: "Minnesota State Capitol Building (2022)",
-        additionalInfo: "The Capitol’s dome is the second-largest self-supported marble dome in the world, after St. Peter's Basilica in Vatican City."
+        additionalInfo: "The Capitol’s dome is the second-largest self-supported marble dome in the world, after St. Peter's Basilica in Vatican City.",
+        difficulty: 1
     },
 
     {
@@ -124,7 +129,8 @@ const locations = [
         today: "Near the Visitor Center",
         link: "https://mnthen.com/blog/people/whiskey.html",
         imageSource: "Whiskey with Captain W.R. Hazelrigg (1943)",
-        additionalInfo: "Whiskey was buried with full military honors, marking the end of an era where horses played a significant role in the U.S. Army."
+        additionalInfo: "Whiskey was buried with full military honors, marking the end of an era where horses played a significant role in the U.S. Army.",
+        difficulty: 1
     },
 
     {
@@ -142,7 +148,8 @@ const locations = [
         today: "Swede Hollow Park",
         link: "https://www.mnopedia.org/place/swede-hollow",
         imageSource: "Swede Hollow looking north, (c.1910). via MNopedia",
-        additionalInfo: "In 1976, Swede Hollow was transformed into a nature sanctuary with trails and signs commemorating the communities that once lived there."
+        additionalInfo: "In 1976, Swede Hollow was transformed into a nature sanctuary with trails and signs commemorating the communities that once lived there.",
+        difficulty: 2
     },
 
     {
@@ -160,26 +167,28 @@ const locations = [
         today: "Cass Gilbert Park",
         link: "https://mnthen.com/blog/place/merriam_mansion.html",
         imageSource: "William R. Merriam residence, (c.1890). via St Paul Historical",
-        additionalInfo: "After serving as Minnesota's governor, Merriam was appointed by President McKinley to direct the U.S. Census Bureau in 1899."
+        additionalInfo: "After serving as Minnesota's governor, Merriam was appointed by President McKinley to direct the U.S. Census Bureau in 1899.",
+        difficulty: 1
     },
     
     {
-    "id": "1019",
-    "lat": 45.08421675605315,
-    "lng": -92.78683662323817,
-    "name": "St. Croix Boom Site (1856 - 1914)",
-    "title": "St. Croix Boom Site",
-    "image": "https://mnthen.com/images/boom1.jpg",
-    "creator": "Matt Reicher",
-    "city": "Stillwater",
-    "audio": "/audio/exhibit/boomsite.mp3",
-    "tours": "place",
-    "summary": "The St. Croix Boom Site marked Minnesota's lumbering peak, processing 15 billion feet of logs over six decades. Deforestation, shifting industry, and infrastructure changes contributed to its 1914 closure.",
-    "today": "Three miles north of downtown Stillwater on 95.",
-    "link": "https://mnthen.com/blog/place/boomsite.html",
-    "imageSource": "Men working the boom via the Forest Lake Times",
-    "additionalInfo": "Recent efforts to clean up and preserve the St. Croix Boom Site have helped highlight its natural beauty and historical significance."
-},
+        "id": "1019",
+        "lat": 45.08421675605315,
+        "lng": -92.78683662323817,
+        "name": "St. Croix Boom Site (1856 - 1914)",
+        "title": "St. Croix Boom Site",
+        "image": "https://mnthen.com/images/boom1.jpg",
+        "creator": "Matt Reicher",
+        "city": "Stillwater",
+        "audio": "/audio/exhibit/boomsite.mp3",
+        "tours": "place",
+        "summary": "The St. Croix Boom Site marked Minnesota's lumbering peak, processing 15 billion feet of logs over six decades. Deforestation, shifting industry, and infrastructure changes contributed to its 1914 closure.",
+        "today": "Three miles north of downtown Stillwater on 95.",
+        "link": "https://mnthen.com/blog/place/boomsite.html",
+        "imageSource": "Men working the boom via the Forest Lake Times",
+        "additionalInfo": "Recent efforts to clean up and preserve the St. Croix Boom Site have helped highlight its natural beauty and historical significance.",
+        difficulty: 1
+    },
 
 {
         id: "1020",
@@ -196,7 +205,8 @@ const locations = [
         today: "Intersection of Shepard Rd. and Randolph",
         link: "https://www.mnopedia.org/person/morgan-samuel-huntington-1911-2000",
         imageSource: "Image of Samuel H. Morgan, ca 1990s. via MNOpedia",
-        additionalInfo: "The Samuel H. Morgan Land Fund supports Minnesota land conservation by funding acquisitions to expand state parks, public trails, and green spaces."
+        additionalInfo: "The Samuel H. Morgan Land Fund supports Minnesota land conservation by funding acquisitions to expand state parks, public trails, and green spaces.",
+        difficulty: 1
 },
 /*
    {
@@ -218,40 +228,42 @@ const locations = [
     },
 */
     {
-    id: "1022",
-    lat: 44.7695002003817,
-    lng: -92.90470981679262,
-    name: "Nininger",
-    title: "Nininger",
-    image: "https://mnthen.com/images/exhibit/nininger.jpg",
-    creator: "Matt Reicher",
-    city: "Hastings",
-    audio: "/audio/exhibit/nininger.mp3",
-    tours: "place",
-    summary: "Nininger, founded in 1856 by John Nininger and promoted by Ignatius Donnelly, boomed briefly before the 1857 Panic. Economic hardship and unfulfilled infrastructure promises led to its abandonment by 1869.",
-    today: "Nininger Town Hall, Hastings",
-    link: "https://www3.mnhs.org/mnopedia/search/index/place/nininger",
-    imageSource: "Cyanotype photograph of Nininger c.1890 via MNopedia",
-    additionalInfo: "Ignatius Donnelly later became famous for his writings on Atlantis, theories about Shakespeare’s works, and his political career."
+        id: "1022",
+        lat: 44.7695002003817,
+        lng: -92.90470981679262,
+        name: "Nininger",
+        title: "Nininger",
+        image: "https://mnthen.com/images/exhibit/nininger.jpg",
+        creator: "Matt Reicher",
+        city: "Hastings",
+        audio: "/audio/exhibit/nininger.mp3",
+        tours: "place",
+        summary: "Nininger, founded in 1856 by John Nininger and promoted by Ignatius Donnelly, boomed briefly before the 1857 Panic. Economic hardship and unfulfilled infrastructure promises led to its abandonment by 1869.",
+        today: "Nininger Town Hall, Hastings",
+        link: "https://www3.mnhs.org/mnopedia/search/index/place/nininger",
+        imageSource: "Cyanotype photograph of Nininger c.1890 via MNopedia",
+        additionalInfo: "Ignatius Donnelly later became famous for his writings on Atlantis, theories about Shakespeare’s works, and his political career.",
+        difficulty: 1
     },
 
     {
-  "id": "1023",
-  "lat": 44.97998830008001,
-  "lng": -93.25704091894147,
-  "name": "Washburn ‘A’ Mill Explosion (May 2, 1878)",
-  "title": "Washburn ‘A’ Mill Explosion",
-  "image": "https://mnthen.com/images/mill-explosion.webp",
-  "creator": "Matt Reicher",
-  "city": "Minneapolis",
-  "audio": "/audio/exhibit/washburn.mp3",
-  "tours": "event",
-  "summary": "Minneapolis' Washburn ‘A’ Mill exploded in 1878 when flour dust ignited, killing 18 people. Owner Cadwallader Washburn rebuilt with innovative safety systems, revolutionizing industrial practices while supporting victims' families.",
-  "today": "Mill Ruins Park",
-  "link": "https://mnthen.com/blog/event/washburn_mill.html",
-  "imageSource": "Washburn Mill Explosion via General Mills",
-  "additionalInfo": "In 1928, Washburn-Crosby Company merged with several other regional milling companies to form General Mills, which remains a major food corporation today."
-},
+      "id": "1023",
+      "lat": 44.97998830008001,
+      "lng": -93.25704091894147,
+      "name": "Washburn ‘A’ Mill Explosion (May 2, 1878)",
+      "title": "Washburn ‘A’ Mill Explosion",
+      "image": "https://mnthen.com/images/mill-explosion.webp",
+      "creator": "Matt Reicher",
+      "city": "Minneapolis",
+      "audio": "/audio/exhibit/washburn.mp3",
+      "tours": "event",
+      "summary": "Minneapolis' Washburn ‘A’ Mill exploded in 1878 when flour dust ignited, killing 18 people. Owner Cadwallader Washburn rebuilt with innovative safety systems, revolutionizing industrial practices while supporting victims' families.",
+      "today": "Mill Ruins Park",
+      "link": "https://mnthen.com/blog/event/washburn_mill.html",
+      "imageSource": "Washburn Mill Explosion via General Mills",
+      "additionalInfo": "In 1928, Washburn-Crosby Company merged with several other regional milling companies to form General Mills, which remains a major food corporation today.",
+      difficulty: 1
+    },
     {
   "id": "1024",
   "lat": 44.45572863141056,
@@ -285,7 +297,8 @@ const locations = [
   "today": "Matoska Park alongside White Bear Lake",
   "link": "https://mnthen.com/blog/place/geist.html",
   "imageSource": "Geist Gazebo, White Bear Lake(1885) via MN Digital Library",
-  "additionalInfo": "Local legend has it that the gazebo was moved across the frozen White Bear Lake in 1974. However, the ice was deemed too thin to safely support the structure and the plan was changed."
+  "additionalInfo": "Local legend has it that the gazebo was moved across the frozen White Bear Lake in 1974. However, the ice was deemed too thin to safely support the structure and the plan was changed.",
+    difficulty: 2
 },
 
 {
@@ -303,7 +316,8 @@ const locations = [
   "today": "Downtown St. Paul",
   "link": "https://mnthen.com/blog/people/clifford.html",
   "imageSource": "Image of Clifford’s brothel via MNopedia",
-  "additionalInfo": "Legend claimed secret tunnels connected Clifford's brothel to the exclusive Minnesota Club, though this was later debunked."
+  "additionalInfo": "Legend claimed secret tunnels connected Clifford's brothel to the exclusive Minnesota Club, though this was later debunked.",
+    difficulty: 1
 },
 {
   "id": "1027",
@@ -320,7 +334,8 @@ const locations = [
   "today": "Crosby Business Center",
   "link": "https://mnthen.com/blog/place/summit.html",
   "imageSource": "Summit Brewing Co. via All About Beer",
-  "additionalInfo": "Summit founder Mark Stutrud retired as CEO in 2023 after 37 years, succeeded by former Chief Strategy Officer Brandon Bland."
+  "additionalInfo": "Summit founder Mark Stutrud retired as CEO in 2023 after 37 years, succeeded by former Chief Strategy Officer Brandon Bland.",
+    difficulty: 1
 },
 
 {
@@ -338,7 +353,8 @@ const locations = [
   "today": "State Capitol Complex",
   "link": "https://mnthen.com/blog/place/pillbox.html",
   "imageSource": "Pillbox (1903) via MPR News",
-  "additionalInfo": "Hall of Famer Andrew \"Rube\" Foster threw a no-hitter for the St. Paul Colored Gophers at the Pillbox in 1908."
+  "additionalInfo": "Hall of Famer Andrew \"Rube\" Foster threw a no-hitter for the St. Paul Colored Gophers at the Pillbox in 1908.",
+    difficulty: 1
 },
 
 {
@@ -356,7 +372,8 @@ const locations = [
   "today": "Near St. Paul Brewing Co.",
   "link": "https://mnthen.com/blog/event/hamm_kidnap.html",
   "imageSource": "Investigators inspect the home of Theodore Hamm via 1889 Minnesota Good Age",
-  "additionalInfo": "The Barker-Karpis gang brought in a strategist from Al Capone's Chicago syndicate to help plan Hamm Jr.'s kidnapping."
+  "additionalInfo": "The Barker-Karpis gang brought in a strategist from Al Capone's Chicago syndicate to help plan Hamm Jr.'s kidnapping.",
+    difficulty: 1
 },
 
 {
@@ -374,7 +391,8 @@ const locations = [
   "today": "On East Hennepin Ave. in NE Minneapolis",
   "link": "https://mnthen.com/blog/place/nyes.html",
   "imageSource": "Nye's Polonaise Room, Minneapolis, March 27, 2009 via MPRNews",
-  "additionalInfo": "Guy Fieri featured Nye's on Season 13 of Food Network’s \"Diners, Drive-Ins and Dives,\" praising their pierogi and prime rib sandwich."
+  "additionalInfo": "Guy Fieri featured Nye's on Season 13 of Food Network’s \"Diners, Drive-Ins and Dives,\" praising their pierogi and prime rib sandwich.",
+    difficulty: 1
 },
 
 {
@@ -392,7 +410,8 @@ const locations = [
   "today": "Appleton Veterans Memorial",
   "link": "https://mnthen.com/blog/place/appleton.html",
   "imageSource": "Street signs denoting the names of fallen veterans via Appleton Website",
-  "additionalInfo": "Some streets carry not just one name, but several from the same family—like Werring and Nelson Avenues—honoring brothers and cousins who died in war."
+  "additionalInfo": "Some streets carry not just one name, but several from the same family—like Werring and Nelson Avenues—honoring brothers and cousins who died in war.",
+    difficulty: 1
 }
 
 
