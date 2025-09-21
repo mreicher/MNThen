@@ -15,7 +15,8 @@ const locations = [
         today: "Southeast corner of White Bear Lake",
         link: "https://mnthen.com/blog/place/wildwood.html",
         imageSource: "Image of the slide at Wildwood Park c. 1905 via MPRNews",
-        additionalInfo: "Wildwood featured the popular 'Scenic Railway,' a wooden roller coaster designed by Fred W. Pearce. It was later moved to his Excelsior Amusement Park."
+        additionalInfo: "Wildwood featured the popular 'Scenic Railway,' a wooden roller coaster designed by Fred W. Pearce. It was later moved to his Excelsior Amusement Park.",
+        difficulty: 2
     },
 
     {
