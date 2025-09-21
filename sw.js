@@ -1,7 +1,7 @@
 // sw.js – Minnesota Then Service Worker
-// Version: 4.2.1 (iOS-optimised + Lighthouse maskable & opaque guard)
+// Version: 4.2.2 (iOS-optimised + 404-guard)
 
-const CACHE_NAME        = 'mnthen-v4-ios';
+const CACHE_NAME        = 'mnthen-v4-ios-2';
 const RUNTIME_CACHE     = 'mnthen-runtime-v4-ios';
 const AUDIO_CACHE       = 'mnthen-audio-v4';
 
@@ -82,7 +82,6 @@ async function networkFirst(request) {
     });
     clearTimeout(timeoutId);
 
-    // Lighthouse fix: opaque guard moved before cache touch
     if (response.status === 200 && response.type !== 'opaque') {
       const cache = await caches.open(RUNTIME_CACHE);
       cache.put(request, response.clone()).then(() => {
@@ -113,7 +112,8 @@ async function handleMediaRequest(request) {
     cache: 'default'
   });
 
-  if (response.status === 200) {
+  // 404-guard: only cache successful, non-opaque responses
+  if (response.status === 200 && response.ok && response.type !== 'opaque') {
     cache.put(request, response.clone()).then(() => {
       manageCacheSize(AUDIO_CACHE, MAX_AUDIO_ENTRIES);
     }).catch(() => {});
@@ -154,13 +154,12 @@ self.addEventListener('fetch', (event) => {
 
 // ----------  lifecycle ----------
 self.addEventListener('install', (e) => {
-  console.log('[SW] 4.2.1 installing');
+  console.log('[SW] 4.2.2 installing');
   e.waitUntil(
     caches.open(CACHE_NAME)
           .then(cache => cache.addAll(STATIC_RESOURCES))
           .catch(error => {
             console.error('[SW] Failed to cache static resources:', error);
-            // Don't fail install if some resources fail to cache
             return Promise.resolve();
           })
           .then(() => self.skipWaiting())
@@ -168,7 +167,7 @@ self.addEventListener('install', (e) => {
 });
 
 self.addEventListener('activate', (e) => {
-  console.log('[SW] 4.2.1 activating');
+  console.log('[SW] 4.2.2 activating');
   e.waitUntil(
     Promise.all([
       caches.keys().then(names => Promise.all(
@@ -208,11 +207,11 @@ self.addEventListener('message', (event) => {
 // ----------  error shields ----------
 self.addEventListener('error', (e) => {
   console.error('[SW] global error', e.error);
-  e.preventDefault();                // iOS safety
+  e.preventDefault();
 });
 self.addEventListener('unhandledrejection', (e) => {
   console.error('[SW] unhandled rejection', e.reason);
-  e.preventDefault();                // iOS safety
+  e.preventDefault();
 });
 
-console.log('[SW] 4.2.1 ready (iOS-optimised + maskable & opaque guard)');
+console.log('[SW] 4.2.2 ready (404-guard + iOS-optimised)');
