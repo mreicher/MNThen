@@ -6,9 +6,9 @@ const RUNTIME_CACHE     = 'mnthen-runtime-v4-ios';
 const AUDIO_CACHE       = 'mnthen-audio-v4';
 
 // iOS Safari cache size limits (conservative)
-const MAX_CACHE_SIZE        = 50 * 1024 * 1024; // 50 MB total
+const MAX_CACHE_SIZE        = 80 * 1024 * 1024; // 80 MB total
 const MAX_RUNTIME_ENTRIES   = 100;
-const MAX_AUDIO_ENTRIES     = 20;
+const MAX_AUDIO_ENTRIES     = 100;
 
 // Critical install-time shell
 const STATIC_RESOURCES = [
@@ -215,4 +215,5 @@ self.addEventListener('unhandledrejection', (e) => {
 });
 
 console.log('[SW] 4.2.3 ready (404-guard + iOS-optimised)');
+
 
