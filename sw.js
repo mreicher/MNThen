@@ -1,7 +1,7 @@
 // sw.js – Minnesota Then Service Worker
 // Version: 4.4.0 (offline-first, install-shell, stale-while-revalidate for locations)
 
-const CACHE_NAME        = 'mnthen-v4-ios-3';
+const CACHE_NAME        = 'mnthen-v4-ios-4';
 const RUNTIME_CACHE     = 'mnthen-runtime-v4-ios';
 const AUDIO_CACHE       = 'mnthen-audio-v4';
 const TILE_CACHE        = 'mnthen-tiles-v4';
@@ -226,3 +226,4 @@ self.addEventListener('unhandledrejection', (e) => {
 });
 
 console.log('[SW] 4.4.0 ready (install-shell + offline-first + tile-cache)');
+
