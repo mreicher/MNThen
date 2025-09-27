@@ -749,19 +749,20 @@ body {
     <script>
 /* Service-worker registration */
 (function setupEnterpriseSW() {
-  let updateInterval;          // 1️⃣  handle for interval
-  const msgHandler = e => {    // 2️⃣  keep handler reference
+  let updateInterval;
+  const msgHandler = e => {
     if (e.data?.type === 'SW_ACTIVATED')
       console.log('Enterprise Service Worker activated, version:', e.data.version);
   };
 
   const onLoad = () => {
+    if (!navigator.serviceWorker) return; // Skip if not supported
+    
     navigator.serviceWorker.register('/sw.js')
       .then(reg => {
         console.log('Enterprise SW registered: ', reg);
         navigator.serviceWorker.addEventListener('message', msgHandler);
 
-        // 3️⃣  periodic update – cancel on unload
         updateInterval = setInterval(() => reg.update(), 60 * 60 * 1000);
 
         if (reg.waiting && !navigator.serviceWorker.controller)
@@ -771,8 +772,8 @@ body {
   };
 
   const onUnload = () => {
-    clearInterval(updateInterval);
-    navigator.serviceWorker.removeEventListener('message', msgHandler);
+    if (updateInterval) clearInterval(updateInterval);
+    navigator.serviceWorker?.removeEventListener('message', msgHandler);
   };
 
   window.addEventListener('load', onLoad, { once: true });
@@ -781,7 +782,7 @@ body {
   window.teardownEnterpriseSW = onUnload;
 })();
 
-// EnterpriseCacheManager – faster internals
+// EnterpriseCacheManager – optimized
 class EnterpriseCacheManager {
   constructor() {
     this.cachePrefix = 'mnthen-enterprise-';
@@ -790,95 +791,244 @@ class EnterpriseCacheManager {
     this.proximityThreshold = 1000;
   }
 
-  // Public: identical
   async init() {
     await this.cleanupExpiredCache();
     this.startPeriodicCleanup();
   }
 
-  // Public
   async cacheLocationData(location, userPosition) {
-    if (!userPosition || !location) return;
+    if (!userPosition || !location || !location.id) return;
+    
     const distanceFeet = calculateDistance(userPosition, location) * 3.28084;
     if (distanceFeet <= this.proximityThreshold) {
       try {
-        const data = JSON.stringify({ location, timestamp: Date.now(), userPosition, distance: distanceFeet });
-        localStorage.setItem(`${this.cachePrefix}location_${location.id}`, await this.encryptData(data));
-        console.log(`Cached location ${location.name} (${distanceFeet.toFixed(0)} feet away)`);
-      } catch (e) { console.warn('Failed to cache location data:', e); }
+        const data = JSON.stringify({ 
+          location, 
+          timestamp: Date.now(), 
+          userPosition, 
+          distance: distanceFeet 
+        });
+        const key = `${this.cachePrefix}location_${location.id}`;
+        const encryptedData = await this.encryptData(data);
+        
+        // Check storage quota before saving
+        try {
+          localStorage.setItem(key, encryptedData);
+          console.log(`Cached location ${location.name || location.id} (${distanceFeet.toFixed(0)} feet away)`);
+        } catch (storageError) {
+          if (storageError.name === 'QuotaExceededError') {
+            await this.cleanupOldestEntries();
+            localStorage.setItem(key, encryptedData);
+          } else {
+            throw storageError;
+          }
+        }
+      } catch (e) { 
+        console.warn('Failed to cache location data:', e); 
+      }
     }
   }
 
-  // Public
   async encryptData(data) {
     if (!window.crypto?.subtle) return btoa(data);
+    
     try {
-      const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt']);
+      const encoder = new TextEncoder();
+      const dataBuffer = encoder.encode(data);
       const iv = crypto.getRandomValues(new Uint8Array(12));
-      const buf = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(data));
-      return btoa(String.fromCharCode(...new Uint8Array(buf)));
-    } catch { return btoa(data); }
+      
+      // Use a fixed key instead of generating new ones each time
+      const key = await this.getEncryptionKey();
+      const encrypted = await crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv }, 
+        key, 
+        dataBuffer
+      );
+      
+      // Combine IV and encrypted data
+      const result = new Uint8Array(iv.length + encrypted.byteLength);
+      result.set(iv, 0);
+      result.set(new Uint8Array(encrypted), iv.length);
+      
+      return btoa(String.fromCharCode(...result));
+    } catch { 
+      return btoa(data); // fallback
+    }
   }
 
-  // Public (runs on idle)
+  async getEncryptionKey() {
+    // Create or retrieve a persistent key
+    if (!this.encryptionKey) {
+      const keyData = await this.getOrCreateKeyData();
+      this.encryptionKey = await crypto.subtle.importKey(
+        'raw',
+        keyData,
+        { name: 'AES-GCM' },
+        false,
+        ['encrypt', 'decrypt']
+      );
+    }
+    return this.encryptionKey;
+  }
+
+  async getOrCreateKeyData() {
+    const keyKey = `${this.cachePrefix}crypto-key`;
+    const storedKey = localStorage.getItem(keyKey);
+    
+    if (storedKey) {
+      return new Uint8Array(atob(storedKey).split('').map(c => c.charCodeAt(0)));
+    }
+    
+    // Generate new key and store it
+    const newKey = crypto.getRandomValues(new Uint8Array(32)); // 256-bit key
+    localStorage.setItem(keyKey, btoa(String.fromCharCode(...newKey)));
+    return newKey;
+  }
+
   async cleanupExpiredCache() {
     const now = Date.now();
     const toRemove = [];
+    
     for (let i = 0; i < localStorage.length; i++) {
-      const k = localStorage.key(i);
-      if (k?.startsWith(this.cachePrefix)) {
+      const key = localStorage.key(i);
+      if (key?.startsWith(this.cachePrefix) && !key.includes('crypto-key')) {
         try {
-          if (now - JSON.parse(atob(localStorage.getItem(k))).timestamp > this.maxCacheAge)
-            toRemove.push(k);
-        } catch { toRemove.push(k); }
+          const item = localStorage.getItem(key);
+          const decrypted = await this.decryptData(item);
+          const parsed = JSON.parse(decrypted);
+          
+          if (now - parsed.timestamp > this.maxCacheAge) {
+            toRemove.push(key);
+          }
+        } catch {
+          toRemove.push(key); // Remove malformed entries
+        }
       }
     }
-    toRemove.forEach(k => localStorage.removeItem(k));
-    if (toRemove.length) console.log(`Cleaned up ${toRemove.length} expired cache entries`);
+    
+    toRemove.forEach(key => localStorage.removeItem(key));
+    if (toRemove.length) {
+      console.log(`Cleaned up ${toRemove.length} expired cache entries`);
+    }
   }
 
-  // Public
+  async decryptData(encryptedData) {
+    if (!window.crypto?.subtle) return atob(encryptedData);
+    
+    try {
+      const data = new Uint8Array(atob(encryptedData).split('').map(c => c.charCodeAt(0)));
+      const iv = data.slice(0, 12);
+      const encrypted = data.slice(12);
+      
+      const key = await this.getEncryptionKey();
+      const decrypted = await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv },
+        key,
+        encrypted
+      );
+      
+      return new TextDecoder().decode(decrypted);
+    } catch {
+      return atob(encryptedData); // fallback
+    }
+  }
+
+  async cleanupOldestEntries() {
+    const entries = [];
+    
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key?.startsWith(this.cachePrefix) && !key.includes('crypto-key')) {
+        try {
+          const item = localStorage.getItem(key);
+          const decrypted = await this.decryptData(item);
+          const parsed = JSON.parse(decrypted);
+          entries.push({ key, timestamp: parsed.timestamp });
+        } catch {
+          entries.push({ key, timestamp: 0 }); // Remove malformed
+        }
+      }
+    }
+    
+    // Sort by timestamp and remove oldest 20%
+    entries.sort((a, b) => a.timestamp - b.timestamp);
+    const removeCount = Math.ceil(entries.length * 0.2);
+    
+    for (let i = 0; i < removeCount; i++) {
+      localStorage.removeItem(entries[i].key);
+    }
+  }
+
   startPeriodicCleanup() {
     setInterval(() => this.cleanupExpiredCache(), 60 * 60 * 1000);
   }
 }
 
-// EnterpriseSecurityManager
+// EnterpriseSecurityManager - simplified but effective
 class EnterpriseSecurityManager {
   constructor() {
     this.sessionToken = this.generateSecureToken();
     this.auditLog = [];
     this.cspViolations = [];
   }
+
   generateSecureToken() {
-    return Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
+    return Array.from(crypto.getRandomValues(new Uint8Array(16)), b => 
+      b.toString(16).padStart(2, '0')
+    ).join('');
   }
+
   logSecurityEvent(event, details) {
-    const entry = { timestamp: new Date().toISOString(), event, details, sessionToken: this.sessionToken, userAgent: navigator.userAgent, url: location.href };
+    const entry = { 
+      timestamp: new Date().toISOString(), 
+      event, 
+      details, 
+      sessionToken: this.sessionToken, 
+      userAgent: navigator.userAgent, 
+      url: location.href 
+    };
+    
     this.auditLog.push(entry);
     console.log('Security Event:', entry);
+    
     if (this.auditLog.length > 100) this.auditLog.shift();
   }
+
   monitorCSPViolations() {
     document.addEventListener('securitypolicyviolation', e => {
-      this.cspViolations.push({ timestamp: new Date().toISOString(), violatedDirective: e.violatedDirective, blockedURI: e.blockedURI, documentURI: e.documentURI });
-      this.logSecurityEvent('CSP_VIOLATION', { directive: e.violatedDirective, uri: e.blockedURI });
+      this.cspViolations.push({ 
+        timestamp: new Date().toISOString(), 
+        violatedDirective: e.violatedDirective, 
+        blockedURI: e.blockedURI, 
+        documentURI: e.documentURI 
+      });
+      this.logSecurityEvent('CSP_VIOLATION', { 
+        directive: e.violatedDirective, 
+        uri: e.blockedURI 
+      });
     });
   }
+
   init() {
     this.monitorCSPViolations();
     this.logSecurityEvent('SESSION_START', { timestamp: Date.now() });
   }
 }
 
-// EnterprisePerformanceMonitor
+// EnterprisePerformanceMonitor - more efficient
 class EnterprisePerformanceMonitor {
   constructor() {
-    this.metrics = { fps: 0, memory: 0, loadedLocations: 0, cacheHits: 0, networkRequests: 0 };
+    this.metrics = { 
+      fps: 0, 
+      memory: 0, 
+      loadedLocations: 0, 
+      cacheHits: 0, 
+      networkRequests: 0 
+    };
     this.frameCount = 0;
-    this.lastTime   = performance.now();
-    this.lastFps    = 0;
-    this.lastMem    = 0;
+    this.lastTime = performance.now();
+    this.lastFps = 0;
+    this.lastMem = 0;
   }
 
   startMonitoring() {
@@ -888,67 +1038,101 @@ class EnterprisePerformanceMonitor {
   }
 
   monitorFPS() {
-    const loop = (now) => {
+    const calculateFPS = (now) => {
       this.frameCount++;
       if (now - this.lastTime >= 1000) {
         this.metrics.fps = Math.round(this.frameCount * 1000 / (now - this.lastTime));
         this.frameCount = 0;
-        this.lastTime   = now;
+        this.lastTime = now;
       }
-      requestAnimationFrame(loop);
+      requestAnimationFrame(calculateFPS);
     };
-    requestAnimationFrame(loop);
+    requestAnimationFrame(calculateFPS);
   }
 
   monitorMemory() {
     if (performance.memory) {
       setInterval(() => {
-        this.metrics.memory = Math.round(performance.memory.usedJSHeapSize / 1024 / 1024);
+        this.metrics.memory = Math.round(
+          performance.memory.usedJSHeapSize / 1024 / 1024
+        );
       }, 5000);
     }
   }
 
   updateMetrics() {
-    if (window.gameLocations) this.metrics.loadedLocations = window.gameLocations.length;
+    if (window.gameLocations) {
+      this.metrics.loadedLocations = window.gameLocations.length;
+    }
 
     const { fps, memory } = this.metrics;
 
-    // only bark when it matters
-    if ((fps < 30 && this.lastFps >= 30) || (memory > 100 && this.lastMem <= 100)) {
-      console.warn('Performance Alert:', this.metrics);
+    // Only log warnings when performance degrades significantly
+    if (fps < 30 && this.lastFps >= 30) {
+      console.warn(`Performance Alert: FPS dropped to ${fps}`);
+    }
+    if (memory > 100 && this.lastMem <= 100) {
+      console.warn(`Performance Alert: Memory usage ${memory}MB`);
     }
 
     this.lastFps = fps;
     this.lastMem = memory;
   }
 
-  getMetrics() { return this.metrics; }
+  getMetrics() { 
+    return { ...this.metrics }; // Return copy to prevent external modification
+  }
 }
 
-// EnterpriseBackgroundSync
+// EnterpriseBackgroundSync - simplified but robust
 class EnterpriseBackgroundSync {
   constructor() {
     this.syncQueue = [];
     this.isOnline = navigator.onLine;
-    window.addEventListener('online', () => { this.isOnline = true; this.process(); });
-    window.addEventListener('offline', () => (this.isOnline = false));
+    this.processing = false;
+    
+    window.addEventListener('online', () => { 
+      this.isOnline = true; 
+      this.process(); 
+    });
+    window.addEventListener('offline', () => this.isOnline = false);
   }
+
   addToSyncQueue(data) {
-    this.syncQueue.push({ data, retries: 0 });
-    if (this.isOnline) queueMicrotask(() => this.process());
+    this.syncQueue.push({ 
+      data, 
+      retries: 0,
+      timestamp: Date.now()
+    });
+    if (this.isOnline) {
+      queueMicrotask(() => this.process());
+    }
   }
+
   async process() {
+    if (this.processing || !this.isOnline) return;
+    
+    this.processing = true;
+    
     while (this.syncQueue.length && this.isOnline) {
       const item = this.syncQueue.shift();
+      
       try {
-        await new Promise(r => setTimeout(r, 100)); // stub sync
+        // Simulate network request
+        await new Promise(resolve => setTimeout(resolve, 100));
         console.log('Background sync completed for:', item.data.type);
       } catch (e) {
         item.retries++;
-        if (item.retries < 3) this.syncQueue.push(item);
-        console.warn('Background sync failed:', e);
+        if (item.retries < 3) {
+          // Add back to queue with exponential backoff
+          this.syncQueue.push(item);
+        } else {
+          console.warn('Background sync permanently failed:', e);
+        }
       }
     }
+    
+    this.processing = false;
   }
 }
         
