@@ -2872,569 +2872,925 @@ const VIEWPORT_MARGIN = 0.05;
 const EAST_WEST_FACTOR = 0.9;
 const EAST_WEST_EASE_FACTOR = 0.8;
 
-/* --------------  GEOFENCING MODULE (original behaviour) -------------- */
+/* --------------  GEOFENCING MODULE -------------- */
 const GeofenceManager = (() => {
-  const audioCache = new Map();
-  let currentLocationId = null;
+    const audioCache = new Map();
+    let currentLocationId = null;
+    let preloadedLocationId = null;
+    let locationState = 'closed';
+    
+    const PRELOAD_THRESHOLD_FEET = 75;
+    const OPEN_THRESHOLD_FEET = 100;
+    const COOLDOWN_MS = 120000;
 
-  function clearLocationAudio(locationId) {
-    Promise.resolve().then(() => {
-      const audio = audioCache.get(locationId);
-      if (audio) {
-        audio.pause();
-        audio.src = '';
-        audio.load();
-        audioCache.delete(locationId);
-      }
-    });
-  }
+    function asyncClearAudio(locationId) {
+        Promise.resolve().then(() => {
+            const audio = audioCache.get(locationId);
+            if (audio) {
+                audio.pause();
+                audio.src = '';
+                audio.load();
+                audioCache.delete(locationId);
+            }
+        });
+    }
 
-  function isLocationPageOpen() {
-    const overlay = document.querySelector('.location-details-overlay');
-    const page = document.querySelector('.location-page');
-    const modal = document.querySelector('.poi-modal');
-    return (overlay && overlay.style.display !== 'none') ||
-           (page && page.classList.contains('active')) ||
-           (modal && modal.style.display !== 'none');
-  }
+    function preloadLocation(location) {
+        if (preloadedLocationId === location.id || locationState !== 'closed') return;
+        preloadedLocationId = location.id;
+        locationState = 'preloading';
+        if (location.audioUrl) {
+            const audio = new Audio();
+            audio.preload = 'auto';
+            audio.src = location.audioUrl;
+            audioCache.set(location.id, audio);
+        }
+    }
 
-  /* ---- EXACT original logic: open instantly if ≤ CONFIG.DISTANCE_THRESHOLD ---- */
-  function checkProximity(userPos, locations) {
-    if (!locations?.length || !userPos) return;
+    function openLocationImmediate(location) {
+        if (locationState === 'open' || locationState === 'opening') return;
+        locationState = 'opening';
+        
+        if (currentLocationId && currentLocationId !== location.id) {
+            asyncClearAudio(currentLocationId);
+        }
+        
+        currentLocationId = location.id;
+        location._lastBuzzed = Date.now();
+        
+        if (navigator.vibrate) {
+            try { navigator.vibrate([50, 30, 50]); } catch (e) {}
+        }
+        
+        requestAnimationFrame(() => {
+            try {
+                showLocationHunt(location);
+                locationState = 'open';
+            } catch (e) {
+                console.error('Failed to open location:', e);
+                locationState = 'closed';
+            }
+        });
+    }
+
+    function isLocationPageOpen() {
+        const overlay = document.querySelector('.location-details-overlay');
+        const page = document.querySelector('.location-page');
+        const modal = document.querySelector('.poi-modal');
+        return (overlay?.style.display !== 'none') ||
+               (page?.classList.contains('active')) ||
+               (modal?.style.display !== 'none');
+    }
+
+    function checkProximity(userPos, locations) {
+        if (!locations?.length || !userPos) return;
+        
+        const now = Date.now();
+        let closestLocation = null;
+        let minDistanceFeet = Infinity;
+
+        for (const loc of locations) {
+            if (!loc?.lat) continue;
+            const dMeters = calculateDistance(userPos, loc);
+            const dFeet = dMeters * 3.28084;
+            if (dFeet < minDistanceFeet) {
+                minDistanceFeet = dFeet;
+                closestLocation = loc;
+            }
+        }
+
+        if (!closestLocation) {
+            if (currentLocationId) {
+                asyncClearAudio(currentLocationId);
+                currentLocationId = null;
+                preloadedLocationId = null;
+                locationState = 'closed';
+            }
+            return;
+        }
+
+        if (minDistanceFeet <= PRELOAD_THRESHOLD_FEET && minDistanceFeet > OPEN_THRESHOLD_FEET) {
+            if (locationState === 'closed') {
+                preloadLocation(closestLocation);
+            }
+            return;
+        }
+
+        if (minDistanceFeet <= OPEN_THRESHOLD_FEET) {
+            if (isLocationPageOpen()) return;
+            const lastBuzzed = closestLocation._lastBuzzed || 0;
+            if (now - lastBuzzed < COOLDOWN_MS) return;
+            openLocationImmediate(closestLocation);
+        } else if (minDistanceFeet > PRELOAD_THRESHOLD_FEET) {
+            if (currentLocationId) {
+                asyncClearAudio(currentLocationId);
+                currentLocationId = null;
+                preloadedLocationId = null;
+                locationState = 'closed';
+            }
+        }
+    }
+
+    function cleanup() {
+        audioCache.forEach((audio) => {
+            audio.pause();
+            audio.src = '';
+            audio.load();
+        });
+        audioCache.clear();
+        currentLocationId = null;
+        preloadedLocationId = null;
+        locationState = 'closed';
+    }
+
+    return { checkProximity, cleanup };
+})();
+
+/* --------------  FRAME CACHE -------------- */
+const FrameCache = (() => {
+    let frame = 0;
+    let cache = {};
+
+    function invalidate() {
+        frame++;
+        cache = {};
+    }
+
+    function get(key, computer) {
+        const cacheKey = `${key}_${frame}`;
+        if (cache[cacheKey] === undefined) {
+            cache[cacheKey] = computer();
+        }
+        return cache[cacheKey];
+    }
+
+    return { get, invalidate };
+})();
+
+/* --------------  TEMPORAL SMOOTHER -------------- */
+const TemporalSmoother = (() => {
+    const history = [];
+    const MAX_HISTORY = 5;
+    const INTERPOLATION_FRAMES = 3;
+    let interpolationQueue = [];
+
+    function detectJump(newPos, lastPos) {
+        if (!lastPos) return false;
+        const dist = calculateDistance(newPos, lastPos);
+        const timeDelta = (newPos.timestamp - lastPos.timestamp) / 1000;
+        if (timeDelta === 0) return false;
+        const speed = dist / timeDelta;
+        const expectedSpeed = newPos.speedMPS * 1.5;
+        return speed > Math.max(expectedSpeed, 5);
+    }
+
+    function createInterpolation(from, to) {
+        interpolationQueue = [];
+        for (let i = 1; i <= INTERPOLATION_FRAMES; i++) {
+            const t = i / INTERPOLATION_FRAMES;
+            const eased = 1 - Math.pow(1 - t, 3);
+            interpolationQueue.push({
+                lat: from.lat + (to.lat - from.lat) * eased,
+                lng: from.lng + (to.lng - from.lng) * eased,
+                accuracy: from.accuracy + (to.accuracy - from.accuracy) * eased,
+                heading: to.heading,
+                speedMPS: to.speedMPS,
+                timestamp: from.timestamp + (to.timestamp - from.timestamp) * t
+            });
+        }
+    }
+
+    function getSmoothedPosition(newPos, lastPos) {
+        if (interpolationQueue.length > 0) {
+            return interpolationQueue.shift();
+        }
+        if (detectJump(newPos, lastPos)) {
+            createInterpolation(lastPos, newPos);
+            return interpolationQueue.shift() || newPos;
+        }
+        history.push(newPos);
+        if (history.length > MAX_HISTORY) history.shift();
+        return newPos;
+    }
+
+    function reset() {
+        history.length = 0;
+        interpolationQueue.length = 0;
+    }
+
+    return { getSmoothedPosition, reset };
+})();
+
+/* --------------  AGGRESSIVENESS CONFIG -------------- */
+const ULP_AGGRESSIVENESS_CONFIG = { lo: 1.5, hi: 25, exp: 0.8 };
+
+function ulpAggressiveness(speedMPH, lo = ULP_AGGRESSIVENESS_CONFIG.lo, hi = ULP_AGGRESSIVENESS_CONFIG.hi, exp = ULP_AGGRESSIVENESS_CONFIG.exp) {
+    const t = Math.max(0, Math.min(1, (speedMPH - lo) / (hi - lo)));
+    return Math.max(0.1, Math.pow(t, exp));
+}
+
+/* --------------  TIER INDEX -------------- */
+function ulpTierIndex(speedMPH) {
+    return (speedMPH < 0.5) ? 0 :
+        (speedMPH < 1.5) ? 1 : (speedMPH < 2.5) ? 2 : (speedMPH < 4) ? 3 : (speedMPH < 6) ? 4 :
+        (speedMPH < 8.5) ? 5 : (speedMPH < 12) ? 6 : (speedMPH < 16) ? 7 : (speedMPH < 22) ? 8 :
+        (speedMPH < 28) ? 9 : (speedMPH < 38) ? 10 : (speedMPH < 48) ? 11 : (speedMPH < 58) ? 12 :
+        (speedMPH < 68) ? 13 : (speedMPH < 78) ? 14 : (speedMPH < 88) ? 15 : 16;
+}
+
+/* --------------  IMMUTABLE TIER TABLE -------------- */
+const ulpTierTable = (() => {
+    const base = [
+        { micro: 0.22, minD: 0.22, maxA: 1.45, maxS: 0.45, mapInt: 950, mapDist: 1.8, pan: 2.6, ease: 0.05, zoomThr: 2.8, zoomDur: 4.5 },
+        { micro: 0.30, minD: 0.28, maxA: 1.35, maxS: 0.55, mapInt: 850, mapDist: 2.2, pan: 2.3, ease: 0.06, zoomThr: 2.6, zoomDur: 4.1 },
+        { micro: 0.25, minD: 0.35, maxA: 1.28, maxS: 0.65, mapInt: 750, mapDist: 2.8, pan: 2.1, ease: 0.07, zoomThr: 2.4, zoomDur: 3.8 },
+        { micro: 0.32, minD: 0.42, maxA: 1.22, maxS: 0.75, mapInt: 650, mapDist: 3.5, pan: 1.9, ease: 0.08, zoomThr: 2.2, zoomDur: 3.5 },
+        { micro: 0.38, minD: 0.48, maxA: 1.18, maxS: 0.85, mapInt: 550, mapDist: 4.2, pan: 1.7, ease: 0.09, zoomThr: 2.0, zoomDur: 3.2 },
+        { micro: 0.42, minD: 0.52, maxA: 1.12, maxS: 0.95, mapInt: 480, mapDist: 4.8, pan: 1.5, ease: 0.10, zoomThr: 1.8, zoomDur: 2.9 },
+        { micro: 0.45, minD: 0.55, maxA: 1.08, maxS: 1.10, mapInt: 420, mapDist: 5.5, pan: 1.4, ease: 0.11, zoomThr: 1.6, zoomDur: 2.6 },
+        { micro: 0.52, minD: 0.62, maxA: 1.06, maxS: 1.25, mapInt: 370, mapDist: 6.5, pan: 1.2, ease: 0.12, zoomThr: 1.5, zoomDur: 2.3 },
+        { micro: 0.58, minD: 0.68, maxA: 1.04, maxS: 1.40, mapInt: 330, mapDist: 7.8, pan: 1.1, ease: 0.13, zoomThr: 1.35, zoomDur: 2.1 },
+        { micro: 0.68, minD: 0.78, maxA: 1.08, maxS: 1.55, mapInt: 300, mapDist: 9.5, pan: 0.95, ease: 0.15, zoomThr: 1.25, zoomDur: 1.9 },
+        { micro: 0.85, minD: 0.95, maxA: 1.15, maxS: 1.75, mapInt: 280, mapDist: 12.5, pan: 0.88, ease: 0.16, zoomThr: 1.15, zoomDur: 1.7 },
+        { micro: 1.10, minD: 1.20, maxA: 1.25, maxS: 2.0, mapInt: 260, mapDist: 16, pan: 0.82, ease: 0.18, zoomThr: 1.05, zoomDur: 1.6 },
+        { micro: 1.35, minD: 1.45, maxA: 1.35, maxS: 2.3, mapInt: 240, mapDist: 20, pan: 0.75, ease: 0.20, zoomThr: 0.95, zoomDur: 1.5 },
+        { micro: 1.65, minD: 1.75, maxA: 1.48, maxS: 2.65, mapInt: 200, mapDist: 24, pan: 0.68, ease: 0.22, zoomThr: 0.85, zoomDur: 1.4 },
+        { micro: 1.95, minD: 2.05, maxA: 1.65, maxS: 3.1, mapInt: 170, mapDist: 28, pan: 0.62, ease: 0.25, zoomThr: 0.75, zoomDur: 1.3 },
+        { micro: 2.25, minD: 2.35, maxA: 1.8, maxS: 3.6, mapInt: 140, mapDist: 32, pan: 0.55, ease: 0.28, zoomThr: 0.65, zoomDur: 1.2 },
+        { micro: 2.60, minD: 2.70, maxA: 2.0, maxS: 4.2, mapInt: 110, mapDist: 38, pan: 0.48, ease: 0.32, zoomThr: 0.55, zoomDur: 1.1 }
+    ];
+    return base.map(o => ({
+        microMovementThreshold: CONFIG.MICRO_MOVEMENT_THRESHOLD * o.micro,
+        minDistanceThreshold: CONFIG.MIN_DISTANCE_THRESHOLD * o.minD,
+        maxAccuracy: CONFIG.MAX_ACCEPTABLE_ACCURACY * o.maxA,
+        maxSpeedThreshold: CONFIG.MAX_SPEED * o.maxS,
+        mapUpdateInterval: o.mapInt,
+        mapUpdateDistance: o.mapDist,
+        panDuration: o.pan,
+        easeLinearity: o.ease,
+        zoomThreshold: o.zoomThr,
+        zoomDuration: o.zoomDur
+    }));
+})();
+
+const ulpTier = speedMPH => ulpTierTable[ulpTierIndex(speedMPH)];
+
+/* --------------  RUNTIME MODIFIERS -------------- */
+function ulpApplyModifiers(speedMPH, eastWest) {
+    const agg = ulpAggressiveness(speedMPH);
+    const base = ulpTier(speedMPH);
+    const ew = eastWest ? EAST_WEST_FACTOR : 1;
+    return {
+        micro: base.microMovementThreshold * ew,
+        minDist: base.minDistanceThreshold * ew,
+        maxAcc: base.maxAccuracy,
+        maxSpeed: base.maxSpeedThreshold,
+        mapInt: Math.max(33, base.mapUpdateInterval * ew),
+        mapDist: base.mapUpdateDistance * (1 - 0.4 * agg) * ew,
+        panDur: Math.min(1.5, base.panDuration * ew),
+        ease: base.easeLinearity * (eastWest ? EAST_WEST_EASE_FACTOR : 1),
+        zoomThr: base.zoomThreshold,
+        zoomDur: base.zoomDuration,
+        agg
+    };
+}
+
+/* --------------  DIRECTIONAL HELPERS -------------- */
+function ulpEastWest(p, last) {
+    return Math.abs(p.lng - last.lng) > Math.abs(p.lat - last.lat) * 1.2;
+}
+
+function ulpHeadingDiff(p, last) {
+    if (last.heading == null || p.heading == null) return 0;
+    let d = Math.abs(p.heading - last.heading);
+    if (d > 180) d = 360 - d;
+    return d;
+}
+
+function ulpDirectionChangeFactor(headingDiff) {
+    return headingDiff > 12 ? Math.max(0.4, 1 - headingDiff / 200) : 1;
+}
+
+/* --------------  LOOK-AHEAD -------------- */
+function ulpLookAhead(smoothed, predicted, last, speedMPH, headingDiff, eastWest) {
+    const brackets = [0.025, 0.05, 0.08, 0.12, 0.18, 0.26, 0.35, 0.44, 0.54, 0.65];
+    const idx = Math.min(9, Math.max(0, Math.floor(speedMPH / 10)));
+    let factor = brackets[idx];
+    factor += Math.min(0.12, calculateDistance(smoothed, last) * 0.008);
+    factor -= headingDiff > 25 ? Math.min(0.2, headingDiff / 180 * 0.3) : 0;
+    factor += eastWest ? Math.min(0.08, calculateDistance(smoothed, last) * 0.002) : 0;
+    factor = Math.min(0.8, Math.max(0.01, factor));
+    return {
+        lat: smoothed.lat + (predicted.lat - last.lat) * factor,
+        lng: smoothed.lng + (predicted.lng - last.lng) * factor
+    };
+}
+
+/* --------------  MAP-UPDATE GATE -------------- */
+function ulpShouldUpdateMap(now, lastMapTime, distance, mod) {
+    return (now - lastMapTime > mod.mapInt) || (distance > mod.mapDist);
+}
+
+/* --------------  INTERACTION GUARDS -------------- */
+function ulpBeginInteraction() {
+    isMapInteracting = true;
+    if (animationFrameId !== null) {
+        cancelAnimationFrame(animationFrameId);
+        animationFrameId = null;
+    }
+}
+
+function ulpEndInteraction() {
+    isMapInteracting = false;
+}
+
+/* --------------  FOLLOW MODE DETECTION -------------- */
+function ulpDetectFollowModeFromHistory(speedSamples) {
+    if (!speedSamples || speedSamples.length < 10) return true;
+    const sorted = [...speedSamples].sort((a, b) => a - b);
+    const median = sorted[Math.floor(sorted.length / 2)];
+    const followMode = median < 2 ? false : true;
+    localStorage.setItem('ulp_follow_mode', JSON.stringify(followMode));
+    return followMode;
+}
+
+/* --------------  PROXIMITY ZOOM -------------- */
+function ulpProximityZoom(userLatLng, speedMPH) {
+    if (!userLatLng || !gameLocations?.length) return;
 
     const now = Date.now();
-    const DISTANCE_THRESHOLD_FEET = CONFIG.DISTANCE_THRESHOLD; // <— original
+    const PROXIMITY_ZOOM_IN_LEVEL = 19;
+    const PROXIMITY_ZOOM_OUT_LEVEL = 17;
+    const ZOOM_IN_THRESHOLD_FEET = CONFIG.PROXIMITY_THRESHOLD;
+    const ZOOM_OUT_THRESHOLD_FEET = CONFIG.PROXIMITY_THRESHOLD * 1.3;
+
+    let closestDistance = Infinity;
     let closestLocation = null;
-    let minDistanceFeet = Infinity;
-
-    for (const loc of locations) {
-      if (!loc?.lat) continue;
-      const dMeters = calculateDistance(userPos, loc);
-      const dFeet = dMeters * 3.28084;
-      if (dFeet <= DISTANCE_THRESHOLD_FEET && dFeet < minDistanceFeet) {
-        minDistanceFeet = dFeet;
-        closestLocation = loc;
-      }
-    }
-
-    if (!closestLocation) {
-      if (currentLocationId) {
-        clearLocationAudio(currentLocationId);
-        currentLocationId = null;
-      }
-      return;
-    }
-
-    if (isLocationPageOpen()) return;
-
-    const lastBuzzed = closestLocation._lastBuzzed || 0;
-    const cooldownPeriod = 2 * 60 * 1000; // original
-    if (now - lastBuzzed >= cooldownPeriod) {
-      if (currentLocationId && currentLocationId !== closestLocation.id) {
-        clearLocationAudio(currentLocationId);
-      }
-      closestLocation._lastBuzzed = now;
-      currentLocationId = closestLocation.id;
-
-      if (navigator.vibrate) {
-        try { navigator.vibrate([50, 30, 50]); } catch (_) {}
-      }
-      // open IMMEDIATELY – no preload wait, no state machine
-      requestAnimationFrame(() => {
-        try {
-          if (typeof showLocationHunt === 'function') showLocationHunt(closestLocation);
-          else if (typeof openLocationPage === 'function') openLocationPage(closestLocation);
-          else if (typeof showLocationDetails === 'function') showLocationDetails(closestLocation);
-        } catch (e) {
-          console.error('Failed to open location page:', e);
+    for (const loc of gameLocations) {
+        if (!loc?.lat) continue;
+        const d = calculateDistance(userLatLng, loc);
+        if (d < closestDistance) {
+            closestDistance = d;
+            closestLocation = loc;
         }
-      });
     }
-  }
 
-  function cleanup() {
-    audioCache.forEach(audio => {
-      audio.pause(); audio.src = ''; audio.load();
-    });
-    audioCache.clear();
-    currentLocationId = null;
-  }
+    if (!closestLocation) return;
 
-  return { checkProximity, cleanup };
-})();
+    const distanceFeet = closestDistance * 3.28084;
+    const cooldownPassed = !lastZoomChangeTime || (now - lastZoomChangeTime >= CONFIG.ZOOM_COOLDOWN);
+    let newState = window.zoomedInState || false;
 
-/* --------------  FRAME CACHE (perf only, no behaviour change) -------------- */
-const FrameCache = (() => {
-  let frame = 0;
-  const store = {};
-  function invalidate() { ++frame; store[frame] = {}; }
-  function get(key, computer) {
-    const k = `${key}_${frame}`;
-    if (store[frame][k] === undefined) store[frame][k] = computer();
-    return store[frame][k];
-  }
-  return { invalidate, get };
-})();
-
-/* --------------  TEMPORAL SMOOTHER (perf+quality, same gate rules) -------------- */
-const TemporalSmoother = (() => {
-  const history = [];
-  const MAX_HISTORY = 5;
-  const INTERPOLATION_FRAMES = 3;
-  let queue = [];
-
-  function detectJump(newPos, lastPos) {
-    if (!lastPos) return false;
-    const dist = calculateDistance(newPos, lastPos);
-    const dt = (newPos.timestamp - lastPos.timestamp) / 1000;
-    if (!dt) return false;
-    const speed = dist / dt;
-    const expected = newPos.speedMPS * 1.5;
-    return speed > Math.max(expected, 5);
-  }
-  function createInterpolation(from, to) {
-    queue = [];
-    for (let i = 1; i <= INTERPOLATION_FRAMES; i++) {
-      const t = 1 - Math.pow(1 - i / INTERPOLATION_FRAMES, 3);
-      queue.push({
-        lat: from.lat + (to.lat - from.lat) * t,
-        lng: from.lng + (to.lng - from.lng) * t,
-        accuracy: from.accuracy + (to.accuracy - from.accuracy) * t,
-        heading: to.heading,
-        speedMPS: to.speedMPS,
-        timestamp: from.timestamp + (to.timestamp - from.timestamp) * t
-      });
-    }
-  }
-  function getSmoothedPosition(newPos, lastPos) {
-    if (queue.length) return queue.shift();
-    if (detectJump(newPos, lastPos)) {
-      createInterpolation(lastPos, newPos);
-      return queue.shift() || newPos;
-    }
-    history.push(newPos);
-    if (history.length > MAX_HISTORY) history.shift();
-    return newPos;
-  }
-  function reset() { history.length = 0; queue.length = 0; }
-  return { getSmoothedPosition, reset };
-})();
-
-/* --------------  ORIGINAL TIER / AGGRESSIVENESS / MODIFIERS -------------- */
-const ULP_AGGRESSIVENESS_CONFIG = { lo: 1.5, hi: 25, exp: 0.8 };
-function ulpAggressiveness(speedMPH, lo = ULP_AGGRESSIVENESS_CONFIG.lo, hi = ULP_AGGRESSIVENESS_CONFIG.hi, exp = ULP_AGGRESSIVENESS_CONFIG.exp) {
-  const t = Math.max(0, Math.min(1, (speedMPH - lo) / (hi - lo)));
-  return Math.max(0.1, Math.pow(t, exp));
-}
-function ulpTierIndex(speedMPH) { /* unchanged */ ... }
-const ulpTierTable = (() => { /* unchanged */ ... })();
-const ulpTier = speedMPH => ulpTierTable[ulpTierIndex(speedMPH)];
-function ulpApplyModifiers(speedMPH, eastWest) { /* unchanged */ ... }
-function ulpEastWest(p, last) { /* unchanged */ ... }
-function ulpHeadingDiff(p, last) { /* unchanged */ ... }
-function ulpDirectionChangeFactor(headingDiff) { /* unchanged */ ... }
-function ulpLookAhead(smoothed, predicted, last, speedMPH, headingDiff, eastWest) { /* unchanged */ ... }
-function ulpShouldUpdateMap(now, lastMapTime, distance, mod) { /* unchanged */ ... }
-function ulpBeginInteraction() { /* unchanged */ ... }
-function ulpEndInteraction() { /* unchanged */ ... }
-function ulpDetectFollowModeFromHistory(speedSamples) { /* unchanged */ ... }
-function ulpProximityZoom(userLatLng, speedMPH) { /* unchanged from original */ ... }
-function ulpViewportSafety(pos, lookAhead, speedMPH, dirFactor, eastWest) { /* unchanged except wrapped with FrameCache */ ... }
-
-/* --------------  VISUAL CENTERING (original timing restored) -------------- */
-function ulpApplyVisualCentering(markerEl, speedMPH, map) {
-  if (!markerEl || !map || !markerEl._latlng) return;
-  const agg = ulpAggressiveness(speedMPH);
-  if (agg < 0.55) {
-    if (markerEl.style.transform.includes('translate(')) markerEl.style.transform = 'translateZ(0)';
-    return;
-  }
-  if (isMapInteracting) { markerEl.style.transform = 'translateZ(0)'; return; }
-
-  const container = map.getContainer();
-  if (!container) return;
-  const cRect = FrameCache.get('containerRect', () => container.getBoundingClientRect());
-  const centerX = cRect.width / 2, centerY = cRect.height / 2;
-  const mPoint = map.latLngToContainerPoint({ lat: markerEl._latlng.lat, lng: markerEl._latlng.lng });
-  if (!mPoint) return;
-
-  const offsetX = centerX - mPoint.x, offsetY = centerY - mPoint.y;
-  const transform = `translate(${offsetX}px, ${offsetY}px) translateZ(0)`;
-  if (markerEl.style.transform !== transform) {
-    markerEl.style.transform = transform;
-    markerEl.style.willChange = 'transform';
-    markerEl.style.backfaceVisibility = 'hidden';
-  }
-}
-
-/* --------------  ORIGINAL SMOOTHING PIPELINE -------------- */
-function smoothPosition(rawPos, lastPos, speedMPH, eastWest, headingDiff, timeDelta) {
-  if (!lastPos) return rawPos;
-
-  const temporal = TemporalSmoother.getSmoothedPosition(rawPos, lastPos);
-  updatePositionBuffer(temporal);
-  const finalPos = calculateFinalPosition();
-  const baseSmoothed = applyExponentialSmoothing(finalPos, lastPos, 0.25);
-  const predicted = calculateEnhancedVelocityFilter(baseSmoothed, lastPos, timeDelta, rawPos.speedMPS);
-
-  const brackets = [0.28, 0.40, 0.55, 0.68, 0.75, 0.82, 0.87, 0.90, 0.93, 0.95];
-  const idx = Math.min(9, Math.max(0, Math.floor(speedMPH / 10)));
-  let f = brackets[idx];
-  f -= speedMPH < 3 ? Math.max(0, 0.05 - speedMPH * 0.016) : 0;
-  f -= headingDiff > 20 ? Math.max(0, 0.08 - headingDiff / 180 * 0.1) : 0;
-  f += eastWest ? 0.03 : 0;
-  f = Math.min(0.95, Math.max(0.05, f));
-  const jitterScale = speedMPH < 3 ? Math.min(0.98, 0.85 + (3 - speedMPH) * 0.065) : 1;
-  const dirFactor = ulpDirectionChangeFactor(headingDiff);
-  const smoothFactor = f * jitterScale * dirFactor;
-
-  return {
-    lat: lastPos.lat * (1 - smoothFactor) + predicted.lat * smoothFactor,
-    lng: lastPos.lng * (1 - smoothFactor) + predicted.lng * smoothFactor,
-    accuracy: Math.min(predicted.accuracy, baseSmoothed.accuracy),
-    heading: predicted.heading !== undefined ? predicted.heading : baseSmoothed.heading,
-    timestamp: rawPos.timestamp,
-    speedMPS: predicted.speedMPS
-  };
-}
-
-/* --------------  MARKER UPDATE (original rules, original timing) -------------- */
-function updateMarker(smoothed, speedMPH, eastWest, headingDiff, dirFactor, distance, micro, isStationary) {
-  const markerEl = userMarker.getElement();
-  if (markerEl) {
-    markerEl.style.willChange = 'transform';
-    markerEl.style.backfaceVisibility = 'hidden';
-    markerEl.style.transform = 'translateZ(0)';
-    if (eastWest) markerEl.style.imageRendering = 'crisp-edges';
-  }
-
-  const shouldUpdateLatLng = !isStationary || distance >= micro;
-  if (!shouldUpdateLatLng) return;
-
-  const brackets = [1.5, 1.2, 0.9, 0.7, 0.55, 0.47, 0.40, 0.32, 0.26, 0.20];
-  const idx = Math.min(9, Math.max(0, Math.floor(speedMPH / 10)));
-  let d = brackets[idx];
-  d += speedMPH < 2 ? Math.min(0.08, (2 - speedMPH) * 0.04) : 0;
-  d += headingDiff > 15 ? Math.min(0.1, headingDiff / 180 * 0.15) : 0;
-  d += eastWest ? Math.min(0.05, distance * 0.001) : 0;
-  const animDur = Math.max(0.02, d * dirFactor);
-
-  const ease = eastWest
-    ? Math.max(0.02, Math.min(0.18, (0.10 - speedMPH * 0.0008) * dirFactor))
-    : Math.max(0.03, Math.min(0.22, (0.12 - speedMPH * 0.0015) * dirFactor));
-
-  const animateMarker = () => {
-    userMarker.setLatLng([smoothed.lat, smoothed.lng], { animate: true, duration: animDur, easeLinearity: ease });
-    if (markerEl) markerEl.style.transform = 'translateZ(0)';
-  };
-  speedMPH > 30 ? requestAnimationFrame(animateMarker) : animateMarker();
-
-  // Visual centering – original 16 ms throttle (not 48 ms)
-  if (markerEl && speedMPH >= 10) {
-    if (typeof window.ulpLastVisualCenteringTime === 'undefined') window.ulpLastVisualCenteringTime = 0;
-    const now = performance.now();
-    if (now - window.ulpLastVisualCenteringTime > 16) {
-      requestAnimationFrame(() => {
-        if (userMarker.getElement() === markerEl) {
-          ulpApplyVisualCentering(markerEl, speedMPH, map);
-          window.ulpLastVisualCenteringTime = performance.now();
+    if (!window.zoomedInState && distanceFeet <= ZOOM_IN_THRESHOLD_FEET && cooldownPassed) {
+        newState = true;
+        window.blockSpeedZoom = true;
+        setTimeout(() => window.blockSpeedZoom = false, 5000);
+        if (!isMapInteracting) {
+            try {
+                map.flyTo(userLatLng, PROXIMITY_ZOOM_IN_LEVEL, { duration: 1.8, easeLinearity: 0.15 });
+            } catch (e) {}
         }
-      });
+    } else if (window.zoomedInState && distanceFeet >= ZOOM_OUT_THRESHOLD_FEET && cooldownPassed) {
+        newState = false;
+        window.blockSpeedZoom = true;
+        setTimeout(() => window.blockSpeedZoom = false, 5000);
+        if (!isMapInteracting) {
+            try {
+                map.flyTo(userLatLng, PROXIMITY_ZOOM_OUT_LEVEL, { duration: 1.8, easeLinearity: 0.15 });
+            } catch (e) {}
+        }
     }
-  }
+
+    if (window.zoomedInState !== newState) {
+        window.zoomedInState = newState;
+        lastZoomChangeTime = now;
+    }
 }
 
-/* --------------  MAP VIEW UPDATE (original gates) -------------- */
-function updateMapView(smoothed, lookAhead, speedMPH, eastWest, dirFactor, mod, now) {
-  GeofenceManager.checkProximity(smoothed, gameLocations);
-  ulpProximityZoom(smoothed, speedMPH);
+/* --------------  VIEWPORT SAFETY -------------- */
+function ulpViewportSafety(pos, lookAhead, speedMPH, dirFactor, eastWest) {
+    const last = window.lastViewportSafetyCheck || 0;
+    const deb = speedMPH < 3 ? 50 : Math.max(60, ulpTier(speedMPH).mapUpdateInterval * 0.4);
+    if (performance.now() - last < deb) return;
+    window.lastViewportSafetyCheck = performance.now();
 
-  const execute = () => {
-    if (!followUser || isMapInteracting) return;
-
+    if (isMapInteracting) return;
+    if (!map || !map.getContainer()) return;
+    
     const b = FrameCache.get('bounds', () => map.getBounds());
     const s = FrameCache.get('size', () => map.getSize());
-    if (!b || !s) return;
+    const p = FrameCache.get(`point_${pos.lat}_${pos.lng}`, () => map.latLngToContainerPoint(pos));
+    
+    const margin = VIEWPORT_MARGIN;
+    const atRisk = p.x < s.x * margin || p.x > s.x * (1 - margin) ||
+                   p.y < s.y * margin || p.y > s.y * (1 - margin) || !b.contains(pos);
+    if (!atRisk) return;
 
-    const userPixel = map.latLngToContainerPoint(smoothed);
-    const pixelThr = Math.max(0.08, 0.25 - 0.1 * mod.agg - (speedMPH / 80) * 0.17);
-    const ewThr = eastWest ? pixelThr * 0.85 : pixelThr;
-    const nsThr = eastWest ? pixelThr * 1.1 : pixelThr;
-    const nearEdge = userPixel.x < s.x * ewThr || userPixel.x > s.x * (1 - ewThr) ||
-                     userPixel.y < s.y * nsThr || userPixel.y > s.y * (1 - nsThr);
+    const container = map.getContainer();
+    container.style.willChange = 'transform';
+    const target = lookAhead || pos;
+    const urgency = Math.min(1, Math.hypot(p.x - s.x / 2, p.y - s.y / 2) / Math.hypot(s.x / 2, s.y / 2));
+    const dur = Math.max(1.2, ulpTier(speedMPH).panDuration * 0.6 * (1 - urgency * 0.5) * dirFactor);
+    const opt = { animate: true, duration: dur, easeLinearity: Math.max(0.04, ulpTier(speedMPH).easeLinearity * 0.8), noMoveStart: true };
+    const pan = () => {
+        map.panTo(target, opt);
+        requestAnimationFrame(() => container.style.willChange = 'auto');
+    };
+    speedMPH > 50 ? requestAnimationFrame(pan) : pan();
+}
 
-    const geoThr = Math.max(0.08, 0.25 - 0.13 * mod.agg - (speedMPH / 80) * 0.17);
-    const mapW = b.getEast() - b.getWest(), mapH = b.getNorth() - b.getSouth();
-    const edgeLng = mapW * geoThr * (eastWest ? 0.85 : 1);
-    const edgeLat = mapH * geoThr * (eastWest ? 1.1 : 1);
-    const nearGeo = smoothed.lat > b.getNorth() - edgeLat ||
-                    smoothed.lat < b.getSouth() + edgeLat ||
-                    smoothed.lng > b.getEast() - edgeLng ||
-                    smoothed.lng < b.getWest() + edgeLng;
-    const outBounds = !b.contains(smoothed);
-
-    if (outBounds || nearEdge || nearGeo) {
-      const minInt = Math.max(200, 1000 - 700 * mod.agg);
-      if (now - (lastCenteringTime || 0) > minInt) {
-        const container = map.getContainer();
-        const markerEl = userMarker.getElement();
-        if (markerEl) markerEl.style.transform = 'translateZ(0)';
-        container.style.willChange = 'transform';
-        const panOpt = { animate: true, duration: mod.panDur * dirFactor, easeLinearity: mod.ease, noZoom: true, noMoveStart: true };
-        const pan = () => { map.panTo(lookAhead, panOpt); requestAnimationFrame(() => container.style.willChange = 'auto'); };
-        speedMPH > 40 ? requestAnimationFrame(pan) : pan();
-        lastCenteringTime = now;
-      }
-    } else if (lookAhead) {
-      const panOpt = { animate: true, duration: mod.panDur * (1.15 - 0.35 * mod.agg) * dirFactor * (eastWest ? 0.85 : 1), easeLinearity: mod.ease * 0.75, noMoveStart: true };
-      const pan = () => map.panTo([lookAhead.lat, lookAhead.lng], panOpt);
-      speedMPH > 35 ? requestAnimationFrame(pan) : pan();
+/* --------------  VISUAL CENTERING -------------- */
+function ulpApplyVisualCentering(markerEl, speedMPH, map) {
+    if (!markerEl || !map || !markerEl._latlng) return;
+    
+    const agg = ulpAggressiveness(speedMPH);
+    if (agg < 0.55) {
+        if (markerEl.style.transform.includes('translate(')) {
+            markerEl.style.transform = 'translateZ(0)';
+        }
+        return;
     }
 
-    const iz = getSpeedBasedZoom(smoothed.speedMPS);
-    if (iz && !window.blockSpeedZoom && Math.abs(map.getZoom() - iz) >= mod.zoomThr) {
-      const container = map.getContainer();
-      const old = container.style.overflow;
-      container.style.overflow = 'hidden';
-      const zoomOpt = { animate: true, duration: mod.zoomDur * dirFactor, noMoveStart: true };
-      const zoom = () => { map.setZoom(iz, zoomOpt); setTimeout(() => container.style.overflow = old, mod.zoomDur * 1000 + 50); };
-      speedMPH > 45 ? requestAnimationFrame(zoom) : zoom();
+    if (isMapInteracting) {
+        markerEl.style.transform = 'translateZ(0)';
+        return;
     }
-  };
-  speedMPH > 30 ? requestAnimationFrame(execute) : execute();
+
+    const container = map.getContainer();
+    if (!container) return;
+    
+    const containerRect = FrameCache.get('containerRect', () => container.getBoundingClientRect());
+    const centerScreenX = containerRect.width / 2;
+    const centerScreenY = containerRect.height / 2;
+
+    const markerLatLng = map.latLngToContainerPoint({lat: markerEl._latlng.lat, lng: markerEl._latlng.lng});
+    if (!markerLatLng) return;
+
+    const offsetX = centerScreenX - markerLatLng.x;
+    const offsetY = centerScreenY - markerLatLng.y;
+
+    const transform = `translate(${offsetX}px, ${offsetY}px) translateZ(0)`;
+    if (markerEl.style.transform !== transform) {
+        markerEl.style.transform = transform;
+        markerEl.style.willChange = 'transform';
+        markerEl.style.backfaceVisibility = 'hidden';
+    }
+}
+
+/* --------------  VALIDATION -------------- */
+function validatePosition(position) {
+    if (!map || !map.getContainer()) return null;
+    if (!position?.coords?.latitude || !position?.coords?.longitude) return null;
+    if (!userMarker) return null;
+    
+    return {
+        lat: position.coords.latitude,
+        lng: position.coords.longitude,
+        accuracy: position.coords.accuracy || 20,
+        heading: position.coords.heading ?? null,
+        timestamp: Date.now(),
+        speedMPS: position.coords.speed || 0
+    };
+}
+
+/* --------------  SMOOTHING PIPELINE -------------- */
+function smoothPosition(rawPos, lastPos, speedMPH, eastWest, headingDiff, timeDelta) {
+    if (!lastPos) return rawPos;
+
+    const temporallySmoothed = TemporalSmoother.getSmoothedPosition(rawPos, lastPos);
+    updatePositionBuffer(temporallySmoothed);
+    const finalPos = calculateFinalPosition();
+    const baseSmoothed = applyExponentialSmoothing(finalPos, lastPos, 0.25);
+    const predicted = calculateEnhancedVelocityFilter(baseSmoothed, lastPos, timeDelta, rawPos.speedMPS);
+
+    const brackets = [0.28, 0.40, 0.55, 0.68, 0.75, 0.82, 0.87, 0.90, 0.93, 0.95];
+    const idx = Math.min(9, Math.max(0, Math.floor(speedMPH / 10)));
+    let f = brackets[idx];
+    f -= speedMPH < 3 ? Math.max(0, 0.05 - speedMPH * 0.016) : 0;
+    f -= headingDiff > 20 ? Math.max(0, 0.08 - headingDiff / 180 * 0.1) : 0;
+    f += eastWest ? 0.03 : 0;
+    f = Math.min(0.95, Math.max(0.05, f));
+    const jitterScale = speedMPH < 3 ? Math.min(0.98, 0.85 + (3 - speedMPH) * 0.065) : 1;
+    const dirFactor = ulpDirectionChangeFactor(headingDiff);
+    const smoothFactor = f * jitterScale * dirFactor;
+
+    return {
+        lat: lastPos.lat * (1 - smoothFactor) + predicted.lat * smoothFactor,
+        lng: lastPos.lng * (1 - smoothFactor) + predicted.lng * smoothFactor,
+        accuracy: Math.min(predicted.accuracy, baseSmoothed.accuracy),
+        heading: predicted.heading !== undefined ? predicted.heading : baseSmoothed.heading,
+        timestamp: rawPos.timestamp,
+        speedMPS: predicted.speedMPS
+    };
+}
+
+/* --------------  MARKER UPDATE -------------- */
+function updateMarker(smoothed, speedMPH, eastWest, headingDiff, dirFactor, distance, micro, isStationary) {
+    const markerEl = userMarker.getElement();
+    if (markerEl) {
+        markerEl.style.willChange = 'transform';
+        markerEl.style.backfaceVisibility = 'hidden';
+        markerEl.style.transform = 'translateZ(0)';
+        if (eastWest) markerEl.style.imageRendering = 'crisp-edges';
+    }
+
+    const shouldUpdateLatLng = !isStationary || distance >= micro;
+    if (!shouldUpdateLatLng) return;
+
+    const brackets = [1.5, 1.2, 0.9, 0.7, 0.55, 0.47, 0.40, 0.32, 0.26, 0.20];
+    const idx = Math.min(9, Math.max(0, Math.floor(speedMPH / 10)));
+    let d = brackets[idx];
+    d += speedMPH < 2 ? Math.min(0.08, (2 - speedMPH) * 0.04) : 0;
+    d += headingDiff > 15 ? Math.min(0.1, headingDiff / 180 * 0.15) : 0;
+    d += eastWest ? Math.min(0.05, distance * 0.001) : 0;
+    const animDur = Math.max(0.02, d * dirFactor);
+
+    const ease = eastWest
+        ? Math.max(0.02, Math.min(0.18, (0.10 - speedMPH * 0.0008) * dirFactor))
+        : Math.max(0.03, Math.min(0.22, (0.12 - speedMPH * 0.0015) * dirFactor));
+
+    const animateMarker = () => {
+        userMarker.setLatLng([smoothed.lat, smoothed.lng], {
+            animate: true,
+            duration: animDur,
+            easeLinearity: ease
+        });
+        if (markerEl) {
+            markerEl.style.transform = 'translateZ(0)';
+        }
+    };
+    speedMPH > 30 ? requestAnimationFrame(animateMarker) : animateMarker();
+
+    if (markerEl && speedMPH >= 10) {
+        if (typeof window.ulpLastVisualCenteringTime === 'undefined') {
+            window.ulpLastVisualCenteringTime = 0;
+        }
+        const nowTime = performance.now();
+        if (nowTime - window.ulpLastVisualCenteringTime > 48) {
+            requestAnimationFrame(() => {
+                if (userMarker.getElement() === markerEl) {
+                    ulpApplyVisualCentering(markerEl, speedMPH, map);
+                    window.ulpLastVisualCenteringTime = performance.now();
+                }
+            });
+        }
+    }
+}
+
+/* --------------  MAP UPDATE -------------- */
+function updateMapView(smoothed, lookAhead, speedMPH, eastWest, dirFactor, mod, now) {
+    GeofenceManager.checkProximity(smoothed, gameLocations);
+    ulpProximityZoom(smoothed, speedMPH);
+    
+    const execute = () => {
+        if (!followUser || isMapInteracting) return;
+        
+        const b = FrameCache.get('bounds', () => map.getBounds());
+        const s = FrameCache.get('size', () => map.getSize());
+        if (!b || !s) return;
+        
+        const userPixel = map.latLngToContainerPoint(smoothed);
+        const pixelThr = Math.max(0.08, 0.25 - 0.1 * mod.agg - (speedMPH / 80) * 0.17);
+        const ewThr = eastWest ? pixelThr * 0.85 : pixelThr;
+        const nsThr = eastWest ? pixelThr * 1.1 : pixelThr;
+        const nearEdge = userPixel.x < s.x * ewThr || userPixel.x > s.x * (1 - ewThr) ||
+                         userPixel.y < s.y * nsThr || userPixel.y > s.y * (1 - nsThr);
+        
+        const geoThr = Math.max(0.08, 0.25 - 0.13 * mod.agg - (speedMPH / 80) * 0.17);
+        const mapW = b.getEast() - b.getWest();
+        const mapH = b.getNorth() - b.getSouth();
+        const edgeLng = mapW * geoThr * (eastWest ? 0.85 : 1);
+        const edgeLat = mapH * geoThr * (eastWest ? 1.1 : 1);
+        const nearGeo = smoothed.lat > b.getNorth() - edgeLat ||
+                        smoothed.lat < b.getSouth() + edgeLat ||
+                        smoothed.lng > b.getEast() - edgeLng ||
+                        smoothed.lng < b.getWest() + edgeLng;
+        const outBounds = !b.contains(smoothed);
+        
+        if (outBounds || nearEdge || nearGeo) {
+            const minInt = Math.max(200, 1000 - 700 * mod.agg);
+            if (now - (lastCenteringTime || 0) > minInt) {
+                const container = map.getContainer();
+                const markerEl = userMarker.getElement();
+                if (markerEl) markerEl.style.transform = 'translateZ(0)';
+                container.style.willChange = 'transform';
+                const panOpt = {
+                    animate: true,
+                    duration: mod.panDur * dirFactor,
+                    easeLinearity: mod.ease,
+                    noZoom: true,
+                    noMoveStart: true
+                };
+                const pan = () => {
+                    map.panTo(lookAhead, panOpt);
+                    requestAnimationFrame(() => container.style.willChange = 'auto');
+                };
+                speedMPH > 40 ? requestAnimationFrame(pan) : pan();
+                lastCenteringTime = now;
+            }
+        } else if (lookAhead) {
+            const panOpt = {
+                animate: true,
+                duration: mod.panDur * (1.15 - 0.35 * mod.agg) * dirFactor * (eastWest ? 0.85 : 1),
+                easeLinearity: mod.ease * 0.75,
+                noMoveStart: true
+            };
+            const pan = () => map.panTo([lookAhead.lat, lookAhead.lng], panOpt);
+            speedMPH > 35 ? requestAnimationFrame(pan) : pan();
+        }
+        
+        const iz = getSpeedBasedZoom(smoothed.speedMPS);
+        if (iz && !window.blockSpeedZoom && Math.abs(map.getZoom() - iz) >= mod.zoomThr) {
+            const container = map.getContainer();
+            const old = container.style.overflow;
+            container.style.overflow = 'hidden';
+            const zoomOpt = { animate: true, duration: mod.zoomDur * dirFactor, noMoveStart: true };
+            const zoom = () => {
+                map.setZoom(iz, zoomOpt);
+                setTimeout(() => container.style.overflow = old, mod.zoomDur * 1000 + 50);
+            };
+            speedMPH > 45 ? requestAnimationFrame(zoom) : zoom();
+        }
+    };
+    speedMPH > 30 ? requestAnimationFrame(execute) : execute();
 }
 
 /* --------------  SPEED MPS → MPH -------------- */
 const ulpSpeedMPH = mps => (mps || 0) * 2.23694;
 
-/* --------------  MAIN LOCATION UPDATE (original flow, original timing) -------------- */
+/* --------------  MAIN LOCATION UPDATE -------------- */
 function updateUserLocation(position, forceUpdate = false) {
-  FrameCache.invalidate();
+    FrameCache.invalidate();
+    
+    const p = validatePosition(position);
+    if (!p) return;
+    
+    if (!forceUpdate && isMapInteracting) return;
 
-  const p = validatePosition(position);
-  if (!p) return;
-  if (!forceUpdate && isMapInteracting) return;
+    const now = Date.now();
+    const speedMPH = ulpSpeedMPH(p.speedMPS);
 
-  const now = Date.now();
-  const speedMPH = ulpSpeedMPH(p.speedMPS);
-
-  // speed-history boot-strap (unchanged)
-  if (typeof window.ulpSpeedHistory === 'undefined') window.ulpSpeedHistory = [];
-  window.ulpSpeedHistory.push(speedMPH);
-  if (window.ulpSpeedHistory.length > 50) {
-    window.ulpSpeedHistory.shift();
-    if (typeof window.ulpFollowModeSet === 'undefined') {
-      followUser = ulpDetectFollowModeFromHistory(window.ulpSpeedHistory);
-      window.ulpFollowModeSet = true;
+    if (typeof window.ulpSpeedHistory === 'undefined') {
+        window.ulpSpeedHistory = [];
     }
-  }
-
-  const distance = lastPosition ? calculateDistance(lastPosition, p) : 0;
-
-  // first-fix block (unchanged)
-  if (!lastPosition) {
-    lastPosition = p;
-    const container = map.getContainer();
-    const origTransition = container.style.transition;
-    container.style.transition = 'none';
-
-    userMarker.setLatLng([p.lat, p.lng]);
-    map.setView([p.lat, p.lng], map.getZoom(), { animate: false, noMoveStart: true });
-
-    requestAnimationFrame(() => { container.style.transition = origTransition; });
-
-    lastUpdateTime = now;
-    stationaryStartTime = now;
-    isStationary = true;
-    positionBuffer = Array(3).fill(p);
-
-    let initialVelocity = { lat: 0, lng: 0 };
-    if (p.speedMPS > 0.1 && p.heading !== null) {
-      const headingRad = (p.heading * Math.PI) / 180;
-      const earthRadius = 6378137;
-      const distLat = (p.speedMPS / earthRadius) * (180 / Math.PI);
-      const distLng = distLat / Math.cos((p.lat * Math.PI) / 180);
-      initialVelocity = { lat: distLat * Math.cos(headingRad), lng: distLat * Math.sin(headingRad) };
-    }
-    lastVelocity = initialVelocity;
-
-    const iz = getSpeedBasedZoom(p.speedMPS);
-    if (iz) map.setZoom(iz, { animate: false });
-
-    updateDistanceBox();
-    updateAccuracyIndicator(p.accuracy);
-    TemporalSmoother.reset();
-    return;
-  }
-
-  // big-jump / first-real-move block (unchanged)
-  const wasLongIdle = stationaryStartTime && (now - stationaryStartTime > 10000);
-  const isFirstRealMovement = isStationary &&
-                               (distance > CONFIG.MIN_DISTANCE_THRESHOLD * 0.6) &&
-                               (!stationaryStartTime || wasLongIdle);
-
-  if (distance > CONFIG.EXTENDED_DISTANCE_THRESHOLD || forceUpdate || isFirstRealMovement) {
-    if (stationaryCheckTimeout) { clearTimeout(stationaryCheckTimeout); stationaryCheckTimeout = null; }
-    isStationary = false;
-    stationaryStartTime = null;
-
-    const container = map.getContainer();
-    const orig = container.style.transition;
-    container.style.transition = 'none';
-
-    userMarker.setLatLng([p.lat, p.lng], { animate: false });
-
-    lastPosition = p;
-    positionBuffer = [p];
-    lastVelocity = { lat: 0, lng: 0 };
-    lastUpdateTime = now;
-    lastUpdateTimestamp = now;
-
-    const iz = getSpeedBasedZoom(p.speedMPS);
-    if (iz) map.setZoom(iz, { animate: false });
-
-    if (followUser && !isMapInteracting) {
-      map.setView([p.lat, p.lng], map.getZoom(), { animate: false, noMoveStart: true });
-    }
-
-    setTimeout(() => { container.style.transition = orig; }, 16);
-
-    if (isSignificantMovement(p)) resetInactivityTimer(false);
-    updateDistanceBox();
-    if (map._container) map._onResize();
-    TemporalSmoother.reset();
-    return;
-  }
-
-  // modifiers & micro-movement / quality gates (unchanged)
-  const eastWest = ulpEastWest(p, lastPosition);
-  const headingDiff = ulpHeadingDiff(p, lastPosition);
-  const dirFactor = ulpDirectionChangeFactor(headingDiff);
-  const mod = ulpApplyModifiers(speedMPH, eastWest);
-
-  const micro = speedMPH < 2 ? Math.max(mod.micro, distance * 1.5) : mod.micro;
-  if (distance < micro) {
-    if (!isStationary) {
-      if (!stationaryStartTime) stationaryStartTime = now;
-      else if (now - stationaryStartTime >= CONFIG.STATIONARY_TIME_THRESHOLD * 0.7) {
-        isStationary = true;
-        const cur = userMarker.getLatLng(), tgt = L.latLng(p.lat, p.lng);
-        if (cur.distanceTo(tgt) > 1) {
-          userMarker.setLatLng([p.lat, p.lng], { animate: true, duration: 0.5, easeLinearity: 0.1 });
-        } else {
-          userMarker.setLatLng([p.lat, p.lng], { animate: false });
+    window.ulpSpeedHistory.push(speedMPH);
+    if (window.ulpSpeedHistory.length > 50) {
+        window.ulpSpeedHistory.shift();
+        if (typeof window.ulpFollowModeSet === 'undefined') {
+            followUser = ulpDetectFollowModeFromHistory(window.ulpSpeedHistory);
+            window.ulpFollowModeSet = true;
         }
+    }
+
+    const distance = lastPosition ? calculateDistance(lastPosition, p) : 0;
+
+    if (!lastPosition) {
+        lastPosition = p;
+        const container = map.getContainer();
+        const origTransition = container.style.transition;
+        container.style.transition = 'none';
+
+        userMarker.setLatLng([p.lat, p.lng]);
+        map.setView([p.lat, p.lng], map.getZoom(), { animate: false, noMoveStart: true });
+
+        requestAnimationFrame(() => {
+            container.style.transition = origTransition;
+        });
+
+        lastUpdateTime = now;
+        stationaryStartTime = now;
+        isStationary = true;
+        positionBuffer = Array(3).fill(p);
+
+        let initialVelocity = { lat: 0, lng: 0 };
+        if (p.speedMPS > 0.1 && p.heading !== null) {
+            const headingRad = (p.heading * Math.PI) / 180;
+            const earthRadius = 6378137;
+            const distLat = (p.speedMPS / earthRadius) * (180 / Math.PI);
+            const distLng = distLat / Math.cos((p.lat * Math.PI) / 180);
+            initialVelocity = {
+                lat: distLat * Math.cos(headingRad),
+                lng: distLat * Math.sin(headingRad)
+            };
+        }
+        lastVelocity = initialVelocity;
+
+        const iz = getSpeedBasedZoom(p.speedMPS);
+        if (iz) map.setZoom(iz, { animate: false });
+
+        updateDistanceBox();
+        updateAccuracyIndicator(p.accuracy);
+        TemporalSmoother.reset();
+        return;
+    }
+
+    const wasLongIdle = stationaryStartTime && (now - stationaryStartTime > 10000);
+    const isFirstRealMovement = isStationary && 
+                                 (distance > CONFIG.MIN_DISTANCE_THRESHOLD * 0.6) && 
+                                 (!stationaryStartTime || wasLongIdle);
+
+    if (distance > CONFIG.EXTENDED_DISTANCE_THRESHOLD || forceUpdate || isFirstRealMovement) {
+        if (stationaryCheckTimeout) {
+            clearTimeout(stationaryCheckTimeout);
+            stationaryCheckTimeout = null;
+        }
+        isStationary = false;
+        stationaryStartTime = null;
+
+        const container = map.getContainer();
+        const orig = container.style.transition;
+        container.style.transition = 'none';
+
+        userMarker.setLatLng([p.lat, p.lng], { animate: false });
+
         lastPosition = p;
         positionBuffer = [p];
-        if (stationaryCheckTimeout) clearTimeout(stationaryCheckTimeout);
-        stationaryCheckTimeout = setTimeout(() => checkStationaryState(p), CONFIG.STATIONARY_CHECK_INTERVAL);
-        updateDistanceBox();
-        return;
-      }
-    } else {
-      if (p.accuracy < lastPosition.accuracy * 0.9) {
-        userMarker.setLatLng([p.lat, p.lng], { animate: false });
-        lastPosition = p;
-        updateDistanceBox();
-      }
-      return;
-    }
-  } else {
-    isStationary = false;
-    stationaryStartTime = null;
-    if (stationaryCheckTimeout) { clearTimeout(stationaryCheckTimeout); stationaryCheckTimeout = null; }
-  }
+        lastVelocity = { lat: 0, lng: 0 };
+        lastUpdateTime = now;
+        lastUpdateTimestamp = now;
 
-  const timeDelta = (now - lastUpdateTime) / 1000;
-  const jitterFiltered = speedMPH < 5 ? Math.max(distance, mod.minDist * (2.5 - speedMPH * 0.5)) : distance;
-  if (!forceUpdate &&
-      (p.accuracy > mod.maxAcc || jitterFiltered < mod.minDist || (timeDelta > 0 && jitterFiltered / timeDelta > mod.maxSpeed))) {
-    return;
-  }
+        const iz = getSpeedBasedZoom(p.speedMPS);
+        if (iz) map.setZoom(iz, { animate: false });
 
-  // smoothing + lookahead (same math, tighter code)
-  const smoothed = smoothPosition(p, lastPosition, speedMPH, eastWest, headingDiff, timeDelta);
-  const predicted = calculateEnhancedVelocityFilter(smoothed, lastPosition, timeDelta, p.speedMPS);
-  const lookAhead = ulpLookAhead(smoothed, predicted, lastPosition, speedMPH, headingDiff, eastWest);
-
-  updateMarker(smoothed, speedMPH, eastWest, headingDiff, dirFactor, distance, micro, isStationary);
-
-  if (ulpShouldUpdateMap(now, lastMapUpdateTime, distance, mod)) {
-    updateMapView(smoothed, lookAhead, speedMPH, eastWest, dirFactor, mod, now);
-    lastMapUpdateTime = now;
-  }
-
-  lastPosition = smoothed;
-  lastUpdateTime = now;
-  lastUpdateTimestamp = now;
-  updateDistanceBox();
-  ulpViewportSafety(smoothed, lookAhead, speedMPH, dirFactor, eastWest);
-}
-
-/* --------------  VISIBILITY / RESIZE (original timing, original behaviour) -------------- */
-function ulpHandleVisibilityChange() {
-  if (document.hidden) {
-    GeofenceManager.cleanup();
-    if (window.ulpVisibilityTimer) clearInterval(window.ulpVisibilityTimer);
-    window.ulpVisibilityTimer = setInterval(() => {
-      if (lastPosition) {
-        const p = { ...lastPosition, timestamp: Date.now() };
-        updateUserLocation({ coords: { latitude: p.lat, longitude: p.lng, accuracy: p.accuracy, heading: p.heading, speed: p.speedMPS } });
-      }
-    }, 30000);
-  } else {
-    if (window.ulpVisibilityTimer) { clearInterval(window.ulpVisibilityTimer); window.ulpVisibilityTimer = null; }
-    if (userMarker && map && map.getContainer() && lastPosition && !isMapInteracting) {
-      userMarker.setLatLng([lastPosition.lat, lastPosition.lng]);
-      const markerEl = userMarker.getElement();
-      const speedMPH = ulpSpeedMPH(lastPosition.speedMPS || 0);
-      if (markerEl) {
-        // single RAF – original
-        requestAnimationFrame(() => {
-          if (markerEl.isConnected && userMarker.getElement() === markerEl && map && map.getContainer()) {
-            ulpApplyVisualCentering(markerEl, Math.max(speedMPH, 15), map);
-          }
-        });
-      }
-      try {
-        const bounds = map.getBounds(), size = map.getSize();
-        if (bounds && size && size.x > 0 && size.y > 0) {
-          const userPixel = map.latLngToContainerPoint(lastPosition);
-          const margin = size.x * VIEWPORT_MARGIN;
-          const nearEdge = userPixel.x < margin || userPixel.x > size.x - margin ||
-                           userPixel.y < margin || userPixel.y > size.y - margin;
-          if (nearEdge || !bounds.contains(lastPosition)) {
-            map.panTo(lastPosition, { animate: false, noMoveStart: true });
-          }
+        if (followUser && !isMapInteracting) {
+            map.setView([p.lat, p.lng], map.getZoom(), { animate: false, noMoveStart: true });
         }
-      } catch (_) {}
+
+        setTimeout(() => {
+            container.style.transition = orig;
+        }, 16);
+
+        if (isSignificantMovement(p)) resetInactivityTimer(false);
+        updateDistanceBox();
+        if (map._container) map._onResize();
+        TemporalSmoother.reset();
+        return;
     }
-    if (map && typeof map.invalidateSize === 'function') {
-      setTimeout(() => {
-        if (map && !map._animatingZoom && map.getContainer()) map.invalidateSize({ pan: false });
-      }, 100);
+
+    const eastWest = ulpEastWest(p, lastPosition);
+    const headingDiff = ulpHeadingDiff(p, lastPosition);
+    const dirFactor = ulpDirectionChangeFactor(headingDiff);
+    const mod = ulpApplyModifiers(speedMPH, eastWest);
+
+    const micro = speedMPH < 2 ? Math.max(mod.micro, distance * 1.5) : mod.micro;
+    if (distance < micro) {
+        if (!isStationary) {
+            if (!stationaryStartTime) stationaryStartTime = now;
+            else if (now - stationaryStartTime >= CONFIG.STATIONARY_TIME_THRESHOLD * 0.7) {
+                isStationary = true;
+                const cur = userMarker.getLatLng();
+                const tgt = L.latLng(p.lat, p.lng);
+                if (cur.distanceTo(tgt) > 1) {
+                    userMarker.setLatLng([p.lat, p.lng], { animate: true, duration: 0.5, easeLinearity: 0.1 });
+                } else {
+                    userMarker.setLatLng([p.lat, p.lng], { animate: false });
+                }
+                lastPosition = p;
+                positionBuffer = [p];
+                if (stationaryCheckTimeout) clearTimeout(stationaryCheckTimeout);
+                stationaryCheckTimeout = setTimeout(() => checkStationaryState(p), CONFIG.STATIONARY_CHECK_INTERVAL);
+                updateDistanceBox();
+                return;
+            }
+        } else {
+            if (p.accuracy < lastPosition.accuracy * 0.9) {
+                userMarker.setLatLng([p.lat, p.lng], { animate: false });
+                lastPosition = p;
+                updateDistanceBox();
+            }
+            return;
+        }
+    } else {
+        isStationary = false;
+        stationaryStartTime = null;
+        if (stationaryCheckTimeout) {
+            clearTimeout(stationaryCheckTimeout);
+            stationaryCheckTimeout = null;
+        }
     }
-  }
+
+    const timeDelta = (now - lastUpdateTime) / 1000;
+    const jitterFiltered = speedMPH < 5 ? Math.max(distance, mod.minDist * (2.5 - speedMPH * 0.5)) : distance;
+    if (!forceUpdate && (p.accuracy > mod.maxAcc || jitterFiltered < mod.minDist || (timeDelta > 0 && jitterFiltered / timeDelta > mod.maxSpeed))) {
+        return;
+    }
+
+    const smoothed = smoothPosition(p, lastPosition, speedMPH, eastWest, headingDiff, timeDelta);
+    const predicted = calculateEnhancedVelocityFilter(smoothed, lastPosition, timeDelta, p.speedMPS);
+    const lookAhead = ulpLookAhead(smoothed, predicted, lastPosition, speedMPH, headingDiff, eastWest);
+
+    updateMarker(smoothed, speedMPH, eastWest, headingDiff, dirFactor, distance, micro, isStationary);
+
+    if (ulpShouldUpdateMap(now, lastMapUpdateTime, distance, mod)) {
+        updateMapView(smoothed, lookAhead, speedMPH, eastWest, dirFactor, mod, now);
+        lastMapUpdateTime = now;
+    }
+
+    lastPosition = smoothed;
+    lastUpdateTime = now;
+    lastUpdateTimestamp = now;
+    updateDistanceBox();
+    ulpViewportSafety(smoothed, lookAhead, speedMPH, dirFactor, eastWest);
 }
+
+/* --------------  VISIBILITY CHANGE HANDLER -------------- */
+function ulpHandleVisibilityChange() {
+    if (document.hidden) {
+        GeofenceManager.cleanup();
+        
+        if (window.ulpVisibilityTimer) {
+            clearInterval(window.ulpVisibilityTimer);
+        }
+        window.ulpVisibilityTimer = setInterval(() => {
+            if (lastPosition) {
+                const p = { ...lastPosition, timestamp: Date.now() };
+                updateUserLocation({
+                    coords: {
+                        latitude: p.lat,
+                        longitude: p.lng,
+                        accuracy: p.accuracy,
+                        heading: p.heading,
+                        speed: p.speedMPS
+                    }
+                });
+            }
+        }, 30000);
+    } else {
+        if (window.ulpVisibilityTimer) {
+            clearInterval(window.ulpVisibilityTimer);
+            window.ulpVisibilityTimer = null;
+        }
+
+        if (userMarker && map && map.getContainer() && lastPosition && !isMapInteracting) {
+            userMarker.setLatLng([lastPosition.lat, lastPosition.lng]);
+
+            const markerEl = userMarker.getElement();
+            const speedMPH = ulpSpeedMPH(lastPosition.speedMPS || 0);
+            if (markerEl) {
+                requestAnimationFrame(() => {
+                    requestAnimationFrame(() => {
+                        if (markerEl.isConnected && userMarker.getElement() === markerEl && map && map.getContainer()) {
+                            ulpApplyVisualCentering(markerEl, Math.max(speedMPH, 15), map);
+                        }
+                    });
+                });
+            }
+
+            try {
+                const bounds = map.getBounds();
+                const size = map.getSize();
+                if (bounds && size && size.x > 0 && size.y > 0) {
+                    const userPixel = map.latLngToContainerPoint(lastPosition);
+                    const margin = size.x * VIEWPORT_MARGIN;
+                    const nearEdge = userPixel.x < margin || userPixel.x > size.x - margin ||
+                                     userPixel.y < margin || userPixel.y > size.y - margin;
+
+                    if (nearEdge || !bounds.contains(lastPosition)) {
+                        map.panTo(lastPosition, { animate: false, noMoveStart: true });
+                    }
+                }
+            } catch (e) {}
+        }
+
+        if (map && typeof map.invalidateSize === 'function') {
+            setTimeout(() => {
+                if (map && !map._animatingZoom && map.getContainer()) {
+                    map.invalidateSize({ pan: false });
+                }
+            }, 100);
+        }
+    }
+}
+
 document.removeEventListener('visibilitychange', ulpHandleVisibilityChange);
 document.addEventListener('visibilitychange', ulpHandleVisibilityChange);
 
+/* --------------  RESIZE/ORIENTATION CHANGE HANDLER -------------- */
 function ulpHandleResize() {
-  if (userMarker && userMarker.getElement() && !isMapInteracting) {
-    const markerEl = userMarker.getElement();
-    const speedMPH = ulpSpeedMPH(lastPosition?.speedMPS || 0);
-    if (speedMPH >= 10) {
-      // single RAF – original
-      requestAnimationFrame(() => ulpApplyVisualCentering(markerEl, speedMPH, map));
+    if (userMarker && userMarker.getElement() && !isMapInteracting) {
+        const markerEl = userMarker.getElement();
+        const speedMPH = ulpSpeedMPH(lastPosition?.speedMPS || 0);
+        if (speedMPH >= 10) {
+            requestAnimationFrame(() => {
+                ulpApplyVisualCentering(markerEl, speedMPH, map);
+            });
+        }
     }
-  }
 }
+
 window.addEventListener('resize', ulpHandleResize);
 window.addEventListener('orientationchange', ulpHandleResize);
 
 /* --------------  INTERACTION HOOKS -------------- */
-function handleInteractionStart(mode) { isMapInteracting = true; ulpBeginInteraction(); }
-function handleInteractionEnd(mode) { isMapInteracting = false; ulpEndInteraction(); }
+function handleInteractionStart(mode) {
+    isMapInteracting = true;
+    ulpBeginInteraction();
+}
+
+function handleInteractionEnd(mode) {
+    isMapInteracting = false;
+    ulpEndInteraction();
+}
         
 function updateDistanceBox() {
     const distanceBox = cachedElements.distanceBox || document.getElementById('distanceBox');
