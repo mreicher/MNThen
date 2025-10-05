@@ -3896,103 +3896,208 @@ function recenterMap() {
     }, 500);
 }
 
-/* 2-MINUTE LOCATION COOLDOWN */
+/********************************************************************
+ *  2-MINUTE LOCATION COOLDOWN – PRODUCTION READY
+ *  Per-location hidden-time tracking, no global skew
+ ********************************************************************/
 
-const COOLDOWN_PERIOD = 120 * 1000;
+const COOLDOWN_PERIOD = 2 * 60 * 1000; // 2 minutes
 const STORAGE_KEY     = 'locationCooldowns';
+const DEBOUNCE_TIME   = 'ontouchstart' in window || navigator.maxTouchPoints > 0 ? 100 : 50;
 
-const isTouchDevice = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
-const DEBOUNCE_TIME = isTouchDevice ? 100 : 50;
+class LocationCooldownManager {
+  constructor() {
+    this.cooldowns       = this.loadFromStorage();
+    this.hiddenMsPerLoc  = {};               // locationId -> ms hidden
+    this.currentLocationId = null;
+    this.lastActionTime  = 0;
+    this.hiddenAt        = null;
 
-let lastFunctionCall = 0;
+    this.initVisibilityTracking();
+    this.cleanupExpiredCooldowns();
+  }
 
-/* ---------- visibility tracker ---------- */
-let hiddenAt = null;
-let totalHidden = 0;
-
-document.addEventListener('visibilitychange', () => {
-    if (document.hidden) {
-        hiddenAt = Date.now();
-    } else if (hiddenAt) {
-        totalHidden += Date.now() - hiddenAt;
-        hiddenAt = null;
-    }
-});
-
-/* ---------- cooldown manager ---------- */
-class CooldownManager {
-    constructor() {
-        this.cooldowns = this.load();
-        this.cleanup();
-    }
-
-    load() {
-        try {
-            return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
-        } catch {
-            return {};
+  /* ---------- visibility tracking ---------- */
+  initVisibilityTracking() {
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        this.hiddenAt = Date.now();
+      } else if (this.hiddenAt) {
+        const gone = Date.now() - this.hiddenAt;
+        for (const id of Object.keys(this.cooldowns)) {
+          this.hiddenMsPerLoc[id] = (this.hiddenMsPerLoc[id] || 0) + gone;
         }
+        this.hiddenAt = null;
+      }
+    });
+  }
+
+  /* ---------- storage ---------- */
+  loadFromStorage() {
+    try {
+      const data = localStorage.getItem(STORAGE_KEY);
+      return data ? JSON.parse(data) : {};
+    } catch (e) {
+      console.warn('Failed to load cooldowns:', e);
+      return {};
+    }
+  }
+
+  saveToStorage() {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(this.cooldowns));
+    } catch (e) {
+      console.warn('Failed to save cooldowns:', e);
+    }
+  }
+
+  /* ---------- cleanup ---------- */
+  cleanupExpiredCooldowns() {
+    const now = Date.now();
+    let dirty = false;
+    for (const [id, ts] of Object.entries(this.cooldowns)) {
+      const elapsed = now - ts - (this.hiddenMsPerLoc[id] || 0);
+      if (elapsed >= COOLDOWN_PERIOD) {
+        delete this.cooldowns[id];
+        delete this.hiddenMsPerLoc[id];
+        dirty = true;
+      }
+    }
+    if (dirty) this.saveToStorage();
+  }
+
+  /* ---------- cooldown query ---------- */
+  checkCooldown(locationId) {
+    const ts = this.cooldowns[locationId];
+    if (!ts) {
+      return {
+        isOnCooldown: false,
+        reason: 'no_cooldown',
+        remainingMs: 0,
+        remainingSeconds: 0,
+      };
     }
 
-    save() {
-        try {
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(this.cooldowns));
-        } catch {}
+    const elapsed = Date.now() - ts - (this.hiddenMsPerLoc[locationId] || 0);
+    if (elapsed < 0) {
+      delete this.cooldowns[locationId];
+      delete this.hiddenMsPerLoc[locationId];
+      this.saveToStorage();
+      return {
+        isOnCooldown: false,
+        reason: 'invalid_timestamp',
+        remainingMs: 0,
+        remainingSeconds: 0,
+      };
     }
 
-    cleanup() {
-        const now = Date.now();
-        let dirty = false;
-        for (const [k, ts] of Object.entries(this.cooldowns)) {
-            if (now - ts >= COOLDOWN_PERIOD + totalHidden) {
-                delete this.cooldowns[k];
-                dirty = true;
-            }
-        }
-        if (dirty) this.save();
+    if (elapsed >= COOLDOWN_PERIOD) {
+      delete this.cooldowns[locationId];
+      delete this.hiddenMsPerLoc[locationId];
+      this.saveToStorage();
+      return {
+        isOnCooldown: false,
+        reason: 'cooldown_expired',
+        remainingMs: 0,
+        remainingSeconds: 0,
+      };
     }
 
-    isOnCooldown(locationId) {
-        const key = `location_${locationId}`;
-        const ts  = this.cooldowns[key];
-        if (!ts) return { onCooldown: false, reason: 'no_cooldown' };
+    const remainingMs = COOLDOWN_PERIOD - elapsed;
+    return {
+      isOnCooldown: true,
+      reason: 'cooldown_active',
+      remainingMs: remainingMs,
+      remainingSeconds: Math.ceil(remainingMs / 1000),
+      remainingMinutes: Math.ceil(remainingMs / 60000),
+    };
+  }
 
-        const elapsed = Date.now() - ts - totalHidden;
-        if (elapsed < 0) return { onCooldown: false, reason: 'invalid_timestamp' };
+  /* ---------- enter location ---------- */
+  enterLocation(locationId) {
+    const now = Date.now();
+    if (now - this.lastActionTime < DEBOUNCE_TIME) {
+      return {
+        success: false,
+        reason: 'debounced',
+        message: 'Action too rapid, please try again',
+      };
+    }
+    this.lastActionTime = now;
 
-        if (elapsed < COOLDOWN_PERIOD) {
-            return {
-                onCooldown: true,
-                reason: 'cooldown_period',
-                timeRemaining: COOLDOWN_PERIOD - elapsed,
-                timeElapsed: elapsed
-            };
-        }
-
-        delete this.cooldowns[key];
-        this.save();
-        return { onCooldown: false, reason: 'expired' };
+    const status = this.checkCooldown(locationId);
+    if (status.isOnCooldown) {
+      const { remainingSeconds, remainingMinutes } = status;
+      const timeMessage =
+        remainingSeconds > 60
+          ? `${remainingMinutes} minute${remainingMinutes > 1 ? 's' : ''}`
+          : `${remainingSeconds} second${remainingSeconds > 1 ? 's' : ''}`;
+      return {
+        success: false,
+        reason: 'on_cooldown',
+        message: `Please wait ${timeMessage} before returning to this location`,
+        remainingMs: status.remainingMs,
+        remainingSeconds: status.remainingSeconds,
+      };
     }
 
-    setCooldown(locationId) {
-        this.cooldowns[`location_${locationId}`] = Date.now();
-        totalHidden = 0;
-        this.save();
-    }
+    this.currentLocationId = locationId;
+    return {
+      success: true,
+      reason: 'allowed',
+      message: 'Location entry allowed',
+    };
+  }
 
-    clearAll() {
-        this.cooldowns = {};
-        totalHidden = 0;
-        this.save();
-    }
+  /* ---------- leave location ---------- */
+  leaveLocation(locationId = null) {
+    const id = locationId || this.currentLocationId;
+    if (!id) return;
 
-    getRemainingTime(locationId) {
-        const status = this.isOnCooldown(locationId);
-        return status.onCooldown ? Math.ceil(status.timeRemaining / 1000) : 0;
+    this.cooldowns[id] = Date.now();
+    this.hiddenMsPerLoc[id] = 0; // start fresh hidden tally
+    this.saveToStorage();
+    if (this.currentLocationId === id) this.currentLocationId = null;
+    console.log(`Left location ${id}, cooldown started`);
+  }
+
+  /* ---------- helpers ---------- */
+  getRemainingTime(locationId) {
+    return this.checkCooldown(locationId).remainingSeconds;
+  }
+
+  getAllCooldowns() {
+    const out = {};
+    for (const id of Object.keys(this.cooldowns)) {
+      const rem = this.getRemainingTime(id);
+      if (rem > 0) out[id] = rem;
     }
+    return out;
+  }
+
+  clearCooldown(locationId) {
+    delete this.cooldowns[locationId];
+    delete this.hiddenMsPerLoc[locationId];
+    this.saveToStorage();
+    console.log(`Cooldown cleared for location ${locationId}`);
+  }
+
+  clearAllCooldowns() {
+    this.cooldowns = {};
+    this.hiddenMsPerLoc = {};
+    this.saveToStorage();
+    console.log('All cooldowns cleared');
+  }
+
+  getCurrentLocation() {
+    return this.currentLocationId;
+  }
 }
 
-const cooldownManager = new CooldownManager();
+/* ---------- singleton ---------- */
+const cooldownManager = new LocationCooldownManager();
+if (typeof window !== 'undefined') window.cooldownManager = cooldownManager;
+if (typeof module !== 'undefined') module.exports = cooldownManager;
 
 /* ---------- entry point ---------- */
 function showLocationHunt(location) {
@@ -4005,22 +4110,16 @@ function showLocationHunt(location) {
 
     console.log(`Processing location ${location.id} on ${isTouchDevice ? 'touch' : 'desktop'} device`);
 
-    const cooldownStatus = cooldownManager.isOnCooldown(location.id);
-
-    if (cooldownStatus.onCooldown) {
-        const remainingSeconds = Math.ceil(cooldownStatus.timeRemaining / 1000);
-        const remainingMinutes = Math.ceil(remainingSeconds / 60);
-        console.log(`Location ${location.id} is on cooldown: ${cooldownStatus.reason}, ${remainingSeconds}s (${remainingMinutes}min) remaining`);
-        if (remainingSeconds > 60) {
-            console.log(`Please wait ${remainingMinutes} more minute(s) before visiting this location again.`);
-        } else {
-            console.log(`Please wait ${remainingSeconds} more seconds before visiting this location again.`);
-        }
+    const result = cooldownManager.enterLocation(location.id); // NEW API
+    if (!result.success) {
+        const s = result.remainingSeconds || 0;
+        const m = Math.ceil(s / 60);
+        const msg = s > 60 ? `${m} min` : `${s} s`;
+        console.log(`Location ${location.id} on cooldown: ${result.message} (${msg} remaining)`);
         return;
     }
 
-    console.log(`Location ${location.id} cooldown check passed: ${cooldownStatus.reason}`);
-    cooldownManager.setCooldown(location.id);
+    cooldownManager.leaveLocation(location.id); // start cooldown for this one
 
     lastVisitedLocationId = location.id;
     isLocationHuntVisible = true;
