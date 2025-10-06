@@ -5,7 +5,7 @@ const CACHE_NAME        = 'mnthen-v4-ios-4';
 const RUNTIME_CACHE     = 'mnthen-runtime-v4-ios';
 const AUDIO_CACHE       = 'mnthen-audio-v4';
 const TILE_CACHE        = 'mnthen-tiles-v4';
-const SHELL_CACHE       = 'mnthen-shell-v4';
+const SHELL_CACHE       = 'mnthen-shell-v4';        // NEW: install-time shell
 
 // iOS Safari cache quotas (conservative)
 const MAX_CACHE_SIZE        = 80 * 1024 * 1024; // 80 MB total
@@ -14,46 +14,30 @@ const MAX_AUDIO_ENTRIES     = 100;
 const MAX_TILE_ENTRIES      = 1500;
 const MAX_SHELL_ENTRIES     = 50;
 
-// ---------- install-time shell ----------
+// ----------  install-time shell  ----------
+// These assets are cached during install so the PWA works offline from first launch.
 const SHELL_RESOURCES = [
   '/',
   '/index.html',
   '/css/mainmap.css',
   '/css/mnthen_main_map2.css',
   '/manifest.json',
-  '/locations_main.js',
+  '/locations_main.js',               // ← location summaries, coords, audio URLs
   '/images/logo.webp',
   '/images/index/index_1.jpg'
 ];
 
-const NEVER_CACHE = [];
+// Assets that must **never** be served from cache (always live).
+const NEVER_CACHE = [];   // locations_main.js removed
 
 // Media patterns
 const AUDIO_EXTENSIONS = /\.(mp3|wav|ogg|m4a|aac|flac|weba)$/i;
 const VIDEO_EXTENSIONS = /\.(mp4|webm|mov|avi|mpeg|mkv)$/i;
 const TILE_REGEX = /tile\.openstreetmap\.org\/\d+\/\d+\/\d+\.(png|jpg|jpeg|webp)/i;
 
-// CORS audio domains
-const CORS_AUDIO_DOMAINS = [
-  'storage.googleapis.com',
-  'firebasestorage.googleapis.com',
-  's3.amazonaws.com',
-  'cloudfront.net',
-  'd1234567890.cloudfront.net'
-];
-
-// ---------- helpers ----------
+// ----------  helpers  ----------
 function isIOSSafari() {
   return /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
-}
-
-function isCORSAudio(url) {
-  try {
-    const urlObj = new URL(url);
-    return CORS_AUDIO_DOMAINS.some(domain => urlObj.hostname.includes(domain));
-  } catch {
-    return false;
-  }
 }
 
 async function manageCacheSize(cacheName, maxEntries) {
@@ -69,7 +53,7 @@ async function manageCacheSize(cacheName, maxEntries) {
   }
 }
 
-// ---------- strategies ----------
+// ----------  strategies  ----------
 async function cacheFirst(request, cacheName = CACHE_NAME) {
   try {
     const cache   = await caches.open(cacheName);
@@ -109,6 +93,7 @@ async function networkFirst(request) {
   }
 }
 
+// Stale-while-revalidate for locations script / JSON
 async function staleWhileRevalidate(request) {
   const cache = await caches.open(SHELL_CACHE);
   const cached = await cache.match(request);
@@ -121,144 +106,60 @@ async function staleWhileRevalidate(request) {
   return cached || fetchPromise;
 }
 
-// ---------- CORS Audio Handling ----------
-async function handleCORSAudio(request) {
-  const url = request.url;
-  const isCORS = isCORSAudio(url);
-  
-  // Handle range requests - always go to network
+async function handleMediaRequest(request) {
   if (request.headers.has('range')) {
-    console.log('[SW] Range request for:', url);
-    return fetch(request.clone(), { 
-      cache: 'no-cache', 
-      mode: isCORS ? 'cors' : 'no-cors',
-      credentials: 'omit'
-    });
+    return fetch(request.clone(), { cache: 'no-cache', mode: 'cors' });
   }
-
   const cache = await caches.open(AUDIO_CACHE);
   const cached = await cache.match(request);
-  
-  if (cached) {
-    console.log('[SW] Serving cached audio:', url);
-    return cached;
-  }
+  if (cached) return cached;
 
-  try {
-    console.log('[SW] Fetching audio:', url, 'CORS:', isCORS);
-    
-    const fetchOptions = {
-      cache: 'default',
-      credentials: isCORS ? 'omit' : 'same-origin',
-      mode: isCORS ? 'cors' : 'same-origin'
-    };
-
-    const response = await fetch(request, fetchOptions);
-    
-    if (response.ok && response.status === 200) {
-      // For CORS, check if response is opaque
-      if (response.type === 'opaque') {
-        console.warn('[SW] Opaque CORS response, not caching:', url);
-        return response;
-      }
-      
-      // Clone and cache
-      console.log('[SW] Caching audio:', url);
-      cache.put(request, response.clone())
-        .then(() => manageCacheSize(AUDIO_CACHE, MAX_AUDIO_ENTRIES))
-        .catch(err => console.warn('[SW] Cache put failed:', err));
-    }
-    
-    return response;
-  } catch (error) {
-    console.error('[SW] Audio fetch failed:', url, error);
-    // Return cached if available, otherwise error
-    return cached || new Response('Audio unavailable', { 
-      status: 503,
-      statusText: 'Service Unavailable'
-    });
+  const response = await fetch(request, { mode: 'cors', credentials: 'same-origin', cache: 'default' });
+  if (response.status === 200 && response.ok && response.type !== 'opaque') {
+    cache.put(request, response.clone()).then(() => manageCacheSize(AUDIO_CACHE, MAX_AUDIO_ENTRIES));
   }
+  return response;
 }
 
-async function handleMediaRequest(request) {
-  const url = request.url;
-  
-  // Check if it's audio
-  if (AUDIO_EXTENSIONS.test(url)) {
-    return handleCORSAudio(request);
-  }
-  
-  // Video handling - simpler, no caching typically
-  if (VIDEO_EXTENSIONS.test(url)) {
-    if (request.headers.has('range')) {
-      return fetch(request.clone(), { 
-        cache: 'no-cache', 
-        mode: isCORSAudio(url) ? 'cors' : 'no-cors',
-        credentials: 'omit'
-      });
-    }
-    return fetch(request, { 
-      mode: isCORSAudio(url) ? 'cors' : 'same-origin',
-      credentials: 'omit',
-      cache: 'default'
-    });
-  }
-  
-  return fetch(request);
-}
-
-// ---------- fetch ----------
+// ----------  fetch ----------
 self.addEventListener('fetch', (event) => {
   const { request } = event;
   const url = request.url;
 
   if (request.method !== 'GET') return;
-  
   if (NEVER_CACHE.some(p => url.includes(p))) {
     event.respondWith(fetch(request, { cache: 'no-cache' }));
     return;
   }
-  
-  // Media handling (audio/video)
   if (AUDIO_EXTENSIONS.test(url) || VIDEO_EXTENSIONS.test(url)) {
     event.respondWith(handleMediaRequest(request));
     return;
   }
-  
-  // Map tiles
   if (TILE_REGEX.test(url)) {
     event.respondWith(cacheFirst(request, TILE_CACHE));
     return;
   }
-  
-  // locations_main.js - stale-while-revalidate
   if (url.includes('/locations_main.js')) {
     event.respondWith(staleWhileRevalidate(request));
     return;
   }
-  
-  // Static assets - cache first
   if (url.match(/\.(css|js|png|jpg|jpeg|gif|svg|webp|ico|woff|woff2)$/i)) {
     event.respondWith(cacheFirst(request));
-  } 
-  // API calls - network first
-  else if (url.includes('/api/') || url.includes('geolocation') || url.includes('weather')) {
+  } else if (url.includes('/api/') || url.includes('geolocation') || url.includes('weather')) {
     event.respondWith(networkFirst(request));
-  } 
-  // Everything else - cache first
-  else {
+  } else {
     event.respondWith(cacheFirst(request));
   }
 });
 
-// ---------- lifecycle ----------
+// ----------  lifecycle ----------
 self.addEventListener('install', (e) => {
   console.log('[SW] 4.4.0 installing');
   e.waitUntil(
     caches.open(SHELL_CACHE)
-      .then(cache => cache.addAll(SHELL_RESOURCES))
-      .catch(err => console.error('[SW] shell cache fail:', err))
-      .then(() => self.skipWaiting())
+          .then(cache => cache.addAll(SHELL_RESOURCES))
+          .catch(err => console.error('[SW] shell cache fail:', err))
+          .then(() => self.skipWaiting())
   );
 });
 
@@ -266,16 +167,12 @@ self.addEventListener('activate', (e) => {
   console.log('[SW] 4.4.0 activating');
   e.waitUntil(
     Promise.all([
-      caches.keys().then(names =>
-        Promise.all(
-          names
-            .filter(name => ![
-              CACHE_NAME, RUNTIME_CACHE, AUDIO_CACHE,
-              TILE_CACHE, SHELL_CACHE
-            ].includes(name))
-            .map(name => caches.delete(name))
-        )
-      ),
+      caches.keys().then(names => Promise.all(
+        names.map(n => ![
+          CACHE_NAME, RUNTIME_CACHE, AUDIO_CACHE,
+          TILE_CACHE, SHELL_CACHE
+        ].includes(n) ? caches.delete(n) : null)
+      )),
       manageCacheSize(RUNTIME_CACHE, MAX_RUNTIME_ENTRIES),
       manageCacheSize(AUDIO_CACHE, MAX_AUDIO_ENTRIES),
       manageCacheSize(TILE_CACHE, MAX_TILE_ENTRIES),
@@ -284,15 +181,12 @@ self.addEventListener('activate', (e) => {
   );
 });
 
-// ---------- messages ----------
+// ----------  messages ----------
 self.addEventListener('message', (event) => {
   const { data } = event;
-  if (!data || typeof data !== 'object') return;
+  if (!data) return;
 
-  if (data.type === 'SKIP_WAITING') {
-    self.skipWaiting();
-    return;
-  }
+  if (data.type === 'SKIP_WAITING') self.skipWaiting();
 
   if (data.type === 'CLEAR_CACHE') {
     Promise.all([
@@ -301,10 +195,8 @@ self.addEventListener('message', (event) => {
       caches.delete(AUDIO_CACHE),
       caches.delete(TILE_CACHE),
       caches.delete(SHELL_CACHE)
-    ])
-    .then(() => event.ports[0]?.postMessage({ success: true }))
-    .catch(err => event.ports[0]?.postMessage({ success: false, error: err.message }));
-    return;
+    ]).then(() => event.ports[0].postMessage({ success: true }))
+     .catch(err => event.ports[0].postMessage({ success: false, error: err.message }));
   }
 
   if (data.type === 'MANAGE_CACHE_SIZE') {
@@ -313,28 +205,24 @@ self.addEventListener('message', (event) => {
       manageCacheSize(RUNTIME_CACHE, MAX_RUNTIME_ENTRIES),
       manageCacheSize(AUDIO_CACHE, MAX_AUDIO_ENTRIES),
       manageCacheSize(TILE_CACHE, MAX_TILE_ENTRIES)
-    ])
-    .then(() => event.ports[0]?.postMessage({ success: true, message: 'cache size managed' }));
-    return;
+    ]).then(() => event.ports[0].postMessage({ success: true, message: 'cache size managed' }));
   }
 
   if (data.type === 'CHECK_FOR_UPDATE') {
     self.registration.update()
-      .then(() => event.ports[0]?.postMessage({ updateAvailable: true }))
-      .catch(() => event.ports[0]?.postMessage({ updateAvailable: false }));
-    return;
+      .then(() => event.ports[0].postMessage({ updateAvailable: true }))
+      .catch(() => event.ports[0].postMessage({ updateAvailable: false }));
   }
 });
 
-// ---------- error shields ----------
+// ----------  error shields ----------
 self.addEventListener('error', (e) => {
   console.error('[SW] global error', e.error);
   e.preventDefault();
 });
-
 self.addEventListener('unhandledrejection', (e) => {
   console.error('[SW] unhandled rejection', e.reason);
   e.preventDefault();
 });
 
-console.log('[SW] 4.4.0 ready (install-shell + offline-first + tile-cache + CORS audio)');
+console.log('[SW] 4.4.0 ready (install-shell + offline-first + tile-cache)');
