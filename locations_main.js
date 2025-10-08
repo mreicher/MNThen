@@ -11,11 +11,11 @@ const locations = [
         city: "Mahtomedi",
         audio: "/audio/exhibit/wildwood.mp3", 
         tours: "history",
-        summary: "Wildwood Amusement Park thrilled Twin Cities crowds for 30+ years with rides, shows & lakeside fun. It closed in 1938 due to financial decline.",
+        summary: "Wildwood Amusement Park thrilled Twin Cities crowds for 30+ years with rides, shows & lakeside fun. It closed after years of financial issues. No ruins remain.",
         today: "Southeast corner of White Bear Lake",
         link: "https://mnthen.com/blog/place/wildwood.html",
         imageSource: "Image of the slide at Wildwood Park c. 1905 via MPRNews",
-        additionalInfo: "Wildwood featured the popular 'Scenic Railway,' a wooden roller coaster designed by Fred W. Pearce. It was later moved to his Excelsior Amusement Park.",
+        additionalInfo: "Visitors didn’t just arrive by streetcar — some came by steamboat across White Bear Lake to spend the day swimming, dancing, and riding Wildwood’s coaster.",
         difficulty: 2
     },
 
