@@ -1218,6 +1218,109 @@ class EnterpriseBackgroundSync {
   }
 }
 
+// --- Add the ZoomController class definition ---
+class ZoomController {
+    constructor() {
+        this.authorities = { proximity: 0, speed: 0, user: 0 }; // Priority levels (simplified)
+        this.currentSource = null; // 'proximity', 'speed', 'user', or null
+        this.currentZoom = 17; // Default zoom level, adjust if needed
+        this.lockUntil = 0; // Timestamp until which other sources are locked out
+        this.pendingZoom = null; // Store pending zoom if current source is locked
+        this.isApplyingPending = false;
+    }
+
+    /**
+     * Requests to change the zoom level.
+     * @param {string} source - The source requesting the change ('proximity', 'speed', 'user').
+     * @param {number} level - The target zoom level.
+     * @param {number} priority - Priority of the request (higher number = higher priority). Default 1.
+     * @returns {boolean} True if the request is granted, false otherwise.
+     */
+    request(source, level, priority = 1) {
+        const now = Date.now();
+
+        // Check if another source currently has authority and lock duration hasn't expired
+        if (this.currentSource && 
+            this.currentSource !== source && 
+            now < this.lockUntil) {
+            // Another source has lock. Check if this request has higher priority.
+            if (priority > (this.authorities[this.currentSource] || 0)) {
+                // Higher priority request overrides, take control
+                console.debug(`ZoomController: ${source} (prio ${priority}) overriding ${this.currentSource} (prio ${this.authorities[this.currentSource]}).`);
+                this.currentSource = source;
+                this.authorities[source] = priority;
+                this.currentZoom = level;
+                this.lockUntil = now + 2000; // Reset lock duration
+                this.applyZoom(level);
+                return true;
+            } else {
+                // Lower or equal priority, denied
+                console.debug(`ZoomController: ${source} request denied, ${this.currentSource} has lock.`);
+                return false;
+            }
+        }
+
+        // No active lock or request is from the current source, or higher priority override occurred above
+        this.currentSource = source;
+        this.authorities[source] = priority;
+        this.currentZoom = level;
+        this.lockUntil = now + 2000; // Set lock duration (2 seconds as per Claude's suggestion)
+        this.applyZoom(level);
+        return true;
+    }
+
+    /**
+     * Actually applies the zoom level to the map.
+     * @param {number} level - The zoom level to set.
+     */
+    applyZoom(level) {
+        if (map) { // Ensure map object exists
+            // Example: Using Leaflet's setZoom
+            // Adjust animation options as needed based on source if necessary
+            const animate = true; // Or false for speed changes if desired
+            const duration = source === 'proximity' ? 1.2 : 0.6; // Example durations
+            map.setZoom(level, { animate: animate, duration: duration, noMoveStart: true });
+            console.debug(`ZoomController: Applied zoom ${level} for source ${this.currentSource}.`);
+        } else {
+            console.warn("ZoomController: Cannot apply zoom, map object not found.");
+        }
+    }
+
+    /**
+     * Releases authority for a specific source. Does not necessarily change the zoom.
+     * Useful for 'user' interaction ending.
+     * @param {string} source - The source releasing authority.
+     */
+    release(source) {
+        if (this.currentSource === source) {
+             // Simple release: clear current source, allow others to request
+             // Could also implement logic to revert to a default zoom based on the other active source
+             console.debug(`ZoomController: Authority released by ${source}.`);
+             this.currentSource = null; // Allow next request to proceed
+             // Consider resetting lock time or keeping it if other auto-zooms are active?
+             // For now, just release the source.
+             // this.lockUntil = 0; // Uncomment if you want to immediately allow other sources without waiting for lock expiry
+        }
+    }
+
+    /**
+     * Gets the current zoom authority state.
+     * @returns {Object} Object containing current source, lock status, etc.
+     */
+    getState() {
+        return {
+            currentSource: this.currentSource,
+            lockUntil: this.lockUntil,
+            isLocked: Date.now() < this.lockUntil,
+            currentZoom: this.currentZoom
+        };
+    }
+}
+
+// Initialize the global ZoomController instance
+window.zoomController = new ZoomController();
+// --- End of ZoomController class definition ---
+
 const enterpriseCacheManager = new EnterpriseCacheManager();
 const enterpriseSecurityManager = new EnterpriseSecurityManager();
 const enterprisePerformanceMonitor = new EnterprisePerformanceMonitor();
@@ -2619,6 +2722,22 @@ function updatePositionBuffer(position) {
     }
 }
 
+function seedPositionBuffer(seedPosition, count = CONFIG.MAX_BUFFER_SIZE || 5) {
+    // Clear the buffer completely first
+    positionBuffer.length = 0; // Assuming 'positionBuffer' is accessible here, or use window.positionBuffer if necessary
+    // Fill it with the specified number of identical seed positions
+    for (let i = 0; i < count; i++) {
+        positionBuffer.push({
+            lat: seedPosition.lat,
+            lng: seedPosition.lng,
+            accuracy: seedPosition.accuracy,
+            timestamp: seedPosition.timestamp, // Or potentially adjust timestamp slightly if needed for smoothing logic
+            heading: seedPosition.heading,
+            speedMPS: seedPosition.speedMPS
+        });
+    }
+}
+
 function calculateWeightedPosition(positions) {
     if (!Array.isArray(positions) || positions.length === 0) {
         return null;
@@ -3149,7 +3268,8 @@ async function updateUserLocation(position, forceUpdate = false) {
     // GPS recovery handling
     if (window.isGPSSearching) {
         window.isGPSSearching = false;
-        window.positionBuffer = [newPosition];
+        positionBuffer.length = 0; // Clear the buffer first
+        updatePositionBuffer(newPosition); 
         window.lastVelocity = { lat: 0, lng: 0 };
         window.smoothedVelocity = { lat: 0, lng: 0 };
         window.isStationary = false;
@@ -3401,17 +3521,18 @@ async function updateUserLocation(position, forceUpdate = false) {
         }
     }
 
-    // Skip smoothing for better fixes or large jumps
-    const accuracyImproved = window.lastPosition && (newPosition.accuracy < window.lastPosition.accuracy * 0.6);
-    if (distance > 8 || accuracyImproved) {
-        userMarker.setLatLng([newPosition.lat, newPosition.lng]);
-        window.lastPosition = newPosition;
-        window.positionBuffer = [newPosition];
-        window.lastUpdateTime = currentTime;
-        if (typeof updateDistanceBox === 'function') updateDistanceBox();
-        isUpdatingGPS = false;
-        return;
-    }
+// Skip smoothing for better fixes or large jumps
+const accuracyImproved = window.lastPosition && (newPosition.accuracy < window.lastPosition.accuracy * 0.6);
+if (distance > 8 || accuracyImproved) {
+    userMarker.setLatLng([newPosition.lat, newPosition.lng]);
+    window.lastPosition = newPosition;
+    positionBuffer.length = 0; // Clear the buffer first
+    updatePositionBuffer(newPosition); 
+    window.lastUpdateTime = currentTime;
+    if (typeof updateDistanceBox === 'function') updateDistanceBox();
+    isUpdatingGPS = false;
+    return;
+}
 
     // ✅ BEGIN TRY BLOCK — now properly scoped
     try {
@@ -3662,7 +3783,8 @@ function _initializeUserLocationState(newPosition, currentTime) {
     window.lastPosition = newPosition;
     window.lastUpdateTime = currentTime;
     window.stationaryStartTime = currentTime;
-    window.positionBuffer = [newPosition];
+    positionBuffer.length = 0; // Clear the buffer first
+    updatePositionBuffer(newPosition); 
     window.lastVelocity = { lat: 0, lng: 0 };
     window.smoothedVelocity = { lat: 0, lng: 0 };
     window.isStationary = false;
@@ -3764,9 +3886,16 @@ function _handleProximityZoom(speedMPH, eastWestMovement) {
         !window.lastClosestLocation?.lat ||
         !window.lastClosestLocation?.lng
     ) {
+        // Optionally, if zoomedInState was true, we might want to request a zoom-out here
+        // when proximity data becomes invalid, but often the speed-based zoom or user action will handle it.
+        // For now, just ensure the state is consistent if it was previously zoomed in.
         if (window.zoomedInState) {
-            window.zoomedInState = false;
-            window.isNearLocation = false;
+            // Consider if this should trigger a zoom out request, or just reset state.
+            // For now, just reset state if controller is not actively managing proximity zoom.
+            if (window.zoomController.getState().currentSource !== 'proximity') {
+                 window.zoomedInState = false;
+                 window.isNearLocation = false;
+            }
         }
         return;
     }
@@ -3788,62 +3917,74 @@ function _handleProximityZoom(speedMPH, eastWestMovement) {
     // ZOOM IN when entering proximity
     if (!window.zoomedInState && distanceFeet <= ZOOM_IN_THRESHOLD) {
         if (timeSinceLastZoom >= 2000) {
-            window.zoomedInState = true;
-            window.isNearLocation = true;
-            window.lastZoomChangeTime = proximityNow;
-            window.blockSpeedZoom = true;
-            window.lastProximityZoomTime = proximityNow;
+            // Request zoom from the controller
+            // Using a higher priority for proximity might be appropriate
+            const zoomGranted = window.zoomController.request('proximity', PROXIMITY_ZOOM_IN_LEVEL, 3); // Example priority
 
-            setTimeout(() => { 
-                if (window.lastClosestDistance * 3.28084 > ZOOM_OUT_THRESHOLD && (window.currentSpeed || 0) < 5) {
-                    window.blockSpeedZoom = false;
-                }
-            }, 8000);
+            // Only update state if the controller granted the request
+            if (zoomGranted && window.zoomController.getState().currentSource === 'proximity') {
+                window.zoomedInState = true;
+                window.isNearLocation = true;
+                window.lastZoomChangeTime = proximityNow;
+                // Consider if blockSpeedZoom is still necessary if the controller manages conflicts
+                // window.blockSpeedZoom = true; // Potentially less needed with controller, but might still be used elsewhere
+                window.lastProximityZoomTime = proximityNow;
 
-            if (!window.isMapInteracting && map && window.userMarker) {
-                const userPos = window.userMarker.getLatLng();
-                const closestLoc = window.lastClosestLocation;
+                // The flyToBounds logic for framing user + location is complex.
+                // The ZoomController currently only handles setZoom.
+                // We might need to enhance the controller or handle framing separately *after* the zoom level is set.
+                // For now, the primary zoom level change is handled by the controller.
+                // The controller's applyZoom will handle the basic setZoom with animation.
 
-                if (userPos && closestLoc.lat != null && closestLoc.lng != null) {
-                    try {
-                        const locationPos = L.latLng(closestLoc.lat, closestLoc.lng);
-                        const bounds = L.latLngBounds([userPos, locationPos]);
-
-                        map.flyToBounds(bounds, {
-                            paddingTopLeft: [50, 50],
-                            paddingBottomRight: [50, 50],
-                            maxZoom: PROXIMITY_ZOOM_IN_LEVEL,
-                            animate: true,
-                            duration: 1.2,
-                            easeLinearity: 0.25
-                        });
-                    } catch (e) {
-                        console.warn("Proximity zoom bounds error:", e);
-                        map.setZoom(PROXIMITY_ZOOM_IN_LEVEL, { animate: true, duration: 1.2 });
+                // Set the timeout to potentially unblock speed zoom later
+                setTimeout(() => {
+                    if (window.lastClosestDistance * 3.28084 > ZOOM_OUT_THRESHOLD && (window.currentSpeed || 0) < 5) {
+                        // window.blockSpeedZoom = false; // Relies on controller managing state now
+                        // Potentially request a speed zoom update here if conditions are met and controller allows
+                        // if (window.zoomController.getState().currentSource !== 'user') { // Only if user isn't interacting
+                        //    const newSpeedZoom = getSpeedBasedZoom(window.lastPosition?.speedMPS || 0);
+                        //    if (newSpeedZoom !== -1) window.zoomController.request('speed', newSpeedZoom, 1);
+                        // }
                     }
-                } else {
-                    map.setZoom(PROXIMITY_ZOOM_IN_LEVEL, { animate: true, duration: 1.2 });
-                }
+                }, 8000);
+            } else {
+                 // Zoom request denied, potentially log or handle differently
+                 console.debug("Proximity Zoom IN request denied by controller.");
             }
         }
     }
     // ZOOM OUT when leaving proximity
     else if (window.zoomedInState && distanceFeet >= ZOOM_OUT_THRESHOLD) {
         if (timeSinceLastZoom >= 3000) {
-            window.zoomedInState = false;
-            window.isNearLocation = false;
-            window.lastZoomChangeTime = proximityNow;
-            window.blockSpeedZoom = true;
-            window.lastProximityZoomTime = proximityNow;
+            // Request zoom from the controller
+            // Using a higher priority for proximity might be appropriate
+            const zoomGranted = window.zoomController.request('proximity', PROXIMITY_ZOOM_OUT_LEVEL, 3); // Example priority
 
-            setTimeout(() => { 
-                if (window.lastClosestDistance * 3.28084 > ZOOM_OUT_THRESHOLD * 1.2 && (window.currentSpeed || 0) < 8) {
-                    window.blockSpeedZoom = false;
-                }
-            }, 8000);
+            // Only update state if the controller granted the request
+            if (zoomGranted && window.zoomController.getState().currentSource === 'proximity') {
+                window.zoomedInState = false;
+                window.isNearLocation = false;
+                window.lastZoomChangeTime = proximityNow;
+                // Consider if blockSpeedZoom is still necessary if the controller manages conflicts
+                // window.blockSpeedZoom = true; // Potentially less needed with controller, but might still be used elsewhere
+                window.lastProximityZoomTime = proximityNow;
 
-            if (!window.isMapInteracting && map) {
-                map.setZoom(PROXIMITY_ZOOM_OUT_LEVEL, { animate: true, duration: 0.6, easeLinearity: 0.15 });
+                 // The controller's applyZoom will handle the basic setZoom with animation.
+
+                // Set the timeout to potentially unblock speed zoom later
+                setTimeout(() => {
+                    if (window.lastClosestDistance * 3.28084 > ZOOM_OUT_THRESHOLD * 1.2 && (window.currentSpeed || 0) < 8) {
+                        // window.blockSpeedZoom = false; // Relies on controller managing state now
+                        // Potentially request a speed zoom update here if conditions are met and controller allows
+                        // if (window.zoomController.getState().currentSource !== 'user') { // Only if user isn't interacting
+                        //    const newSpeedZoom = getSpeedBasedZoom(window.lastPosition?.speedMPS || 0);
+                        //    if (newSpeedZoom !== -1) window.zoomController.request('speed', newSpeedZoom, 1);
+                        // }
+                    }
+                }, 8000);
+            } else {
+                 // Zoom request denied, potentially log or handle differently
+                 console.debug("Proximity Zoom OUT request denied by controller.");
             }
         }
     }
@@ -3969,53 +4110,62 @@ function _applyIntelligentZoom(speedMPS, speedTier, directionChangeFactor, speed
     setTimeout(() => { mapContainer.style.overflow = originalOverflow; }, zoomDuration * 1000 + 50);
 }
 
-// Viewport safety - runs every frame to guarantee visibility
+// Viewport safety - runs frequently but not every frame to guarantee visibility, reducing jank
 function _enforceViewportSafety(speedMPH, currentMarkerPos) {
     if (!window.followUser || window.isMapInteracting) return;
-    
-    // Check EVERY frame at high speeds, frequently at moderate speeds
-    const CHECK_INTERVAL = speedMPH > 40 ? 0 : (speedMPH > 20 ? 33 : 66);
+
+    // Introduce a minimum interval even at high speeds to reduce frequency of checks
+    // This addresses Claude's concern about "every frame" execution.
+    const BASE_CHECK_INTERVAL = 16; // ~60fps minimum
+    const SPEED_FACTOR_INTERVAL = speedMPH > 40 ? 0 : (speedMPH > 20 ? 33 : 66);
+    // Use the larger of the two: either the speed-based interval OR the minimum
+    const CHECK_INTERVAL = Math.max(BASE_CHECK_INTERVAL, SPEED_FACTOR_INTERVAL);
+
     const now_vsf = performance.now();
-    
+
     if (!window.lastViewportCheck) window.lastViewportCheck = 0;
-    if (CHECK_INTERVAL > 0 && (now_vsf - window.lastViewportCheck <= CHECK_INTERVAL)) return;
-    
+    // Check against the calculated interval
+    if (now_vsf - window.lastViewportCheck <= CHECK_INTERVAL) return;
+
     window.lastViewportCheck = now_vsf;
-    
+
     const markerPos = currentMarkerPos || userMarker.getLatLng();
     const bounds = map.getBounds();
     const mapSize = map.getSize();
-    
+
     if (!markerPos || !bounds || !mapSize) return;
-    
-    // Strict safety margins - prevent ANY edge touching
-    const HARD_EDGE_LIMIT = speedMPH > 50 ? 0.05 : 
-                           (speedMPH > 30 ? 0.04 : 
-                           (speedMPH > 15 ? 0.03 : 0.025));
-    
+
+    // Use safety margins based on speed (similar to original, potentially adjustable)
+    // These margins define the "safe zone" INSIDE the viewport edges.
+    const HARD_EDGE_LIMIT = speedMPH > 50 ? 0.05 : // 5% margin at very high speed
+                           (speedMPH > 30 ? 0.04 : // 4% margin at high speed
+                           (speedMPH > 15 ? 0.03 : 0.025)); // 3% or 2.5% at lower speeds
+
     const pixelPoint = map.latLngToContainerPoint(markerPos);
     const xMargin = mapSize.x * HARD_EDGE_LIMIT;
     const yMargin = mapSize.y * HARD_EDGE_LIMIT;
-    
+
+    // Check if outside the strict limits (the margin) OR outside the map bounds entirely
     const violatesEdgeLimit = (
-        pixelPoint.x < xMargin ||
-        pixelPoint.x > mapSize.x - xMargin ||
-        pixelPoint.y < yMargin ||
-        pixelPoint.y > mapSize.y - yMargin ||
-        !bounds.contains(markerPos)
+        pixelPoint.x < xMargin || // Left edge (within margin)
+        pixelPoint.x > mapSize.x - xMargin || // Right edge (within margin)
+        pixelPoint.y < yMargin || // Top edge (within margin)
+        pixelPoint.y > mapSize.y - yMargin || // Bottom edge (within margin)
+        !bounds.contains(markerPos) // Outside map bounds (fallback)
     );
-    
+
+    // Only correct if it violates the defined limits/margins
     if (!violatesEdgeLimit) return;
-    
+
     // CRITICAL: Immediate correction when safety limit violated
     const container = map.getContainer();
     container.style.willChange = 'transform';
-    
+
     if (speedMPH > 50) {
         // Instant snap - no animation delay
-        map.panTo(markerPos, { 
-            animate: false, 
-            noMoveStart: true 
+        map.panTo(markerPos, {
+            animate: false,
+            noMoveStart: true
         });
         container.style.willChange = 'auto';
     } else if (speedMPH > 30) {
@@ -4046,7 +4196,7 @@ function _enforceViewportSafety(speedMPH, currentMarkerPos) {
         });
         requestAnimationFrame(() => container.style.willChange = 'auto');
     }
-    
+
     window.lastCenteringTime = now_vsf;
 }
         
@@ -5911,29 +6061,22 @@ function clearStationaryState() {
         window.stationaryCheckTimeout = null;
     }
 
-    // CRITICAL FIX: Keep the position buffer intact or seed it to enable immediate smoothing
-    // If we have a valid lastPosition, seed the buffer with it to enable immediate smoothing
-    if (window.lastPosition && window.lastPosition.lat !== undefined && window.lastPosition.lng !== undefined) {
-        const seedPosition = {
-            lat: window.lastPosition.lat,
-            lng: window.lastPosition.lng,
-            accuracy: window.lastPosition.accuracy || 20,
-            heading: window.lastPosition.heading ?? null,
-            timestamp: Date.now(),
-            speedMPS: window.lastPosition.speedMPS || 0
-        };
-
-        // Fill buffer with the last known position (assuming MAX_BUFFER_SIZE is 5)
-        // Using Array constructor with spread to ensure distinct object references if needed in the future
-        window.positionBuffer = Array.from({ length: 5 }, () => ({ ...seedPosition }));
+    // DON'T reset buffer - let it naturally update
+    // Only clear if truly invalid (all points are very old)
+    // This prevents the jitter caused by seeding with identical positions
+    if (window.positionBuffer && Array.isArray(window.positionBuffer)) {
+        if (window.positionBuffer.every(p => p.timestamp < Date.now() - 30000)) { // 30 seconds
+            console.debug("clearStationaryState: Clearing buffer due to old timestamps");
+            window.positionBuffer = []; // Only clear if entirely stale
+        }
+        // Otherwise, leave the buffer untouched
     } else {
-        // Fallback: only clear if we have no valid position
+        // Initialize if it doesn't exist
         window.positionBuffer = [];
     }
 
     // Reset update time to allow immediate next update
     window.lastUpdateTime = null;
-
     // DO NOT mark lastPosition as stale - this prevents jumpiness on exit
     // The next GPS update will naturally refresh the position through the smoothing pipeline
 }
@@ -6026,12 +6169,6 @@ function _restoreFullTracking() {
 
     // Trigger a position update to restore full tracking behavior
     if (window.lastPosition?.lat !== undefined && window.lastPosition?.lng !== undefined) {
-        
-        // Seed the position buffer to prevent initial jump/jitter
-        // This ensures the smoothing algorithm in updateUserLocation has context
-        if (!window.positionBuffer) {
-            window.positionBuffer = [];
-        }
 
         // Create a seed position based on the last known good position
         const seedPosition = {
@@ -6044,8 +6181,7 @@ function _restoreFullTracking() {
         };
 
         // Fill the buffer with copies of the seed position for immediate smoothing context
-        // Using 5 samples as suggested, but could be configurable
-        window.positionBuffer = Array(5).fill({ ...seedPosition }); // Use spread to avoid reference issues
+        seedPositionBuffer(seedPosition, 5); // Use the controlled helper function
 
         // Prepare the restoration position object in the format expected by updateUserLocation
         const restorationPosition = {
