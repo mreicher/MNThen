@@ -1,4 +1,14 @@
 const blogArticles = [
+    {
+  "headline": "Garcia, Augustine 'Augie' (1932 - 1999)",
+  "blurb": "The Godfather of Minnesota Rock 'n' Roll who packed Twin Cities clubs, opened for Elvis, and helped define the region's emerging rock sound.",
+  "icon": "fa-user",
+  "author": "Matt Reicher",
+  "date": "October 28, 2025",
+  "image": "https://mnthen.com/images/garcia.jpg",
+  "url": "https://mnthen.com/blog/people/garcia.html",
+  "keywords": ["augie", "garcia", "west side", "godfather", "music", "rock n roll", "person", "all"]
+},
   {
   "headline": "Appleton, MN: A Living Memorial (1947 - Present)",
   "blurb": "Appleton, Minnesota transformed its street grid into a living war memorial, naming nearly every street after local soldiers killed in combat.",
