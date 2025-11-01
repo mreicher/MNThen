@@ -1,5 +1,5 @@
 // sw.js – Minnesota Then Service Worker
-// Version: 4.4.0 (offline-first, install-shell, stale-while-revalidate for locations)
+// Version: 4.4.1 (offline-first, install-shell, stale-while-revalidate for locations, HTML always fresh)
 
 const CACHE_NAME        = 'mnthen-v4-ios-4';
 const RUNTIME_CACHE     = 'mnthen-runtime-v4-ios';
@@ -35,9 +35,27 @@ const AUDIO_EXTENSIONS = /\.(mp3|wav|ogg|m4a|aac|flac|weba)$/i;
 const VIDEO_EXTENSIONS = /\.(mp4|webm|mov|avi|mpeg|mkv)$/i;
 const TILE_REGEX = /tile\.openstreetmap\.org\/\d+\/\d+\/\d+\.(png|jpg|jpeg|webp)/i;
 
+// CORS audio domains
+const CORS_AUDIO_DOMAINS = [
+  'storage.googleapis.com',
+  'firebasestorage.googleapis.com',
+  's3.amazonaws.com',
+  'cloudfront.net',
+  'd1234567890.cloudfront.net'
+];
+
 // ----------  helpers  ----------
 function isIOSSafari() {
   return /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+}
+
+function isCORSAudio(url) {
+  try {
+    const urlObj = new URL(url);
+    return CORS_AUDIO_DOMAINS.some(domain => urlObj.hostname.includes(domain));
+  } catch {
+    return false;
+  }
 }
 
 async function manageCacheSize(cacheName, maxEntries) {
@@ -127,6 +145,13 @@ self.addEventListener('fetch', (event) => {
   const url = request.url;
 
   if (request.method !== 'GET') return;
+
+  // ✅ NEW: Always fetch HTML documents fresh from the network
+  if (request.destination === 'document') {
+    event.respondWith(networkFirst(request));
+    return;
+  }
+
   if (NEVER_CACHE.some(p => url.includes(p))) {
     event.respondWith(fetch(request, { cache: 'no-cache' }));
     return;
@@ -154,7 +179,7 @@ self.addEventListener('fetch', (event) => {
 
 // ----------  lifecycle ----------
 self.addEventListener('install', (e) => {
-  console.log('[SW] 4.4.0 installing');
+  console.log('[SW] 4.4.1 installing'); // ✅ Version bumped
   e.waitUntil(
     caches.open(SHELL_CACHE)
           .then(cache => cache.addAll(SHELL_RESOURCES))
@@ -164,7 +189,7 @@ self.addEventListener('install', (e) => {
 });
 
 self.addEventListener('activate', (e) => {
-  console.log('[SW] 4.4.0 activating');
+  console.log('[SW] 4.4.1 activating'); // ✅ Version bumped
   e.waitUntil(
     Promise.all([
       caches.keys().then(names => Promise.all(
@@ -225,4 +250,4 @@ self.addEventListener('unhandledrejection', (e) => {
   e.preventDefault();
 });
 
-console.log('[SW] 4.4.0 ready (install-shell + offline-first + tile-cache)');
+console.log('[SW] 4.4.1 ready (install-shell + offline-first + tile-cache + HTML always fresh)');
