@@ -10,7 +10,7 @@ const blogArticles = [
   "keywords": ["augie", "garcia", "west side", "godfather", "music", "rock n roll", "person", "all"]
 },
   {
-  "headline": "Appleton, MN: A Living Memorial (1947 - Present)",
+  "headline": "Appleton, MN: A Living Memorial (1947 - )",
   "blurb": "Appleton, Minnesota transformed its street grid into a living war memorial, naming nearly every street after local soldiers killed in combat.",
   "icon": "fa-building",
   "author": "Matt Reicher",
@@ -280,7 +280,7 @@ const blogArticles = [
     "keywords": ["saint paul", "st. paul", "hamm", "mansion", "east side", "place", "all"]
   },
   {
-   "headline": "Summit Brewing Company (1986 - Present)",
+   "headline": "Summit Brewing Company (1986 - )",
    "blurb": "Summit Brewing Company pioneered underrepresented beer styles in Minnesota, starting in a converted auto parts store and becoming a statewide industry leader.",
    "icon": "fa-building",
    "author": "Matt Reicher",
@@ -360,7 +360,7 @@ const blogArticles = [
     "keywords": ["northeast", "Northeast", "Minneapolis", "saloon", "bar", "place", "all"]
   },
   {
-    "headline": "Grain Belt Beer Sign",
+    "headline": "Grain Belt Beer Sign (1941 - )",
     "blurb": "In 1941, the iconic Grain Belt Beer sign, a giant bottle cap, was erected in Minneapolis. It went dark in 1996 but was relit in 2017 after restoration efforts.",
     "icon": "fa-building",
     "author": "Matt Reicher",
