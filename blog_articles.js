@@ -1,4 +1,14 @@
 const blogArticles = [
+{
+  "headline": "Cassius, Anthony Brutus (A.B.) (1907 – 1983)",
+  "blurb": "Trailblazing Black entrepreneur who broke racial barriers in segregated Minneapolis.",
+  "icon": "fa-user",
+  "author": "Matt Reicher",
+  "date": "November 3, 2025",
+  "image": "https://mnthen.com/images/exhibit/cassius.jpg",
+  "url": "https://mnthen.com/blog/people/cassius.html",
+  "keywords": ["cassius", "anthony cassius", "minneapolis", "civil rights", "labor", "black business", "dreamland cafe", "liquor license", "history", "person", "all"]
+},
     {
   "headline": "Parrant, Pierre \"Pig's Eye\" (c. 1777 – unknown)",
   "blurb": "The whiskey-slinging squatter whose nickname briefly named what would become St. Paul—and whose ramshackle saloon helped seed Minnesota’s capital city.",
