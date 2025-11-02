@@ -6,7 +6,7 @@ const blogArticles = [
   "author": "Matt Reicher",
   "date": "November 3, 2025",
   "image": "https://mnthen.com/images/exhibit/parrant.jpg",
-  "url": "https://mnthen.com/blog/person/pigseye_parrant.html",
+  "url": "https://mnthen.com/blog/people/pigseye_parrant.html",
   "keywords": ["pig's eye", "parrant", "st paul", "frontier", "whiskey", "fort snelling", "minnesota history", "person", "all"]
 },
     {
