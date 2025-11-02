@@ -1,7 +1,7 @@
 const blogArticles = [
 {
   "headline": "Cassius, Anthony Brutus (A.B.) (1907 – 1983)",
-  "blurb": "Trailblazing Black entrepreneur who broke racial barriers in segregated Minneapolis.",
+  "blurb": "A.B. Cassius defied Minneapolis's de facto segregation, breaking barriers as a trailblazing Black entrepreneur and civic leader.",
   "icon": "fa-user",
   "author": "Matt Reicher",
   "date": "November 3, 2025",
