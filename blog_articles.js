@@ -1,6 +1,6 @@
 const blogArticles = [
     {
-  "headline": "Pierre \"Pig's Eye\" Parrant (c. 1777 – unknown)",
+  "headline": "Parrant, Pierre \"Pig's Eye\" (c. 1777 – unknown)",
   "blurb": "The whiskey-slinging squatter whose nickname briefly named what would become St. Paul—and whose ramshackle saloon helped seed Minnesota’s capital city.",
   "icon": "fa-user",
   "author": "Matt Reicher",
