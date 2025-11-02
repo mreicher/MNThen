@@ -1,5 +1,15 @@
 const blogArticles = [
     {
+  "headline": "Pierre \"Pig's Eye\" Parrant (c. 1777 – unknown)",
+  "blurb": "The whiskey-slinging squatter whose nickname briefly named what would become St. Paul—and whose ramshackle saloon helped seed Minnesota’s capital city.",
+  "icon": "fa-user",
+  "author": "Matt Reicher",
+  "date": "November 3, 2025",
+  "image": "https://mnthen.com/images/exhibit/parrant.jpg",
+  "url": "https://mnthen.com/blog/person/pigseye_parrant.html",
+  "keywords": ["pig's eye", "parrant", "st paul", "frontier", "whiskey", "fort snelling", "minnesota history", "person", "all"]
+},
+    {
   "headline": "Garcia, Augustine 'Augie' (1932 - 1999)",
   "blurb": "The Godfather of Minnesota Rock 'n' Roll who packed Twin Cities clubs, opened for Elvis, and helped define the region's emerging rock sound.",
   "icon": "fa-user",
