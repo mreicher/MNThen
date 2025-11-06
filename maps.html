@@ -3888,80 +3888,147 @@ function _clearStationaryState() {
 }
 
 function _handleProximityZoom(speedMPH, eastWestMovement) {
+    // Disable proximity zoom at higher speeds
     if (speedMPH >= 10) return;
-    const proximityNow = Date.now();
+
+    const now = Date.now();
+
+    // Rate-limit proximity checks to prevent thrashing
     if (!window.lastProximityCheck) window.lastProximityCheck = 0;
-    if (proximityNow - window.lastProximityCheck <= 150) return;
-    window.lastProximityCheck = proximityNow;
-    const { closestLocation, distanceMeters, isOnCooldown } = window.proximityState;
-    
+    if (now - window.lastProximityCheck < 150) return;
+    window.lastProximityCheck = now;
+
+    const { closestLocation, distanceMeters } = window.proximityState;
+
+    // Reset zoom state if no valid location
     if (distanceMeters === Infinity || !closestLocation) {
-        if (window.zoomedInState && window.zoomController?.getState()?.currentSource !== 'proximity') {
+        if (window.zoomedInState && window.zoomController?.getState()?.currentSource === 'proximity') {
             window.zoomController.release('proximity');
             window.zoomedInState = false;
             window.isNearLocation = false;
+            window.currentProximityLocationId = null;
+            window.blockSpeedZoom = false;
         }
         return;
     }
-    
-    // NEW: Check if cooldown applies to THIS location
+
+    // Derive stable location ID
     const locationId = closestLocation.id || `${closestLocation.lat},${closestLocation.lng}`;
-    const isThisLocationOnCooldown = isOnCooldown && window.lastCooldownLocationId === locationId;
-    
-    if (isThisLocationOnCooldown) return;
-    
+
+    // ✅ ZOOM-ONLY cooldown: prevent re-zooming too soon after zoom-out
+    const timeSinceZoomOut = now - (window.lastProximityZoomOutTime || 0);
+    const recentlyZoomedOutFromSame = (
+        window.lastProximityZoomOutLocationId === locationId &&
+        timeSinceZoomOut < 8000  // 8-second cooldown
+    );
+
+    // ✅ Location-switch guard: prevent flicker when rapidly swapping between nearby points
+    const locationJustChanged = (
+        window.currentProximityLocationId &&
+        window.currentProximityLocationId !== locationId
+    );
+    const timeSinceLocationChange = now - (window.lastProximityLocationChangeTime || 0);
+    const recentLocationSwitch = locationJustChanged && timeSinceLocationChange < 1000;
+
+    // Exit early if either condition applies
+    if (recentlyZoomedOutFromSame || recentLocationSwitch) return;
+
+    // Update location-change timestamp only when *not* zoomed in (to avoid GPS noise during proximity)
+    if (locationJustChanged && !window.zoomedInState) {
+        window.lastProximityLocationChangeTime = now;
+    }
+
+    // Thresholds (do NOT widen — per your requirement)
     const distanceFeet = distanceMeters * 3.28084;
     const ZOOM_IN_THRESHOLD_FEET = 55;
     const ZOOM_OUT_THRESHOLD_FEET = 77;
     const PROXIMITY_ZOOM_IN_LEVEL = 19;
     const PROXIMITY_ZOOM_OUT_LEVEL = 17;
-    
+
+    // Initialize state if unset
     if (typeof window.zoomedInState === 'undefined') window.zoomedInState = false;
-    const timeSinceLastZoom = window.lastZoomChangeTime ? proximityNow - window.lastZoomChangeTime : Infinity;
-    
+    const timeSinceLastZoom = window.lastZoomChangeTime ? now - window.lastZoomChangeTime : Infinity;
+
+    // ─── ZOOM-IN ───────────────────────────────────────────────────────────────
     if (!window.zoomedInState && distanceFeet <= ZOOM_IN_THRESHOLD_FEET) {
-        if (timeSinceLastZoom >= 2000) {
-            window.zoomController?.release('proximity');
-            const zoomGranted = window.zoomController?.request('proximity', PROXIMITY_ZOOM_IN_LEVEL, 3);
-            if (zoomGranted) {
-                window.zoomedInState = true;
-                window.isNearLocation = true;
-                window.lastZoomChangeTime = proximityNow;
-                window.lastProximityZoomTime = proximityNow;
-                window.currentProximityLocationId = locationId; // Track current location
-                
-                if (!window.isMapInteracting && map && window.userMarker) {
-                    const userPos = window.userMarker.getLatLng();
-                    if (userPos && closestLocation.lat != null && closestLocation.lng != null) {
-                        const locationPos = L.latLng(closestLocation.lat, closestLocation.lng);
-                        window.zoomController.requestFrameBounds(
-                            'proximity',
-                            userPos,
-                            locationPos,
-                            PROXIMITY_ZOOM_IN_LEVEL,
-                            3,
-                            {
-                                paddingTopLeft: [50, 50],
-                                paddingBottomRight: [50, 50],
-                                animate: true,
-                                duration: 1.2,
-                                easeLinearity: 0.25
-                            }
-                        );
-                    }
-                }
-            }
+        // Guard against rapid re-trigger
+        if (timeSinceLastZoom < 2000) return;
+
+        // Ensure no conflicting zoom source
+        const zoomState = window.zoomController?.getState?.();
+        if (zoomState && zoomState.currentSource && zoomState.currentSource !== 'proximity') {
+            return;
         }
-    } else if (window.zoomedInState && distanceFeet >= ZOOM_OUT_THRESHOLD_FEET) {
-        if (timeSinceLastZoom >= 3000) {
+
+        // Request zoom (release only if not already held)
+        if (zoomState?.currentSource !== 'proximity') {
+            window.zoomController?.release('proximity');
+        }
+        const zoomGranted = window.zoomController?.request('proximity', PROXIMITY_ZOOM_IN_LEVEL, 3);
+
+        if (zoomGranted) {
+            window.zoomedInState = true;
+            window.isNearLocation = true;
+            window.lastZoomChangeTime = now;
+            window.lastProximityZoomTime = now;
+            window.currentProximityLocationId = locationId;
+            window.blockSpeedZoom = true;  // 🔑 critical: block _applyIntelligentZoom
+
+            // Defer framing to let zoom settle
+            requestAnimationFrame(() => {
+                requestAnimationFrame(() => {
+                    if (!window.isMapInteracting && map && window.userMarker) {
+                        const userPos = window.userMarker.getLatLng();
+                        if (userPos && closestLocation.lat != null && closestLocation.lng != null) {
+                            const locationPos = L.latLng(closestLocation.lat, closestLocation.lng);
+                            window.zoomController?.requestFrameBounds?.(
+                                'proximity',
+                                userPos,
+                                locationPos,
+                                PROXIMITY_ZOOM_IN_LEVEL,
+                                3,
+                                {
+                                    paddingTopLeft: [50, 50],
+                                    paddingBottomRight: [50, 50],
+                                    animate: true,
+                                    duration: 1.2,
+                                    easeLinearity: 0.25
+                                }
+                            );
+                        }
+                    }
+                });
+            });
+        }
+    }
+
+    // ─── ZOOM-OUT ──────────────────────────────────────────────────────────────
+    else if (window.zoomedInState && distanceFeet >= ZOOM_OUT_THRESHOLD_FEET) {
+        // Ensure proximity still owns the zoom
+        const zoomState = window.zoomController?.getState?.();
+        if (zoomState?.currentSource !== 'proximity') {
+            window.zoomedInState = false;  // self-correct
+            return;
+        }
+
+        // Guard: only zoom out for *current* location, and after cooldown
+        if (
+            window.currentProximityLocationId === locationId &&
+            timeSinceLastZoom >= 3000
+        ) {
             window.zoomController?.release('proximity');
             const zoomGranted = window.zoomController?.request('proximity', PROXIMITY_ZOOM_OUT_LEVEL, 3);
+
             if (zoomGranted) {
                 window.zoomedInState = false;
                 window.isNearLocation = false;
-                window.lastZoomChangeTime = proximityNow;
-                window.lastProximityZoomTime = proximityNow;
-                window.lastCooldownLocationId = window.currentProximityLocationId; // Store for cooldown
+                window.lastZoomChangeTime = now;
+                window.lastProximityZoomTime = now;
+                // ✅ EXCLUSIVE TO ZOOM: do NOT touch lastCooldownLocationId
+                window.lastProximityZoomOutLocationId = locationId;
+                window.lastProximityZoomOutTime = now;
+                window.currentProximityLocationId = null;
+                window.blockSpeedZoom = false;  // 🔑 only release after confirmed exit
             }
         }
     }
