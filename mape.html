@@ -1218,107 +1218,234 @@ class EnterpriseBackgroundSync {
   }
 }
 
-// --- Add the ZoomController class definition ---
 class ZoomController {
     constructor() {
-        this.authorities = { proximity: 0, speed: 0, user: 0 }; // Priority levels (simplified)
-        this.currentSource = null; // 'proximity', 'speed', 'user', or null
-        this.currentZoom = 17; // Default zoom level, adjust if needed
-        this.lockUntil = 0; // Timestamp until which other sources are locked out
-        this.pendingZoom = null; // Store pending zoom if current source is locked
+        this.authorities = { proximity: 0, speed: 0, user: 0 };
+        this.currentSource = null;
+        this.currentZoom = 17;
+        this.lockUntil = 0;
+        this.pendingZoom = null;
         this.isApplyingPending = false;
+        this.lastUserInteraction = 0;
+        this.zoomAnimationFrame = null;
+        this.targetCenter = null; // Store intended center during zoom
     }
 
     /**
      * Requests to change the zoom level.
      * @param {string} source - The source requesting the change ('proximity', 'speed', 'user').
      * @param {number} level - The target zoom level.
-     * @param {number} priority - Priority of the request (higher number = higher priority). Default 1.
+     * @param {number} priority - Priority of the request (higher = more important).
+     * @param {Object} options - Additional options: { center: [lat, lng], animate: bool, duration: number }
      * @returns {boolean} True if the request is granted, false otherwise.
      */
-    request(source, level, priority = 1) {
+    request(source, level, priority = 1, options = {}) {
         const now = Date.now();
 
-        // Check if another source currently has authority and lock duration hasn't expired
+        // CRITICAL: Respect recent user interaction (5 second grace period)
+        if (source !== 'user' && (now - this.lastUserInteraction) < 5000) {
+            console.debug(`ZoomController: ${source} blocked - recent user interaction`);
+            return false;
+        }
+
+        // Block if map is being manually interacted with
+        if (source !== 'user' && window.isMapInteracting) {
+            console.debug(`ZoomController: ${source} blocked - user actively interacting`);
+            return false;
+        }
+
+        // Validate zoom level
+        if (!map || level < 1 || level > 20 || !isFinite(level)) {
+            console.warn(`ZoomController: Invalid zoom level ${level}`);
+            return false;
+        }
+
+        // Check if another source has lock
         if (this.currentSource && 
             this.currentSource !== source && 
             now < this.lockUntil) {
-            // Another source has lock. Check if this request has higher priority.
             if (priority > (this.authorities[this.currentSource] || 0)) {
-                // Higher priority request overrides, take control
-                console.debug(`ZoomController: ${source} (prio ${priority}) overriding ${this.currentSource} (prio ${this.authorities[this.currentSource]}).`);
+                console.debug(`ZoomController: ${source} (prio ${priority}) overriding ${this.currentSource}`);
                 this.currentSource = source;
                 this.authorities[source] = priority;
                 this.currentZoom = level;
-                this.lockUntil = now + 2000; // Reset lock duration
-                this.applyZoom(level);
+                this.lockUntil = now + (source === 'user' ? 5000 : 2000);
+                this.applyZoom(level, options);
                 return true;
             } else {
-                // Lower or equal priority, denied
-                console.debug(`ZoomController: ${source} request denied, ${this.currentSource} has lock.`);
+                // Store as pending for lower priority requests
+                if (source !== 'user') {
+                    this.pendingZoom = { source, level, priority, options };
+                }
+                console.debug(`ZoomController: ${source} request queued`);
                 return false;
             }
         }
 
-        // No active lock or request is from the current source, or higher priority override occurred above
+        // Grant request
         this.currentSource = source;
         this.authorities[source] = priority;
         this.currentZoom = level;
-        this.lockUntil = now + 2000; // Set lock duration (2 seconds as per Claude's suggestion)
-        this.applyZoom(level);
+        this.lockUntil = now + (source === 'user' ? 5000 : 2000);
+        
+        if (source === 'user') {
+            this.lastUserInteraction = now;
+        }
+        
+        this.applyZoom(level, options);
         return true;
     }
 
     /**
      * Actually applies the zoom level to the map.
      * @param {number} level - The zoom level to set.
+     * @param {Object} options - { center: [lat, lng], animate: bool, duration: number }
      */
-   applyZoom(level) {
-        if (map) { // Ensure map object exists
-            // Example: Using Leaflet's setZoom
-            // Adjust animation options as needed based on source if necessary
-            const animate = true; // Or false for speed changes if desired
-            const duration = this.currentSource === 'proximity' ? 2.0 : 0.8;  
-            map.setZoom(level, { animate: animate, duration: duration, noMoveStart: true });
-            console.debug(`ZoomController: Applied zoom ${level} for source ${this.currentSource}.`);
-        } else {
+    applyZoom(level, options = {}) {
+        if (!map) {
             console.warn("ZoomController: Cannot apply zoom, map object not found.");
+            return;
+        }
+
+        // Cancel any pending zoom animation
+        if (this.zoomAnimationFrame) {
+            cancelAnimationFrame(this.zoomAnimationFrame);
+            this.zoomAnimationFrame = null;
+        }
+
+        const currentZoom = map.getZoom();
+        
+        // Prevent micro-adjustments that cause jumping
+        if (Math.abs(currentZoom - level) < 0.1) {
+            console.debug(`ZoomController: Ignoring micro-adjustment (${currentZoom} → ${level})`);
+            return;
+        }
+
+        // Get center point - use provided center or current user position
+        let center = options.center;
+        if (!center) {
+            if (window.lastPosition) {
+                center = [window.lastPosition.lat, window.lastPosition.lng];
+            } else {
+                center = map.getCenter();
+            }
+        }
+
+        this.targetCenter = center;
+
+        // Configure animation based on source
+        const animate = options.animate !== false; // Default true
+        let duration = options.duration;
+        
+        if (!duration) {
+            if (this.currentSource === 'user') {
+                duration = 0.3; // Fast for user
+                animate = false; // Instant for user zoom
+            } else if (this.currentSource === 'proximity') {
+                duration = 2.5; // Smooth for proximity
+            } else {
+                duration = 1.2; // Medium for speed
+            }
+        }
+
+        // Apply zoom with proper centering to prevent jumping
+        const zoomOptions = {
+            animate: animate,
+            duration: duration,
+            noMoveStart: true // Prevents triggering movestart event
+        };
+
+        try {
+            // Use RAF to ensure smooth application
+            this.zoomAnimationFrame = requestAnimationFrame(() => {
+                if (!map) return;
+                
+                // Key fix: Set view and zoom together to prevent jumping
+                if (Array.isArray(center) && center.length === 2) {
+                    map.setView(center, level, zoomOptions);
+                } else {
+                    map.setZoom(level, zoomOptions);
+                }
+                
+                console.debug(`ZoomController: Applied zoom ${level} for ${this.currentSource} at [${center}]`);
+                this.zoomAnimationFrame = null;
+            });
+        } catch (error) {
+            console.error('ZoomController: Error applying zoom', error);
         }
     }
 
     /**
-     * Releases authority for a specific source. Does not necessarily change the zoom.
-     * Useful for 'user' interaction ending.
+     * Releases authority for a specific source.
      */
     release(source) {
         if (this.currentSource === source) {
-             // Simple release: clear current source, allow others to request
-             // Could also implement logic to revert to a default zoom based on the other active source
-             console.debug(`ZoomController: Authority released by ${source}.`);
-             this.currentSource = null; // Allow next request to proceed
-             // Consider resetting lock time or keeping it if other auto-zooms are active?
-             // For now, just release the source.
-             // this.lockUntil = 0; // Uncomment if you want to immediately allow other sources without waiting for lock expiry
+            console.debug(`ZoomController: Authority released by ${source}`);
+            this.currentSource = null;
+            
+            // Process pending zoom request if any
+            if (this.pendingZoom && !this.isApplyingPending) {
+                this.isApplyingPending = true;
+                const { source: pSource, level, priority, options } = this.pendingZoom;
+                this.pendingZoom = null;
+                setTimeout(() => {
+                    this.request(pSource, level, priority, options);
+                    this.isApplyingPending = false;
+                }, 100);
+            }
         }
+    }
+
+    /**
+     * Force cancel all pending zooms (useful when user takes control)
+     */
+    cancelPending() {
+        if (this.zoomAnimationFrame) {
+            cancelAnimationFrame(this.zoomAnimationFrame);
+            this.zoomAnimationFrame = null;
+        }
+        this.pendingZoom = null;
+        this.currentSource = null;
+        this.lastUserInteraction = Date.now();
     }
 
     /**
      * Gets the current zoom authority state.
-     * @returns {Object} Object containing current source, lock status, etc.
      */
     getState() {
         return {
             currentSource: this.currentSource,
             lockUntil: this.lockUntil,
             isLocked: Date.now() < this.lockUntil,
-            currentZoom: this.currentZoom
+            currentZoom: this.currentZoom,
+            hasPending: !!this.pendingZoom
         };
     }
 }
 
 // Initialize the global ZoomController instance
 window.zoomController = new ZoomController();
-// --- End of ZoomController class definition ---
+
+// Hook into map interaction events to cancel auto-zoom
+if (typeof map !== 'undefined') {
+    map.on('zoomstart', (e) => {
+        if (!e.sourceTarget || e.sourceTarget === map) {
+            // User-initiated zoom
+            window.zoomController.cancelPending();
+        }
+    });
+    
+    map.on('movestart', (e) => {
+        if (!e.sourceTarget || e.sourceTarget === map) {
+            // User-initiated move
+            window.isMapInteracting = true;
+        }
+    });
+    
+    map.on('moveend', () => {
+        window.isMapInteracting = false;
+    });
+}
 
 const enterpriseCacheManager = new EnterpriseCacheManager();
 const enterpriseSecurityManager = new EnterpriseSecurityManager();
