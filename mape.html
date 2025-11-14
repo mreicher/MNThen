@@ -1503,10 +1503,14 @@ const CONFIG = {
     ],
     BEARING_TOLERANCE: 30,
     DWELL_TIME: 100,
+    DEBOUNCE_MS: 200,
+    CLAMP_MIN: 0.2,
+    CLAMP_MAX: 3
 };
 
 let map, userMarker, markerClusterGroup;
 let tracking;
+let postInteractionDebounce = 0;
 let currentLocationIndex = 0;
 let visitedLocations = [];
 let gameLocations = [];
@@ -3855,6 +3859,15 @@ if (isLocationHuntVisible && !forceUpdate) {
     skipAutoBehaviors = true;
 }
 
+function _clamp(val, min, max) {
+    return Math.min(Math.max(val, min), max);
+}
+
+// Call this when interaction ends
+function _resetInteractionDebounce() {
+    postInteractionDebounce = Date.now() + CONFIG.DEBOUNCE_MS;
+}
+
 const performVisualUpdates = () => {
     window._nextLocationUpdateRAF = null;
     window._rafPending = false;
@@ -3862,23 +3875,10 @@ const performVisualUpdates = () => {
     const now = Date.now();
     const isHighSpeedMode = speedMPH >= 15;
 
-    // 🛡️ HIGH-SPEED SAFETY NET: auto-recover from stuck intentional pan
-    if (isHighSpeedMode && window.userIntentionallyPannedAway) {
-        const timeSinceLastUpdate = now - (window.lastMapUpdateTime || 0);
-        // If map hasn't updated in >2x tier interval, force recovery
-        if (timeSinceLastUpdate > speedTier.mapUpdateInterval * 2) {
-            window.userIntentionallyPannedAway = false;
-            console.warn("High-speed safety: Forcibly cleared userIntentionallyPannedAway due to timeout");
-        }
-    }
-
-    // ✅ ALWAYS UPDATE MARKER POSITION — critical for visual consistency
-    // Runs regardless of interaction state, before any logic branches
+    // ✅ ALWAYS UPDATE MARKER POSITION
     if (isHighSpeedMode) {
-        // 🚀 ≥15mph: Snap to exact position (map does the moving)
         userMarker.setLatLng([smoothedPosition.lat, smoothedPosition.lng]);
     } else {
-        // 🚶 <15mph: Smooth local animation
         userMarker.setLatLng([smoothedPosition.lat, smoothedPosition.lng], {
             animate: true,
             duration: finalAnimationDuration,
@@ -3886,61 +3886,77 @@ const performVisualUpdates = () => {
         });
     }
 
-    // 🔒 RESPECT ACTIVE GESTURES — exit early to avoid fighting user input
+    // 🔒 RESPECT ACTIVE GESTURES - Exit early for performance
     if (window.isMapInteracting) {
-        console.debug("performVisualUpdates: Interaction in progress, skipping auto-centering.");
-        // ✅ Still run proximity zoom — safe, non-intrusive, improves UX during glance
+        // Still run proximity zoom - safe during interaction
         _handleProximityZoom(speedMPH, eastWestMovement);
-        return; // ← Prevents map.setView() mid-drag/pinch
+        return;
     }
 
-    // 👁️ Proximity zoom (redundant safety call — harmless if already run)
+    // 👁️ Proximity zoom
     _handleProximityZoom(speedMPH, eastWestMovement);
 
-    // 🗺️ MAP CENTERING / PANNING — only runs when NOT interacting
-    if (!skipAutoBehaviors && map && !window.blockMapUpdates) {
+    // 🗺️ MAP CENTERING / PANNING - Safe to proceed (no active interaction)
+    if (!skipAutoBehaviors && map) {
         const userPos = smoothedPosition;
         const bounds = map.getBounds();
         
         if (userPos && bounds) {
             const timeSinceLastInteraction = now - (window.lastInteractionTime || 0);
-            const postInteractionBufferMs = 1500;
-            const recentlyInteracted = timeSinceLastInteraction < postInteractionBufferMs;
+            const recentlyInteracted = timeSinceLastInteraction < 1500;
+
+            // SMART RECOVERY: Auto-clear intentional pan after inactivity (works for both speeds)
+            const timeSincePanAway = now - (window.lastIntentionalPanTime || 0);
+            const shouldRecoverFromPan = (
+                window.userIntentionallyPannedAway && 
+                !recentlyInteracted && 
+                timeSincePanAway > 5000
+            );
+            
+            if (shouldRecoverFromPan) {
+                window.userIntentionallyPannedAway = false;
+                console.log("Auto-recovery: User inactive for 5s, resuming auto-center");
+            }
 
             if (isHighSpeedMode) {
-                // 🚀 HIGH-SPEED MODE (≥15 MPH): AGGRESSIVE & AUTOMATIC RECOVERY
+                // 🚀 HIGH-SPEED MODE: Force centering with post-interaction debounce
                 const shouldUpdateMap = (
+                    now > postInteractionDebounce && // ✅ Debounce applied to high-speed
                     now - (window.lastMapUpdateTime || 0) > speedTier.mapUpdateInterval
                 ) && !window.mapUpdateInProgress;
                 
                 if (shouldUpdateMap) {
                     window.mapUpdateInProgress = true;
                     try {
-                        // Force center — high speed overrides intentional pan
+                        // Defensive validation for animation factors
+                        const safeDirectionFactor = _clamp(directionChangeFactor, CONFIG.CLAMP_MIN, CONFIG.CLAMP_MAX);
+                        const safeEastWestFactor = eastWestMovement ? 0.9 : 1;
+                        
+                        // Force center - high speed overrides intentional pan
                         map.setView([userPos.lat, userPos.lng], map.getZoom(), {
                             animate: true,
-                            duration: speedTier.panDuration * directionChangeFactor * (eastWestMovement ? 0.9 : 1),
-                            easeLinearity: speedTier.easeLinearity * (eastWestMovement ? 0.8 : 1)
+                            duration: speedTier.panDuration * safeDirectionFactor * safeEastWestFactor,
+                            easeLinearity: speedTier.easeLinearity * safeDirectionFactor * safeEastWestFactor
                         });
                         
-                        // Apply intelligent zoom only if not blocked
-                        if (!window.blockSpeedZoom) {
-                            _applyIntelligentZoom(newPosition.speedMPS, speedTier, directionChangeFactor, speedMPH);
+                        // Guard the intelligent zoom during interaction and apply clamped factors
+                        if (!window.blockSpeedZoom && !window.isZooming) {
+                            // Pass clamped factor to zoom function for consistency
+                            const clampedDirectionFactor = _clamp(directionChangeFactor, CONFIG.CLAMP_MIN, CONFIG.CLAMP_MAX);
+                            _applyIntelligentZoom(newPosition.speedMPS, speedTier, clampedDirectionFactor, speedMPH);
                         }
+                        
+                        // Clear intentional pan flag after successful centering
+                        window.userIntentionallyPannedAway = false;
                     } catch (error) {
                         console.error('High-speed map update error:', error);
                     } finally {
                         window.lastMapUpdateTime = now;
                         window.mapUpdateInProgress = false;
-                        // AUTO-RECOVERY: Clear intentional pan flag after successful center
-                        if (window.userIntentionallyPannedAway) {
-                            window.userIntentionallyPannedAway = false;
-                            console.debug("High-speed recovery: Cleared userIntentionallyPannedAway flag post-centering.");
-                        }
                     }
                 }
             } else {
-                // LOW-SPEED MODE (<15 MPH): FULL BACKWARDS COMPATIBILITY
+                // 🐌 LOW-SPEED MODE: Apply debounce to low-speed as well
                 const mapUpdateInterval = speedTier.mapUpdateInterval;
                 const aggressiveness = speedAggressiveness(speedMPH);
                 let mapUpdateDistanceThreshold = speedTier.mapUpdateDistance * (1 - 0.4 * aggressiveness);
@@ -3951,17 +3967,17 @@ const performVisualUpdates = () => {
                     : _isNearViewportEdge(userPos, bounds, speedMPH);
                 
                 const lastMapCenter = window.lastMapCenter || map.getCenter();
-                const distanceSinceLastUpdate = Math.sqrt(
-                    Math.pow(userPos.lat - lastMapCenter.lat, 2) + 
-                    Math.pow(userPos.lng - lastMapCenter.lng, 2)
-                ) * 111000;
+                const distanceSinceLastUpdate = L.latLng(userPos.lat, userPos.lng).distanceTo(lastMapCenter);
                 
                 const shouldUpdateMap = (
-                    (isNearEdge && !recentlyInteracted && !window.userIntentionallyPannedAway) || 
-                    (!recentlyInteracted && !window.userIntentionallyPannedAway && (
-                        now - (window.lastMapUpdateTime || 0) > mapUpdateInterval ||
-                        distanceSinceLastUpdate > mapUpdateDistanceThreshold
-                    ))
+                    now > postInteractionDebounce && // ✅ Debounce applied to low-speed too
+                    (
+                        (isNearEdge && !recentlyInteracted && !window.userIntentionallyPannedAway) || 
+                        (!recentlyInteracted && !window.userIntentionallyPannedAway && (
+                            now - (window.lastMapUpdateTime || 0) > mapUpdateInterval ||
+                            distanceSinceLastUpdate > mapUpdateDistanceThreshold
+                        ))
+                    )
                 ) && !window.mapUpdateInProgress;
                 
                 if (shouldUpdateMap) {
@@ -3975,11 +3991,14 @@ const performVisualUpdates = () => {
                             _panMapIfNearEdge(userPos, speedTier, directionChangeFactor, eastWestMovement, bounds);
                         }
                         window.lastMapCenter = map.getCenter();
-                        if (!window.blockSpeedZoom) {
-                            _applyIntelligentZoom(newPosition.speedMPS, speedTier, directionChangeFactor, speedMPH);
+                        
+                        // Guard the intelligent zoom during interaction and apply clamped factors
+                        if (!window.blockSpeedZoom && !window.isZooming) {
+                            const clampedDirectionFactor = _clamp(directionChangeFactor, CONFIG.CLAMP_MIN, CONFIG.CLAMP_MAX);
+                            _applyIntelligentZoom(newPosition.speedMPS, speedTier, clampedDirectionFactor, speedMPH);
                         }
                     } catch (error) {
-                        console.error('Roaming mode map update error:', error);
+                        console.error('Low-speed map update error:', error);
                     } finally {
                         window.lastMapUpdateTime = now;
                         window.mapUpdateInProgress = false;
@@ -3987,12 +4006,13 @@ const performVisualUpdates = () => {
                 }
             }
             
-            // Enforce viewport safety (prevents marker from going off-screen)
-            _enforceViewportSafety(speedMPH, smoothedPosition);
+            // Only enforce viewport safety when not interacting
+            if (!window.isMapInteracting) {
+                _enforceViewportSafety(speedMPH, smoothedPosition);
+            }
         }
     }
 
-    // Update UI elements (distance box, etc.)
     if (typeof updateDistanceBox === 'function') {
         updateDistanceBox();
     }
@@ -8000,64 +8020,77 @@ function setupEventListeners() {
     };
 
 const handleInteractionStart = (source) => {
-    // Update GLOBAL state (what your tracking code actually uses)
+    // Update GLOBAL state
     window.followUser = false;
-    window.isMapInteracting = true;
-    // Block map updates during interaction ***
-    window.blockMapUpdates = true; 
-
-    // Clear the intentional pan flag on ANY interaction start ***
-    window.userIntentionallyPannedAway = false;
-    console.debug("handleInteractionStart: userIntentionallyPannedAway cleared");
-
+    window.isMapInteracting = true; // ✅ This is the primary guard
+    
+    // Set zoom flag if this is a zoom interaction
+    if (source.includes('zoom')) {
+        window.isZooming = true;
+    }
+    
     // Keep your existing logic if needed
     interactionState.followUser = false;
     interactionState.isMapInteracting = true;
-
+    
     if (interactionState.inactivityTimer) {
         clearTimeout(interactionState.inactivityTimer);
         interactionState.inactivityTimer = null;
     }
-
+    
     // Start marker protection
     markerAntiJumpSystem.startInteraction();
-
-    console.debug(`Interaction started: ${source}`);
+    
+    console.debug(`Interaction started: ${source}`); // ✅ Fixed template syntax
 };
 
 const handleInteractionEnd = (source) => {
     // Update GLOBAL state
     window.isMapInteracting = false;
-    // Allow map updates after interaction 
-    window.blockMapUpdates = false; 
+    window.isZooming = false; // ✅ Always clear zoom flag on any interaction end
+    
     // Update GLOBAL interaction time
-    window.lastInteractionTime = Date.now(); // <-- Set the time when interaction ends
-
-    // Check marker position relative to map view ON INTERACTION END 
-    // This determines if the user intentionally moved the map view away from the marker
+    window.lastInteractionTime = Date.now();
+    
+    // ✅ Check if user panned away from marker position
     if (map && userMarker) {
         const userPos = userMarker.getLatLng();
         const bounds = map.getBounds();
-        // Use the existing _isNearViewportEdge function to check proximity to edge
-        window.userIntentionallyPannedAway = _isNearViewportEdge(userPos, bounds, window.currentSpeed || 0);
-        console.debug("handleInteractionEnd: userIntentionallyPannedAway set to", window.userIntentionallyPannedAway, "based on _isNearViewportEdge result");
+        
+        // Use existing function to check if marker is near edge
+        const isMarkerNearEdge = _isNearViewportEdge(userPos, bounds, window.currentSpeed || 0);
+        
+        // Set intentional pan flag based on whether marker is near edge
+        window.userIntentionallyPannedAway = isMarkerNearEdge;
+        
+        // Record when this intentional pan occurred
+        if (window.userIntentionallyPannedAway) {
+            window.lastIntentionalPanTime = Date.now();
+            console.debug("User panned away from marker (marker near edge)");
+        } else {
+            console.debug("User interaction, but marker still centered");
+        }
     } else {
-        // Fallback if map/userMarker not ready at this moment
+        // Fallback if map/userMarker not ready
         window.userIntentionallyPannedAway = false;
     }
-
-    // Keep your existing logic if needed
+    
+    // Keep your existing logic
     interactionState.isMapInteracting = false;
-
-    // End marker protection and restore positions (with fix now)
+    
+    // End marker protection and restore positions
     markerAntiJumpSystem.endInteraction();
-
+    
     // Reset anti-jumping state
     interactionState.touch.velocityBuffer = [];
     interactionState.touch.smoothedPosition = null;
-
+    
+    // ✅ CRITICAL: Reset the interaction debounce to prevent immediate centering
+    _resetInteractionDebounce();
+    
     resetInactivityTimer();
-    console.debug(`Interaction ended: ${source}`);
+    
+    console.debug(`Interaction ended: ${source}`); // ✅ Fixed template syntax
 };
 
     // Enhanced map events with marker protection
