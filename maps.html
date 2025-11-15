@@ -1747,6 +1747,7 @@ function initMap() {
     }
     
     map = L.map('map', {
+        worldCopyJump: true, 
         zoomControl: false,
         attributionControl: false,
         zoomSnap: 0.1,
@@ -3733,114 +3734,166 @@ if (isLocationHuntVisible && !forceUpdate) {
       const HIGH_SPEED_THRESHOLD_MPH = 0.5; // Change to 15 for production
 
 const performVisualUpdates = () => {
-    window._nextLocationUpdateRAF = null;
-    window._rafPending = false;
-    
-    // Early exit conditions
-    if (!map || !smoothedPosition || window.blockMapUpdates) return;
-    
-    // --- 1. Always update marker position
+  window._nextLocationUpdateRAF = null;
+  window._rafPending = false;
+
+  // --- Guard clauses ---
+  if (!map || !smoothedPosition || window.blockMapUpdates) return;
+
+  const userPos = smoothedPosition;
+  const bounds = map.getBounds();
+  if (!userPos || !bounds) return;
+
+  const now = Date.now();
+  const isHighSpeedMode = speedMPH >= HIGH_SPEED_THRESHOLD_MPH; // 0.5 for testing
+
+  // --- 1. Always update marker position (smooth)
+  try {
+    userMarker.setLatLng([userPos.lat, userPos.lng], {
+      animate: true,
+      duration: Math.max(0.1, finalAnimationDuration),
+      easeLinearity: Math.min(1, Math.max(0.2, finalEaseLinearity))
+    });
+  } catch (e) {
+    console.warn('Marker update failed:', e);
+  }
+
+  // --- 2. Proximity zoom (if user not interacting)
+  if (!window.isMapInteracting) {
+    _handleProximityZoom(speedMPH, eastWestMovement);
+  }
+
+  // --- 3. Auto-behaviors (skip if user is interacting)
+  if (window.isMapInteracting || skipAutoBehaviors) {
+    return;
+  }
+
+  // --- Helper: compute dynamic edge margin (larger at low speed)
+  const getEdgeMarginFraction = (speed) => {
+    // 0.4 at 0 mph → 0.15 at 15+ mph (smooth decay)
+    return Math.max(0.15, 0.4 - (speed / 30));
+  };
+
+  // --- 4. Determine zoom level *before* pan (to avoid flicker)
+  let targetZoom = map.getZoom();
+  let zoomChanged = false;
+  if (!window.blockSpeedZoom) {
     try {
-        userMarker.setLatLng([smoothedPosition.lat, smoothedPosition.lng], {
-            animate: true,
-            duration: Math.max(0.1, finalAnimationDuration),
-            easeLinearity: Math.min(1, Math.max(0.2, finalEaseLinearity))
+      // Let intelligent zoom suggest new level; returns { zoom, changed }
+      const zoomResult = _applyIntelligentZoom(newPosition.speedMPS, speedTier, directionChangeFactor, speedMPH);
+      if (zoomResult && zoomResult.changed) {
+        targetZoom = zoomResult.zoom;
+        zoomChanged = true;
+      }
+    } catch (error) {
+      console.error('Intelligent zoom failed:', error);
+    }
+  }
+
+  // --- 5. Handle centering / roaming
+  const timeSinceLastUpdate = now - (window.lastMapUpdateTime || 0);
+  const lastMapCenter = window.lastMapCenter || map.getCenter();
+  const metersSinceLastCenter = map.distance(lastMapCenter, userPos);
+
+  // --- HIGH-SPEED: Center + Look-Ahead (≥ threshold)
+  if (isHighSpeedMode) {
+    // Dynamic update trigger: time OR distance (>5m drift)
+    const shouldUpdateMap = (
+      (timeSinceLastUpdate >= 100) ||
+      (metersSinceLastCenter > 5)
+    ) && !window.mapUpdateInProgress;
+
+    if (shouldUpdateMap) {
+      window.mapUpdateInProgress = true;
+      try {
+        // Adaptive easing: more linear at high speeds
+        const easeLinearity = Math.min(1, Math.max(0.3, speedMPH / 25));
+
+        // Duration scales with speed (faster = quicker update)
+        const duration = Math.max(0.08, speedTier.panDuration * (eastWestMovement ? 0.85 : 1));
+
+        // Atomic flyTo: lat/lng + zoom in one smooth call
+        map.flyTo([userPos.lat, userPos.lng], targetZoom, {
+          animate: true,
+          duration,
+          easeLinearity,
+          noMoveStart: true
         });
-    } catch (e) {
-        console.warn('Marker update failed:', e);
+
+        window.lastMapCenter = L.latLng(userPos.lat, userPos.lng);
+        window.lastMapUpdateTime = now;
+      } catch (error) {
+        console.error('High-speed flyTo failed:', error);
+      } finally {
+        window.mapUpdateInProgress = false;
+      }
     }
-    
-    // --- 2. Proximity zoom
-    if (!window.isMapInteracting) {
-        _handleProximityZoom(speedMPH, eastWestMovement);
-    }
-    
-    // --- 3. CENTERING LOGIC — SKIP IF USER IS INTERACTING
-    if (window.isMapInteracting || skipAutoBehaviors) {
-        return; // Let user control the map
-    }
-    
-    const userPos = smoothedPosition;
-    const bounds = map.getBounds();
-    if (!userPos || !bounds) return;
-    
-    const now = Date.now();
-    const isHighSpeedMode = speedMPH >= HIGH_SPEED_THRESHOLD_MPH;
-    
-    if (isHighSpeedMode) {
-        // HIGH SPEED: Always center on user
-        const timeSinceLastUpdate = now - (window.lastMapUpdateTime || 0);
-        const shouldUpdateMap = (timeSinceLastUpdate >= 250) && !window.mapUpdateInProgress;
-        
-        if (shouldUpdateMap) {
-            window.mapUpdateInProgress = true;
-            try {
-                map.setView([userPos.lat, userPos.lng], map.getZoom(), {
-                    animate: true,
-                    duration: Math.max(0.2, speedTier.panDuration * (eastWestMovement ? 0.85 : 1)),
-                    easeLinearity: Math.max(0.3, speedTier.easeLinearity * (eastWestMovement ? 0.8 : 1)),
-                    noMoveStart: true
-                });
-                
-                window.lastMapCenter = L.latLng(userPos.lat, userPos.lng);
-                window.lastMapUpdateTime = now;
-                
-                if (!window.blockSpeedZoom) {
-                    _applyIntelligentZoom(newPosition.speedMPS, speedTier, directionChangeFactor, speedMPH);
-                }
-            } catch (error) {
-                console.error('High-speed centering failed:', error);
-            } finally {
-                window.mapUpdateInProgress = false;
-            }
+  }
+  // --- LOW-SPEED: Roaming (keep icon visible, not centered)
+  else {
+    const mapUpdateInterval = speedTier.mapUpdateInterval;
+    const aggressiveness = speedAggressiveness(speedMPH);
+    let mapUpdateDistanceThreshold = speedTier.mapUpdateDistance * (1 - 0.4 * aggressiveness);
+    mapUpdateDistanceThreshold *= (eastWestMovement ? 0.9 : 1.0);
+
+    // Dynamic edge margin based on speed
+    const edgeMargin = getEdgeMarginFraction(speedMPH);
+    const isNearEdge = _isNearViewportEdge(userPos, bounds, speedMPH, edgeMargin);
+
+    const shouldUpdateMap = (
+      isNearEdge ||
+      timeSinceLastUpdate > mapUpdateInterval ||
+      metersSinceLastCenter > mapUpdateDistanceThreshold
+    ) && !window.mapUpdateInProgress;
+
+    if (shouldUpdateMap) {
+      window.mapUpdateInProgress = true;
+      try {
+        // Compute target center *at target zoom* (avoids post-pan shift)
+        let targetCenter;
+
+        if (isNearEdge) {
+          targetCenter = _emergencyCenterMap(userPos, speedTier, directionChangeFactor, eastWestMovement, speedMPH);
+        } else if (speedMPH >= 10 && lookAheadPosition) {
+          targetCenter = _panMapToLookAhead(lookAheadPosition, speedTier, directionChangeFactor, eastWestMovement, speedMPH, bounds);
+        } else {
+          targetCenter = _panMapIfNearEdge(userPos, speedTier, directionChangeFactor, eastWestMovement, bounds);
         }
-    } else {
-        // LOW SPEED: Roaming mode with edge detection
-        const mapUpdateInterval = speedTier.mapUpdateInterval;
-        const aggressiveness = speedAggressiveness(speedMPH);
-        let mapUpdateDistanceThreshold = speedTier.mapUpdateDistance * (1 - 0.4 * aggressiveness);
-        mapUpdateDistanceThreshold *= (eastWestMovement ? 0.9 : 1.0);
-        
-        const isNearEdge = _isNearViewportEdge(userPos, bounds, speedMPH);
-        const lastMapCenter = window.lastMapCenter || map.getCenter();
-        const distanceSinceLastUpdate = Math.sqrt(
-            Math.pow(userPos.lat - lastMapCenter.lat, 2) + 
-            Math.pow(userPos.lng - lastMapCenter.lng, 2)
-        ) * 111000;
-        
-        const shouldUpdateMap = (
-            isNearEdge ||
-            now - (window.lastMapUpdateTime || 0) > mapUpdateInterval ||
-            distanceSinceLastUpdate > mapUpdateDistanceThreshold
-        ) && !window.mapUpdateInProgress;
-        
-        if (shouldUpdateMap) {
-            window.mapUpdateInProgress = true;
-            try {
-                if (isNearEdge) {
-                    _emergencyCenterMap(userPos, speedTier, directionChangeFactor, eastWestMovement, speedMPH);
-                } else if (speedMPH >= 10) {
-                    _panMapToLookAhead(lookAheadPosition, speedTier, directionChangeFactor, eastWestMovement, speedMPH, bounds);
-                } else {
-                    _panMapIfNearEdge(userPos, speedTier, directionChangeFactor, eastWestMovement, bounds);
-                }
-                
-                window.lastMapCenter = map.getCenter();
-                window.lastMapUpdateTime = now;
-                
-                if (!window.blockSpeedZoom) {
-                    _applyIntelligentZoom(newPosition.speedMPS, speedTier, directionChangeFactor, speedMPH);
-                }
-            } catch (error) {
-                console.error('Roaming mode update failed:', error);
-            } finally {
-                window.mapUpdateInProgress = false;
-            }
+
+        // Ensure targetCenter is valid
+        if (!targetCenter || !targetCenter.lat || !targetCenter.lng) {
+          targetCenter = userPos;
         }
+
+        // Adaptive easing: smoother at low speeds
+        const easeLinearity = Math.min(0.8, Math.max(0.3, 0.6 + (speedMPH / 20)));
+
+        const duration = Math.max(0.2, speedTier.panDuration * (1 + (1 - aggressiveness) * 0.5));
+
+        // Atomic flyTo: center + zoom
+        map.flyTo([targetCenter.lat, targetCenter.lng], targetZoom, {
+          animate: true,
+          duration,
+          easeLinearity,
+          noMoveStart: true
+        });
+
+        window.lastMapCenter = map.getCenter();
+        window.lastMapUpdateTime = now;
+      } catch (error) {
+        console.error('Roaming flyTo failed:', error);
+      } finally {
+        window.mapUpdateInProgress = false;
+      }
     }
-    
-    // Safety check
+  }
+
+  // --- 6. Safety: enforce viewport bounds (with world wrap awareness)
+  try {
     _enforceViewportSafety(speedMPH, userPos);
+  } catch (e) {
+    console.warn('Viewport safety check failed:', e);
+  }
 };
 
         window._nextLocationUpdateRAF = requestAnimationFrame(performVisualUpdates);
@@ -4114,18 +4167,68 @@ function _handleProximityZoom(speedMPH, eastWestMovement) {
     }
 }
 
-function _isNearViewportEdge(userPos, bounds, speedMPH) {
-    const EDGE_MARGIN = speedMPH > 50 ? 0.15 : (speedMPH > 30 ? 0.12 : (speedMPH > 15 ? 0.10 : 0.08));
+function _isNearViewportEdge(userPos, bounds, speedMPH, marginFraction = null) {
+  // Guard: invalid input
+  if (!userPos || !bounds || !map) return true;
+
+  // Compute dynamic margin if not provided (larger at low speeds for better roaming)
+  const speedBasedMargin = (() => {
+    if (marginFraction !== null) return marginFraction; // allow override
+    // 0.35 at 0 mph → 0.10 at 50+ mph (smooth, non-linear decay)
+    // Favor forward context at low speeds: user should see "what's ahead"
+    const base = 0.35;
+    const decay = Math.min(1, speedMPH / 60);
+    return base * (1 - decay) + 0.10 * decay;
+  })();
+
+  // Fast-path: if inside and well within bounds, skip pixel conversion
+  if (bounds.contains(userPos)) {
+    // Use geographic margin (more stable than pixels across zoom levels)
+    const [south, west, north, east] = [
+      bounds.getSouth(), bounds.getWest(),
+      bounds.getNorth(), bounds.getEast()
+    ];
+
+    const latMargin = (north - south) * speedBasedMargin;
+    const lngMargin = (east - west) * speedBasedMargin;
+
+    // Account for world-wrapping: normalize longitude difference
+    const lngDiff = Math.min(
+      Math.abs(userPos.lng - east),
+      Math.abs(userPos.lng - west),
+      Math.abs(userPos.lng - east + 360),
+      Math.abs(userPos.lng - west - 360)
+    );
+
+    const isDeepInside =
+      userPos.lat > south + latMargin &&
+      userPos.lat < north - latMargin &&
+      lngDiff > lngMargin;
+
+    if (isDeepInside) return false;
+  }
+
+  // Fallback: pixel-based edge check (more precise near edges)
+  try {
     const userPixel = map.latLngToContainerPoint(userPos);
     const mapSize = map.getSize();
-    const isNearEdge = (
-        userPixel.x < mapSize.x * EDGE_MARGIN ||
-        userPixel.x > mapSize.x * (1 - EDGE_MARGIN) ||
-        userPixel.y < mapSize.y * EDGE_MARGIN ||
-        userPixel.y > mapSize.y * (1 - EDGE_MARGIN)
+
+    // Avoid division by zero or invalid sizes
+    if (mapSize.x <= 0 || mapSize.y <= 0) return true;
+
+    const marginX = mapSize.x * speedBasedMargin;
+    const marginY = mapSize.y * speedBasedMargin;
+
+    return (
+      userPixel.x < marginX ||
+      userPixel.x > mapSize.x - marginX ||
+      userPixel.y < marginY ||
+      userPixel.y > mapSize.y - marginY
     );
-    const isOutsideBounds = !bounds.contains(userPos);
-    return isOutsideBounds || isNearEdge;
+  } catch (e) {
+    console.warn('Edge detection pixel fallback failed:', e);
+    return true; // conservative: assume near edge
+  }
 }
 
 function _emergencyCenterMap(position, speedTier, directionChangeFactor, eastWestMovement, speedMPH) {
