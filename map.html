@@ -2779,6 +2779,7 @@ function initializeUserLocation(position) {
 }
 
 let onlineListenerAdded = false;
+let onlineRestartTimeout = null;
 
 function startPositionUpdates() {
     try {
@@ -2791,6 +2792,7 @@ function startPositionUpdates() {
         // Clear any existing watch before starting a new one
         if (window.positionWatchId !== undefined && window.positionWatchId !== null) {
             navigator.geolocation.clearWatch(window.positionWatchId);
+            window.positionWatchId = null;
         }
         
         window.positionWatchId = startWatch();
@@ -2798,14 +2800,37 @@ function startPositionUpdates() {
         // Add the online listener ONCE per page load
         if (!onlineListenerAdded) {
             window.addEventListener('online', () => {
-                if (window.positionWatchId) {
-                    navigator.geolocation.clearWatch(window.positionWatchId);
+                console.debug('Online event detected - scheduling position watch restart');
+                
+                // Clear any pending restart
+                if (onlineRestartTimeout) {
+                    clearTimeout(onlineRestartTimeout);
                 }
-                window.positionWatchId = startWatch();
-                console.debug('Position watch restarted after coming online');
-            }); // No { once: true } - works every time you go online
+                
+                // Wait for network to stabilize
+                onlineRestartTimeout = setTimeout(() => {
+                    if (window.positionWatchId !== null) {
+                        navigator.geolocation.clearWatch(window.positionWatchId);
+                        console.debug('Cleared stale position watch');
+                    }
+                    
+                    window.positionWatchId = startWatch();
+                    console.debug('Position watch restarted successfully');
+                    onlineRestartTimeout = null;
+                }, 500);
+            });
             
-            onlineListenerAdded = true; // Prevents duplicate listeners
+            // Optional: Cancel restart if we go offline again before timeout
+            window.addEventListener('offline', () => {
+                if (onlineRestartTimeout) {
+                    clearTimeout(onlineRestartTimeout);
+                    onlineRestartTimeout = null;
+                    console.debug('Cancelled pending position watch restart (offline)');
+                }
+            });
+            
+            onlineListenerAdded = true;
+            console.debug('Online/offline event listeners registered');
         }
     } catch (err) {
         console.error('Geolocation not available:', err);
@@ -3424,20 +3449,21 @@ const SPEED_THRESHOLDS = {
 
 const HIGH_SPEED_THRESHOLD_MPH = SPEED_THRESHOLDS.HIGH_SPEED;
 
-function speedAggressiveness(speedMPH, loSpeed = 2, hiSpeed = SPEED_THRESHOLDS.HIGH_SPEED, exponent = 0.6) {
-    if (speedMPH >= hiSpeed) return 0;
+// Returns 0-1 scale of how much to REDUCE update frequency (inverted scale)
+function speedAggressiveness(speedMPH, loSpeed = 2, hiSpeed = 15, exponent = 0.6) {
+    if (speedMPH >= hiSpeed) return 0;  // High speed = no reduction
     const t = Math.max(0, Math.min(1, (speedMPH - loSpeed) / (hiSpeed - loSpeed)));
     return Math.pow(t, exponent);
 }
 
+// Returns 0-1 scale of update aggressiveness (corrected scale)
 function highSpeedAggressiveness(speedMPH) {
-    if (speedMPH >= SPEED_THRESHOLDS.HIGH_SPEED) return 1.0;
+    if (speedMPH >= SPEED_THRESHOLDS.HIGH_SPEED) return 1.0;  // High speed = max aggressiveness
     return speedAggressiveness(speedMPH);
 }
 
 /* Handles proximity checks and auto-opening location pages. */
 function handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, closestDistance) {
-    // Handle no valid location case
     if (closestDistance === Infinity || !closestLocation || !closestLocation.id) {
         window.proximityState = {
             closestLocation: null,
@@ -3448,31 +3474,59 @@ function handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, c
         return;
     }
     
-    // Cache closest location data
     window.lastClosestDistance = closestDistance;
     window.lastClosestLocation = closestLocation;
-    
     const distanceFeet = closestDistance * 3.28084;
     const PROXIMITY_THRESHOLD = (typeof CONFIG !== 'undefined' && CONFIG.DISTANCE_THRESHOLD) ? CONFIG.DISTANCE_THRESHOLD : 20;
     
-    // Preload content at 100 feet
-    if (distanceFeet <= 100 && (!window.preloadedLocation || window.preloadedLocation.id !== closestLocation.id)) {
+    // Preload logic
+    if (distanceFeet <= 100 && closestLocation && (!window.preloadedLocation || window.preloadedLocation.id !== closestLocation.id)) {
         window.preloadedLocation = closestLocation;
-        if (typeof preloadLocationData === 'function') {
-            preloadLocationData(closestLocation);
+        
+        // FLICKER-FREE tile prefetch using hidden technique
+        if (!window._didPrefetch19 && typeof map !== 'undefined' && map.getZoom && map.getZoom() < 18) {
+            // Store original state
+            const center = map.getCenter();
+            const currentZoom = map.getZoom();
+            const mapContainer = map.getContainer();
+            
+            // Hide the visual change using CSS
+            const originalTransition = mapContainer.style.transition;
+            const originalOpacity = mapContainer.style.opacity;
+            
+            mapContainer.style.transition = 'none';
+            mapContainer.style.opacity = '0.9999'; // Forces GPU layer without visible change
+            
+            // Quick zoom toggle to trigger tile load
+            map.setView(center, 19, { animate: false });
+            
+            // Use requestAnimationFrame to ensure tiles are requested before reverting
+            requestAnimationFrame(() => {
+                map.setView(center, currentZoom, { animate: false });
+                
+                // Restore original state
+                requestAnimationFrame(() => {
+                    mapContainer.style.transition = originalTransition;
+                    mapContainer.style.opacity = originalOpacity;
+                });
+            });
+            
+            window._didPrefetch19 = true;
         }
+        
+        // Data preload (non-visual, no flicker)
+        if (typeof preloadLocationData === 'function') preloadLocationData(closestLocation);
     } else if (distanceFeet > 120) {
         window.preloadedLocation = null;
     }
     
-    // Check cooldown status
+    // Update proximity state
     let isOnCooldown = false;
-    if (window.cooldownManager) {
+    if (typeof window.cooldownManager !== 'undefined') {
         const cooldownStatus = window.cooldownManager.checkCooldown(closestLocation.id);
         isOnCooldown = cooldownStatus.isOnCooldown;
     }
     
-    // Update proximity state for other systems (like proximity zoom)
     window.proximityState = {
         closestLocation,
         distanceMeters: closestDistance,
@@ -3480,37 +3534,57 @@ function handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, c
         lastUpdateTime: currentTime
     };
     
-    // Auto-open location at proximity threshold
-    if (distanceFeet <= PROXIMITY_THRESHOLD) {
+    // Proximity trigger for auto-opening
+    if (distanceFeet <= PROXIMITY_THRESHOLD && closestLocation && closestLocation.id) {
+        console.log(`Within proximity threshold: ${distanceFeet.toFixed(1)} feet to ${closestLocation.name || closestLocation.id}`);
+        
         // Check if location page is already open
         const lochuntContainer = document.querySelector('.lochunt-container');
         const locationPageOpen = lochuntContainer && lochuntContainer.style.display !== 'none';
         
-        // Initialize trigger tracker if needed
+        console.log(`Location page open: ${locationPageOpen}`);
+        
+        // Initialize last trigger tracker
         if (!window._lastProximityTriggerByLocation) {
             window._lastProximityTriggerByLocation = {};
         }
         
-        const now = performance.now();
-        const lastTrigger = window._lastProximityTriggerByLocation[closestLocation.id] || 0;
-        const timeSinceLastTrigger = now - lastTrigger;
+        const proximityNow = performance.now();
+        const lastTriggerForThisLocation = window._lastProximityTriggerByLocation[closestLocation.id] || 0;
+        const timeSinceLastTrigger = proximityNow - lastTriggerForThisLocation;
         
-        // Determine if we should auto-open
-        const shouldAutoOpen = !isOnCooldown && 
-                               !locationPageOpen && 
-                               timeSinceLastTrigger >= 5000;
+        let shouldAutoOpen = !isOnCooldown && !locationPageOpen;
+        
+        // Only debounce if we SUCCESSFULLY opened this location recently
+        if (timeSinceLastTrigger < 5000) {
+            console.log(`Debounced - already opened ${closestLocation.id} ${(timeSinceLastTrigger / 1000).toFixed(1)}s ago`);
+            shouldAutoOpen = false;
+        }
+        
+        console.log(`Should auto-open: ${shouldAutoOpen}, On cooldown: ${isOnCooldown}`);
         
         if (shouldAutoOpen) {
-            // Mark location as triggered to prevent duplicate opens
-            window._lastProximityTriggerByLocation[closestLocation.id] = now;
+            console.log('Opening location page immediately...');
+            
+            // Mark this location as triggered NOW (before opening to prevent race conditions)
+            window._lastProximityTriggerByLocation[closestLocation.id] = proximityNow;
             
             const locationToOpen = window.preloadedLocation || closestLocation;
             
             if (typeof showLocationHunt === 'function') {
+                console.log('Opening with showLocationHunt()');
                 showLocationHunt(locationToOpen);
                 window.preloadedLocation = null;
+            } else {
+                console.error('showLocationHunt() function not found!');
             }
+        } else {
+            if (isOnCooldown) console.log('Not opening: location on cooldown');
+            if (locationPageOpen) console.log('Not opening: location page already open');
+            if (timeSinceLastTrigger < 5000) console.log('Not opening: recently triggered');
         }
+    } else {
+        console.log(`Not within threshold: ${distanceFeet.toFixed(1)} feet (threshold: ${PROXIMITY_THRESHOLD})`);
     }
 }
         
@@ -3653,16 +3727,13 @@ if (locationsWithDistance.length && (!window.lastCacheUpdate || now_cache - wind
     window.lastCacheUpdate = now_cache;
 }
 
-// ── Proximity Trigger (vibe + open)
-handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, closestDistance);
-
 // ── First Fix: Initialize
 if (!window.lastPosition) {
     _initializeUserLocationState(newPosition, currentTime);
     return;
 } 
 
-// ── Proximity Zoom (using GPS speed)
+// ── Proximity Zoom (using GPS speed) - MOVED BEFORE PROXIMITY TRIGGER
 if (!window.isLocationHuntVisible) {
     // Use GPS-reported speed directly
     let speedMPH = (newPosition.speedMPS || 0) * 2.23694;
@@ -3679,7 +3750,10 @@ if (!window.isLocationHuntVisible) {
         _handleProximityZoom(speedMPH, eastWestMovement);
     }
 }
-   
+
+// ── Proximity Trigger (vibe + open) 
+handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, closestDistance);
+
 // ── Motion Helpers
 const distance = calculateDistance(window.lastPosition, newPosition);
 const speedMPH = newPosition.speedMPS * 2.23694;
@@ -4373,24 +4447,38 @@ function _handleProximityZoom(speedMPH, eastWestMovement) {
 
     if (recentlyZoomedOutFromSame || recentLocationSwitch) return;
 
-    if (locationJustChanged && !window.zoomedInState) {
+    // Handle location changes - FIXED: Also handle when already zoomed
+    if (locationJustChanged) {
         window.lastProximityLocationChangeTime = now;
+        
+        // If already zoomed to a different location, reset state
+        if (window.zoomedInState) {
+            window.zoomController?.release('proximity');
+            window.zoomedInState = false;
+            window.isNearLocation = false;
+            window.currentProximityLocationId = null;
+            window.blockSpeedZoom = false;
+            return; // Wait for next iteration to zoom to new location
+        }
     }
 
     // Thresholds
     const distanceFeet = distanceMeters * 3.28084;
-    const ZOOM_IN_THRESHOLD_FEET = 45;
+    const ZOOM_IN_THRESHOLD_FEET = 45; 
     const ZOOM_OUT_THRESHOLD_FEET = 70;
     const PROXIMITY_ZOOM_IN_LEVEL = 19;
     const PROXIMITY_ZOOM_OUT_LEVEL = 17;
 
     if (typeof window.zoomedInState === 'undefined') window.zoomedInState = false;
-    const timeSinceLastZoom = window.lastZoomChangeTime ? now - window.lastZoomChangeTime : Infinity;
+    
+    // FIXED: Separate cooldowns for zoom-in vs zoom-out
+    const timeSinceLastZoomIn = window.lastProximityZoomInTime ? now - window.lastProximityZoomInTime : Infinity;
+    const timeSinceLastZoomOut = window.lastProximityZoomOutTime ? now - window.lastProximityZoomOutTime : Infinity;
 
     // ZOOM-IN: User-centered framing with POI pulled gently into view
     if (!window.zoomedInState && distanceFeet <= ZOOM_IN_THRESHOLD_FEET) {
-        // Reduce cooldown and allow proximity to override speed zoom
-        if (timeSinceLastZoom < 1500) return;
+        // FIXED: Use zoom-in specific cooldown
+        if (timeSinceLastZoomIn < 1500) return;
         
         const zoomState = window.zoomController?.getState?.();
         
@@ -4405,65 +4493,69 @@ function _handleProximityZoom(speedMPH, eastWestMovement) {
         if (zoomState?.currentSource) {
             window.zoomController?.release(zoomState.currentSource);
         }
-
+        
         const zoomGranted = window.zoomController?.request('proximity', PROXIMITY_ZOOM_IN_LEVEL, 3);
         if (!zoomGranted) return;
-
+        
         window.zoomedInState = true;
         window.isNearLocation = true;
-        window.lastZoomChangeTime = now;
+        window.lastProximityZoomInTime = now;  // FIXED: Track zoom-in time separately
         window.lastProximityZoomTime = now;
         window.currentProximityLocationId = locationId;
         window.blockSpeedZoom = true;
-
-        requestAnimationFrame(() => {
+        
+        // FIXED: Check conditions BEFORE scheduling animation
+        if (!window.isMapInteracting && map && window.userMarker) {
             requestAnimationFrame(() => {
-                if (!window.isMapInteracting && map && window.userMarker) {
-                    const userPos = window.userMarker.getLatLng();
-                    if (!userPos || !closestLocation.lat || !closestLocation.lng) return;
-
-                    const locationPos = L.latLng(closestLocation.lat, closestLocation.lng);
-                    const bounds = L.latLngBounds([userPos, locationPos]);
-
-                    // HYBRID CENTERING: 20% toward POI for narrative focus
-                    const biasedCenter = L.latLng(
-                        userPos.lat + (locationPos.lat - userPos.lat) * 0.20,
-                        userPos.lng + (locationPos.lng - userPos.lng) * 0.20
-                    );
-
-                    // Visibility fallback function
-                    const verifyVisibility = () => {
-                        map.off('moveend', verifyVisibility);
-                        if (map && window.zoomedInState) {
-                            const mapBounds = map.getBounds();
-                            const userVisible = mapBounds.contains(userPos);
-                            const poiVisible = mapBounds.contains(locationPos);
-                            
-                            // Only intervene if framing failed
-                            if (!userVisible || !poiVisible) {
-                                map.fitBounds(bounds, {
-                                    paddingTopLeft: [80, 80],
-                                    paddingBottomRight: [80, 80],
-                                    animate: true,
-                                    duration: 0.7,
-                                    maxZoom: PROXIMITY_ZOOM_IN_LEVEL
-                                });
+                requestAnimationFrame(() => {
+                    // Recheck in case state changed during delay
+                    if (!window.isMapInteracting && map && window.userMarker && window.zoomedInState) {
+                        const userPos = window.userMarker.getLatLng();
+                        if (!userPos || !closestLocation.lat || !closestLocation.lng) return;
+                        
+                        const locationPos = L.latLng(closestLocation.lat, closestLocation.lng);
+                        const bounds = L.latLngBounds([userPos, locationPos]);
+                        
+                        // HYBRID CENTERING: 20% toward POI for narrative focus
+                        const biasedCenter = L.latLng(
+                            userPos.lat + (locationPos.lat - userPos.lat) * 0.20,
+                            userPos.lng + (locationPos.lng - userPos.lng) * 0.20
+                        );
+                        
+                        // Visibility fallback function
+                        const verifyVisibility = () => {
+                            map.off('moveend', verifyVisibility);
+                            if (map && window.zoomedInState) {
+                                const mapBounds = map.getBounds();
+                                const userVisible = mapBounds.contains(userPos);
+                                const poiVisible = mapBounds.contains(locationPos);
+                                
+                                // Only intervene if framing failed
+                                if (!userVisible || !poiVisible) {
+                                    map.fitBounds(bounds, {
+                                        paddingTopLeft: [80, 80],
+                                        paddingBottomRight: [80, 80],
+                                        animate: true,
+                                        duration: 0.7,
+                                        maxZoom: PROXIMITY_ZOOM_IN_LEVEL
+                                    });
+                                }
                             }
-                        }
-                    };
+                        };
 
-                    // Attach listener *before* animation starts
-                    map.once('moveend', verifyVisibility);
+                        // Attach listener *before* animation starts
+                        map.once('moveend', verifyVisibility);
 
-                    // Primary animation: smooth, intentional, story-guided
-                    map.setView(biasedCenter, PROXIMITY_ZOOM_IN_LEVEL, {
-                        animate: true,
-                        duration: 2.0,
-                        easeLinearity: 0.12
-                    });
-                }
+                        // Primary animation: smooth, intentional, story-guided
+                        map.setView(biasedCenter, PROXIMITY_ZOOM_IN_LEVEL, {
+                            animate: true,
+                            duration: 2.0,
+                            easeLinearity: 0.12
+                        });
+                    }
+                });
             });
-        });
+        }
     }
 
     // ZOOM-OUT: Gentle return to situational awareness
@@ -4473,23 +4565,23 @@ function _handleProximityZoom(speedMPH, eastWestMovement) {
             window.zoomedInState = false;
             return;
         }
-
+        
+        // FIXED: Use zoom-out specific cooldown
         if (
             window.currentProximityLocationId === locationId &&
-            timeSinceLastZoom >= 3000
+            timeSinceLastZoomOut >= 3000
         ) {
             // Simply release proximity zoom control
             window.zoomController?.release('proximity');
             
             window.zoomedInState = false;
             window.isNearLocation = false;
-            window.lastZoomChangeTime = now;
             window.lastProximityZoomTime = now;
             window.lastProximityZoomOutLocationId = locationId;
             window.lastProximityZoomOutTime = now;
             window.currentProximityLocationId = null;
             window.blockSpeedZoom = false;
-
+            
             // Smooth animated zoom-out — no snap
             if (map && !window.isMapInteracting) {
                 const currentZoom = map.getZoom();
@@ -4505,7 +4597,10 @@ function _handleProximityZoom(speedMPH, eastWestMovement) {
     }
 }
 
+// FIXED: Move helper functions OUTSIDE - define them at top level
 function _isNearViewportEdge(userPos, bounds, speedMPH) {
+    if (!map || !userPos || !bounds) return false;
+    
     const EDGE_MARGIN = speedMPH > 50 ? 0.15 : (speedMPH > 30 ? 0.12 : (speedMPH > 15 ? 0.10 : 0.08));
     const userPixel = map.latLngToContainerPoint(userPos);
     const mapSize = map.getSize();
@@ -4520,7 +4615,7 @@ function _isNearViewportEdge(userPos, bounds, speedMPH) {
 }
 
 function _emergencyCenterMap(position, speedTier, directionChangeFactor, eastWestMovement, speedMPH) {
-    if (!map || !map.getContainer) return;
+    if (!map || !map.getContainer || !position) return;
 
     const mapContainer = map.getContainer();
     mapContainer.style.willChange = 'transform';
@@ -4528,13 +4623,13 @@ function _emergencyCenterMap(position, speedTier, directionChangeFactor, eastWes
     // Cleanup function
     const cleanup = () => {
         map.off('moveend', cleanup);
-        map.off('zoomend', cleanup); // just in case
+        map.off('zoomend', cleanup);
         if (mapContainer.isConnected) {
             mapContainer.style.willChange = 'auto';
         }
     };
 
-    // Ensure cleanup even if pan doesn’t trigger moveend (e.g., same position)
+    // Ensure cleanup even if pan doesn't trigger moveend
     const fallbackTimeout = setTimeout(cleanup, 500);
 
     // Attach cleanup to moveend
@@ -4543,7 +4638,7 @@ function _emergencyCenterMap(position, speedTier, directionChangeFactor, eastWes
         cleanup();
     });
 
-    // Pan
+    // Pan with speed-appropriate animation
     if (speedMPH > 30) {
         map.panTo(position, { animate: false, noMoveStart: true });
     } else if (speedMPH > 15) {
@@ -6611,38 +6706,50 @@ function handleContinueClick() {
     // Clear stationary state
     clearStationaryState();
     
-    // **Reset proximity zoom state to prevent interference**
+    // **COMPREHENSIVE STATE RESET**
     window.zoomedInState = false;
     window.isNearLocation = false;
     window.blockSpeedZoom = false;
+    window.currentProximityLocationId = null;
     
-    // Release proximity zoom control if active
-    if (window.zoomController?.getState()?.currentSource === 'proximity') {
-        window.zoomController.release('proximity');
+    // **CRITICAL: Set cooldown for the specific location we're leaving**
+    const now = Date.now();
+    window.lastProximityZoomOutTime = now;
+    window.lastProximityZoomOutLocationId = lastVisitedLocationId; // ← ESSENTIAL
+    window.lastProximityZoomInTime = now - 2000;
+    window.lastProximityZoomTime = now;
+    window._didPrefetch19 = false;
+    
+    // Release any active zoom control
+    if (window.zoomController) {
+        const currentSource = window.zoomController.getState()?.currentSource;
+        if (currentSource) {
+            window.zoomController.release(currentSource);
+        }
     }
     
-    // **CENTER MAP ON USER IMMEDIATELY**
+    // Center on user (keep current zoom)
     if (map && window.lastPosition) {
-        // Stop any ongoing map interactions
         window.isMapInteracting = false;
         window.followUser = true;
+        window._blockAutoMapUpdates = true;
         
-        // Force immediate center with animation
         map.setView(
             [window.lastPosition.lat, window.lastPosition.lng], 
             map.getZoom(),
             {
                 animate: true,
                 duration: 0.6,
-                easeLinearity: 0.15
+                easeLinearity: 0.18
             }
         );
+        
+        setTimeout(() => {
+            window._blockAutoMapUpdates = false;
+        }, 800);
     }
     
-    // Ensure GPS is active to resume tracking
     ensureGPSActive();
-    
-    // Start UI cleanup with proper sequencing
     closeModalWithAnimation(FADE_DURATION_MS);
 }
 
