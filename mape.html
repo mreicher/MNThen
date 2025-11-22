@@ -3856,7 +3856,7 @@ function throttle(func, limit) {
 const SPEED_THRESHOLDS = {
     WALKING: 3,
     JOGGING: 5, 
-    TRANSITION_START: 6,    // Start blending roaming/look-ahead
+    TRANSITION_START: 8,    // Start blending roaming/look-ahead
     HIGH_SPEED: 15          // Full look-ahead mode
 };
 
@@ -4581,8 +4581,8 @@ async function updateUserLocation(position, forceUpdate = false) {
                     if (speedMPH >= SPEED_THRESHOLDS.HIGH_SPEED) {
                         _panMapToLookAhead(lookAheadPosition, speedTier, directionChangeFactor, eastWestMovement, speedMPH, bounds);
                     } else if (speedMPH >= SPEED_THRESHOLDS.TRANSITION_START) {
-                        const blendFactor = Math.min(1, (speedMPH - SPEED_THRESHOLDS.TRANSITION_START) /
-                            (SPEED_THRESHOLDS.HIGH_SPEED - SPEED_THRESHOLDS.TRANSITION_START));
+                        const blendFactor = Math.pow((speedMPH - SPEED_THRESHOLDS.TRANSITION_START) / 
+                            (SPEED_THRESHOLDS.HIGH_SPEED - SPEED_THRESHOLDS.TRANSITION_START), 1.5);
                         const isNearEdge = _isNearViewportEdge(userPos, bounds, speedMPH);
                         const isMovingSteadily = distance > mapUpdateDistanceThreshold * 0.5;
 
@@ -5160,7 +5160,7 @@ function _panMapIfNearEdge(userPos, speedTier, directionChangeFactor, eastWestMo
     if (!userPos || !bounds) return;
     
     // Use a consistent, small margin for the edge check
-    if (!_isNearViewportEdge(userPos, bounds, 0)) return;
+    if (!_isNearViewportEdge(userPos, bounds, 0.97)) return;
     
     // Prevent overlapping pan operations (CRITICAL)
     if (window.isPanning) return;
@@ -5289,20 +5289,31 @@ function _applyIntelligentZoom(speedMPS, speedTier, directionChangeFactor, speed
 }
 
 function _enforceViewportSafety(speedMPH, currentMarkerPos) {
+    // —————— CONFIGURATION ——————
+    const CONFIG = {
+        GPS_JUMP_THRESHOLD: 150, // meters
+        PREDICTION_SPEED_THRESHOLD: 12, // mph
+        MIN_RECENTER_INTERVAL: 300, // ms
+        MAX_REASONABLE_VEL: (100 * 1609.34) / 2.5, // 100mph at zoom 15
+        CHECK_INTERVAL: { 40: 16, 20: 25, default: 50 },
+        PREDICTION_TIME: { 50: 0.25, 35: 0.3, 20: 0.35, default: 0.4 },
+        HARD_EDGE_LIMIT: { 50: 0.05, 30: 0.045, 15: 0.05, 5: 0.06, default: 0.07 }
+    };
+
     // —————— EARLY EXITS ——————
     if (!window.followUser || window.isMapInteracting || window.isPanning) return;
     
-    // Validate speed parameter
     const speed = typeof speedMPH === 'number' && isFinite(speedMPH) ? speedMPH : 0;
-
-    // —————— ADAPTIVE THROTTLING ——————
-    const CHECK_INTERVAL = speed > 40 ? 16 : (speed > 20 ? 25 : 50);
     const now = performance.now();
 
-    if (!window.lastViewportCheck) window.lastViewportCheck = 0;
-    if (now - window.lastViewportCheck < CHECK_INTERVAL) return;
-    window.lastViewportCheck = now;
+    // —————— ADAPTIVE THROTTLING (but not for critical safety checks) ——————
+    const checkInterval = speed > 40 ? CONFIG.CHECK_INTERVAL[40] : 
+                         speed > 20 ? CONFIG.CHECK_INTERVAL[20] : 
+                         CONFIG.CHECK_INTERVAL.default;
 
+    window.lastViewportCheck = window.lastViewportCheck || 0;
+    const timeSinceLastCheck = now - window.lastViewportCheck;
+    
     // —————— VALIDATE MAP STATE ——————
     const markerPos = currentMarkerPos || userMarker?.getLatLng?.();
     const bounds = map?.getBounds?.();
@@ -5314,38 +5325,47 @@ function _enforceViewportSafety(speedMPH, currentMarkerPos) {
         return;
     }
 
-    // —————— GPS JUMP DETECTION (150m = ~490ft) ——————
+    // —————— CRITICAL: ALWAYS CHECK IF OFF-SCREEN (never throttle this) ——————
+    if (!bounds.contains(markerPos)) {
+        console.warn('[Viewport] Marker off-screen → emergency recenter');
+        _executeInstantPan(markerPos, container);
+        window.lastViewportCheck = now;
+        window.lastCenteringTime = now;
+        window.prevMarkerPos = { pos: markerPos, time: now };
+        return;
+    }
+
+    // Now apply throttling for non-critical checks
+    if (timeSinceLastCheck < checkInterval) return;
+    window.lastViewportCheck = now;
+
+    // —————— DEBOUNCE RAPID RECENTERING ——————
+    window.lastCenteringTime = window.lastCenteringTime || 0;
+    const timeSinceLastCenter = now - window.lastCenteringTime;
+    const shouldDebounce = timeSinceLastCenter < CONFIG.MIN_RECENTER_INTERVAL;
+
+    // —————— GPS JUMP DETECTION ——————
     if (window.prevMarkerPos?.pos && map.distance) {
         const distanceMeters = map.distance(window.prevMarkerPos.pos, markerPos);
         
-        if (typeof distanceMeters === 'number' && isFinite(distanceMeters) && distanceMeters > 150) {
+        if (typeof distanceMeters === 'number' && isFinite(distanceMeters) && 
+            distanceMeters > CONFIG.GPS_JUMP_THRESHOLD) {
             console.warn(`[Viewport] GPS jump: ${distanceMeters.toFixed(0)}m → instant snap`);
             
             _executeInstantPan(markerPos, container);
-            
+            window.lastCenteringTime = now;
             window.lastViewportCheck = now;
             window.prevMarkerPos = { pos: markerPos, time: now };
             return;
         }
     }
 
-    // —————— OFF-SCREEN FAILSAFE ——————
-    if (!bounds.contains(markerPos)) {
-        console.warn('[Viewport] Marker off-screen → emergency recenter');
-        
-        _executeInstantPan(markerPos, container);
-        
-        window.lastViewportCheck = now;
-        window.prevMarkerPos = { pos: markerPos, time: now };
-        return;
-    }
-
-    // —————— EDGE DETECTION WITH ADAPTIVE MARGINS ——————
-    const HARD_EDGE_LIMIT = speed > 50 ? 0.05 :
-                           speed > 30 ? 0.045 :
-                           speed > 15 ? 0.05 :
-                           speed > 5  ? 0.06 :
-                           0.07;  // Larger margin when slow/stationary
+    // —————— EDGE DETECTION ——————
+    const hardEdgeLimit = speed > 50 ? CONFIG.HARD_EDGE_LIMIT[50] :
+                         speed > 30 ? CONFIG.HARD_EDGE_LIMIT[30] :
+                         speed > 15 ? CONFIG.HARD_EDGE_LIMIT[15] :
+                         speed > 5  ? CONFIG.HARD_EDGE_LIMIT[5] :
+                         CONFIG.HARD_EDGE_LIMIT.default;
 
     const pixelPoint = map.latLngToContainerPoint(markerPos);
     if (!pixelPoint || typeof pixelPoint.x !== 'number' || typeof pixelPoint.y !== 'number') {
@@ -5353,8 +5373,8 @@ function _enforceViewportSafety(speedMPH, currentMarkerPos) {
         return;
     }
 
-    const xMargin = mapSize.x * HARD_EDGE_LIMIT;
-    const yMargin = mapSize.y * HARD_EDGE_LIMIT;
+    const xMargin = mapSize.x * hardEdgeLimit;
+    const yMargin = mapSize.y * hardEdgeLimit;
 
     const isNearEdge = (
         pixelPoint.x < xMargin ||
@@ -5363,13 +5383,12 @@ function _enforceViewportSafety(speedMPH, currentMarkerPos) {
         pixelPoint.y > mapSize.y - yMargin
     );
 
-    // —————— PREDICTIVE PAN (>12 mph threshold) ——————
+    // —————— PREDICTIVE PAN ——————
     let shouldRecenter = isNearEdge;
 
-    if (speed > 12 && window.prevMarkerPos?.pos) {
+    if (speed > CONFIG.PREDICTION_SPEED_THRESHOLD && window.prevMarkerPos?.pos) {
         const deltaTime = (now - window.prevMarkerPos.time) / 1000;
         
-        // Validate time delta (must be positive and reasonable)
         if (deltaTime > 0 && deltaTime < 2) {
             const prevPixel = map.latLngToContainerPoint(window.prevMarkerPos.pos);
             
@@ -5379,42 +5398,63 @@ function _enforceViewportSafety(speedMPH, currentMarkerPos) {
                     y: (pixelPoint.y - prevPixel.y) / deltaTime
                 };
 
-                // Clamp velocity for safety
-                const MAX_VEL = 2000;
-                const safeVel = {
-                    x: Math.max(-MAX_VEL, Math.min(MAX_VEL, velocity.x)),
-                    y: Math.max(-MAX_VEL, Math.min(MAX_VEL, velocity.y))
-                };
+                // ———— VELOCITY VALIDATION ————
+                const absVelX = Math.abs(velocity.x);
+                const absVelY = Math.abs(velocity.y);
+                
+                if (absVelX > CONFIG.MAX_REASONABLE_VEL || absVelY > CONFIG.MAX_REASONABLE_VEL) {
+                    console.warn(`[Viewport] Unrealistic velocity: ${absVelX.toFixed(0)}px/s`);
+                } else {
+                    const predictionTime = speed > 50 ? CONFIG.PREDICTION_TIME[50] :
+                                          speed > 35 ? CONFIG.PREDICTION_TIME[35] :
+                                          speed > 20 ? CONFIG.PREDICTION_TIME[20] :
+                                          CONFIG.PREDICTION_TIME.default;
 
-                // Speed-adaptive prediction window
-                const PREDICTION_TIME = speed > 50 ? 0.25 :
-                                       speed > 35 ? 0.3 :
-                                       speed > 20 ? 0.35 :
-                                       0.4;
+                    const futureX = pixelPoint.x + (velocity.x * predictionTime);
+                    const futureY = pixelPoint.y + (velocity.y * predictionTime);
 
-                const futureX = pixelPoint.x + (safeVel.x * PREDICTION_TIME);
-                const futureY = pixelPoint.y + (safeVel.y * PREDICTION_TIME);
+                    // ———— PIXEL CLAMPING ————
+                    const clampedFutureX = Math.max(0, Math.min(mapSize.x, futureX));
+                    const clampedFutureY = Math.max(0, Math.min(mapSize.y, futureY));
 
-                const headingTowardEdge = (
-                    futureX < xMargin || futureX > mapSize.x - xMargin ||
-                    futureY < yMargin || futureY > mapSize.y - yMargin
-                );
+                    const headingTowardEdge = (
+                        clampedFutureX < xMargin || clampedFutureX > mapSize.x - xMargin ||
+                        clampedFutureY < yMargin || clampedFutureY > mapSize.y - yMargin
+                    );
 
-                shouldRecenter = shouldRecenter || headingTowardEdge;
+                    shouldRecenter = shouldRecenter || headingTowardEdge;
+                }
             }
         }
     }
 
-    // —————— EXECUTE RECENTER ——————
-    if (shouldRecenter) {
+    // —————— EXECUTE RECENTER (skip debounce if critically near edge) ——————
+    // Allow recentering if either: not debouncing OR very close to edge (emergency)
+    const isEmergencyEdge = (
+        pixelPoint.x < xMargin * 0.5 || pixelPoint.x > mapSize.x - (xMargin * 0.5) ||
+        pixelPoint.y < yMargin * 0.5 || pixelPoint.y > mapSize.y - (yMargin * 0.5)
+    );
+
+    if (shouldRecenter && (!shouldDebounce || isEmergencyEdge)) {
         container.style.willChange = 'transform';
 
         if (speed > 50) {
-            // Instant snap at highway speeds
             _executeInstantPan(markerPos, container);
+            window.lastCenteringTime = now;
         } else {
-            // Speed-tuned animated pan
-            const { duration, ease } = _getPanParameters(speed);
+            const duration = speed > 35 ? 0.10 : 
+                            speed > 20 ? 0.15 : 
+                            speed > 10 ? 0.20 : 0.28;
+            const ease = speed > 35 ? 0.5 : 
+                        speed > 20 ? 0.4 : 
+                        speed > 10 ? 0.3 : 0.25;
+
+            // ———— LEAFLET EVENT LISTENER ————
+            const onMoveEnd = () => {
+                if (container) container.style.willChange = 'auto';
+                map.off('moveend', onMoveEnd);
+            };
+            map.on('moveend', onMoveEnd);
 
             try {
                 map.panTo(markerPos, {
@@ -5424,22 +5464,17 @@ function _enforceViewportSafety(speedMPH, currentMarkerPos) {
                     noMoveStart: true
                 });
                 
-                // Reset willChange after animation completes
-                const resetDelay = Math.max(50, duration * 1000 + 16); // Add one frame buffer
-                setTimeout(() => {
-                    if (container) container.style.willChange = 'auto';
-                }, resetDelay);
+                window.lastCenteringTime = now;
                 
             } catch (err) {
                 console.error('[Viewport] Pan failed:', err);
                 container.style.willChange = 'auto';
+                map.off('moveend', onMoveEnd);
             }
         }
-        
-        window.lastCenteringTime = now;
     }
 
-    // —————— UPDATE STATE (always track position) ——————
+    // —————— UPDATE STATE ——————
     window.prevMarkerPos = { pos: markerPos, time: now };
 }
 
@@ -5449,25 +5484,12 @@ function _executeInstantPan(markerPos, container) {
     try {
         map.panTo(markerPos, { animate: false, noMoveStart: true });
         
-        // Use RAF for willChange reset to ensure it happens after paint
         requestAnimationFrame(() => {
             if (container) container.style.willChange = 'auto';
         });
     } catch (err) {
         console.error('[Viewport] Instant pan failed:', err);
         if (container) container.style.willChange = 'auto';
-    }
-}
-
-function _getPanParameters(speedMPH) {
-    if (speedMPH > 35) {
-        return { duration: 0.10, ease: 0.5 };   // Very fast, aggressive
-    } else if (speedMPH > 20) {
-        return { duration: 0.15, ease: 0.4 };   // Fast, balanced
-    } else if (speedMPH > 10) {
-        return { duration: 0.20, ease: 0.3 };   // Moderate, smooth
-    } else {
-        return { duration: 0.28, ease: 0.25 };  // Slow, gentle
     }
 }
         
