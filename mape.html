@@ -3862,7 +3862,7 @@ function handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, c
             const ytile = Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n);
             
             // Get tile URL from current tile layer
-            const tileUrl = window.currentTileLayer?._url || 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
+            const tileUrl = (window.currentTileLayer && window.currentTileLayer._url) || 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
             
             // Prefetch center tile and immediate neighbors (9 tiles total)
             const tilesToPrefetch = [];
@@ -4071,10 +4071,16 @@ async function updateUserLocation(position, forceUpdate = false) {
         window.isStationary = false;
         window.stationaryStartTime = null;
         window.stationaryLockPosition = null;
+        // Initialize Kalman state on GPS recovery
+        window._kalmanState = {
+            position: { lat, lng },
+            velocity: { lat: 0, lng: 0 },
+            acceleration: { lat: 0, lng: 0 }
+        };
         hideGPSSearchingState?.();
     }
 
-    // ── Simplified Proximity & Distance Calculations (with early break)
+    // ── Proximity & Distance Calculations (with early break + squared distance optimization)
     let closestDistance = Infinity;
     let closestLocation = null;
 
@@ -4085,19 +4091,22 @@ async function updateUserLocation(position, forceUpdate = false) {
         closestDistance = window.lastClosestDistance;
         closestLocation = window.lastClosestLocation;
     } else if (Array.isArray(window.gameLocations) && window.gameLocations.length) {
+        let closestDistSq = Infinity;
         for (const loc of window.gameLocations) {
             if (!loc?.lat) continue;
-            const dist = calculateDistance(newPosition, loc);
-            // locationsWithDistance.push({ location: loc, distance: dist }); // Not needed if only finding closest
-            if (dist < closestDistance) {
-                closestDistance = dist;
+            // Optimized: use squared distance to avoid sqrt until needed
+            const dLat = (loc.lat - lat) * 111111;
+            const dLng = (loc.lng - lng) * 111111 * Math.cos(lat * Math.PI / 180);
+            const distSq = dLat * dLat + dLng * dLng;
+            
+            if (distSq < closestDistSq) {
+                closestDistSq = distSq;
                 closestLocation = loc;
-                // Early break if very close, potentially saving iterations
-                if (closestDistance < 10) { // e.g., within 10 meters
-                     break;
-                }
+                // Early break if very close (10m = 100 m²)
+                if (closestDistSq < 100) break;
             }
         }
+        closestDistance = Math.sqrt(closestDistSq);
     }
 
     // ── Enterprise Caching (5s cooldown, ≤100m)
@@ -4105,12 +4114,12 @@ async function updateUserLocation(position, forceUpdate = false) {
     const CACHE_DISTANCE_THRESHOLD = 100;
     const now_cache = Date.now();
     if (
-        closestLocation && closestDistance <= CACHE_DISTANCE_THRESHOLD && // Only cache for the closest found location if within threshold
+        closestLocation && closestDistance <= CACHE_DISTANCE_THRESHOLD &&
         (!window.lastCacheUpdate || now_cache - window.lastCacheUpdate > CACHE_UPDATE_INTERVAL)
     ) {
         const cacheFn = window.enterpriseCacheManager?.cacheLocationData;
         if (cacheFn) {
-            cacheFn(closestLocation, newPosition); // Cache for the closest location only
+            cacheFn(closestLocation, newPosition);
         }
         window.lastCacheUpdate = now_cache;
     }
@@ -4118,6 +4127,12 @@ async function updateUserLocation(position, forceUpdate = false) {
     // ── First Fix: Initialize
     if (!lastPos) {
         _initializeUserLocationState(newPosition, currentTime);
+        // Initialize Kalman state on first fix
+        window._kalmanState = {
+            position: { lat, lng },
+            velocity: { lat: 0, lng: 0 },
+            acceleration: { lat: 0, lng: 0 }
+        };
         return;
     }
 
@@ -4144,17 +4159,18 @@ async function updateUserLocation(position, forceUpdate = false) {
     const lngDelta = Math.abs(lng - lastPos.lng);
     const eastWestMovement = lngDelta > latDelta * 1.2;
 
-    // SMOOTH 8→15 MPH TRANSITION ===
+    // SMOOTHSTEP 8→15 MPH TRANSITION (eliminates "gear shift")
     const TRANSITION_RANGE = SPEED_THRESHOLDS.HIGH_SPEED - SPEED_THRESHOLDS.TRANSITION_START;
     const blendFactorRaw = (speedMPH - SPEED_THRESHOLDS.TRANSITION_START) / TRANSITION_RANGE;
-    const blendFactor = Math.max(0, Math.min(1, blendFactorRaw)); // Clamp 0-1
-    window.lastBlendFactor = blendFactor; // For debugging
+    const t = Math.max(0, Math.min(1, blendFactorRaw));
+    const blendFactor = t * t * (3 - 2 * t); // Smoothstep instead of linear
+    window.lastBlendFactor = blendFactor;
 
     // DYNAMIC UPDATE RATE: Faster during transition for smoothness
     const isInTransition = blendFactor > 0 && blendFactor < 1;
-    const transitionSpeedMultiplier = isInTransition ? 0.7 : 1.0; // 30% faster updates
+    const transitionSpeedMultiplier = isInTransition ? 0.7 : 1.0;
 
-    // GUARANTEED 8→15 MPH TRANSITION ===
+    // GUARANTEED 8→15 MPH TRANSITION with mode tracking
     const isNowCentering = blendFactor >= 1.0;
     window._lastMapMode = window._lastMapMode || 'roaming';
     const justEnteredTransition = window._lastMapMode === 'roaming' && isInTransition;
@@ -4195,18 +4211,27 @@ async function updateUserLocation(position, forceUpdate = false) {
 
     const speedFactor = Math.min(1, Math.max(0.01, speedMPS / 15));
 
-    // ── Speed Tier Lookup (10-tier) 
+    // Speed Tier Lookup with HYSTERESIS (prevents boundary oscillation)
+    const lastTier = window._lastSpeedTier ?? 0;
+    const HYSTERESIS = 1.0; // mph margin
+    
     let currentTierIndex;
-    if (speedMPH < 1) currentTierIndex = 0;
-    else if (speedMPH < SPEED_THRESHOLDS.WALKING) currentTierIndex = 1;
-    else if (speedMPH < SPEED_THRESHOLDS.JOGGING) currentTierIndex = 2;
-    else if (speedMPH < SPEED_THRESHOLDS.HIGH_SPEED + 1) currentTierIndex = 3;
-    else if (speedMPH < 24) currentTierIndex = 4;
-    else if (speedMPH < 34) currentTierIndex = 5;
-    else if (speedMPH < 46) currentTierIndex = 6;
-    else if (speedMPH < 58) currentTierIndex = 7;
-    else if (speedMPH < 70) currentTierIndex = 8;
-    else currentTierIndex = 9;
+    const tierBoundaries = [1, 3, 8, 16, 24, 34, 46, 58, 70];
+    
+    // Apply hysteresis: different threshold based on direction of change
+    currentTierIndex = 0;
+    for (let i = 0; i < tierBoundaries.length; i++) {
+        const boundary = tierBoundaries[i];
+        const threshold = (lastTier > i) ? boundary - HYSTERESIS : boundary + HYSTERESIS;
+        
+        if (speedMPH >= threshold) {
+            currentTierIndex = i + 1;
+        } else {
+            break;
+        }
+    }
+    
+    window._lastSpeedTier = currentTierIndex;
 
     const speedTierConfigs = [
         { micro: 0.08, minDist: 0.3,  maxAcc: 30, maxSpd: 15, mapInt: 1000, mapDist: 2.0, panDur: 2.5, easeLin: 0.04, zoomThresh: 2.5, zoomDur: 4.0 },
@@ -4333,12 +4358,58 @@ async function updateUserLocation(position, forceUpdate = false) {
         return;
     }
 
-    // ── Smoothing & Prediction (robust try/catch) 
+    // ── KALMAN-LITE FUSION + EXISTING SMOOTHING PIPELINE
     try {
-        // Ensure velocity state
+        // Ensure velocity state (backwards compatible)
         window.lastVelocity = window.lastVelocity || { lat: 0, lng: 0 };
         window.smoothedVelocity = window.smoothedVelocity || { lat: 0, lng: 0 };
 
+        // Initialize Kalman state if needed
+        if (!window._kalmanState) {
+            window._kalmanState = {
+                position: { lat: lastPos.lat, lng: lastPos.lng },
+                velocity: { lat: 0, lng: 0 },
+                acceleration: { lat: 0, lng: 0 }
+            };
+        }
+
+        const kState = window._kalmanState;
+        const dt = timeDelta > 0 && timeDelta < 5 ? timeDelta : 0.1;
+
+        // ── KALMAN PREDICTION STEP
+        const predictedLat = kState.position.lat + kState.velocity.lat * dt + 0.5 * kState.acceleration.lat * dt * dt;
+        const predictedLng = kState.position.lng + kState.velocity.lng * dt + 0.5 * kState.acceleration.lng * dt * dt;
+        const predictedVelLat = kState.velocity.lat + kState.acceleration.lat * dt;
+        const predictedVelLng = kState.velocity.lng + kState.acceleration.lng * dt;
+
+        // ── KALMAN MEASUREMENT UPDATE
+        const baseGain = Math.max(0.1, Math.min(0.9, 1 - (newPosition.accuracy / 50)));
+        const kalmanGain = baseGain * (0.65 + speedFactor * 0.35);
+
+        const innovationLat = lat - predictedLat;
+        const innovationLng = lng - predictedLng;
+
+        const kalmanLat = predictedLat + kalmanGain * innovationLat;
+        const kalmanLng = predictedLng + kalmanGain * innovationLng;
+
+        // Update Kalman velocity
+        const measuredVelLat = innovationLat / dt;
+        const measuredVelLng = innovationLng / dt;
+        const velGain = kalmanGain * 0.5;
+        
+        kState.velocity.lat = predictedVelLat + velGain * measuredVelLat;
+        kState.velocity.lng = predictedVelLng + velGain * measuredVelLng;
+
+        // Update Kalman acceleration
+        const accelLat = (kState.velocity.lat - window.lastVelocity.lat) / dt;
+        const accelLng = (kState.velocity.lng - window.lastVelocity.lng) / dt;
+        const accelSmoothing = 0.7;
+        
+        kState.acceleration.lat = kState.acceleration.lat * accelSmoothing + accelLat * (1 - accelSmoothing);
+        kState.acceleration.lng = kState.acceleration.lng * accelSmoothing + accelLng * (1 - accelSmoothing);
+        kState.position = { lat: kalmanLat, lng: kalmanLng };
+
+        // ── smoothedVelocity calculation
         const instantVelocity = {
             lat: timeDelta > 0 ? (lat - lastPos.lat) / timeDelta : 0,
             lng: timeDelta > 0 ? (lng - lastPos.lng) / timeDelta : 0
@@ -4351,31 +4422,36 @@ async function updateUserLocation(position, forceUpdate = false) {
             lng: svLng * velocitySmoothingFactor + instantVelocity.lng * (1 - velocitySmoothingFactor)
         };
 
-        // Dead Reckoning - Adjusted prediction time for potentially better responsiveness at high speeds
-        const PREDICTION_TIME_S = 0.4; // Kept close to original but could be tuned further
+        // ── Enhanced Dead Reckoning with adaptive horizon
+        const predictionHorizon = Math.min(0.5, 0.2 + (speedFactor * 0.3)); // Speed-adaptive
         const headingRad = (validatedHeading || 0) * Math.PI / 180;
-        const earthRadius = 111111; // meters per degree lat
-        const cosLat = Math.cos(lat * Math.PI / 180);
-        const predictedLat = lat + (speedMPS * Math.cos(headingRad) / earthRadius) * PREDICTION_TIME_S;
-        const predictedLng = lng + (speedMPS * Math.sin(headingRad) / (earthRadius * cosLat)) * PREDICTION_TIME_S;
+        const earthRadius = 111111;
+        const cosLat = Math.cos(kalmanLat * Math.PI / 180);
+        
+        const drLat = kalmanLat + (speedMPS * Math.cos(headingRad) / earthRadius) * predictionHorizon;
+        const drLng = kalmanLng + (speedMPS * Math.sin(headingRad) / (earthRadius * cosLat)) * predictionHorizon;
+
+        // Blend Kalman estimate with dead reckoning (more DR at higher speeds)
+        const drBlend = Math.min(0.35, speedFactor * 0.35);
+        const fusedLat = kalmanLat * (1 - drBlend) + drLat * drBlend;
+        const fusedLng = kalmanLng * (1 - drBlend) + drLng * drBlend;
 
         const deadReckonedPosition = {
-            lat: predictedLat,
-            lng: predictedLng,
+            lat: fusedLat,
+            lng: fusedLng,
             accuracy: newPosition.accuracy,
             heading: validatedHeading,
             timestamp: currentTime,
             speedMPS
         };
 
-        // Buffer (FIFO, max 5) - Keep original size
         if (!window.positionBuffer) window.positionBuffer = [];
         window.positionBuffer.push(deadReckonedPosition);
         if (window.positionBuffer.length > 5) window.positionBuffer.shift();
 
-        // Weighted average (exponential decay) - Refine decay factor for high speeds
-        const baseDecayFactor = 0.5 + (speedFactor * 0.4);
-        const decayFactor = Math.min(0.85, baseDecayFactor); // Cap at 0.85 instead of 0.9
+        // Weighted average (exponential decay) - kept at 0.70 for faster adaptation
+        const baseDecayFactor = 0.5 + (speedFactor * 0.2);
+        const decayFactor = Math.min(0.70, baseDecayFactor); // Lowered cap for better high-speed response
 
         let totalWeight = 0, weightedLat = 0, weightedLng = 0;
         for (const pos of window.positionBuffer) {
@@ -4428,7 +4504,7 @@ async function updateUserLocation(position, forceUpdate = false) {
             speedMPS: bufferedPosition.speedMPS
         };
 
-        // ── Adaptive Animation Duration
+        // ── Adaptive Animation Duration 
         const durationBrackets = [
             { base: 1.2, mult: -0.09, max: 1.5, min: 0.9 },
             { base: 0.95, mult: -0.11, max: 1.2, min: 0.70 },
@@ -4450,20 +4526,23 @@ async function updateUserLocation(position, forceUpdate = false) {
 
         let finalAnimationDuration = Math.max(0.05, baseDuration - distanceMod + timeMod + dirChangeComp + eastWestDurBonus) * directionChangeFactor;
 
-        // ── Marker Perf Hints
+        // ── Marker Perf Hints (set once)
         const markerEl = userMarker.getElement?.();
-        if (markerEl) {
+        if (markerEl && !window._markerPerfSetup) {
             markerEl.style.willChange = 'transform';
             markerEl.style.backfaceVisibility = 'hidden';
             markerEl.style.transform = 'translateZ(0)';
-            if (eastWestMovement) markerEl.style.imageRendering = 'crisp-edges';
+            window._markerPerfSetup = true;
+        }
+        if (markerEl && eastWestMovement) {
+            markerEl.style.imageRendering = 'crisp-edges';
         }
 
         const finalEaseLinearity = eastWestMovement
             ? Math.max(0.03, Math.min(0.16, (0.10 - (speedMPH * 0.0007)) * directionChangeFactor))
             : Math.max(0.04, Math.min(0.20, (0.12 - (speedMPH * 0.0013)) * directionChangeFactor));
 
-        // SMOOTH VISUAL UPDATE ===
+        // SMOOTH VISUAL UPDATE (SINGLE RAF)
         const performVisualUpdate = () => {
             const animateOpts = {
                 animate: true,
@@ -4486,7 +4565,7 @@ async function updateUserLocation(position, forceUpdate = false) {
                 window._driftHysteresisCounter = 0;
             }
 
-            // GUARANTEED THRESHOLD TIMING ===
+            // GUARANTEED THRESHOLD TIMING
             const shouldUpdateMap = 
                 justEnteredTransition ||
                 justEnteredCentering ||
@@ -4496,7 +4575,7 @@ async function updateUserLocation(position, forceUpdate = false) {
                 (window._driftHysteresisCounter >= 2);
 
             if (shouldUpdateMap) {
-                // Look-Ahead — tiered - Keep original complex structure
+                // Look-Ahead — tiered 
                 const lookAheadBrackets = [
                     { base: 0, mult: 0.015, max: 0.020 },
                     { base: 0, mult: 0.030, max: 0.050 },
@@ -4534,7 +4613,7 @@ async function updateUserLocation(position, forceUpdate = false) {
                 const bounds = map?.getBounds?.();
 
                 if (bounds && !window.isMapInteracting && window.followUser) {
-                    // === BLENDED PANNING (0=roaming, 1=centering) ===
+                    // === IMPROVED: SMOOTHSTEP BLENDED PANNING (0=roaming, 1=centering) ===
                     const targetLat = userPos.lat + (lookAheadPosition.lat - userPos.lat) * blendFactor;
                     const targetLng = userPos.lng + (lookAheadPosition.lng - userPos.lng) * blendFactor;
 
@@ -4565,7 +4644,7 @@ async function updateUserLocation(position, forceUpdate = false) {
 
         // ── Final State Update
         window.lastPosition = smoothedPosition;
-        window.lastVelocity = instantVelocity;
+        window.lastVelocity = instantVelocity; 
         window.lastUpdateTime = currentTime;
         window.lastUpdateTimestamp = currentTime;
         updateDistanceBox?.();
@@ -4591,27 +4670,6 @@ async function updateUserLocation(position, forceUpdate = false) {
         window.positionBuffer = [newPosition];
         updateDistanceBox?.(); 
     }
-}
- 
-// --- CLEANUP FUNCTION ---
-function disposeMapLoop() {
-    if (window._nextLocationUpdateRAF) {
-        cancelAnimationFrame(window._nextLocationUpdateRAF);
-        window._nextLocationUpdateRAF = null;
-    }
-    if (window.animationFrameId) {
-        cancelAnimationFrame(window.animationFrameId);
-        window.animationFrameId = null;
-    }
-    if (window.gpsTimeoutTimer) {
-        clearTimeout(window.gpsTimeoutTimer);
-        window.gpsTimeoutTimer = null;
-    }
-    if (window.debounceTimeoutId) {
-        clearTimeout(window.debounceTimeoutId);
-        window.debounceTimeoutId = null;
-    }
-    console.log("Map loop timers/RAF disposed. State preserved.");
 }
         
 function _initializeUserLocationState(newPosition, currentTime) {
