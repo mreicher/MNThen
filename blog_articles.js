@@ -5,7 +5,7 @@ const blogArticles = [
   "icon": "fa-cookie-bite",
   "author": "Matt Reicher",
   "date": "November 26, 2025",
-  "image": "https://mnthen.com/images/exhibit/mjohnson.jpg",
+  "image": "https://mnthen.com/images/mjohnson.jpg",
   "url": "https://mnthen.com/blog/people/mjohnson.html",
   "keywords": ["marjorie johnson", "blue ribbon baker", "minnesota state fair", "baking", "robinsdale", "home economics", "rosie o'donnell", "jay leno", "history", "person", "all"]
 },
