@@ -1,5 +1,5 @@
 const blogArticles = [
-  
+{
   "headline": "Johnson, Marjorie Eleanora (1919 – 2025)",
   "blurb": "Minnesota’s 'Blue Ribbon Baker'— the joyful, record-breaking, beloved ambassador of home baking and Minnesotan spirit.",
   "icon": "fa-cookie-bite",
