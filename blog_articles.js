@@ -1,4 +1,14 @@
 const blogArticles = [
+  
+  "headline": "Johnson, Marjorie Eleanora (1919 – 2025)",
+  "blurb": "Minnesota’s 'Blue Ribbon Baker'— the joyful, record-breaking, beloved ambassador of home baking and Minnesotan spirit.",
+  "icon": "fa-cookie-bite",
+  "author": "Matt Reicher",
+  "date": "November 26, 2025",
+  "image": "https://mnthen.com/images/exhibit/johnson.jpg",
+  "url": "https://mnthen.com/blog/people/johnson.html",
+  "keywords": ["marjorie johnson", "blue ribbon baker", "minnesota state fair", "baking", "robinsdale", "home economics", "rosie o'donnell", "jay leno", "history", "person", "all"]
+},
 {
   "headline": "Cassius, Anthony Brutus (A.B.) (1907 – 1983)",
   "blurb": "A.B. Cassius defied Minneapolis's de facto segregation, breaking barriers as a trailblazing Black entrepreneur and civic leader.",
