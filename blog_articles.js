@@ -134,7 +134,7 @@ const blogArticles = [
     "blurb": "The infamous James-Younger gang's daring bank robbery attempt in Northfield, Minnesota in 1876 was thwarted by the town's citizens, leading to a deadly confrontation.", 
     "icon": "fa-calendar", 
     "author": "Matt Reicher",
-    "date": "Novenber 13, 2024",
+    "date": "November 13, 2024",  
     "image": "https://mnthen.com/images/northfield.jpg", 
     "url": "https://mnthen.com/blog/event/northfield.html", 
     "keywords": ["northfield", "bank", "raid", "James", "Younger", "event", "all"]
@@ -184,7 +184,7 @@ const blogArticles = [
     "blurb": "Pioneer brewer who founded the Pittsburg Brewery (later becoming the Hamm's Brewery) in St. Paul in 1857. His contributions remain a mystery.",
     "icon": "fa-user",
     "author": "Matt Reicher",
-    "date": "August 30. 2024",
+    "date": "August 30, 2024",  
     "image": "https://mnthen.com/images/hamms_1880.jpg",
     "url": "https://mnthen.com/blog/people/keller.html",
     "keywords": ["saint paul", "st. paul", "beer", "brewer", "pioneer", "keller", "person", "all"]
@@ -214,7 +214,7 @@ const blogArticles = [
     "blurb": "Nye's Polonaise, a beloved Northeast Minneapolis institution, served its community for nearly 66 years. Known for Polish cuisine, polka music, and unforgettable characters, it remained a timeless haven until closing in 2016.",
     "icon": "fa-building",
     "author": "Matt Reicher",
-    "date": "August 6, 2924",
+    "date": "August 6, 2024",  // ← FIXED: "2924" → "2024"
     "image": "https://mnthen.com/images/nyes.webp",
     "url": "https://mnthen.com/blog/place/nyes.html",
     "keywords": ["northeast", "mpls", "minneapolis", "nyes", "polish", "dance", "place", "all"]
