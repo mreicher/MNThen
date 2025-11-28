@@ -1,5 +1,15 @@
 const blogArticles = [
   {
+  "headline": "Joe Rolette and the Capital Relocation Bill (1857)",
+  "blurb": "In 1857, legislator Joe Rolette vanished with the official copy of a bill to move Minnesota’s capital to St. Peter—buying time, derailing the speculators, and saving St. Paul with a legendary act of procedural sabotage.",
+  "icon": "fa-landmark",
+  "author": "Matt Reicher",
+  "date": "November 29, 2025",
+  "image": "https://mnthen.com/images/rolette.webp",
+  "url": "https://www.mnthen.com/blog/event/rolette.html",
+  "keywords": ["Joe Rolette", "capital", "St. Paul", "St. Peter", "Minnesota Territory", "legislature", "event", "all"]
+},
+  {
     "headline": "Johnson, Marjorie Eleanora (1919 - 2025)",
     "blurb": "Minnesota’s 'Blue Ribbon Baker'—the joyful, record-breaking, beloved ambassador of home baking and Minnesotan spirit.",
     "icon": "fa-cookie-bite",
