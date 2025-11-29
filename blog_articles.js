@@ -1,5 +1,15 @@
 const blogArticles = [
   {
+  "headline": "The Assassination of Walter Liggett (December 9, 1935)",
+  "blurb": "On December 9, 1935, investigative journalist Walter Liggett was murdered in a Minneapolis alley after publishing allegations linking organized crime figures, including Kid Cann, to political figures such as Governor Floyd B. Olson.",
+  "icon": "fa-calendar",
+  "author": "Matt Reicher",
+  "date": "November 30, 2025",
+  "image": "https://www.mnthen.com/images/liggett.jpg",
+  "url": "https://www.mnthen.com/blog/event/liggett.html",
+  "keywords": ["Walter Liggett", "assassination", "journalist", "Minneapolis", "Floyd B. Olson", "Kid Cann", "organized crime", "1930s", "historical event", "all"]
+},
+  {
   "headline": "Joe Rolette and the Capital Relocation Bill (1857)",
   "blurb": "In 1857, legislator Joe Rolette vanished with the official copy of a bill to move Minnesota’s capital to St. Peter—buying time, derailing the speculators, and saving St. Paul with a legendary act of procedural sabotage.",
   "icon": "fa-landmark",
@@ -12,7 +22,7 @@ const blogArticles = [
   {
     "headline": "Johnson, Marjorie Eleanora (1919 - 2025)",
     "blurb": "Minnesota’s 'Blue Ribbon Baker'—the joyful, record-breaking, beloved ambassador of home baking and Minnesotan spirit.",
-    "icon": "fa-cookie-bite",
+    "icon": "fa-user",
     "author": "Matt Reicher",
     "date": "November 26, 2025",
     "image": "https://mnthen.com/images/mjohnson.jpg?v=2",
