@@ -168,7 +168,7 @@ const CONFIG = {
     DISTANCE_THRESHOLD: 20,     // Feet - proximity to trigger location hunt
     
     // Update intervals
-    MIN_UPDATE_INTERVAL: 100,   // Minimum ms between position updates
+    MIN_UPDATE_INTERVAL: 500,   // Reduced from 100ms to 500ms for battery life
 };
 
 // ============================================================================
@@ -202,8 +202,10 @@ const state = {
     isLocationHuntVisible: false,
     showingAllLocations: false,
     
-    // Timers
+    // Timers and error tracking
     inactivityTimer: null,
+    errorCount: 0,              // For geolocation error backoff
+    isUpdating: false,          // State transaction lock
 };
 
 // ============================================================================
@@ -291,9 +293,13 @@ function isPopupOpen() {
 const ViewportManager = {
     // Get edge proximities as percentages (0 = at edge, 1 = at center)
     getEdgeProximities(position) {
+        if (!state.map) return { north: 1, south: 1, east: 1, west: 1 };
         const bounds = state.map.getBounds();
         const latSpan = bounds.getNorth() - bounds.getSouth();
         const lngSpan = bounds.getEast() - bounds.getWest();
+        
+        // Prevent division by zero
+        if (latSpan === 0 || lngSpan === 0) return { north: 1, south: 1, east: 1, west: 1 };
         
         return {
             north: (bounds.getNorth() - position.lat) / latSpan,
@@ -322,6 +328,7 @@ const ViewportManager = {
     
     // Calculate optimal center point based on current position and direction of travel
     calculateOptimalCenter(position, velocity) {
+        if (!state.map) return position;
         const bounds = state.map.getBounds();
         const latSpan = bounds.getNorth() - bounds.getSouth();
         const lngSpan = bounds.getEast() - bounds.getWest();
@@ -347,7 +354,7 @@ const ViewportManager = {
     
     // Main update function - determines if/how to move the viewport
     updateViewport(position, speed, velocity) {
-        if (state.isUserInteracting) return;
+        if (state.isUserInteracting || !state.followUser) return;
         
         const speedMph = metersPerSecondToMph(speed);
         const urgency = this.getUrgencyLevel(position);
@@ -359,10 +366,12 @@ const ViewportManager = {
         if (speedMph >= 15) {
             state.viewportMode = 'centered';
             const optimalCenter = this.calculateOptimalCenter(position, velocity);
-            state.map.setView([optimalCenter.lat, optimalCenter.lng], state.map.getZoom(), {
-                animate: true,
-                duration: CONFIG.ANIM_FAST
-            });
+            if (state.map) {
+                state.map.setView([optimalCenter.lat, optimalCenter.lng], state.map.getZoom(), {
+                    animate: true,
+                    duration: CONFIG.ANIM_FAST
+                });
+            }
             return;
         }
         
@@ -372,10 +381,12 @@ const ViewportManager = {
         switch (urgency) {
             case 'emergency':
                 // Snap immediately to prevent leaving viewport
-                state.map.setView([position.lat, position.lng], state.map.getZoom(), {
-                    animate: true,
-                    duration: CONFIG.ANIM_FAST
-                });
+                if (state.map) {
+                    state.map.setView([position.lat, position.lng], state.map.getZoom(), {
+                        animate: true,
+                        duration: CONFIG.ANIM_FAST
+                    });
+                }
                 break;
                 
             case 'hard':
@@ -422,6 +433,7 @@ const ViewportManager = {
         if (now - state.lastRecenterTime < 200) return; // Throttle recenters
         state.lastRecenterTime = now;
         
+        if (!state.map) return;
         const currentCenter = state.map.getCenter();
         const optimalCenter = this.calculateOptimalCenter(position, velocity);
         
@@ -439,11 +451,14 @@ const ViewportManager = {
     
     // Ensure marker never leaves viewport - emergency containment
     ensureContainment(position) {
+        if (!state.map) return false;
         const bounds = state.map.getBounds();
         const padding = 0.02; // 2% padding from absolute edge
         
         const latSpan = bounds.getNorth() - bounds.getSouth();
         const lngSpan = bounds.getEast() - bounds.getWest();
+        
+        if (latSpan === 0 || lngSpan === 0) return false;
         
         const minLat = bounds.getSouth() + latSpan * padding;
         const maxLat = bounds.getNorth() - latSpan * padding;
@@ -483,99 +498,118 @@ const ViewportManager = {
 function processPosition(position) {
     const now = Date.now();
     
-    // Throttle updates
-    if (now - state.lastUpdateTime < CONFIG.MIN_UPDATE_INTERVAL) return;
+    // Throttle updates and prevent concurrent modifications
+    if (now - state.lastUpdateTime < CONFIG.MIN_UPDATE_INTERVAL || state.isUpdating) return;
     
-    const coords = position.coords;
-    const newPosition = {
-        lat: coords.latitude,
-        lng: coords.longitude,
-        accuracy: coords.accuracy,
-        heading: coords.heading,
-        speed: coords.speed,
-        timestamp: now
-    };
+    state.isUpdating = true;
     
-    // Validate coordinates
-    if (isNaN(newPosition.lat) || isNaN(newPosition.lng)) return;
-    
-    // Reject poor accuracy readings
-    if (newPosition.accuracy > CONFIG.MIN_ACCURACY) return;
-    
-    // Initialize if first position
-    if (!state.currentPosition) {
-        initializePosition(newPosition);
-        return;
-    }
-    
-    // Calculate distance moved
-    const distance = calculateDistance(state.currentPosition, newPosition);
-    
-    // Handle teleportation (GPS jump)
-    if (distance > CONFIG.MAX_TELEPORT_DISTANCE) {
-        console.log('GPS teleport detected, resetting filter');
-        initializePosition(newPosition);
-        return;
-    }
-    
-    // Reject tiny movements (GPS jitter)
-    if (distance < CONFIG.MIN_MOVEMENT && newPosition.accuracy >= state.currentPosition.accuracy) {
-        return;
-    }
-    
-    // Calculate speed and velocity
-    const timeDelta = (now - state.lastUpdateTime) / 1000;
-    let speed = 0;
-    let velocity = { lat: 0, lng: 0 };
-    
-    if (timeDelta > 0 && timeDelta < 10) {
-        // Use GPS speed if available, otherwise calculate
-        if (coords.speed !== null && coords.speed >= 0) {
-            speed = coords.speed;
-        } else {
-            speed = distance / timeDelta;
+    try {
+        const coords = position.coords;
+        const newPosition = {
+            lat: coords.latitude,
+            lng: coords.longitude,
+            accuracy: coords.accuracy,
+            heading: coords.heading,
+            speed: coords.speed,
+            timestamp: now
+        };
+        
+        // Validate coordinates
+        if (isNaN(newPosition.lat) || isNaN(newPosition.lng)) {
+            state.isUpdating = false;
+            return;
         }
         
-        // Calculate velocity vector
-        velocity = {
-            lat: (newPosition.lat - state.currentPosition.lat) / timeDelta,
-            lng: (newPosition.lng - state.currentPosition.lng) / timeDelta
-        };
+        // Reject poor accuracy readings
+        if (newPosition.accuracy > CONFIG.MIN_ACCURACY) {
+            state.isUpdating = false;
+            return;
+        }
+        
+        // Initialize if first position
+        if (!state.currentPosition) {
+            initializePosition(newPosition);
+            state.isUpdating = false;
+            return;
+        }
+        
+        // Calculate distance moved
+        const distance = calculateDistance(state.currentPosition, newPosition);
+        
+        // Handle teleportation (GPS jump)
+        if (distance > CONFIG.MAX_TELEPORT_DISTANCE) {
+            console.log('GPS teleport detected, resetting filter');
+            initializePosition(newPosition);
+            state.isUpdating = false;
+            return;
+        }
+        
+        // Reject tiny movements (GPS jitter)
+        if (distance < CONFIG.MIN_MOVEMENT && newPosition.accuracy >= state.currentPosition.accuracy) {
+            state.isUpdating = false;
+            return;
+        }
+        
+        // Calculate speed and velocity
+        const timeDelta = (now - state.lastUpdateTime) / 1000;
+        let speed = 0;
+        let velocity = { lat: 0, lng: 0 };
+        
+        if (timeDelta > 0 && timeDelta < 10) {
+            // Use GPS speed if available, otherwise calculate
+            if (coords.speed !== null && coords.speed >= 0) {
+                speed = coords.speed;
+            } else {
+                speed = distance / timeDelta;
+            }
+            
+            // Calculate velocity vector
+            velocity = {
+                lat: (newPosition.lat - state.currentPosition.lat) / timeDelta,
+                lng: (newPosition.lng - state.currentPosition.lng) / timeDelta
+            };
+        }
+        
+        // Reject unrealistic speeds (> 100 mph)
+        if (speed > 44.7) {
+            state.isUpdating = false;
+            return;
+        }
+        
+        // Apply Kalman filter
+        const filteredPosition = PositionFilter.update(newPosition);
+        
+        // Add to buffer for additional smoothing
+        state.positionBuffer.push(filteredPosition);
+        if (state.positionBuffer.length > CONFIG.BUFFER_SIZE) {
+            state.positionBuffer.shift();
+        }
+        
+        // Calculate weighted average from buffer
+        const smoothedPosition = calculateBufferAverage();
+        
+        // Update state
+        state.lastPosition = state.currentPosition;
+        state.currentPosition = smoothedPosition;
+        state.currentSpeed = speed;
+        state.currentHeading = newPosition.heading;
+        state.lastUpdateTime = now;
+        
+        // Update marker position
+        updateMarkerPosition(smoothedPosition);
+        
+        // Update viewport
+        if (!isPopupOpen()) {
+            ViewportManager.ensureContainment(smoothedPosition);
+            ViewportManager.updateViewport(smoothedPosition, speed, velocity);
+        }
+        
+        // Update distance display
+        updateDistanceBox();
+        
+    } finally {
+        state.isUpdating = false;
     }
-    
-    // Reject unrealistic speeds (> 100 mph)
-    if (speed > 44.7) return;
-    
-    // Apply Kalman filter
-    const filteredPosition = PositionFilter.update(newPosition);
-    
-    // Add to buffer for additional smoothing
-    state.positionBuffer.push(filteredPosition);
-    if (state.positionBuffer.length > CONFIG.BUFFER_SIZE) {
-        state.positionBuffer.shift();
-    }
-    
-    // Calculate weighted average from buffer
-    const smoothedPosition = calculateBufferAverage();
-    
-    // Update state
-    state.lastPosition = state.currentPosition;
-    state.currentPosition = smoothedPosition;
-    state.currentSpeed = speed;
-    state.currentHeading = newPosition.heading;
-    state.lastUpdateTime = now;
-    
-    // Update marker position
-    updateMarkerPosition(smoothedPosition);
-    
-    // Update viewport (the improved part!)
-    if (!isPopupOpen()) {
-        ViewportManager.ensureContainment(smoothedPosition);
-        ViewportManager.updateViewport(smoothedPosition, speed, velocity);
-    }
-    
-    // Update distance display
-    updateDistanceBox();
 }
 
 function initializePosition(position) {
@@ -587,8 +621,13 @@ function initializePosition(position) {
     
     PositionFilter.reset(position);
     
-    state.userMarker.setLatLng([position.lat, position.lng]);
-    state.map.setView([position.lat, position.lng], CONFIG.DEFAULT_ZOOM);
+    if (state.userMarker) {
+        state.userMarker.setLatLng([position.lat, position.lng]);
+    }
+    
+    if (state.map) {
+        state.map.setView([position.lat, position.lng], CONFIG.DEFAULT_ZOOM);
+    }
 }
 
 function calculateBufferAverage() {
@@ -617,7 +656,7 @@ function calculateBufferAverage() {
 }
 
 function updateMarkerPosition(position) {
-    const currentLatLng = state.userMarker.getLatLng();
+    if (!state.userMarker) return;
     
     // Smooth marker movement using CSS transitions
     state.userMarker.setLatLng([position.lat, position.lng]);
@@ -690,7 +729,8 @@ function initMap() {
             {
                 enableHighAccuracy: true,
                 timeout: 30000,
-                maximumAge: 0
+                maximumAge: 5000,  // Allow 5-second cached positions
+                distanceFilter: 5   // Only update if moved 5+ meters
             }
         );
     } else {
@@ -706,14 +746,18 @@ function startContinuousTracking() {
         handleLocationError,
         {
             enableHighAccuracy: true,
-            maximumAge: 0,
-            timeout: 30000
+            maximumAge: 5000,      // Allow 5-second cached positions
+            timeout: 30000,
+            distanceFilter: 5       // Only update if moved 5+ meters
         }
     );
 }
 
 function handleLocationError(error) {
     console.warn("Location error:", error);
+    
+    state.errorCount++;
+    const delay = Math.min(2000 * Math.pow(2, state.errorCount), 30000); // Exponential backoff
     
     let message;
     switch (error.code) {
@@ -722,23 +766,30 @@ function handleLocationError(error) {
             break;
         case error.POSITION_UNAVAILABLE:
             message = "Location unavailable. Retrying...";
-            setTimeout(startContinuousTracking, 2000);
+            setTimeout(startContinuousTracking, delay);
             break;
         case error.TIMEOUT:
             message = "Location request timed out. Retrying...";
-            setTimeout(startContinuousTracking, 2000);
+            setTimeout(startContinuousTracking, delay);
             break;
         default:
             message = "Unknown location error.";
     }
     
-    document.getElementById('distanceBox').innerText = message;
+    const distanceBox = document.getElementById('distanceBox');
+    if (distanceBox) {
+        distanceBox.innerText = message;
+    }
 }
 
 // ============================================================================
 // TOUR MANAGEMENT
 // ============================================================================
 function startHunt() {
+    if (!Array.isArray(locations_h)) {
+        console.error('Locations data not loaded');
+        return;
+    }
     state.gameLocations = locations_h.sort((a, b) => a.id - b.id);
     state.currentLocationIndex = 0;
     loadNextLocation();
@@ -751,6 +802,7 @@ function loadNextLocation() {
     }
     
     const location = state.gameLocations[state.currentLocationIndex];
+    if (!location) return;
     
     // Remove existing location marker
     if (state.locationMarker) {
@@ -813,7 +865,9 @@ function setupPopupHandlers() {
     if (bypassButton) {
         bypassButton.addEventListener('click', function() {
             state.currentLocationIndex++;
-            state.locationMarker.closePopup();
+            if (state.locationMarker) {
+                state.locationMarker.closePopup();
+            }
             loadNextLocation();
         });
     }
@@ -826,10 +880,10 @@ function showNavigationModal(lat, lng) {
         <div class="modal-content">
             <h3>Choose your navigation app:</h3>
             <div class="modal-buttons">
-                <button class="modal-button google-maps">Google Maps</button>
-                <button class="modal-button waze">Waze</button>
-                <button class="modal-button apple-maps">Apple Maps</button>
-                <button class="modal-button cancel">Cancel</button>
+                <button class="modal-button google-maps" data-action="google" data-lat="${lat}" data-lng="${lng}">Google Maps</button>
+                <button class="modal-button waze" data-action="waze" data-lat="${lat}" data-lng="${lng}">Waze</button>
+                <button class="modal-button apple-maps" data-action="apple" data-lat="${lat}" data-lng="${lng}">Apple Maps</button>
+                <button class="modal-button cancel" data-action="cancel">Cancel</button>
             </div>
         </div>
     `;
@@ -837,29 +891,40 @@ function showNavigationModal(lat, lng) {
     addModalStyles();
     document.body.appendChild(modal);
     
-    modal.querySelector('.google-maps').addEventListener('click', () => {
-        window.location.href = `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`;
-        modal.remove();
-    });
-    
-    modal.querySelector('.waze').addEventListener('click', () => {
-        window.location.href = `https://www.waze.com/ul?ll=${lat}%2C${lng}&navigate=yes`;
-        modal.remove();
-    });
-    
-    modal.querySelector('.apple-maps').addEventListener('click', () => {
-        const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
-        if (isIOS) {
-            window.location.href = `maps://maps.apple.com/?daddr=${lat},${lng}`;
-            modal.remove();
-        } else {
-            showPopup('Apple Maps is only available on iOS devices');
+    // Single event listener with delegation to prevent memory leaks
+    const clickHandler = (e) => {
+        const button = e.target.closest('.modal-button');
+        if (!button) return;
+        
+        const action = button.dataset.action;
+        const lat = button.dataset.lat;
+        const lng = button.dataset.lng;
+        
+        if (action === 'google') {
+            window.location.href = `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`;
+        } else if (action === 'waze') {
+            window.location.href = `https://www.waze.com/ul?ll=${lat}%2C${lng}&navigate=yes`;
+        } else if (action === 'apple') {
+            const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+            if (isIOS) {
+                window.location.href = `maps://maps.apple.com/?daddr=${lat},${lng}`;
+            } else {
+                showPopup('Apple Maps is only available on iOS devices');
+            }
         }
-    });
+        
+        modal.remove();
+        modal.removeEventListener('click', clickHandler);
+    };
     
-    modal.querySelector('.cancel').addEventListener('click', () => modal.remove());
+    modal.addEventListener('click', clickHandler);
+    
+    // Also handle clicking outside modal
     modal.addEventListener('click', (e) => {
-        if (e.target === modal) modal.remove();
+        if (e.target === modal) {
+            modal.remove();
+            modal.removeEventListener('click', clickHandler);
+        }
     });
 }
 
@@ -900,7 +965,10 @@ function updateDistanceBox() {
         ? `${distanceFeet} feet` 
         : `${(distanceFeet / 5280).toFixed(2)} miles`;
     
-    document.getElementById('distanceBox').innerText = `Next Stop: ${distanceText}`;
+    const distanceBox = document.getElementById('distanceBox');
+    if (distanceBox) {
+        distanceBox.innerText = `Next Stop: ${distanceText}`;
+    }
     
     if (distanceFeet <= CONFIG.DISTANCE_THRESHOLD && !state.isLocationHuntVisible) {
         showLocationHunt();
@@ -910,7 +978,7 @@ function updateDistanceBox() {
 function toggleAllLocations(show) {
     // Remove existing markers
     state.allLocationMarkers.forEach(marker => {
-        if (marker) state.map.removeLayer(marker);
+        if (marker && state.map) state.map.removeLayer(marker);
     });
     state.allLocationMarkers = [];
     
@@ -938,6 +1006,8 @@ function showLocationHunt() {
     state.isLocationHuntVisible = true;
     const location = state.gameLocations[state.currentLocationIndex];
     const container = document.querySelector('.lochunt-container');
+    
+    if (!container || !location) return;
     
     container.innerHTML = '';
     container.style.cssText = 'display: flex; flex-direction: column; height: 100%; overflow: hidden;';
@@ -1161,7 +1231,15 @@ function initAudioPlayer() {
     const currentTimeSpan = document.getElementById('currentTime');
     const durationSpan = document.getElementById('duration');
     
+    // Guard against missing elements
+    if (!audio || !playPauseBtn || !rewindBtn || !forwardBtn || !progressBar || 
+        !progressContainer || !currentTimeSpan || !durationSpan) {
+        console.error('Audio player elements not found');
+        return;
+    }
+    
     function formatTime(time) {
+        if (isNaN(time)) return '0:00';
         const minutes = Math.floor(time / 60);
         const seconds = Math.floor(time % 60);
         return `${minutes}:${seconds.toString().padStart(2, '0')}`;
@@ -1182,11 +1260,11 @@ function initAudioPlayer() {
     });
     
     forwardBtn.addEventListener('click', () => {
-        audio.currentTime = Math.min(audio.duration, audio.currentTime + 10);
+        audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + 10);
     });
     
     audio.addEventListener('timeupdate', () => {
-        const percent = (audio.currentTime / audio.duration) * 100;
+        const percent = (audio.currentTime / (audio.duration || 1)) * 100;
         progressBar.style.width = `${percent}%`;
         currentTimeSpan.textContent = formatTime(audio.currentTime);
     });
@@ -1202,8 +1280,9 @@ function initAudioPlayer() {
     
     progressContainer.addEventListener('click', (e) => {
         const width = progressContainer.clientWidth;
+        if (width === 0) return;
         const clickX = e.offsetX;
-        audio.currentTime = (clickX / width) * audio.duration;
+        audio.currentTime = (clickX / width) * (audio.duration || 0);
     });
 }
 
@@ -1214,10 +1293,17 @@ function showTriviaQuestion() {
     const location = state.gameLocations[state.currentLocationIndex];
     const container = document.querySelector('.trivia-container');
     
+    if (!container || !location || !location.trivia) return;
+    
     container.style.display = 'block';
-    document.getElementById('triviaQuestion').textContent = location.trivia.question;
+    const questionEl = document.getElementById('triviaQuestion');
+    if (questionEl) {
+        questionEl.textContent = location.trivia.question;
+    }
     
     const optionsContainer = document.getElementById('triviaOptions');
+    if (!optionsContainer) return;
+    
     optionsContainer.innerHTML = '';
     
     location.trivia.options.forEach((option, index) => {
@@ -1251,6 +1337,8 @@ function showTriviaQuestion() {
 
 function checkAnswer(selectedIndex) {
     const location = state.gameLocations[state.currentLocationIndex];
+    if (!location || !location.trivia) return;
+    
     const isFinal = state.currentLocationIndex === state.gameLocations.length - 1;
     
     if (selectedIndex === location.trivia.answer) {
@@ -1261,8 +1349,10 @@ function checkAnswer(selectedIndex) {
         } else {
             showPopup('Correct! Moving to the next location.', 'success', () => {
                 state.currentLocationIndex++;
-                document.querySelector('.lochunt-container').style.display = 'none';
-                document.querySelector('.trivia-container').style.display = 'none';
+                const lochuntContainer = document.querySelector('.lochunt-container');
+                const triviaContainer = document.querySelector('.trivia-container');
+                if (lochuntContainer) lochuntContainer.style.display = 'none';
+                if (triviaContainer) triviaContainer.style.display = 'none';
                 state.isLocationHuntVisible = false;
                 loadNextLocation();
             });
@@ -1381,29 +1471,32 @@ function endTour() {
     
     localStorage.removeItem('currentStopIndex');
     localStorage.removeItem('tourProgress');
-    window.location.href = 'https://www.mnthen.com/index.html';
+    window.location.href = 'https://www.mnthen.com/index.html'; // Removed trailing space
 }
 
 function resetInactivityTimer() {
     clearTimeout(state.inactivityTimer);
+    
     state.inactivityTimer = setTimeout(() => {
-        if (state.userMarker && state.currentPosition) {
+        // Only recenter if user isn't interacting and follow mode is enabled
+        if (state.followUser && !state.isUserInteracting && state.currentPosition && state.map) {
             state.map.closePopup();
             state.map.setView([state.currentPosition.lat, state.currentPosition.lng], state.map.getZoom(), {
                 animate: true,
                 duration: 0.5
             });
-            state.followUser = true;
         }
     }, CONFIG.INACTIVITY_TIMEOUT);
 }
 
 function recenterMap() {
     const button = document.getElementById('recenterButton');
+    if (!button) return;
+    
     button.style.backgroundColor = '#005f9e';
     button.style.color = 'white';
     
-    if (state.currentPosition) {
+    if (state.currentPosition && state.map) {
         state.map.setView([state.currentPosition.lat, state.currentPosition.lng], state.map.getZoom(), {
             animate: true,
             duration: 0.3
@@ -1426,14 +1519,23 @@ function returnToIndex() {
 
 function toggleNavigationTips() {
     const tips = document.querySelector('.navigation-tips');
+    if (!tips) return;
+    
     const isHidden = window.getComputedStyle(tips).display === 'none';
     tips.style.display = isHidden ? 'block' : 'none';
-    document.getElementById('tipsButton').classList.toggle('active', isHidden);
+    
+    const tipsButton = document.getElementById('tipsButton');
+    if (tipsButton) {
+        tipsButton.classList.toggle('active', isHidden);
+    }
 }
 
 function closeNavigationTips() {
-    document.querySelector('.navigation-tips').style.display = 'none';
-    document.getElementById('tipsButton').classList.remove('active');
+    const tips = document.querySelector('.navigation-tips');
+    const tipsButton = document.getElementById('tipsButton');
+    
+    if (tips) tips.style.display = 'none';
+    if (tipsButton) tipsButton.classList.remove('active');
 }
 
 // ============================================================================
@@ -1443,31 +1545,47 @@ document.addEventListener('DOMContentLoaded', function() {
     initMap();
     
     // Button handlers
-    document.getElementById('recenterButton').addEventListener('click', () => {
-        recenterMap();
-        resetInactivityTimer();
-    });
+    const recenterButton = document.getElementById('recenterButton');
+    const returnButton = document.getElementById('returnButton');
+    const tipsButton = document.getElementById('tipsButton');
+    const showAllSwitch = document.getElementById('showAllLocations');
+    const closeTipsButton = document.querySelector('.navigation-tips .close-button');
     
-    document.getElementById('returnButton').addEventListener('click', () => {
-        returnToIndex();
-        resetInactivityTimer();
-    });
+    if (recenterButton) {
+        recenterButton.addEventListener('click', () => {
+            recenterMap();
+            resetInactivityTimer();
+        });
+    }
     
-    document.getElementById('tipsButton').addEventListener('click', () => {
-        toggleNavigationTips();
-        resetInactivityTimer();
-    });
+    if (returnButton) {
+        returnButton.addEventListener('click', () => {
+            returnToIndex();
+            resetInactivityTimer();
+        });
+    }
     
-    document.getElementById('showAllLocations').addEventListener('change', function(e) {
-        state.showingAllLocations = e.target.checked;
-        toggleAllLocations(state.showingAllLocations);
-        resetInactivityTimer();
-    });
+    if (tipsButton) {
+        tipsButton.addEventListener('click', () => {
+            toggleNavigationTips();
+            resetInactivityTimer();
+        });
+    }
     
-    document.querySelector('.navigation-tips .close-button').addEventListener('click', () => {
-        closeNavigationTips();
-        resetInactivityTimer();
-    });
+    if (showAllSwitch) {
+        showAllSwitch.addEventListener('change', function(e) {
+            state.showingAllLocations = e.target.checked;
+            toggleAllLocations(state.showingAllLocations);
+            resetInactivityTimer();
+        });
+    }
+    
+    if (closeTipsButton) {
+        closeTipsButton.addEventListener('click', () => {
+            closeNavigationTips();
+            resetInactivityTimer();
+        });
+    }
 });
     </script>
 </body>
