@@ -5,7 +5,7 @@ window.locations_h = [
         lat: 44.915278600994434,
         lng: -93.08081040735343,
         image: "https://mnthen.com/tour/gangster/images/wsp_house.jpg",
-        audio: "https://mnthen.com/audio/exhibit/appleton.mp3,
+        audio: "https://mnthen.com/audio/exhibit/appleton.mp3",
         city: "West Saint Paul",
         creator: "Matt Reicher",
         link: "http://www.historictwincities.com/2021/07/12/barker-karpis-gang-hideout-house-1031-south-robert-street/",
