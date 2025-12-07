@@ -16,8 +16,6 @@ const MAX_TILE_ENTRIES      = 1500;
 const MAX_SHELL_ENTRIES     = 50;
 
 // ----------  install-time shell  ----------
-// NOTE: Since you're using CDNs, they can't be added here for the install event.
-// They will be cached on first use by the `cacheFirst` strategy below.
 const SHELL_RESOURCES = [
   '/',
   '/index.html',
@@ -26,7 +24,7 @@ const SHELL_RESOURCES = [
   '/manifest.json',
   '/images/logo.webp',
   '/images/mnthenfav.ico',
-  'https://www.mnthen.com/images/gangster/mccord/gangster_mccord_3.jpg' // Cache the loading screen image
+  'https://www.mnthen.com/images/gangster/mccord/gangster_mccord_3.jpg'
 ];
 
 // Assets that must **never** be served from cache (always live).
