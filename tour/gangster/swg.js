@@ -1,98 +1,118 @@
 // swg.js – Minnesota Then Service Worker
-// Version: 4.4.2 (CORS credentials fix)
+// Version: 4.4.3 (AGGRESSIVE CORS FIX + NEVER_CACHE added)
 // FOR: Gangster Tour App
 
-// MUST MATCH EXACTLY what's in your HTML file
+// FORCE CACHE PURGE
+const SW_VERSION = '4.4.3';
 const CACHE_CONFIG = {
-  STATIC: 'mnthen-static-v1',
-  TILES: 'mnthen-tiles-v1',
-  DATA: 'mnthen-data-v1',
-  AUDIO: 'mnthen-audio-v1',
-  IMAGES: 'mnthen-images-v1'
+  STATIC: `mnthen-static-v1-${SW_VERSION}`,
+  TILES: `mnthen-tiles-v1-${SW_VERSION}`,
+  DATA: `mnthen-data-v1-${SW_VERSION}`,
+  AUDIO: `mnthen-audio-v1-${SW_VERSION}`,
+  IMAGES: `mnthen-images-v1-${SW_VERSION}`
 };
 
-// iOS Safari cache quotas (conservative)
-const MAX_CACHE_SIZE        = 80 * 1024 * 1024;
-const MAX_STATIC_ENTRIES    = 50;
-const MAX_TILE_ENTRIES      = 1500;
-const MAX_AUDIO_ENTRIES     = 100;
-const MAX_DATA_ENTRIES      = 50;
-const MAX_IMAGE_ENTRIES     = 100;
+const MAX_STATIC_ENTRIES = 50;
+const MAX_TILE_ENTRIES = 1500;
+const MAX_AUDIO_ENTRIES = 100;
+const MAX_DATA_ENTRIES = 50;
+const MAX_IMAGE_ENTRIES = 100;
 
-// ----------  install-time shell  ----------
 const SHELL_RESOURCES = [
   '/',
   '/index.html',
-  '/css/mnthen_tour_gangster.css', 
-  '/locations_h.js',                
-  '/manifest.json',
-  '/images/logo.webp',
-  '/images/mnthenfav.ico',
-  'https://www.mnthen.com/images/gangster/mccord/gangster_mccord_3.jpg '
+  '/css/mnthen_tour_gangster.css',
+  '/locations_h.js',
+  '/manifest.json'
 ];
 
-// Media patterns
-const AUDIO_EXTENSIONS = /\.(mp3|wav|ogg|m4a|aac|flac|weba)$/i;
-const TILE_REGEX = /tile\.openstreetmap\.org\/\d+\/\d+\/\d+\.png/i;
+// TILE DEFINITIONS
+const TILE_DOMAINS = ['a.tile.openstreetmap.org', 'b.tile.openstreetmap.org', 'c.tile.openstreetmap.org'];
+const TILE_REGEX = /https:\/\/[abc]\.tile\.openstreetmap\.org\/\d+\/\d+\/\d+\.png/;
+const NEVER_CACHE = []; // ← FIX: Add this line
 
-// ----------  helpers  ----------
+// Audio pattern
+const AUDIO_EXTENSIONS = /\.(mp3|wav|ogg|m4a|aac|flac|weba)$/i;
+
 async function manageCacheSize(cacheName, maxEntries) {
   try {
     const cache = await caches.open(cacheName);
-    const keys  = await cache.keys();
+    const keys = await cache.keys();
     if (keys.length > maxEntries) {
-      const toDelete = keys.length - maxEntries;
-      for (let i = 0; i < toDelete; i++) await cache.delete(keys[i]);
+      const toDelete = keys.slice(0, keys.length - maxEntries);
+      await Promise.all(toDelete.map(key => cache.delete(key)));
     }
   } catch (e) {
-    console.warn('[SW] cache size manage fail:', e);
+    console.warn(`[SW] Cache size manage fail: ${cacheName}`, e);
   }
 }
 
-// ----------  Tile Strategy (FIX: credentials: 'omit') ----------
 async function cacheFirstForTiles(request) {
   const cache = await caches.open(CACHE_CONFIG.TILES);
   const cached = await cache.match(request);
-  if (cached) return cached;
+  if (cached) {
+    console.log('[SW] Serving tile from cache:', request.url);
+    return cached;
+  }
 
   try {
-    // CRITICAL FIX: credentials: 'omit' to avoid CORS wildcard error
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 15000);
-    const response = await fetch(request, { 
-      signal: controller.signal,
-      cache: 'default',
+    const cleanRequest = new Request(request.url, {
+      method: 'GET',
       mode: 'cors',
-      credentials: 'omit' // ← FIX: Don't send cookies to OSM
+      credentials: 'omit',
+      redirect: 'follow',
+      integrity: '',
+      cache: 'default'
     });
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    
+    const response = await fetch(cleanRequest, {
+      signal: controller.signal,
+      headers: {
+        'Accept': 'image/png,image/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache'
+      }
+    });
+    
     clearTimeout(timeoutId);
 
-    if (response && response.status === 200) {
-      cache.put(request, response.clone());
+    if (response.ok && response.status === 200) {
+      const responseToCache = response.clone();
+      cache.put(request, responseToCache);
+      console.log('[SW] Fetched and cached tile:', request.url);
       return response;
     }
-    throw new Error('Tile fetch failed');
+    
+    throw new Error(`Tile fetch failed: ${response.status}`);
   } catch (e) {
-    console.warn('[SW] Tile offline, using transparent fallback');
-    // Return 1x1 transparent PNG
+    console.warn('[SW] Tile fetch failed, serving fallback:', e.message);
     const fallback = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
     return new Response(
       Uint8Array.from(atob(fallback), c => c.charCodeAt(0)),
-      { status: 200, headers: { 'Content-Type': 'image/png' } }
+      { 
+        status: 200, 
+        headers: { 
+          'Content-Type': 'image/png',
+          'Cache-Control': 'no-store'
+        }
+      }
     );
   }
 }
 
-// Your original functions below (unchanged)...
 async function cacheFirst(request, cacheName = CACHE_CONFIG.STATIC) {
   try {
-    const cache   = await caches.open(cacheName);
-    const cached  = await cache.match(request);
+    const cache = await caches.open(cacheName);
+    const cached = await cache.match(request);
     if (cached) return cached;
 
     const controller = new AbortController();
-    const timeoutId  = setTimeout(() => controller.abort(), 10000);
-    const response = await fetch(request, { signal: controller.signal, cache: 'default' });
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    const response = await fetch(request, { signal: controller.signal });
     clearTimeout(timeoutId);
 
     if (response.status === 200 && response.type !== 'opaque') {
@@ -108,7 +128,7 @@ async function cacheFirst(request, cacheName = CACHE_CONFIG.STATIC) {
 async function networkFirst(request) {
   try {
     const controller = new AbortController();
-    const timeoutId  = setTimeout(() => controller.abort(), 8000);
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
     const response = await fetch(request, { signal: controller.signal, cache: 'no-cache' });
     clearTimeout(timeoutId);
 
@@ -149,20 +169,14 @@ async function handleMediaRequest(request) {
   const cached = await cache.match(request);
   if (cached) return cached;
 
-  const response = await fetch(request, { 
-    mode: 'cors', 
-    credentials: 'same-origin',
-    cache: 'default'
-  });
+  const response = await fetch(request, { mode: 'cors', credentials: 'same-origin' });
   if (response.status === 200 && response.ok && response.type !== 'opaque') {
-    cache.put(request, response.clone()).then(() => {
-      manageCacheSize(CACHE_CONFIG.AUDIO, MAX_AUDIO_ENTRIES);
-    });
+    cache.put(request, response.clone()).then(() => manageCacheSize(CACHE_CONFIG.AUDIO, MAX_AUDIO_ENTRIES));
   }
   return response;
 }
 
-// ----------  fetch handler ----------
+// ---------- fetch handler ----------
 self.addEventListener('fetch', (event) => {
   const { request } = event;
   const url = request.url;
@@ -180,8 +194,8 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // TILES - Use dedicated handler
-  if (TILE_REGEX.test(url)) {
+  // TILES - AGGRESSIVE MATCHING
+  if (TILE_DOMAINS.some(domain => url.includes(domain)) || TILE_REGEX.test(url)) {
     event.respondWith(cacheFirstForTiles(request));
     return;
   }
@@ -214,9 +228,9 @@ self.addEventListener('fetch', (event) => {
   event.respondWith(networkFirst(request));
 });
 
-// ----------  lifecycle ----------
+// ---------- lifecycle ----------
 self.addEventListener('install', (e) => {
-  console.log('[SW] Tour App v4.4.2 installing');
+  console.log(`[SW] Tour App ${SW_VERSION} installing`);
   e.waitUntil(
     caches.open(CACHE_CONFIG.STATIC)
       .then(cache => cache.addAll(SHELL_RESOURCES))
@@ -226,9 +240,10 @@ self.addEventListener('install', (e) => {
 });
 
 self.addEventListener('activate', (e) => {
-  console.log('[SW] Tour App v4.4.2 activating');
+  console.log(`[SW] Tour App ${SW_VERSION} activating`);
   e.waitUntil(
     Promise.all([
+      // Delete ALL old caches (aggressive purge)
       caches.keys().then(names => Promise.all(
         names.map(name => {
           if (!Object.values(CACHE_CONFIG).includes(name)) {
@@ -237,20 +252,20 @@ self.addEventListener('activate', (e) => {
           }
         })
       )),
-      // Manage all cache sizes
+      // Manage cache sizes
       manageCacheSize(CACHE_CONFIG.STATIC, MAX_STATIC_ENTRIES),
       manageCacheSize(CACHE_CONFIG.TILES, MAX_TILE_ENTRIES),
       manageCacheSize(CACHE_CONFIG.AUDIO, MAX_AUDIO_ENTRIES),
       manageCacheSize(CACHE_CONFIG.DATA, MAX_DATA_ENTRIES),
       manageCacheSize(CACHE_CONFIG.IMAGES, MAX_IMAGE_ENTRIES)
     ]).then(() => {
-      console.log('[SW] Activated and ready');
+      console.log('[SW] Activated - ALL OLD CACHES PURGED');
       return self.clients.claim();
     })
   );
 });
 
-// ----------  message handler ----------
+// ---------- message handler ----------
 self.addEventListener('message', (event) => {
   const { data } = event;
   if (!data) return;
@@ -260,14 +275,4 @@ self.addEventListener('message', (event) => {
     self.skipWaiting();
   }
 });
-
-// ----------  error shields ----------
-self.addEventListener('error', (e) => {
-  console.error('[SW] global error', e.error);
-  e.preventDefault();
-});
-self.addEventListener('unhandledrejection', (e) => {
-  console.error('[SW] unhandled rejection', e.reason);
-  e.preventDefault();
-});
-console.log('[SW] Tour App v4.4.2 ready (CORS credentials fix)');
+console.log(`[SW] Tour App ${SW_VERSION} ready (AGGRESSIVE CORS FIX + NEVER_CACHE)`);
