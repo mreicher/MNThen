@@ -19,10 +19,10 @@ const MAX_DATA_ENTRIES = 50;
 const MAX_IMAGE_ENTRIES = 100;
 
 const SHELL_RESOURCES = [
-  '/',
+  './',
   '/index.html',
   '/css/mnthen_tour_gangster.css',
-  '/locations_h.js',
+  'locations_h.js',
   '/manifest.json'
 ];
 
