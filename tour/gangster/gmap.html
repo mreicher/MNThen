@@ -1408,159 +1408,125 @@ function debouncedProcessPosition(position) {
   }
 }
 
-const processPosition = withErrorBoundary(function(position) {
-  if (state.isProcessingPosition) return;
+const processPosition = withErrorBoundary(function (position) {
+  /* ---- early exits / guards ---- */
+  if (state.isProcessingPosition) return;          
   state.isProcessingPosition = true;
   positionUpdateLastTime = Date.now();
-  
+
   try {
-    const coords = position.coords;
-    const rawPosition = {
-      lat: coords.latitude,
-      lng: coords.longitude,
-      accuracy: coords.accuracy,
-      heading: coords.heading ?? null,
-      speed: coords.speed ?? 0,
-      timestamp: positionUpdateLastTime,
+    const coords   = position.coords;
+    const rawPos   = {
+      lat      : coords.latitude,
+      lng      : coords.longitude,
+      accuracy : coords.accuracy,
+      heading  : coords.heading ?? null,
+      speed    : coords.speed    ?? 0,
+      timestamp: positionUpdateLastTime
     };
 
-    // Validate coordinates
-    if (isNaN(rawPosition.lat) || isNaN(rawPosition.lng)) {
+    if (Number.isNaN(rawPos.lat) || Number.isNaN(rawPos.lng))
       throw new Error('Invalid coordinates');
-    }
-    
-    // Reject low-accuracy readings
-    if (rawPosition.accuracy > CONFIG.POSITION.MIN_ACCURACY) {
+
+    if (rawPos.accuracy > CONFIG.POSITION.MIN_ACCURACY) {
       state.isProcessingPosition = false;
       return;
     }
 
-    // Track metrics
-    PerformanceMonitor.recordPositionUpdate();
-    PerformanceMonitor.recordGPSAccuracy(rawPosition.accuracy);
-
-    // First position: initialize and exit
+    /* ---- first fix? bootstrap everything ---- */
     if (!state.currentPosition) {
-      initializePosition(rawPosition);
+      initializePosition(rawPos);
       state.isProcessingPosition = false;
       return;
     }
 
-    // Calculate distance from last position
-    const distance = calculateDistance(state.currentPosition, rawPosition);
-    
-    // Detect teleportation (GPS glitch)
-    if (distance > CONFIG.POSITION.MAX_TELEPORT) {
-      console.warn('Teleport detected, resetting filter');
-      PositionFilter.reset(rawPosition);
-      initializePosition(rawPosition);
+    /* ---- basic movement sanity checks ---- */
+    const distance = calculateDistance(state.currentPosition, rawPos);
+
+    if (distance > CONFIG.POSITION.MAX_TELEPORT) {          // GPS jump
+      PositionFilter.reset(rawPos);
+      initializePosition(rawPos);
       state.isProcessingPosition = false;
       return;
     }
 
-    // Skip minimal movements with worse accuracy
-    if (distance < CONFIG.POSITION.MIN_MOVEMENT && rawPosition.accuracy >= state.currentPosition.accuracy) {
+    if (distance < CONFIG.POSITION.MIN_MOVEMENT &&
+        rawPos.accuracy >= state.currentPosition.accuracy) {
       state.isProcessingPosition = false;
       return;
     }
 
-    // Calculate time delta
-    const timeDelta = (positionUpdateLastTime - state.lastUpdateTime) / 1000;
-    let speed = 0;
+    /* ---- velocity & acceleration ---- */
+    const dt = (positionUpdateLastTime - state.lastUpdateTime) / 1000;
+    let speed    = 0;
     let velocity = { lat: 0, lng: 0 };
 
-    // Calculate velocity and speed
-    if (timeDelta > 0 && timeDelta < 10) {
-      // Prefer GPS speed if available, otherwise calculate from distance
-      speed = rawPosition.speed > 0 ? rawPosition.speed : distance / timeDelta;
-      
+    if (dt > 0 && dt < 10) {
+      speed = rawPos.speed > 0 ? rawPos.speed : distance / dt;
+
       velocity = {
-        lat: (rawPosition.lat - state.currentPosition.lat) / timeDelta,
-        lng: (rawPosition.lng - state.currentPosition.lng) / timeDelta,
+        lat: (rawPos.lat - state.currentPosition.lat) / dt,
+        lng: (rawPos.lng - state.currentPosition.lng) / dt
       };
 
-      // Apply acceleration compensation for high speeds
+      /* crude acceleration boost for high-speed travel */
       if (speed > 10 && state.positionBuffer.size >= 3) {
-        const arr = state.positionBuffer.toArray();
-        const p0 = arr[arr.length - 3];
-        const p1 = arr[arr.length - 2];
-        const p2 = arr[arr.length - 1];
-        
+        const buf = state.positionBuffer.toArray();
+        const [p0, p1, p2] = [buf[buf.length - 3], buf[buf.length - 2], buf[buf.length - 1]];
         if (p0 && p1 && p2) {
           const dt1 = (p1.timestamp - p0.timestamp) / 1000;
           const dt2 = (p2.timestamp - p1.timestamp) / 1000;
-          
           if (dt1 >= 0.1 && dt2 >= 0.1 && dt1 < 3 && dt2 < 3) {
-            // Calculate acceleration
             const accLat = ((p2.lat - p1.lat) / dt2 - (p1.lat - p0.lat) / dt1) / ((dt1 + dt2) / 2);
             const accLng = ((p2.lng - p1.lng) / dt2 - (p1.lng - p0.lng) / dt1) / ((dt1 + dt2) / 2);
-            
-            // Clamp acceleration to reasonable limits
-            const maxAccel = 12;
-            const clampedAccLat = clamp(accLat, -maxAccel, maxAccel);
-            const clampedAccLng = clamp(accLng, -maxAccel, maxAccel);
-            
-            state.acceleration = { lat: clampedAccLat, lng: clampedAccLng };
-            
-            // Apply acceleration boost to velocity
-            const boostLat = clampedAccLat * dt2 * 0.4;
-            const boostLng = clampedAccLng * dt2 * 0.4;
-            
-            if (Math.abs(boostLat) > 0.000001 || Math.abs(boostLng) > 0.000001) {
-              velocity.lat += boostLat;
-              velocity.lng += boostLng;
-            }
+            const maxA = 12;
+            state.acceleration = {
+              lat: clamp(accLat, -maxA, maxA),
+              lng: clamp(accLng, -maxA, maxA)
+            };
+            velocity.lat += state.acceleration.lat * dt2 * 0.4;
+            velocity.lng += state.acceleration.lng * dt2 * 0.4;
           }
         }
       }
     }
 
-    // Reject unreasonable speeds (likely GPS error)
-    if (speed > CONFIG.SPEED.MAX_REASONABLE) {
+    if (speed > CONFIG.SPEED.MAX_REASONABLE) {   // reject crazy speeds
       state.isProcessingPosition = false;
       return;
     }
 
-    // Apply Kalman filter
+    /* ---- filter & smooth ---- */
     PositionFilter.adaptToSpeed(speed);
-    const filtered = PositionFilter.update(rawPosition);
+    const filtered = PositionFilter.update(rawPos);
     state.positionBuffer.push(filtered);
-    
-    // Get smoothed position from buffer
     const smoothed = state.positionBuffer.getAverage();
     const speedMph = metersPerSecondToMph(speed);
-    
-    // Update heading with smoothing
-    state.velocity = velocity;
-    state.speed = speed;
-    state.speedMph = speedMph;
-    state.heading = smoothHeading(
-      correctHeading(rawPosition.heading, rawPosition.lat, rawPosition.lng),
+
+    /* ---- update persistent state ---- */
+    state.velocity   = velocity;
+    state.speed      = speed;
+    state.speedMph   = speedMph;
+    state.heading    = smoothHeading(
+      correctHeading(rawPos.heading, rawPos.lat, rawPos.lng),
       state.heading,
       speedMph
     );
-    state.lastPosition = state.currentPosition;
-    state.currentPosition = smoothed;
+    state.lastPosition   = state.currentPosition;
+    state.currentPosition= smoothed;
     state.lastUpdateTime = positionUpdateLastTime;
-    state.errorCount = 0;
+    state.errorCount     = 0;
 
-    // Update user marker icon visual feedback
+    /* ---- UI / viewport ---- */
     if (DOM_CACHE.userMarkerIcon) {
-      const icon = DOM_CACHE.userMarkerIcon;
-      
-      // Apply speed-based classes
-      icon.classList.toggle('moving-fast', speedMph > CONFIG.SPEED.HIGH_SPEED);
-      icon.classList.toggle('moving-very-fast', speedMph >= 15);
-      
-      // Update heading rotation with CSS variable for animation
-      if (state.heading !== null && !isNaN(state.heading)) {
-        icon.style.setProperty('--heading', `${state.heading}deg`);
-        icon.style.transition = `transform ${CONFIG.ANIMATION.HEADING}s cubic-bezier(0.25, 0.1, 0.25, 1)`;
-        icon.style.transform = `rotate(${state.heading}deg)`;
+      DOM_CACHE.userMarkerIcon.classList.toggle('moving-fast',      speedMph > CONFIG.SPEED.HIGH_SPEED);
+      DOM_CACHE.userMarkerIcon.classList.toggle('moving-very-fast', speedMph >= 15);
+      if (state.heading != null && !Number.isNaN(state.heading)) {
+        DOM_CACHE.userMarkerIcon.style.setProperty('--heading', `${state.heading}deg`);
+        DOM_CACHE.userMarkerIcon.style.transform = `rotate(${state.heading}deg)`;
       }
     }
 
-    // Update map viewport and distance (skip if popup is open)
     if (!isPopupOpen()) {
       ViewportManager.ensureContainment(smoothed, velocity);
       ViewportManager.updateViewport(smoothed, speed, velocity);
@@ -1568,9 +1534,9 @@ const processPosition = withErrorBoundary(function(position) {
     }
 
     updateDistanceBox();
-    
-  } catch (error) {
-    console.error('Position processing failed:', error);
+
+  } catch (err) {
+    console.error('Position processing failed:', err);
     state.errorCount++;
   } finally {
     state.isProcessingPosition = false;
