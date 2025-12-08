@@ -569,7 +569,7 @@ const CONFIG = Object.freeze({
     SLOW: 0.6,
     RECENTER: 0.35,
     HEADING: 0.15,
-    HIGH_SPEED_PAN: 0,
+    HIGH_SPEED_PAN: 0.1,  
   },
   
   POSITION: {
@@ -1122,7 +1122,7 @@ function getUpdateIntervalForSpeed(speedMph) {
 }
 
 // ============================================================================
-// VIEWPORT MANAGER
+// VIEWPORT MANAGER 
 // ============================================================================
 
 const ViewportManager = {
@@ -1191,13 +1191,12 @@ const ViewportManager = {
     const speedMph = metersPerSecondToMph(speed);
     state.speedMph = speedMph;
     
-    // Don't move map if user is interacting
     if (!state.followUser || state.isUserInteracting || state.isPinchingZooming) return;
 
     // CENTERED MODE: ≥15 mph - marker stays centered, map moves underneath
     if (speedMph >= 15) {
       state.viewportMode = 'centered';
-      this.centerMarkerInstantly(position);
+      this.centerMarkerSmooth(position);
       return;
     }
 
@@ -1206,7 +1205,7 @@ const ViewportManager = {
     this.handleRoaming(position, speed, velocity);
   },
   
-  centerMarkerInstantly(position) {
+  centerMarkerSmooth(position) {
     // Calculate pixel offset between marker and map center
     const markerPoint = state.map.latLngToContainerPoint([position.lat, position.lng]);
     const centerPoint = state.map.getSize().multiplyBy(0.5);
@@ -1215,9 +1214,10 @@ const ViewportManager = {
     // Only pan if offset is significant (reduces jitter)
     if (Math.abs(offset.x) > 1 || Math.abs(offset.y) > 1) {
       state.map.panBy([offset.x, offset.y], {
-        animate: false,
-        duration: 0,
+        animate: true,
+        duration: CONFIG.ANIMATION.HIGH_SPEED_PAN,
         noMoveStart: true,
+        easeLinearity: 0.1,
       });
       PerformanceMonitor.recordMapMove();
     }
@@ -1227,32 +1227,26 @@ const ViewportManager = {
     const urgency = this.getUrgencyLevel(position);
     const speedMph = metersPerSecondToMph(speed);
     
-    // Emergency: marker very close to edge
     if (urgency === 'emergency') {
       this.recenterImmediate(position);
       return;
     }
     
-    // Hard: marker close to edge
     if (urgency === 'hard') {
       this.recenterSmooth(position, CONFIG.ANIMATION.FAST, 0.75);
       return;
     }
     
-    // Medium: marker approaching edge
     if (urgency === 'medium') {
       const intensity = clamp(speedMph / CONFIG.SPEED.ROAMING_MAX, 0.35, 0.60);
       this.recenterSmooth(position, CONFIG.ANIMATION.NORMAL, intensity);
       return;
     }
     
-    // Soft: gentle correction if moving toward edge
     if (urgency === 'soft' && this.isMovingTowardEdge(position, velocity)) {
       const intensity = clamp(speedMph / CONFIG.SPEED.ROAMING_MAX, 0.15, 0.35);
       this.recenterSmooth(position, CONFIG.ANIMATION.SLOW, intensity);
     }
-    
-    // Otherwise, let marker roam freely in viewport
   },
   
   isMovingTowardEdge(position, velocity) {
@@ -1284,7 +1278,6 @@ const ViewportManager = {
     const optimalCenter = this.calculateOptimalCenter(position, state.velocity, state.speed);
     const currentCenter = state.map.getCenter();
     
-    // Gradually move map center toward optimal position
     const newLat = currentCenter.lat + (optimalCenter.lat - currentCenter.lat) * intensity;
     const newLng = currentCenter.lng + (optimalCenter.lng - currentCenter.lng) * intensity;
     
@@ -1308,7 +1301,6 @@ const ViewportManager = {
     const minLng = bounds.getWest() + lngSpan * padding;
     const maxLng = bounds.getEast() - lngSpan * padding;
     
-    // Force recenter if marker goes outside padded bounds
     if (position.lat < minLat || position.lat > maxLat ||
         position.lng < minLng || position.lng > maxLng) {
       this.recenterImmediate(position);
@@ -1432,22 +1424,158 @@ const processPosition = withErrorBoundary(function(position) {
       timestamp: positionUpdateLastTime,
     };
 
+    // Validate coordinates
     if (isNaN(rawPosition.lat) || isNaN(rawPosition.lng)) {
       throw new Error('Invalid coordinates');
     }
+    
+    // Reject low-accuracy readings
     if (rawPosition.accuracy > CONFIG.POSITION.MIN_ACCURACY) {
       state.isProcessingPosition = false;
       return;
     }
 
+    // Track metrics
     PerformanceMonitor.recordPositionUpdate();
     PerformanceMonitor.recordGPSAccuracy(rawPosition.accuracy);
 
+    // First position: initialize and exit
     if (!state.currentPosition) {
       initializePosition(rawPosition);
       state.isProcessingPosition = false;
       return;
     }
+
+    // Calculate distance from last position
+    const distance = calculateDistance(state.currentPosition, rawPosition);
+    
+    // Detect teleportation (GPS glitch)
+    if (distance > CONFIG.POSITION.MAX_TELEPORT) {
+      console.warn('Teleport detected, resetting filter');
+      PositionFilter.reset(rawPosition);
+      initializePosition(rawPosition);
+      state.isProcessingPosition = false;
+      return;
+    }
+
+    // Skip minimal movements with worse accuracy
+    if (distance < CONFIG.POSITION.MIN_MOVEMENT && rawPosition.accuracy >= state.currentPosition.accuracy) {
+      state.isProcessingPosition = false;
+      return;
+    }
+
+    // Calculate time delta
+    const timeDelta = (positionUpdateLastTime - state.lastUpdateTime) / 1000;
+    let speed = 0;
+    let velocity = { lat: 0, lng: 0 };
+
+    // Calculate velocity and speed
+    if (timeDelta > 0 && timeDelta < 10) {
+      // Prefer GPS speed if available, otherwise calculate from distance
+      speed = rawPosition.speed > 0 ? rawPosition.speed : distance / timeDelta;
+      
+      velocity = {
+        lat: (rawPosition.lat - state.currentPosition.lat) / timeDelta,
+        lng: (rawPosition.lng - state.currentPosition.lng) / timeDelta,
+      };
+
+      // Apply acceleration compensation for high speeds
+      if (speed > 10 && state.positionBuffer.size >= 3) {
+        const arr = state.positionBuffer.toArray();
+        const p0 = arr[arr.length - 3];
+        const p1 = arr[arr.length - 2];
+        const p2 = arr[arr.length - 1];
+        
+        if (p0 && p1 && p2) {
+          const dt1 = (p1.timestamp - p0.timestamp) / 1000;
+          const dt2 = (p2.timestamp - p1.timestamp) / 1000;
+          
+          if (dt1 >= 0.1 && dt2 >= 0.1 && dt1 < 3 && dt2 < 3) {
+            // Calculate acceleration
+            const accLat = ((p2.lat - p1.lat) / dt2 - (p1.lat - p0.lat) / dt1) / ((dt1 + dt2) / 2);
+            const accLng = ((p2.lng - p1.lng) / dt2 - (p1.lng - p0.lng) / dt1) / ((dt1 + dt2) / 2);
+            
+            // Clamp acceleration to reasonable limits
+            const maxAccel = 12;
+            const clampedAccLat = clamp(accLat, -maxAccel, maxAccel);
+            const clampedAccLng = clamp(accLng, -maxAccel, maxAccel);
+            
+            state.acceleration = { lat: clampedAccLat, lng: clampedAccLng };
+            
+            // Apply acceleration boost to velocity
+            const boostLat = clampedAccLat * dt2 * 0.4;
+            const boostLng = clampedAccLng * dt2 * 0.4;
+            
+            if (Math.abs(boostLat) > 0.000001 || Math.abs(boostLng) > 0.000001) {
+              velocity.lat += boostLat;
+              velocity.lng += boostLng;
+            }
+          }
+        }
+      }
+    }
+
+    // Reject unreasonable speeds (likely GPS error)
+    if (speed > CONFIG.SPEED.MAX_REASONABLE) {
+      state.isProcessingPosition = false;
+      return;
+    }
+
+    // Apply Kalman filter
+    PositionFilter.adaptToSpeed(speed);
+    const filtered = PositionFilter.update(rawPosition);
+    state.positionBuffer.push(filtered);
+    
+    // Get smoothed position from buffer
+    const smoothed = state.positionBuffer.getAverage();
+    const speedMph = metersPerSecondToMph(speed);
+    
+    // Update heading with smoothing
+    state.velocity = velocity;
+    state.speed = speed;
+    state.speedMph = speedMph;
+    state.heading = smoothHeading(
+      correctHeading(rawPosition.heading, rawPosition.lat, rawPosition.lng),
+      state.heading,
+      speedMph
+    );
+    state.lastPosition = state.currentPosition;
+    state.currentPosition = smoothed;
+    state.lastUpdateTime = positionUpdateLastTime;
+    state.errorCount = 0;
+
+    // Update user marker icon visual feedback
+    if (DOM_CACHE.userMarkerIcon) {
+      const icon = DOM_CACHE.userMarkerIcon;
+      
+      // Apply speed-based classes
+      icon.classList.toggle('moving-fast', speedMph > CONFIG.SPEED.HIGH_SPEED);
+      icon.classList.toggle('moving-very-fast', speedMph >= 15);
+      
+      // Update heading rotation with CSS variable for animation
+      if (state.heading !== null && !isNaN(state.heading)) {
+        icon.style.setProperty('--heading', `${state.heading}deg`);
+        icon.style.transition = `transform ${CONFIG.ANIMATION.HEADING}s cubic-bezier(0.25, 0.1, 0.25, 1)`;
+        icon.style.transform = `rotate(${state.heading}deg)`;
+      }
+    }
+
+    // Update map viewport and distance (skip if popup is open)
+    if (!isPopupOpen()) {
+      ViewportManager.ensureContainment(smoothed, velocity);
+      ViewportManager.updateViewport(smoothed, speed, velocity);
+      optimizeTileRendering();
+    }
+
+    updateDistanceBox();
+    
+  } catch (error) {
+    console.error('Position processing failed:', error);
+    state.errorCount++;
+  } finally {
+    state.isProcessingPosition = false;
+  }
+}, 'processPosition');
 
     const distance = calculateDistance(state.currentPosition, rawPosition);
     if (distance > CONFIG.POSITION.MAX_TELEPORT) {
@@ -2828,6 +2956,15 @@ function addGlobalStyles() {
       }
     }
     
+    @keyframes subtlePulse {
+      0%, 100% { 
+        transform: scale(1) rotate(var(--heading, 0deg)); 
+      }
+      50% { 
+        transform: scale(1.06) rotate(var(--heading, 0deg)); 
+      }
+    }
+    
     .leaflet-tile-pane {
       transform: translateZ(0);
       will-change: transform;
@@ -2869,7 +3006,8 @@ function addGlobalStyles() {
     }
     
     .user-marker-icon.moving-very-fast {
-      filter: brightness(1.2) drop-shadow(0 0 4px rgba(220, 53, 69, 0.5));
+      animation: subtlePulse 0.8s ease-in-out infinite;
+      filter: brightness(1.15) drop-shadow(0 0 4px rgba(220, 53, 69, 0.5));
       box-shadow: 0 0 12px rgba(220, 53, 69, 0.4);
     }
     
