@@ -1397,8 +1397,9 @@ let positionUpdateLastTime = 0;
 function debouncedProcessPosition(position) {
   clearTimeout(positionUpdateTimeout);
   const now = Date.now();
-  const minInterval = getUpdateIntervalForSpeed(metersPerSecondToMph(position.coords.speed || 0));
-  
+  const speedMph = metersPerSecondToMph(position.coords?.speed || 0);
+  const minInterval = getUpdateIntervalForSpeed(speedMph);
+
   if (now - positionUpdateLastTime < minInterval) {
     positionUpdateTimeout = setTimeout(() => {
       processPosition(position);
@@ -1409,124 +1410,142 @@ function debouncedProcessPosition(position) {
 }
 
 const processPosition = withErrorBoundary(function (position) {
-  /* ---- early exits / guards ---- */
-  if (state.isProcessingPosition) return;          
+  if (state.isProcessingPosition) return;
   state.isProcessingPosition = true;
   positionUpdateLastTime = Date.now();
 
   try {
-    const coords   = position.coords;
-    const rawPos   = {
-      lat      : coords.latitude,
-      lng      : coords.longitude,
-      accuracy : coords.accuracy,
-      heading  : coords.heading ?? null,
-      speed    : coords.speed    ?? 0,
+    const coords = position.coords;
+    if (!coords) {
+      throw new Error('Missing coords in position');
+    }
+
+    const rawPos = {
+      lat: coords.latitude,
+      lng: coords.longitude,
+      accuracy: coords.accuracy,
+      heading: coords.heading ?? null,
+      speed: coords.speed ?? 0,
       timestamp: positionUpdateLastTime
     };
 
-    if (Number.isNaN(rawPos.lat) || Number.isNaN(rawPos.lng))
+    // Validate coordinates
+    if (isNaN(rawPos.lat) || isNaN(rawPos.lng)) {
       throw new Error('Invalid coordinates');
+    }
 
+    // Skip low-accuracy readings
     if (rawPos.accuracy > CONFIG.POSITION.MIN_ACCURACY) {
-      state.isProcessingPosition = false;
       return;
     }
 
-    /* ---- first fix? bootstrap everything ---- */
+    // First position: initialize
     if (!state.currentPosition) {
       initializePosition(rawPos);
-      state.isProcessingPosition = false;
       return;
     }
 
-    /* ---- basic movement sanity checks ---- */
+    // Movement validation
     const distance = calculateDistance(state.currentPosition, rawPos);
 
-    if (distance > CONFIG.POSITION.MAX_TELEPORT) {          // GPS jump
+    // Teleport/jump detection
+    if (distance > CONFIG.POSITION.MAX_TELEPORT) {
+      console.warn('Teleport detected, resetting filter');
       PositionFilter.reset(rawPos);
       initializePosition(rawPos);
-      state.isProcessingPosition = false;
       return;
     }
 
+    // Skip insignificant movement with worse or equal accuracy
     if (distance < CONFIG.POSITION.MIN_MOVEMENT &&
         rawPos.accuracy >= state.currentPosition.accuracy) {
-      state.isProcessingPosition = false;
       return;
     }
 
-    /* ---- velocity & acceleration ---- */
+    // Velocity & timing
     const dt = (positionUpdateLastTime - state.lastUpdateTime) / 1000;
-    let speed    = 0;
+    let speed = 0;
     let velocity = { lat: 0, lng: 0 };
 
     if (dt > 0 && dt < 10) {
       speed = rawPos.speed > 0 ? rawPos.speed : distance / dt;
-
       velocity = {
         lat: (rawPos.lat - state.currentPosition.lat) / dt,
         lng: (rawPos.lng - state.currentPosition.lng) / dt
       };
 
-      /* crude acceleration boost for high-speed travel */
-      if (speed > 10 && state.positionBuffer.size >= 3) {
-        const buf = state.positionBuffer.toArray();
-        const [p0, p1, p2] = [buf[buf.length - 3], buf[buf.length - 2], buf[buf.length - 1]];
+      // Acceleration boost (requires 3 buffered points)
+      if (speed > 10 && state.positionBuffer?.size >= 3) {
+        const arr = state.positionBuffer.toArray();
+        const p0 = arr[arr.length - 3];
+        const p1 = arr[arr.length - 2];
+        const p2 = arr[arr.length - 1];
+
         if (p0 && p1 && p2) {
           const dt1 = (p1.timestamp - p0.timestamp) / 1000;
           const dt2 = (p2.timestamp - p1.timestamp) / 1000;
+
           if (dt1 >= 0.1 && dt2 >= 0.1 && dt1 < 3 && dt2 < 3) {
+            // ⚠️ Fixed typo: was "p2.lat - p1.lng" → now "p2.lat - p1.lat"
             const accLat = ((p2.lat - p1.lat) / dt2 - (p1.lat - p0.lat) / dt1) / ((dt1 + dt2) / 2);
             const accLng = ((p2.lng - p1.lng) / dt2 - (p1.lng - p0.lng) / dt1) / ((dt1 + dt2) / 2);
-            const maxA = 12;
-            state.acceleration = {
-              lat: clamp(accLat, -maxA, maxA),
-              lng: clamp(accLng, -maxA, maxA)
-            };
-            velocity.lat += state.acceleration.lat * dt2 * 0.4;
-            velocity.lng += state.acceleration.lng * dt2 * 0.4;
+
+            const maxAccel = 12;
+            const clampedAccLat = clamp(accLat, -maxAccel, maxAccel);
+            const clampedAccLng = clamp(accLng, -maxAccel, maxAccel);
+
+            state.acceleration = { lat: clampedAccLat, lng: clampedAccLng };
+
+            const boostLat = clampedAccLat * dt2 * 0.4;
+            const boostLng = clampedAccLng * dt2 * 0.4;
+
+            if (Math.abs(boostLat) > 0.000001 || Math.abs(boostLng) > 0.000001) {
+              velocity.lat += boostLat;
+              velocity.lng += boostLng;
+            }
           }
         }
       }
     }
 
-    if (speed > CONFIG.SPEED.MAX_REASONABLE) {   // reject crazy speeds
-      state.isProcessingPosition = false;
+    // Reject unreasonable speeds
+    if (speed > CONFIG.SPEED.MAX_REASONABLE) {
       return;
     }
 
-    /* ---- filter & smooth ---- */
+    // Filtering & smoothing
     PositionFilter.adaptToSpeed(speed);
     const filtered = PositionFilter.update(rawPos);
     state.positionBuffer.push(filtered);
     const smoothed = state.positionBuffer.getAverage();
     const speedMph = metersPerSecondToMph(speed);
 
-    /* ---- update persistent state ---- */
-    state.velocity   = velocity;
-    state.speed      = speed;
-    state.speedMph   = speedMph;
-    state.heading    = smoothHeading(
+    // Update state
+    state.velocity = velocity;
+    state.speed = speed;
+    state.speedMph = speedMph;
+    state.heading = smoothHeading(
       correctHeading(rawPos.heading, rawPos.lat, rawPos.lng),
       state.heading,
       speedMph
     );
-    state.lastPosition   = state.currentPosition;
-    state.currentPosition= smoothed;
+    state.lastPosition = state.currentPosition;
+    state.currentPosition = smoothed;
     state.lastUpdateTime = positionUpdateLastTime;
-    state.errorCount     = 0;
+    state.errorCount = 0;
 
-    /* ---- UI / viewport ---- */
+    // UI feedback
     if (DOM_CACHE.userMarkerIcon) {
-      DOM_CACHE.userMarkerIcon.classList.toggle('moving-fast',      speedMph > CONFIG.SPEED.HIGH_SPEED);
+      DOM_CACHE.userMarkerIcon.classList.toggle('moving-fast', speedMph > CONFIG.SPEED.HIGH_SPEED);
       DOM_CACHE.userMarkerIcon.classList.toggle('moving-very-fast', speedMph >= 15);
-      if (state.heading != null && !Number.isNaN(state.heading)) {
+      if (state.heading != null && !isNaN(state.heading)) {
         DOM_CACHE.userMarkerIcon.style.setProperty('--heading', `${state.heading}deg`);
-        DOM_CACHE.userMarkerIcon.style.transform = `rotate(${state.heading}deg)`;
+        // Note: transform is set in animation loop; this is safe to skip here,
+        // or leave for immediate sync — no harm either way.
       }
     }
 
+    // Viewport & side effects
     if (!isPopupOpen()) {
       ViewportManager.ensureContainment(smoothed, velocity);
       ViewportManager.updateViewport(smoothed, speed, velocity);
@@ -1538,106 +1557,43 @@ const processPosition = withErrorBoundary(function (position) {
   } catch (err) {
     console.error('Position processing failed:', err);
     state.errorCount++;
+    attemptRecovery(); // optional: retry GPS if errors pile up
   } finally {
     state.isProcessingPosition = false;
   }
 }, 'processPosition');
 
-    const distance = calculateDistance(state.currentPosition, rawPosition);
-    if (distance > CONFIG.POSITION.MAX_TELEPORT) {
-      console.warn('Teleport detected, resetting filter');
-      PositionFilter.reset(rawPosition);
-      initializePosition(rawPosition);
-      state.isProcessingPosition = false;
-      return;
-    }
+function initializePosition(position) {
+  state.currentPosition = position;
+  state.lastPosition = position;
+  state.positionBuffer = new CircularPositionBuffer(CONFIG.POSITION.BUFFER_SIZE);
+  state.positionBuffer.push(position);
+  state.velocity = { lat: 0, lng: 0 };
+  state.acceleration = { lat: 0, lng: 0 };
+  state.speed = 0;
+  state.speedMph = 0;
+  state.heading = null;
+  state.lastUpdateTime = Date.now();
+  state.errorCount = 0;
 
-    if (distance < CONFIG.POSITION.MIN_MOVEMENT && rawPosition.accuracy >= state.currentPosition.accuracy) {
-      state.isProcessingPosition = false;
-      return;
-    }
+  PositionFilter.reset(position);
 
-    const timeDelta = (positionUpdateLastTime - state.lastUpdateTime) / 1000;
-    let speed = 0;
-    let velocity = { lat: 0, lng: 0 };
-
-    if (timeDelta > 0 && timeDelta < 10) {
-      speed = rawPosition.speed > 0 ? rawPosition.speed : distance / timeDelta;
-      velocity = {
-        lat: (rawPosition.lat - state.currentPosition.lat) / timeDelta,
-        lng: (rawPosition.lng - state.currentPosition.lng) / timeDelta,
-      };
-
-      if (speed > 10 && state.positionBuffer.size >= 3) {
-        const arr = state.positionBuffer.toArray();
-        const p0 = arr[arr.length - 3];
-        const p1 = arr[arr.length - 2];
-        const p2 = arr[arr.length - 1];
-        
-        if (p0 && p1 && p2) {
-          const dt1 = (p1.timestamp - p0.timestamp) / 1000;
-          const dt2 = (p2.timestamp - p1.timestamp) / 1000;
-          
-          if (dt1 >= 0.1 && dt2 >= 0.1 && dt1 < 3 && dt2 < 3) {
-            const accLat = ((p2.lat - p1.lng) / dt2 - (p1.lat - p0.lat) / dt1) / ((dt1 + dt2) / 2);
-            const accLng = ((p2.lng - p1.lng) / dt2 - (p1.lng - p0.lng) / dt1) / ((dt1 + dt2) / 2);
-            
-            const maxAccel = 12;
-            const clampedAccLat = clamp(accLat, -maxAccel, maxAccel);
-            const clampedAccLng = clamp(accLng, -maxAccel, maxAccel);
-            
-            state.acceleration = { lat: clampedAccLat, lng: clampedAccLng };
-            
-            const boostLat = clampedAccLat * dt2 * 0.4;
-            const boostLng = clampedAccLng * dt2 * 0.4;
-            
-            if (Math.abs(boostLat) > 0.000001 || Math.abs(boostLng) > 0.000001) {
-              velocity.lat += boostLat;
-              velocity.lng += boostLng;
-            }
-          }
-        }
-      }
-    }
-
-    if (speed > CONFIG.SPEED.MAX_REASONABLE) {
-      state.isProcessingPosition = false;
-      return;
-    }
-
-    PositionFilter.adaptToSpeed(speed);
-    const filtered = PositionFilter.update(rawPosition);
-    state.positionBuffer.push(filtered);
-    
-    const smoothed = state.positionBuffer.getAverage();
-    const speedMph = metersPerSecondToMph(speed);
-    
-    state.velocity = velocity;
-    state.speed = speed;
-    state.heading = smoothHeading(
-      correctHeading(rawPosition.heading, rawPosition.lat, rawPosition.lng),
-      state.heading,
-      speedMph
-    );
-    state.lastPosition = state.currentPosition;
-    state.currentPosition = smoothed;
-    state.lastUpdateTime = positionUpdateLastTime;
-    state.errorCount = 0;
-
-    if (!isPopupOpen()) {
-      ViewportManager.ensureContainment(smoothed, velocity);
-      ViewportManager.updateViewport(smoothed, speed, velocity);
-      optimizeTileRendering();
-    }
-
-    updateDistanceBox();
-  } catch (error) {
-    console.error('Position processing failed:', error);
-    state.errorCount++;
-  } finally {
-    state.isProcessingPosition = false;
+  if (state.userMarker) {
+    state.userMarker.setLatLng([position.lat, position.lng]);
+    state.userMarker.setOpacity(1);
+    requestAnimationFrame(() => {
+      DOM_CACHE.userMarkerIcon = state.userMarker.getElement()?.querySelector('.user-marker-icon');
+    });
   }
-}, 'processPosition');
+
+  if (state.map) {
+    state.map.setView([position.lat, position.lng], CONFIG.MAP.DEFAULT_ZOOM, {
+      animate: false
+    });
+  }
+
+  A11yManager.announce('Your location has been found', 'polite');
+}
 
 function initializePosition(position) {
   state.currentPosition = position;
