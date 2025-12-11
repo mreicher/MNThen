@@ -1,5 +1,5 @@
 const blogArticles = [
-  {
+{
   "headline": "George Herrold’s Northern Route Proposal (Interstate 94)",
   "blurb": "In 1945, St. Paul city planner George Herrold proposed an alternate alignment for what would become Interstate 94—one that would spare the Rondo and Prospect Park neighborhoods. His plan was rejected, and the freeway was built through the heart of Rondo.",
   "icon": "fa-building",
