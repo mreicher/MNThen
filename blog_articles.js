@@ -1,5 +1,15 @@
 const blogArticles = [
   {
+  "headline": "George Herrold’s Northern Route Proposal (Interstate 94)",
+  "blurb": "In 1945, St. Paul city planner George Herrold proposed an alternate alignment for what would become Interstate 94—one that would spare the Rondo and Prospect Park neighborhoods. His plan was rejected, and the freeway was built through the heart of Rondo.",
+  "icon": "fa-building",
+  "author": "Matt Reicher",
+  "date": "December 11, 2025",
+  "image": "https://www.mnthen.com/images/herrold.jpg",
+  "url": "https://www.mnthen.com/blog/place/herrold.html",
+  "keywords": ["George Herrold", "Interstate 94", "Rondo neighborhood", "urban planning", "St. Paul history", "freeway construction", "Northern Route", "Minnesota transportation", "place", "all"]
+},
+  {
   "headline": "The Assassination of Walter Liggett (December 9, 1935)",
   "blurb": "On December 9, 1935, investigative journalist Walter Liggett was murdered in a Minneapolis alley after publishing allegations linking organized crime figures, including Kid Cann, to political figures such as Governor Floyd B. Olson.",
   "icon": "fa-calendar",
@@ -7,12 +17,12 @@ const blogArticles = [
   "date": "November 30, 2025",
   "image": "https://www.mnthen.com/images/liggett.jpg",
   "url": "https://www.mnthen.com/blog/event/liggett.html",
-  "keywords": ["Walter Liggett", "assassination", "journalist", "Minneapolis", "Floyd B. Olson", "Kid Cann", "organized crime", "1930s", "historical event", "all"]
+  "keywords": ["Walter Liggett", "assassination", "journalist", "Minneapolis", "Floyd B. Olson", "Kid Cann", "organized crime", "1930s", "event", "all"]
 },
   {
   "headline": "Joe Rolette and the Capital Relocation Bill (1857)",
   "blurb": "In 1857, legislator Joe Rolette vanished with the official copy of a bill to move Minnesota’s capital to St. Peter—buying time, derailing the speculators, and saving St. Paul with a legendary act of procedural sabotage.",
-  "icon": "fa-landmark",
+  "icon": "fa-building",
   "author": "Matt Reicher",
   "date": "November 29, 2025",
   "image": "https://mnthen.com/images/rolette.webp",
