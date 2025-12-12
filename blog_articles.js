@@ -1,4 +1,14 @@
 const blogArticles = [
+  {
+  "headline": "Rohland, Margaret \"Babe\" (1914 – 2011)",
+  "blurb": "A lifelong St. Paul resident and eyewitness to pivotal 20th-century moments—from Henry Ford’s visit to the Barker-Karpis Gang shootings to shaking JFK’s hand—whose personal narrative illuminates the fabric of local history.",
+  "icon": "fa-user",
+  "author": "Matt Reicher",
+  "date": "December 12, 2025",
+  "image": "https://www.mnthen.com/images/rohland.jpg ",
+  "url": "https://www.mnthen.com/blog/people/rohland.html ",
+  "keywords": ["babe rohland", "margaret rohland", "st paul", "personal narrative", "lawrence welk", "barker-karpis gang", "jfk visit minnesota", "henry ford", "history", "person", "all"]
+},
 {
   "headline": "George Herrold’s Northern Route Proposal (Interstate 94)",
   "blurb": "In 1945, St. Paul city planner George Herrold proposed an alternate alignment for what would become Interstate 94—one that would spare the Rondo and Prospect Park neighborhoods. His plan was rejected, and the freeway was built through the heart of Rondo.",
