@@ -537,7 +537,7 @@ async function preCacheTourData() {
 /**
  * @fileoverview Location-based tour application with adaptive viewport management
  * Features: roaming/centered viewport modes, Kalman filtering, dead reckoning, offline support
- * @version 2.3.1 - Perfect Movement with Hysteresis
+ * @version 2.5.1 - Perfect Movement with Zero Drift & Enhanced Recenter
  */
 
 // ============================================================================
@@ -546,14 +546,13 @@ async function preCacheTourData() {
 
 const CONFIG = Object.freeze({
   SPEED: {
-    ROAMING_MAX: 6.7056,      // 15 mph
-    CENTERED_MIN: 6.7056,     // 15 mph (enter threshold)
-    CENTERED_EXIT: 5.3648,    // 12 mph (exit threshold)
+    ROAMING_MAX: 6.7056,      // 15 mph (exact)
+    CENTERED_MIN: 6.7056,     // 15 mph enter threshold
+    CENTERED_EXIT: 5.3648,    // 12 mph exit threshold
     INSTANT_PAN: 5.3648,      // 12 mph
-    TRANSITION_WIDTH: 1.3411, // 3 mph
-    HIGH_SPEED: 15.6464,      // 35 mph
     MAX_REASONABLE: 35.7632,  // 80 mph
-    VERY_HIGH_SPEED: 22.352,  // 50 mph
+    STATIONARY_THRESHOLD: 0.0447, // 0.1 mph (complete freeze)
+    PREDICTION_THRESHOLD: 15.6464, // 35 mph - only predict above this speed
   },
   
   EDGE: {
@@ -573,14 +572,13 @@ const CONFIG = Object.freeze({
     HIGH_SPEED_PAN: 0.1,
     CENTERED_PREDICTIVE_OFFSET: 0.15, // 150ms ahead prediction
     ROAMING_EASING: 0.25,
-    MODE_TRANSITION: 0.4, // Smooth mode transitions
   },
   
   POSITION: {
     BUFFER_SIZE: 10,
     BUFFER_MAX_AGE_MS: 30000,
     MIN_ACCURACY: 65,
-    MIN_MOVEMENT: 0.3,
+    MIN_MOVEMENT: 0.1, // 10cm for precision
     MAX_TELEPORT: 150,
     UPDATE_INTERVALS: {
       VERY_HIGH_SPEED: 100,
@@ -666,6 +664,9 @@ const state = {
   lastTouchTime: 0,
   lastTouchPos: null,
   isProcessingPosition: false,
+  positionFrozen: false, // Perfect stationary lock
+  recenterButtonPressed: false,
+  recenterButtonTimeout: null,
 };
 
 // ============================================================================
@@ -902,7 +903,8 @@ const PositionFilter = {
   
   adaptToSpeed(speedMps) {
     const mph = speedMps * 2.23694;
-    this.processNoise = mph < 1 ? 0.003 :
+    this.processNoise = mph < CONFIG.SPEED.STATIONARY_THRESHOLD ? 0.001 :
+                       mph < 1 ? 0.003 :
                        mph < 5 ? 0.006 :
                        mph < CONFIG.SPEED.ROAMING_MAX ? 0.010 :
                        mph < 30 ? 0.020 : 0.035;
@@ -938,6 +940,11 @@ class CircularPositionBuffer {
       arr.push(this.buffer[(this.tail + i) % this.maxSize]);
     }
     return arr;
+  }
+  
+  getLatest() {
+    if (this.size === 0) return null;
+    return this.buffer[(this.head - 1 + this.maxSize) % this.maxSize];
   }
   
   getAverage() {
@@ -1126,7 +1133,7 @@ function getUpdateIntervalForSpeed(speedMph) {
 }
 
 // ============================================================================
-// VIEWPORT MANAGER WITH HYSTERESIS
+// VIEWPORT MANAGER - PERFECT MODE SWITCHING
 // ============================================================================
 
 const ViewportManager = {
@@ -1134,15 +1141,12 @@ const ViewportManager = {
   cachedBoundsTime: 0,
   BOUNDS_CACHE_TTL: 100,
   
-  // Hysteresis configuration - dual thresholds with time confirmation
+  // Instant mode switching at thresholds
   HYSTERESIS: {
-    ENTER_CENTERED: 15,      // mph: must be ≥ this to enter centered mode
-    EXIT_CENTERED: 12,       // mph: must be ≤ this to exit centered mode
-    CONFIRM_MS: 500,         // Must hold speed for this duration to switch
+    ENTER_CENTERED: 15,      // mph: instant switch to centered
+    EXIT_CENTERED: 12,       // mph: instant switch to roaming
+    EPSILON: 0.001,          // ~1cm margin to prevent micro-adjustments
   },
-  
-  enterThresholdTime: 0,     // Timestamp when we first crossed enter threshold
-  exitThresholdTime: 0,      // Timestamp when we first crossed exit threshold
   
   getEdgeProximities(position) {
     const now = Date.now();
@@ -1166,7 +1170,9 @@ const ViewportManager = {
   },
   
   getMinEdgeProximity(position) {
-    return Math.min(...Object.values(this.getEdgeProximities(position)));
+    const min = Math.min(...Object.values(this.getEdgeProximities(position)));
+    // Apply epsilon to prevent micromovements when near center
+    return Math.max(0, min - this.HYSTERESIS.EPSILON);
   },
   
   getUrgencyLevel(position) {
@@ -1201,55 +1207,18 @@ const ViewportManager = {
   
   updateViewport(position, speed, velocity) {
     if (!state.map || !state.userMarker || !state.followUser || 
-        state.isUserInteracting || state.isPinchingZooming) {
+        state.isUserInteracting || state.isPinchingZooming || state.positionFrozen) {
       return;
     }
     
     const speedMph = metersPerSecondToMph(speed);
     state.speedMph = speedMph;
     
-    const now = Date.now();
-    
-    // ============================================================================
-    // HYSTERESIS LOGIC - Prevents mode oscillation around threshold
-    // ============================================================================
-    // Track time spent above/below thresholds
-    if (speedMph >= this.HYSTERESIS.ENTER_CENTERED) {
-      // Speed is high enough for centered mode
-      this.exitThresholdTime = 0; // Reset exit timer
-      if (this.enterThresholdTime === 0) {
-        this.enterThresholdTime = now; // Start enter timer
-      }
-    } else if (speedMph <= this.HYSTERESIS.EXIT_CENTERED) {
-      // Speed is low enough for roaming mode
-      this.enterThresholdTime = 0; // Reset enter timer
-      if (this.exitThresholdTime === 0) {
-        this.exitThresholdTime = now; // Start exit timer
-      }
-    } else {
-      // In buffer zone (12-15 mph) - reset all timers
-      this.enterThresholdTime = 0;
-      this.exitThresholdTime = 0;
-    }
-    
-    // Determine if we should switch modes based on sustained speed
-    let targetMode = state.viewportMode;
-    
-    if (state.viewportMode === 'roaming' && 
-        this.enterThresholdTime > 0 && 
-        now - this.enterThresholdTime >= this.HYSTERESIS.CONFIRM_MS) {
-      // Been fast long enough - switch to centered
-      targetMode = 'centered';
-    } else if (state.viewportMode === 'centered' && 
-               this.exitThresholdTime > 0 && 
-               now - this.exitThresholdTime >= this.HYSTERESIS.CONFIRM_MS) {
-      // Been slow long enough - switch to roaming
-      targetMode = 'roaming';
-    }
-    
-    // Handle mode transition with smooth animation
-    if (targetMode !== state.viewportMode) {
-      this.transitionMode(targetMode);
+    // INSTANT mode switching - no hysteresis delay
+    if (state.viewportMode === 'roaming' && speedMph >= CONFIG.SPEED.ROAMING_MAX) {
+      this.transitionMode('centered');
+    } else if (state.viewportMode === 'centered' && speedMph < CONFIG.SPEED.CENTERED_EXIT) {
+      this.transitionMode('roaming');
     }
     
     // Execute viewport logic for current mode
@@ -1266,10 +1235,6 @@ const ViewportManager = {
     
     // Update inertia based on mode
     state.map.options.inertia = newMode === 'roaming';
-    
-    // Reset timers after successful transition
-    this.enterThresholdTime = 0;
-    this.exitThresholdTime = 0;
   },
   
   centerMapOnPosition(position, velocity) {
@@ -1277,13 +1242,20 @@ const ViewportManager = {
     if (now - state.lastRecenterTime < CONFIG.INTERACTION.MIN_RECENTER_INTERVAL) return;
     state.lastRecenterTime = now;
     
-    // Predict 150ms ahead to compensate for GPS latency
-    const predictAhead = CONFIG.ANIMATION.CENTERED_PREDICTIVE_OFFSET;
-    const predictedLat = position.lat + (velocity.lat * predictAhead);
-    const predictedLng = position.lng + (velocity.lng * predictAhead);
+    // Use exact position for normal speeds, predict only for very high speeds
+    const speedMph = metersPerSecondToMph(state.speed);
+    let targetLat = position.lat;
+    let targetLng = position.lng;
     
-    // Always center on predicted position - hysteresis ensures this only runs when appropriate
-    state.map.setView([predictedLat, predictedLng], state.map.getZoom(), {
+    // Only apply prediction for very high speeds (> 35 mph)
+    if (speedMph > CONFIG.SPEED.PREDICTION_THRESHOLD) {
+      const predictAhead = CONFIG.ANIMATION.CENTERED_PREDICTIVE_OFFSET;
+      targetLat = position.lat + (velocity.lat * predictAhead);
+      targetLng = position.lng + (velocity.lng * predictAhead);
+    }
+    
+    // Always center on target position
+    state.map.setView([targetLat, targetLng], state.map.getZoom(), {
       animate: true,
       duration: CONFIG.ANIMATION.HIGH_SPEED_PAN,
       noMoveStart: true,
@@ -1367,7 +1339,7 @@ const ViewportManager = {
 };
 
 // ============================================================================
-// ANIMATION LOOP
+// ANIMATION LOOP - SIMPLIFIED FOR PERFECT STATIONARY BEHAVIOR
 // ============================================================================
 
 function startAnimationLoop() {
@@ -1394,7 +1366,7 @@ function startAnimationLoop() {
     const now = Date.now();
     const elapsedSec = (now - state.lastUpdateTime) / 1000;
     
-    // Dead reckoning when GPS signal is lost
+    // ONLY handle dead reckoning when GPS is lost
     if (elapsedSec > CONFIG.DEAD_RECKONING.TIMEOUT / 1000) {
       if (!state.inDeadReckoning) {
         state.inDeadReckoning = true;
@@ -1408,33 +1380,20 @@ function startAnimationLoop() {
       };
       
       state.userMarker.setLatLng([predicted.lat, predicted.lng]);
-      ViewportManager.updateViewport(predicted, state.speed, state.velocity);
+      ViewportManager.updateViewport(predicted, state.speed * decay, state.velocity);
     } 
-    // Normal interpolation between GPS updates
-    else if (elapsedSec < 2.5 && !state.isUpdating) {
+    // Normal operation - position is handled by processPosition
+    else {
       if (state.inDeadReckoning) {
         state.inDeadReckoning = false;
         A11yManager.announce('GPS signal restored', 'polite');
       }
-      
-      const damping = Math.exp(-elapsedSec * 1.5);
-      const interpolated = {
-        lat: state.currentPosition.lat + state.velocity.lat * elapsedSec * damping,
-        lng: state.currentPosition.lng + state.velocity.lng * elapsedSec * damping,
-      };
-      
-      state.userMarker.setLatLng([interpolated.lat, interpolated.lng]);
-      ViewportManager.updateViewport(interpolated, state.speed, state.velocity);
-    }
-    // GPS is current - use latest position directly
-    else {
-      state.userMarker.setLatLng([state.currentPosition.lat, state.currentPosition.lng]);
-      ViewportManager.updateViewport(state.currentPosition, state.speed, state.velocity);
+      // Position is updated directly in processPosition - just handle heading here
     }
     
-    // Update heading rotation
+    // Update heading rotation ONLY when moving
     const icon = DOM_CACHE.userMarkerIcon;
-    if (icon && state.heading !== null && !isNaN(state.heading)) {
+    if (icon && state.heading !== null && !isNaN(state.heading) && state.speed > 0.1) {
       icon.style.transform = `rotate(${state.heading}deg)`;
     }
   }
@@ -1443,7 +1402,7 @@ function startAnimationLoop() {
 }
 
 // ============================================================================
-// POSITION PROCESSING
+// POSITION PROCESSING - PERFECT STATIONARY LOCK
 // ============================================================================
 
 let positionUpdateTimeout = null;
@@ -1491,12 +1450,31 @@ const processPosition = withErrorBoundary(function (position) {
 
     // Skip low-accuracy readings
     if (rawPos.accuracy > CONFIG.POSITION.MIN_ACCURACY) {
+      state.isProcessingPosition = false;
       return;
+    }
+
+    // PERFECT STATIONARY LOCK: When speed is effectively zero, freeze everything
+    if (rawPos.speed < CONFIG.SPEED.STATIONARY_THRESHOLD / 2.23694) {
+      if (!state.positionFrozen) {
+        state.positionFrozen = true;
+        state.velocity = { lat: 0, lng: 0 };
+        state.speed = 0;
+        state.speedMph = 0;
+        state.heading = null;
+        DOM_CACHE.userMarkerIcon?.classList.remove('moving-fast', 'moving-very-fast');
+      }
+      state.lastUpdateTime = positionUpdateLastTime;
+      state.isProcessingPosition = false;
+      return;
+    } else {
+      state.positionFrozen = false;
     }
 
     // First position: initialize
     if (!state.currentPosition) {
       initializePosition(rawPos);
+      state.isProcessingPosition = false;
       return;
     }
 
@@ -1508,12 +1486,14 @@ const processPosition = withErrorBoundary(function (position) {
       console.warn('Teleport detected, resetting filter');
       PositionFilter.reset(rawPos);
       initializePosition(rawPos);
+      state.isProcessingPosition = false;
       return;
     }
 
     // Skip insignificant movement with worse or equal accuracy
     if (distance < CONFIG.POSITION.MIN_MOVEMENT &&
         rawPos.accuracy >= state.currentPosition.accuracy) {
+      state.isProcessingPosition = false;
       return;
     }
 
@@ -1564,6 +1544,7 @@ const processPosition = withErrorBoundary(function (position) {
 
     // Reject unreasonable speeds
     if (speed > CONFIG.SPEED.MAX_REASONABLE) {
+      state.isProcessingPosition = false;
       return;
     }
 
@@ -1571,8 +1552,10 @@ const processPosition = withErrorBoundary(function (position) {
     PositionFilter.adaptToSpeed(speed);
     const filtered = PositionFilter.update(rawPos);
     state.positionBuffer.push(filtered);
-    const smoothed = state.positionBuffer.getAverage();
+    
+    // Use latest position when moving fast, average when slow
     const speedMph = metersPerSecondToMph(speed);
+    const smoothed = speedMph > 10 ? state.positionBuffer.getLatest() : state.positionBuffer.getAverage();
 
     // Update state
     state.velocity = velocity;
@@ -1588,19 +1571,24 @@ const processPosition = withErrorBoundary(function (position) {
     state.lastUpdateTime = positionUpdateLastTime;
     state.errorCount = 0;
 
+    // Update marker position directly (single source of truth)
+    state.userMarker.setLatLng([smoothed.lat, smoothed.lng]);
+
     // Update icon classes for visual feedback
     if (DOM_CACHE.userMarkerIcon) {
-      DOM_CACHE.userMarkerIcon.classList.toggle('moving-very-fast', speedMph >= 15);
-      DOM_CACHE.userMarkerIcon.classList.toggle('moving-fast', speedMph >= 25);
+      DOM_CACHE.userMarkerIcon.classList.toggle('moving-very-fast', speedMph >= 25);
+      DOM_CACHE.userMarkerIcon.classList.toggle('moving-fast', speedMph >= 15 && speedMph < 25);
       
       if (state.heading != null && !isNaN(state.heading)) {
         DOM_CACHE.userMarkerIcon.style.setProperty('--heading', `${state.heading}deg`);
       }
     }
 
-    // Side effects
-    if (!isPopupOpen()) {
-      ViewportManager.ensureContainment(smoothed, velocity);
+    // Update viewport only if position changed significantly or mode changed
+    if (distance > 0.5 || Math.abs(state.lastPosition.lat - smoothed.lat) > 0.000001) {
+      if (!isPopupOpen()) {
+        ViewportManager.ensureContainment(smoothed, velocity);
+      }
     }
 
     updateDistanceBox();
@@ -1626,7 +1614,8 @@ function initializePosition(position) {
   state.heading = null;
   state.lastUpdateTime = Date.now();
   state.errorCount = 0;
-  state.viewportMode = 'roaming'; // Always start in roaming mode
+  state.viewportMode = 'roaming';
+  state.positionFrozen = false;
   
   PositionFilter.reset(position);
   
@@ -1749,7 +1738,7 @@ function initMap() {
     {
       enableHighAccuracy: true,
       timeout: 10000,
-      maximumAge: 0
+      maximumAge: 0,
     }
   );
 }
@@ -2032,7 +2021,7 @@ function endTour() {
     congratsElement.style.display = 'none';
   }
   
-  window.location.href = 'https://www.mnthen.com/index.html ';
+  window.location.href = 'https://www.mnthen.com/index.html';
 }
 
 const popupHandlers = new WeakMap();
@@ -2600,7 +2589,7 @@ function showCongratulations() {
     'success',
     () => {
       StorageManager.clear();
-      window.location.href = 'https://www.mnthen.com/index.html ';
+      window.location.href = 'https://www.mnthen.com/index.html';
     },
     null,
     'Return Home'
@@ -2754,7 +2743,7 @@ function optimizeTileRendering() {
 }
 
 // ============================================================================
-// UI CONTROLS
+// UI CONTROLS - PERFECT RECENTER BEHAVIOR
 // ============================================================================
 
 function recenterMap() {
@@ -2765,29 +2754,59 @@ function recenterMap() {
     return;
   }
 
+  // Clear any existing timeout to prevent double-click issues
+  if (state.recenterButtonTimeout) {
+    clearTimeout(state.recenterButtonTimeout);
+    state.recenterButtonTimeout = null;
+  }
+  
+  // Set flag to prevent double processing
+  state.recenterButtonPressed = true;
+  
+  // INSTANT state reset - clears all interaction flags
+  state.isUserInteracting = false;
+  state.isPinchingZooming = false;
+  state.followUser = true;
+  state.lastInteractionEndTime = 0;
+  state.dragCooldownEndTime = 0;
+  state.positionFrozen = false;
+  
+  // Clear UI overlays immediately
   const huntPanel = document.querySelector('.lochunt-container');
   if (huntPanel && huntPanel.style.display !== 'none') {
     huntPanel.style.display = 'none';
     state.isLocationHuntVisible = false;
   }
   state.map.closePopup();
-
+  
+  // Force centered mode and disable inertia
+  state.viewportMode = 'centered';
+  state.map.options.inertia = false;
+  
+  // IMMEDIATE centering with no animation delay
+  state.map.setView([targetPos.lat, targetPos.lng], CONFIG.MAP.DEFAULT_ZOOM, {
+    animate: false // Instant for perfect user experience
+  });
+  
+  // Reset recenter timer
+  ViewportManager.lastRecenterTime = Date.now();
+  
+  // Visual feedback
   const btn = document.getElementById('recenterButton');
   if (btn) {
     btn.style.backgroundColor = '#005f9e';
     btn.style.color = 'white';
-    setTimeout(() => {
+  }
+  
+  // Clear button state after a short delay (longer than visual feedback)
+  state.recenterButtonTimeout = setTimeout(() => {
+    state.recenterButtonPressed = false;
+    if (btn) {
       btn.style.backgroundColor = '';
       btn.style.color = '';
-    }, 400);
-  }
+    }
+  }, 400); // Slightly longer than visual feedback duration
 
-  state.map.setView([targetPos.lat, targetPos.lng], CONFIG.MAP.DEFAULT_ZOOM, {
-    animate: true,
-    duration: CONFIG.ANIMATION.RECENTER,
-  });
-
-  state.followUser = true;
   A11yManager.announce('Map centered on your location', 'polite');
 }
 
@@ -2798,7 +2817,7 @@ function returnToIndex() {
     () => {},
     () => {
       StorageManager.clear();
-      window.location.href = 'https://www.mnthen.com/index.html ';
+      window.location.href = 'https://www.mnthen.com/index.html';
     },
     'Continue Tour',
     'Exit Tour'
@@ -3024,7 +3043,9 @@ function bindGlobalEvents() {
   if (DOM_CACHE.recenterBtn) {
     DOM_CACHE.recenterBtn.addEventListener('click', (e) => {
       e.preventDefault();
-      recenterMap();
+      if (!state.recenterButtonPressed) {
+        recenterMap();
+      }
     });
   }
   
@@ -3094,7 +3115,7 @@ window.CloseNavigationTips = closeNavigationTips;
 window.ToggleAllLocations = toggleAllLocations;
 
 console.log('%c🗺️ Minnesota Then Gangster Tour', 'font-size: 20px; color: #005f9e; font-weight: bold;');
-console.log('%cVersion 2.3.1', 'font-size: 12px; color: #666;');
+console.log('%cVersion 2.5.1 - Perfect Movement with Enhanced Recenter', 'font-size: 12px; color: #666;');
 </script>
 </body>
 </html>
