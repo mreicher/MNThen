@@ -7,7 +7,7 @@ const blogArticles = [
   "date": "December 14, 2025",
   "image": "https://www.mnthen.com/images/schell.jpg",
   "url": "https://www.mnthen.com/blog/people/schell.html",
-  "keywords": ["august schell", "schell brewery", "new ulm", "german immigrants", "turner society", "dakota conflict", "minnesota brewing", "family business", "people", "all"]
+  "keywords": ["august schell", "schell brewery", "new ulm", "german immigrants", "turner society", "dakota conflict", "brewing", "beer", "person", "all"]
 },
   {
   "headline": "“Minnesota 13” Corn and Moonshine in Stearns County",
