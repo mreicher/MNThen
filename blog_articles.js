@@ -1,5 +1,15 @@
 const blogArticles = [
   {
+  "headline": "“Minnesota 13” Corn and Moonshine in Stearns County",
+  "blurb": "How a University of Minnesota corn strain—bred for cold resilience—became the backbone of a clandestine moonshine empire in Stearns County, as desperate farmers chose moral pragmatism over Prohibition laws to save their land and families.",
+  "icon": "fa-box",
+  "author": "Matt Reicher",
+  "date": "December 13, 2025",
+  "image": "https://www.mnthen.com/images/mn13.jpg",
+  "url": "https://www.mnthen.com/blog/thing/minn13.html",
+  "keywords": ["minnesota 13", "moonshine", "stearns county", "prohibition", "bootlegging", "holdingford", "university of minnesota", "corn whiskey", "thing", "all"]
+},
+  {
   "headline": "Rohland, Margaret \"Babe\" (1914 – 2011)",
   "blurb": "A lifelong St. Paul resident and eyewitness to pivotal 20th-century moments—from Henry Ford’s visit to the Barker-Karpis Gang shootings to shaking JFK’s hand—whose personal narrative illuminates the fabric of local history.",
   "icon": "fa-user",
