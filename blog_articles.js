@@ -1,5 +1,15 @@
 const blogArticles = [
   {
+  "headline": "Minnesota’s State Capitol Fire (March 1, 1881)",
+  "blurb": "A dramatic nighttime fire that gutted Minnesota’s first capitol building during a legislative session—sparking heroism, chaos, and the loss of 13,000 books. Though no lives were lost, the blaze catalyzed a new era of civic ambition and led to the construction of the iconic 1905 capitol.",
+  "icon": "fa-calendar",
+  "author": "Matt Reicher",
+  "date": "December 14, 2025",
+  "image": "https://www.mnthen.com/images/firstcap.jpg",
+  "url": "https://www.mnthen.com/blog/event/firstcap.html",
+  "keywords": ["capitol fire", "1881 fire", "saint paul history", "minnesota legislature", "william crooks", "charles gilman", "state capitol", "historical disasters", "event", "all"]
+},
+  {
   "headline": "Schell, August (1828 – 1891)",
   "blurb": "A German immigrant, machinist, and Turner Society leader who founded one of Minnesota’s earliest and most enduring family breweries in New Ulm—building a legacy of resilience, community goodwill, and entrepreneurial vision that survives to this day.",
   "icon": "fa-user",
