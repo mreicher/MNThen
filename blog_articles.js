@@ -1,5 +1,15 @@
 const blogArticles = [
   {
+  "headline": "Schell, August (1828 – 1891)",
+  "blurb": "A German immigrant, machinist, and Turner Society leader who founded one of Minnesota’s earliest and most enduring family breweries in New Ulm—building a legacy of resilience, community goodwill, and entrepreneurial vision that survives to this day.",
+  "icon": "fa-user",
+  "author": "Matt Reicher",
+  "date": "December 14, 2025",
+  "image": "https://www.mnthen.com/images/schell.jpg",
+  "url": "https://www.mnthen.com/blog/people/schell.html",
+  "keywords": ["august schell", "schell brewery", "new ulm", "german immigrants", "turner society", "dakota conflict", "minnesota brewing", "family business", "people", "all"]
+},
+  {
   "headline": "“Minnesota 13” Corn and Moonshine in Stearns County",
   "blurb": "How a University of Minnesota corn strain—bred for cold resilience—became the backbone of a clandestine moonshine empire in Stearns County, as desperate farmers chose moral pragmatism over Prohibition laws to save their land and families.",
   "icon": "fa-box",
