@@ -624,6 +624,69 @@ const CONFIG = Object.freeze({
 });
 
 // ============================================================================
+// SPEED MODE CONTROLLER (with hysteresis & debouncing)
+// ============================================================================
+const SpeedModeController = {
+  mode: 'roaming', // 'roaming' | 'centered'
+  lastMode: 'roaming',
+  transitionDebounce: null,
+  ROAMING_UPPER: 13.5,
+  CENTERED_LOWER: 16.5,
+  STABILIZATION_DELAY_MS: 500,
+
+  update(speedMph) {
+    const now = Date.now();
+
+    // Determine *candidate* mode based on hysteresis bands
+    let candidateMode;
+    if (speedMph >= this.CENTERED_LOWER) {
+      candidateMode = 'centered';
+    } else if (speedMph <= this.ROAMING_UPPER) {
+      candidateMode = 'roaming';
+    } else {
+      // In hysteresis band — preserve current mode
+      candidateMode = this.mode;
+    }
+
+    // If unchanged, nothing to do
+    if (candidateMode === this.mode) {
+      return false;
+    }
+
+    // Mode changed — debounce to avoid flicker
+    clearTimeout(this.transitionDebounce);
+    this.transitionDebounce = setTimeout(() => {
+      this._commitMode(candidateMode);
+    }, this.STABILIZATION_DELAY_MS);
+
+    return false; // not committed yet
+  },
+
+  _commitMode(newMode) {
+    if (newMode === this.mode) return;
+    this.lastMode = this.mode;
+    this.mode = newMode;
+    A11yManager.announce(
+      newMode === 'centered'
+        ? 'Switching to highway mode: map follows your motion'
+        : 'Switching to local mode: explore freely',
+      'polite'
+    );
+    console.log(`[SpeedMode] Transitioned to ${newMode}`);
+  },
+
+  // Force immediate sync (e.g., on recenter button)
+  forceMode(mode) {
+    clearTimeout(this.transitionDebounce);
+    if (mode !== this.mode) {
+      this.lastMode = this.mode;
+      this.mode = mode;
+      console.log(`[SpeedMode] Forced to ${mode}`);
+    }
+  }
+};
+
+// ============================================================================
 // GLOBAL STATE
 // ============================================================================
 
@@ -1185,43 +1248,78 @@ const ViewportManager = {
     };
   },
   
+// Replace existing ViewportManager.updateViewport()
 updateViewport(position, speed, velocity) {
   if (!state.map || !state.userMarker) return;
+
   const speedMph = metersPerSecondToMph(speed);
   state.speedMph = speedMph;
 
-  if (!state.followUser || state.isUserInteracting || state.isPinchingZooming) return;
-
-  // CENTERED MODE: ≥15 mph — icon stays dead-center, map moves
-  if (speedMph >= 15) {
-    state.viewportMode = 'centered';
-    // Only recenter if sufficiently off-center — reduce jitter
-    this.centerMarkerSmooth(position, speedMph);
+  // Skip if user is interacting
+  if (state.isUserInteracting || state.isPinchingZooming) {
+    state.followUser = false;
     return;
   }
 
-  // ROAMING MODE: <15 mph — roam freely, gentle nudges near edges
-  state.viewportMode = 'roaming';
-  this.handleRoaming(position, speed, velocity);
-},
+  // Update mode (may or may not commit immediately)
+  const modeChanged = SpeedModeController.update(speedMph);
+
+  // Always update viewport per current mode — even if mode transition pending
+  switch (SpeedModeController.mode) {
+    case 'centered':
+      this.centerMarkerPredictive(position, velocity, speedMph);
+      break;
+    case 'roaming':
+    default:
+      this.handleRoaming(position, speed, velocity);
+      break;
+  }
+
+  // Keep followUser true in auto modes
+  state.followUser = true;
+}
   
-centerMarkerSmooth(position, speedMph = 15) {
+centerMarkerPredictive(position, velocity, speedMph) {
   const now = Date.now();
   if (now - state.lastRecenterTime < CONFIG.INTERACTION.MIN_RECENTER_INTERVAL) return;
-  state.lastRecenterTime = now;
 
-  // ============================================================================
-  // INERTIA MANAGEMENT: Disable at high speed, re-enable when slowing
-  // ============================================================================
-  if (speedMph >= 15) {
-    if (state.map.options.inertia !== false) {
-      state.map.options.inertia = false;
-    }
-  } else {
-    if (state.map.options.inertia === false) {
-      state.map.options.inertia = true;
-    }
+  // Disable inertia for true highway feel
+  if (state.map.options.inertia !== false) {
+    state.map.options.inertia = false;
   }
+
+  // Get current screen center & marker position
+  const currentCenter = state.map.getCenter();
+  const markerPoint = state.map.latLngToContainerPoint([position.lat, position.lng]);
+  const centerPoint = state.map.getSize().multiplyBy(0.5);
+  const dx = markerPoint.x - centerPoint.x;
+  const dy = markerPoint.y - centerPoint.y;
+  const offsetPx = Math.sqrt(dx * dx + dy * dy);
+
+  // Only act if significantly off-center (>3px) OR moving fast and drifting
+  const shouldRecenter = offsetPx > 3 || (speedMph > 25 && offsetPx > 1);
+
+  if (!shouldRecenter) return;
+
+  // Predict where user will be in ~100ms — reduces perceived lag
+  const predictMs = 100;
+  const predictSec = predictMs / 1000;
+  const predictedLat = position.lat + velocity.lat * predictSec;
+  const predictedLng = position.lng + velocity.lng * predictSec;
+
+  const target = [predictedLat, predictedLng];
+
+  // Pan map to keep icon at visual center
+  state.map.panTo(target, {
+    animate: true,
+    duration: CONFIG.ANIMATION.HIGH_SPEED_PAN, // 0.1s
+    noMoveStart: true,
+    easeLinearity: 0.25 // snappier easing
+  });
+
+  state.lastRecenterTime = now;
+  PerformanceMonitor.recordMapMove();
+}
 
   // ============================================================================
   // PIXEL-PERFECT CENTERING: Only adjust if >2px off-center
@@ -1243,31 +1341,40 @@ centerMarkerSmooth(position, speedMph = 15) {
   }
 },
   
-  handleRoaming(position, speed, velocity) {
-    const urgency = this.getUrgencyLevel(position);
-    const speedMph = metersPerSecondToMph(speed);
-    
-    if (urgency === 'emergency') {
-      this.recenterImmediate(position);
-      return;
-    }
-    
-    if (urgency === 'hard') {
-      this.recenterSmooth(position, CONFIG.ANIMATION.FAST, 0.75);
-      return;
-    }
-    
-    if (urgency === 'medium') {
-      const intensity = clamp(speedMph / CONFIG.SPEED.ROAMING_MAX, 0.35, 0.60);
-      this.recenterSmooth(position, CONFIG.ANIMATION.NORMAL, intensity);
-      return;
-    }
-    
-    if (urgency === 'soft' && this.isMovingTowardEdge(position, velocity)) {
-      const intensity = clamp(speedMph / CONFIG.SPEED.ROAMING_MAX, 0.15, 0.35);
-      this.recenterSmooth(position, CONFIG.ANIMATION.SLOW, intensity);
-    }
-  },
+handleRoaming(position, speed, velocity) {
+  // Re-enable inertia if disabled
+  if (state.map.options.inertia === false) {
+    state.map.options.inertia = true;
+  }
+
+  const urgency = this.getUrgencyLevel(position);
+  const speedMph = metersPerSecondToMph(speed);
+
+  // Emergency edge case: snap back
+  if (urgency === 'emergency') {
+    this.recenterImmediate(position);
+    return;
+  }
+
+  // Hard/Medium: guided recenter — intensity scales with speed
+  if (urgency === 'hard' || urgency === 'medium') {
+    const baseDuration = urgency === 'hard' ? CONFIG.ANIMATION.FAST : CONFIG.ANIMATION.NORMAL;
+    const intensity = urgency === 'hard'
+      ? 0.75
+      : clamp(speedMph / CONFIG.SPEED.ROAMING_MAX, 0.3, 0.6);
+
+    this.recenterSmooth(position, baseDuration, intensity);
+    return;
+  }
+
+  // Soft edge + moving toward edge: gentle nudge
+  if (urgency === 'soft' && this.isMovingTowardEdge(position, velocity)) {
+    const intensity = clamp(speedMph / CONFIG.SPEED.ROAMING_MAX, 0.1, 0.3);
+    this.recenterSmooth(position, CONFIG.ANIMATION.SLOW, intensity);
+  }
+
+  // Otherwise: let user roam freely — no intervention
+}
   
   isMovingTowardEdge(position, velocity) {
     if (!velocity || !position) return false;
@@ -1440,91 +1547,96 @@ const processPosition = withErrorBoundary(function (position) {
   positionUpdateLastTime = Date.now();
 
   try {
-    const coords = position.coords;
-    if (!coords) {
-      throw new Error('Missing coords in position');
+    // ── 1. Input validation ───────────────────────────────────────────────
+    const { coords } = position;
+    if (!coords) throw new Error('Missing coords in position');
+    const { latitude, longitude, accuracy, heading, speed } = coords;
+
+    if (isNaN(latitude) || isNaN(longitude)) {
+      throw new Error('Invalid coordinates: NaN detected');
     }
 
+    // ── 2. Construct raw position ──────────────────────────────────────────
     const rawPos = {
-      lat: coords.latitude,
-      lng: coords.longitude,
-      accuracy: coords.accuracy,
-      heading: coords.heading ?? null,
-      speed: coords.speed ?? 0,
-      timestamp: positionUpdateLastTime
+      lat: latitude,
+      lng: longitude,
+      accuracy: accuracy ?? Number.POSITIVE_INFINITY,
+      heading: heading ?? null,
+      speed: speed ?? 0,
+      timestamp: positionUpdateLastTime,
     };
 
-    // Validate coordinates
-    if (isNaN(rawPos.lat) || isNaN(rawPos.lng)) {
-      throw new Error('Invalid coordinates');
-    }
-
-    // Skip low-accuracy readings
+    // Skip poor accuracy (configurable)
     if (rawPos.accuracy > CONFIG.POSITION.MIN_ACCURACY) {
+      console.debug(`[Position] Skipped: accuracy = ${rawPos.accuracy.toFixed(1)} > ${CONFIG.POSITION.MIN_ACCURACY}`);
       return;
     }
 
-    // First position: initialize
+    // ── 3. Initialization (first fix) ──────────────────────────────────────
     if (!state.currentPosition) {
+      console.info('[Position] Initializing from first GPS fix');
       initializePosition(rawPos);
       return;
     }
 
-    // Movement validation
-    const distance = calculateDistance(state.currentPosition, rawPos);
+    // ── 4. Temporal & spatial deltas ───────────────────────────────────────
+    const dtSec = Math.max(0, (positionUpdateLastTime - state.lastUpdateTime) / 1000);
+    const distanceMeters = calculateDistance(state.currentPosition, rawPos);
 
-    // Teleport/jump detection
-    if (distance > CONFIG.POSITION.MAX_TELEPORT) {
-      console.warn('Teleport detected, resetting filter');
+    // Teleport/jump guard
+    if (distanceMeters > CONFIG.POSITION.MAX_TELEPORT) {
+      console.warn(`[Position] Teleport detected (${distanceMeters.toFixed(1)}m). Resetting filter.`);
       PositionFilter.reset(rawPos);
       initializePosition(rawPos);
       return;
     }
 
-    // Skip insignificant movement with worse or equal accuracy
-    if (distance < CONFIG.POSITION.MIN_MOVEMENT &&
+    // Skip insignificant movement with no accuracy improvement
+    if (distanceMeters < CONFIG.POSITION.MIN_MOVEMENT &&
         rawPos.accuracy >= state.currentPosition.accuracy) {
       return;
     }
 
-    // Velocity & timing
-    const dt = (positionUpdateLastTime - state.lastUpdateTime) / 1000;
-    let speed = 0;
+    // ── 5. Velocity estimation ─────────────────────────────────────────────
     let velocity = { lat: 0, lng: 0 };
+    let filteredSpeed = rawPos.speed > 0 ? rawPos.speed : (distanceMeters / Math.max(0.1, dtSec));
+    const speedMph = metersPerSecondToMph(filteredSpeed);
 
-    if (dt > 0 && dt < 10) {
-      speed = rawPos.speed > 0 ? rawPos.speed : distance / dt;
+    // Clamp to reasonable max
+    if (filteredSpeed > CONFIG.SPEED.MAX_REASONABLE) {
+      console.debug(`[Position] Speed clamped: ${filteredSpeed.toFixed(1)} → ${CONFIG.SPEED.MAX_REASONABLE}`);
+      filteredSpeed = CONFIG.SPEED.MAX_REASONABLE;
+    }
+
+    if (dtSec > 0 && dtSec < 10) {
       velocity = {
-        lat: (rawPos.lat - state.currentPosition.lat) / dt,
-        lng: (rawPos.lng - state.currentPosition.lng) / dt
+        lat: (rawPos.lat - state.currentPosition.lat) / dtSec,
+        lng: (rawPos.lng - state.currentPosition.lng) / dtSec,
       };
 
-      // Acceleration boost (requires 3 buffered points)
-      if (speed > 10 && state.positionBuffer?.size >= 3) {
-        const arr = state.positionBuffer.toArray();
-        const p0 = arr[arr.length - 3];
-        const p1 = arr[arr.length - 2];
-        const p2 = arr[arr.length - 1];
-
+      // ── 6. Acceleration boost (Kalman-style correction) ───────────────
+      if (filteredSpeed > 10 && state.positionBuffer?.size >= 3) {
+        const buf = state.positionBuffer.toArray();
+        const [p0, p1, p2] = [buf[buf.length - 3], buf[buf.length - 2], buf[buf.length - 1]];
         if (p0 && p1 && p2) {
           const dt1 = (p1.timestamp - p0.timestamp) / 1000;
           const dt2 = (p2.timestamp - p1.timestamp) / 1000;
-
           if (dt1 >= 0.1 && dt2 >= 0.1 && dt1 < 3 && dt2 < 3) {
-            // ✅ TYPO FIX: was "p2.lat - p1.lng" → now "p2.lat - p1.lat"
-            const accLat = ((p2.lat - p1.lat) / dt2 - (p1.lat - p0.lat) / dt1) / ((dt1 + dt2) / 2);
-            const accLng = ((p2.lng - p1.lng) / dt2 - (p1.lng - p0.lng) / dt1) / ((dt1 + dt2) / 2);
+            const accLat = (((p2.lat - p1.lat) / dt2) - ((p1.lat - p0.lat) / dt1)) / ((dt1 + dt2) / 2);
+            const accLng = (((p2.lng - p1.lng) / dt2) - ((p1.lng - p0.lng) / dt1)) / ((dt1 + dt2) / 2);
 
-            const maxAccel = 12;
-            const clampedAccLat = clamp(accLat, -maxAccel, maxAccel);
-            const clampedAccLng = clamp(accLng, -maxAccel, maxAccel);
+            const MAX_ACCEL = 12;
+            const clampedAcc = {
+              lat: clamp(accLat, -MAX_ACCEL, MAX_ACCEL),
+              lng: clamp(accLng, -MAX_ACCEL, MAX_ACCEL),
+            };
+            state.acceleration = clampedAcc;
 
-            state.acceleration = { lat: clampedAccLat, lng: clampedAccLng };
+            const boostLat = clampedAcc.lat * dt2 * 0.4;
+            const boostLng = clampedAcc.lng * dt2 * 0.4;
 
-            const boostLat = clampedAccLat * dt2 * 0.4;
-            const boostLng = clampedAccLng * dt2 * 0.4;
-
-            if (Math.abs(boostLat) > 0.000001 || Math.abs(boostLng) > 0.000001) {
+            // Apply only if meaningful
+            if (Math.abs(boostLat) > 1e-6 || Math.abs(boostLng) > 1e-6) {
               velocity.lat += boostLat;
               velocity.lng += boostLng;
             }
@@ -1533,58 +1645,62 @@ const processPosition = withErrorBoundary(function (position) {
       }
     }
 
-    // Reject unreasonable speeds
-    if (speed > CONFIG.SPEED.MAX_REASONABLE) {
-      return;
-    }
-
-    // Filtering & smoothing
-    PositionFilter.adaptToSpeed(speed);
+    // ── 7. Filtering & smoothing ───────────────────────────────────────────
+    PositionFilter.adaptToSpeed(filteredSpeed);
     const filtered = PositionFilter.update(rawPos);
     state.positionBuffer.push(filtered);
-    const smoothed = state.positionBuffer.getAverage();
-    const speedMph = metersPerSecondToMph(speed);
+    const smoothed = state.positionBuffer.getAverage() || filtered;
 
-    // Update state
+    // ── 8. Update core state ───────────────────────────────────────────────
+    state.lastPosition = state.currentPosition;
+    state.currentPosition = smoothed;
     state.velocity = velocity;
-    state.speed = speed;
+    state.speed = filteredSpeed;
     state.speedMph = speedMph;
     state.heading = smoothHeading(
       correctHeading(rawPos.heading, rawPos.lat, rawPos.lng),
       state.heading,
       speedMph
     );
-    state.lastPosition = state.currentPosition;
-    state.currentPosition = smoothed;
     state.lastUpdateTime = positionUpdateLastTime;
     state.errorCount = 0;
 
-    // ICON CLASS ALIGNMENT: Use >= 15 mph threshold
-    if (DOM_CACHE.userMarkerIcon) {
-      DOM_CACHE.userMarkerIcon.classList.toggle('moving-very-fast', speedMph >= 15);
-      DOM_CACHE.userMarkerIcon.classList.toggle('moving-fast', speedMph >= 25);
-      
-      // Reset inertia when speed drops below threshold
-      if (speedMph < 15 && state.map.options.inertia === false) {
-        state.map.options.inertia = true;
-      }
-      
+    // ── 9. Update SpeedModeController (hysteresis-aware mode) ─────────────
+    SpeedModeController.update(speedMph);
+
+    // ── 10. DOM & icon visual feedback (realtime, *not* debounced) ────────
+    const icon = DOM_CACHE.userMarkerIcon;
+    if (icon) {
+      // Class sync for CSS control — responsive *before* mode commits
+      icon.classList.toggle('moving-roaming', SpeedModeController.mode === 'roaming');
+      icon.classList.toggle('moving-centered', SpeedModeController.mode === 'centered');
+      icon.classList.toggle('moving-very-fast', speedMph >= 25);
+
+      // Heading (if valid)
       if (state.heading != null && !isNaN(state.heading)) {
-        DOM_CACHE.userMarkerIcon.style.setProperty('--heading', `${state.heading}deg`);
+        icon.style.setProperty('--heading', `${state.heading}deg`);
       }
     }
 
-    // Viewport & side effects
+    // ── 11. Inertia management (auto-sync to *actual* mode, not just speed) ─
+    if (state.map) {
+      const shouldDisableInertia = SpeedModeController.mode === 'centered';
+      if (state.map.options.inertia !== !shouldDisableInertia) {
+        state.map.options.inertia = !shouldDisableInertia;
+        console.debug(`[Inertia] ${shouldDisableInertia ? 'Disabled' : 'Enabled'} for ${SpeedModeController.mode} mode`);
+      }
+    }
+
+    // ── 12. Side effects (viewport, UI, rendering) ─────────────────────────
     if (!isPopupOpen()) {
       ViewportManager.ensureContainment(smoothed, velocity);
-      ViewportManager.updateViewport(smoothed, speed, velocity);
+      ViewportManager.updateViewport(smoothed, filteredSpeed, velocity);
       optimizeTileRendering();
     }
-
     updateDistanceBox();
 
   } catch (err) {
-    console.error('Position processing failed:', err);
+    console.error('[Position] Processing failed:', err.message || err);
     state.errorCount++;
     attemptRecovery();
   } finally {
