@@ -1,5 +1,15 @@
 const blogArticles = [
   {
+  "headline": "Life and Death of Daniel 'Dapper Dan' Hogan (1880–1928)",
+  "blurb": "The stylish St. Paul gangster who brokered peace between criminals and police under the infamous O'Connor Layover Agreement—until a car bomb ended his reign and left his killer unknown. His funeral drew over 2,500 mourners, including rival mob bosses and city officials alike.",
+  "icon": "fa-user-secret",
+  "author": "Matt Reicher",
+  "date": "December 19, 2025",
+  "image": "https://www.mnthen.com/images/gangster/hogan/stp_hogan.jpg",
+  "url": "https://www.mnthen.com/blog/people/hogan.html",
+  "keywords": ["dapper dan hogan", "st paul", "o'connor layover agreement", "green lantern saloon", "harry dutch sawyer", "minnesota crime", "gangsters", "car bombing", "people", "all"]
+},
+  {
   "headline": "Minnesota’s State Capitol Fire (March 1, 1881)",
   "blurb": "A dramatic nighttime fire that gutted Minnesota’s first capitol building during a legislative session—sparking heroism, chaos, and the loss of 13,000 books. Though no lives were lost, the blaze catalyzed a new era of civic ambition and led to the construction of the iconic 1905 capitol.",
   "icon": "fa-calendar",
