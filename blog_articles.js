@@ -1,5 +1,15 @@
 const blogArticles = [
   {
+  "headline": "John’s Bar and Funhouse Prostitution Scandal (1952–1956)",
+  "blurb": "A sensational 1952 police raid exposed John’s Bar and Funhouse at 2500 Marshall St NE as the Minneapolis hub of an interstate prostitution ring—triggering Mann Act prosecutions, prison sentences for the Gawron brothers, and the bar’s abrupt closure. Its legacy lives on in the beloved dive bar that replaced it: Tony Jaros’ River Garden.",
+  "icon": "fa-gavel",
+  "author": "Matt Reicher",
+  "date": "December 20, 2025",
+  "image": "https://www.mnthen.com/tour/NE/gallery/NE_johns_bar1.jpg",
+  "url": "https://www.mnthen.com/blog/event/johnsbar.html",
+  "keywords": ["john's bar", "funhouse scandal", "mann act", "gawron brothers", "northeast minneapolis", "prostitution scandal", "tony jaros", "river garden", "1950s crime", "event", "all"]
+},
+  {
   "headline": "Life and Death of Daniel 'Dapper Dan' Hogan (1880–1928)",
   "blurb": "The stylish St. Paul gangster who brokered peace between criminals and police under the infamous O'Connor Layover Agreement—until a car bomb ended his reign and left his killer unknown. His funeral drew over 2,500 mourners, including rival mob bosses and city officials alike.",
   "icon": "fa-user-secret",
