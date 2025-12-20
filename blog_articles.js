@@ -1,8 +1,18 @@
 const blogArticles = [
   {
+  "headline": "Minnesota's Second State Capitol (1883 - 1938)",
+  "blurb": "After the 1881 fire, Minnesota's second capitol opened in 1883. Criticized for design flaws and space issues, it served until 1905 and was razed in 1938.",
+  "icon": "fa-building",
+  "author": "Matt Reicher",
+  "date": "December 21, 2025",
+  "image": "https://www.mnthen.com/images/secondcap1.jpg",
+  "url": "https://www.mnthen.com/blog/place/secondcap.html",
+  "keywords": ["Minnesota second state capitol", "Leroy S. Buffington", "St. Paul history", "Minnesota government", "Works Progress Administration", "Fitzgerald Park", "place", "all"]
+},
+  {
   "headline": "John’s Bar and Funhouse Prostitution Scandal (1952–1956)",
   "blurb": "A sensational 1952 police raid exposed John’s Bar and Funhouse at 2500 Marshall St NE as the Minneapolis hub of an interstate prostitution ring—triggering Mann Act prosecutions, prison sentences for the Gawron brothers, and the bar’s abrupt closure. Its legacy lives on in the beloved dive bar that replaced it: Tony Jaros’ River Garden.",
-  "icon": "fa-gavel",
+  "icon": "fa-calendar",
   "author": "Matt Reicher",
   "date": "December 20, 2025",
   "image": "https://www.mnthen.com/tour/NE/gallery/NE_johns_bar1.jpg",
@@ -12,7 +22,7 @@ const blogArticles = [
   {
   "headline": "Life and Death of Daniel 'Dapper Dan' Hogan (1880–1928)",
   "blurb": "The stylish St. Paul gangster who brokered peace between criminals and police under the infamous O'Connor Layover Agreement—until a car bomb ended his reign and left his killer unknown. His funeral drew over 2,500 mourners, including rival mob bosses and city officials alike.",
-  "icon": "fa-user-secret",
+  "icon": "fa-user",
   "author": "Matt Reicher",
   "date": "December 19, 2025",
   "image": "https://www.mnthen.com/images/gangster/hogan/stp_hogan.jpg",
