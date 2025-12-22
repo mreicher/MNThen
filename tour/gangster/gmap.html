@@ -923,6 +923,8 @@ const PerformanceMonitor = {
     interactionLatency: [],
     audioLoadTimes: [],
     positionUpdates: 0,
+    rawPositionUpdates: 0,        // NEW: Track raw GPS updates
+    smoothedPositionUpdates: 0,   // NEW: Track filtered updates
     frameTimes: [],
     mapMoves: 0,
     highSpeedFrames: 0,
@@ -943,7 +945,8 @@ const PerformanceMonitor = {
     } else if (key === 'frame') {
       this.metrics.frameTimes.push(duration);
       if (this.metrics.frameTimes.length > 60) this.metrics.frameTimes.shift();
-      if (metersPerSecondToMph(state.speed) > 30) {
+      // Use state.speedMph instead of recalculating
+      if (state.speedMph > 30) {
         this.metrics.highSpeedFrames++;
       }
     }
@@ -963,6 +966,14 @@ const PerformanceMonitor = {
     this.metrics.positionUpdates++;
   },
   
+  recordRawPositionUpdate() {
+    this.metrics.rawPositionUpdates++;
+  },
+  
+  recordSmoothedPositionUpdate() {
+    this.metrics.smoothedPositionUpdates++;
+  },
+  
   recordMapMove() {
     this.metrics.mapMoves++;
   },
@@ -978,6 +989,8 @@ const PerformanceMonitor = {
       avgAudioLoadTime: this.getAverage(this.metrics.audioLoadTimes),
       avgFrameTime: this.getAverage(this.metrics.frameTimes),
       totalPositionUpdates: this.metrics.positionUpdates,
+      totalRawPositionUpdates: this.metrics.rawPositionUpdates,
+      totalSmoothedPositionUpdates: this.metrics.smoothedPositionUpdates,
       totalMapMoves: this.metrics.mapMoves,
       highSpeedFramePercentage: this.metrics.highSpeedFrames / Math.max(1, this.metrics.positionUpdates) * 100,
     };
@@ -985,7 +998,7 @@ const PerformanceMonitor = {
 };
 
 // ============================================================================
-// POSITION FILTER (ENHANCED KALMAN)
+// POSITION FILTER (ENHANCED KALMAN) - For Viewport Smoothing Only
 // ============================================================================
 
 const PositionFilter = {
@@ -1004,7 +1017,9 @@ const PositionFilter = {
       return measurement;
     }
     
-    const measurementNoise = Math.max(0.08, measurement.accuracy / 60);
+    // INCREASED measurement noise = LESS smoothing = MORE raw position influence
+    // This reduces drift while maintaining some filtering for viewport stability
+    const measurementNoise = Math.max(0.15, measurement.accuracy / 40); // Was 0.08 and / 60
     const predictedError = this.errorEstimate + this.processNoise;
     const kalmanGain = predictedError / (predictedError + measurementNoise);
     
@@ -1024,15 +1039,18 @@ const PositionFilter = {
   
   adaptToSpeed(speedMps) {
     const mph = speedMps * 2.23694;
-    this.processNoise = mph < 1 ? 0.002 :
-                       mph < 5 ? 0.005 :
-                       mph < CONFIG.SPEED.ROAMING_MAX ? 0.008 :
-                       mph < 30 ? 0.015 : 0.025;
+    // INCREASED process noise at all speeds = LESS filtering = more raw position
+    // This makes the filter more responsive and reduces lag/drift
+    this.processNoise = mph < 1 ? 0.005 :    // Was 0.002
+                       mph < 5 ? 0.010 :    // Was 0.005
+                       mph < CONFIG.SPEED.ROAMING_MAX ? 0.015 :  // Was 0.008
+                       mph < 30 ? 0.025 :   // Was 0.015
+                       0.035;               // Was 0.025
   },
 };
 
 // ============================================================================
-// CIRCULAR POSITION BUFFER
+// CIRCULAR POSITION BUFFER - For Viewport Smoothing Only
 // ============================================================================
 
 class CircularPositionBuffer {
@@ -1064,21 +1082,30 @@ class CircularPositionBuffer {
   
   getAverage() {
     if (this.size === 0) return null;
+    if (this.size === 1) return this.buffer[this.tail];
     
     const positions = this.toArray();
-    const weights = positions.map((pos, index) => {
-      const recency = (index + 1) / positions.length;
-      const accuracy = 1 / (1 + pos.accuracy / 25);
-      return recency * accuracy;
-    });
     
-    const totalWeight = weights.reduce((a, b) => a + b, 0);
-    const lat = positions.reduce((sum, pos, i) => sum + pos.lat * weights[i], 0) / totalWeight;
-    const lng = positions.reduce((sum, pos, i) => sum + pos.lng * weights[i], 0) / totalWeight;
+    // NEW: Exponential moving average favoring RECENT positions
+    // This dramatically reduces smoothing while providing viewport stability
+    const alpha = 0.75; // Higher = more weight on recent (was effectively ~0.5)
+    let weightedLat = positions[0].lat;
+    let weightedLng = positions[0].lng;
+    
+    for (let i = 1; i < positions.length; i++) {
+      weightedLat = alpha * positions[i].lat + (1 - alpha) * weightedLat;
+      weightedLng = alpha * positions[i].lng + (1 - alpha) * weightedLng;
+    }
+    
+    // BLEND: Mix weighted average with most recent raw position
+    // This ensures marker accuracy while providing smooth viewport transitions
+    const recentWeight = 0.65; // 65% recent, 35% weighted (was 100% weighted)
+    const finalLat = positions[positions.length - 1].lat * recentWeight + weightedLat * (1 - recentWeight);
+    const finalLng = positions[positions.length - 1].lng * recentWeight + weightedLng * (1 - recentWeight);
     
     return {
-      lat,
-      lng,
+      lat: finalLat,
+      lng: finalLng,
       accuracy: positions[positions.length - 1].accuracy,
       timestamp: positions[positions.length - 1].timestamp,
     };
@@ -1509,7 +1536,7 @@ function startAnimationLoop() {
   function animate(timestamp) {
     state.animationFrameId = requestAnimationFrame(animate);
     
-    // CRITICAL FIX: Skip animation if no movement or processing
+    // Skip if no marker or position data
     if (!state.userMarker || !state.currentPosition) {
       return;
     }
@@ -1527,19 +1554,30 @@ function startAnimationLoop() {
     
     state.lastSleepCheckTime = now;
     
+    // CRITICAL: Marker position is set DIRECTLY in processPositionCore()
+    // This animation loop only handles dead reckoning fallback and heading rotation
+    
     if (elapsedSec > CONFIG.DEAD_RECKONING.TIMEOUT / 1000) {
       if (!state.inDeadReckoning) {
         state.inDeadReckoning = true;
         A11yManager.announce('GPS signal lost, using estimated position', 'polite');
       }
       
+      // Minimize prediction drift - use minimal decay and shortest possible prediction time
       const decay = Math.exp(-elapsedSec * CONFIG.DEAD_RECKONING.DECAY_RATE);
+      const predictSec = Math.min(elapsedSec, 0.15); // Cap prediction time to 150ms max
+      
       const predicted = {
-        lat: state.currentPosition.lat + state.velocity.lat * elapsedSec * decay,
-        lng: state.currentPosition.lng + state.velocity.lng * elapsedSec * decay,
+        lat: state.currentPosition.lat + state.velocity.lat * predictSec * decay,
+        lng: state.currentPosition.lng + state.velocity.lng * predictSec * decay,
       };
       
-      state.userMarker.setLatLng([predicted.lat, predicted.lng]);
+      // Only update marker with predicted position as last resort when GPS is truly lost
+      // This prevents the "thinking it's elsewhere" issue
+      if (elapsedSec > 8) {
+        state.userMarker.setLatLng([predicted.lat, predicted.lng]);
+      }
+      
       state.predictedPosition = predicted;
     } else if (elapsedSec < 2.5 && !state.isUpdating) {
       if (state.inDeadReckoning) {
@@ -1547,70 +1585,37 @@ function startAnimationLoop() {
         A11yManager.announce('GPS signal restored', 'polite');
       }
       
-      const speedMph = metersPerSecondToMph(state.speed);
-      const interpolated = calculateAdvancedInterpolation(
-        state.currentPosition, 
-        state.velocity, 
-        state.acceleration, 
-        elapsedSec, 
-        speedMph
-      );
+      // CRITICAL: NO interpolation for marker position - it's set directly in processPositionCore()
+      // This eliminates the "thinking it's elsewhere" problem
       
-      if (speedMph > 15) {
-        state.userMarker.setLatLng([interpolated.lat, interpolated.lng]);
-        if (state.markerTransition.active) {
-          state.markerTransition.active = false;
-        }
-      } else {
-        if (state.markerTransition.active) {
-          const progress = Math.min((now - state.markerTransition.startTime) / state.markerTransition.duration, 1);
-          const easedProgress = UltraSmoothMovementSystem.getEasingFunction('smooth')(progress);
-          
-          const currentPos = state.userMarker.getLatLng();
-          const newLat = lerp(currentPos.lat, interpolated.lat, easedProgress);
-          const newLng = lerp(currentPos.lng, interpolated.lng, easedProgress);
-          
-          state.userMarker.setLatLng([newLat, newLng]);
-          
-          if (progress >= 1) {
-            state.markerTransition.active = false;
-          }
-        } else {
-          const currentPos = state.userMarker.getLatLng();
-          const distance = calculateDistance(currentPos, interpolated);
-          
-          if (distance > 2) {
-            state.markerTransition = {
-              active: true,
-              startTime: now,
-              duration: Math.max(50, Math.min(200, distance * 10)),
-              startPos: currentPos,
-              targetPos: interpolated,
-            };
-          } else {
-            state.userMarker.setLatLng([interpolated.lat, interpolated.lng]);
-          }
-        }
+      // Only handle heading rotation and sub-pixel positioning here
+      const speedMph = metersPerSecondToMph(state.speed);
+      
+      // Update sub-pixel rendering for smoother appearance at low speeds
+      if (speedMph < 15 && state.currentPosition) {
+        updateSubPixelPosition(state.currentPosition.lat, state.currentPosition.lng);
       }
       
-      state.predictedPosition = interpolated;
-      
-      const icon = DOM_CACHE.userMarkerIcon;
-      if (icon && state.heading !== null && !isNaN(state.heading)) {
-        if (now - lastHeadingUpdate > headingUpdateInterval) {
-          const smoothHeadingValue = smoothHeading(
-            state.heading, 
-            state.smoothHeading || state.heading, 
-            state.speedMph,
-            deltaTime / 1000
-          );
-          
-          icon.style.willChange = 'transform';
-          icon.style.transform = `rotate(${smoothHeadingValue}deg) translate3d(${state.subPixelPosition.x}px, ${state.subPixelPosition.y}px, 0)`;
-          icon.style.transition = `transform ${CONFIG.ANIMATION.HEADING}s ${UltraSmoothMovementSystem.easingFunctions.smooth}`;
-          
-          lastHeadingUpdate = now;
-        }
+      state.predictedPosition = state.currentPosition; // Sync with raw position
+    }
+    
+    // Handle heading rotation independently of position updates
+    const icon = DOM_CACHE.userMarkerIcon;
+    if (icon && state.heading !== null && !isNaN(state.heading)) {
+      if (now - lastHeadingUpdate > headingUpdateInterval) {
+        const smoothHeadingValue = smoothHeading(
+          state.heading, 
+          state.smoothHeading || state.heading, 
+          state.speedMph,
+          deltaTime / 1000
+        );
+        
+        // Apply rotation without affecting position accuracy
+        icon.style.willChange = 'transform';
+        icon.style.transform = `rotate(${smoothHeadingValue}deg) translate3d(${state.subPixelPosition.x}px, ${state.subPixelPosition.y}px, 0)`;
+        icon.style.transition = `transform ${CONFIG.ANIMATION.HEADING}s ${UltraSmoothMovementSystem.easingFunctions.smooth}`;
+        
+        lastHeadingUpdate = now;
       }
     }
     
@@ -1621,6 +1626,9 @@ function startAnimationLoop() {
 }
 
 function calculateAdvancedInterpolation(position, velocity, acceleration, elapsedSec, speedMph) {
+  // This function is now ONLY used for viewport prediction, not marker position
+  // It helps the map pan smoothly ahead of the user's movement
+  
   if (speedMph > 15) {
     const predictSec = speedMph > 50 ? 0.20 : 
                        speedMph > 30 ? 0.15 : 0.10;
@@ -1631,39 +1639,24 @@ function calculateAdvancedInterpolation(position, velocity, acceleration, elapse
     };
   }
   
-  let interpolationFactor;
-  if (speedMph > 10) {
-    interpolationFactor = 0.85;
-  } else {
-    interpolationFactor = 0.80;
-  }
-  
-  const timeFactor = Math.min(elapsedSec / 1.0, 1.0);
-  const accelerationFactor = 0.95;
-  const damping = Math.exp(-elapsedSec * 3.0) * interpolationFactor;
+  // At lower speeds, minimal prediction for viewport stability
+  const predictSec = 0.05; // Only 50ms ahead for smoothness without drift
   
   return {
-    lat: position.lat + 
-          velocity.lat * elapsedSec * damping * accelerationFactor +
-          0.5 * acceleration.lat * elapsedSec * elapsedSec * accelerationFactor,
-    lng: position.lng + 
-          velocity.lng * elapsedSec * damping * accelerationFactor +
-          0.5 * acceleration.lng * elapsedSec * elapsedSec * accelerationFactor,
+    lat: position.lat + velocity.lat * predictSec,
+    lng: position.lng + velocity.lng * predictSec,
   };
 }
 
 function updateSubPixelPosition(lat, lng) {
   if (!state.map) return;
   
+  // Sub-pixel positioning for smoother visual appearance without affecting accuracy
   const point = state.map.latLngToContainerPoint([lat, lng]);
   state.subPixelPosition.x = point.x - Math.floor(point.x);
   state.subPixelPosition.y = point.y - Math.floor(point.y);
   state.lastRenderedPosition = { lat, lng };
 }
-
-// ============================================================================
-// POSITION PROCESSING - ADVANCED INTERPOLATION ENGINE
-// ============================================================================
 
 let positionUpdateLastTime = 0;
 
@@ -1701,29 +1694,35 @@ function processPositionCore(position) {
     return;
   }
 
+  // RAW GPS position - this is the TRUTH for marker placement
   const rawPos = {
     lat: latitude,
     lng: longitude,
-    accuracy: accuracy ?? Number.POSITIVE_INFINITY,
+    accuracy: accuracy ?? 100,
     heading: heading ?? null,
     speed: speed ?? 0,
     timestamp: Date.now(),
   };
 
+  // Accuracy filtering
   if (rawPos.accuracy > CONFIG.POSITION.MIN_ACCURACY) {
     console.debug(`[Position] Skipped: accuracy = ${rawPos.accuracy.toFixed(1)} > ${CONFIG.POSITION.MIN_ACCURACY}`);
     return;
   }
 
+  // First position
   if (!state.currentPosition) {
     console.info('[Position] Initializing from first GPS fix');
     initializePosition(rawPos);
     return;
   }
 
+  // Calculate velocity using raw positions
   const dtSec = Math.max(0, (Date.now() - state.lastUpdateTime) / 1000);
-  const distanceMeters = calculateDistance(state.currentPosition, rawPos);
+  const lastRawPos = state.lastRawPosition || state.currentPosition;
+  const distanceMeters = calculateDistance(lastRawPos, rawPos);
 
+  // Teleport detection
   if (distanceMeters > CONFIG.POSITION.MAX_TELEPORT) {
     console.warn(`[Position] Teleport detected (${distanceMeters.toFixed(1)}m). Resetting filter.`);
     PositionFilter.reset(rawPos);
@@ -1731,10 +1730,17 @@ function processPositionCore(position) {
     return;
   }
 
-  if (distanceMeters < CONFIG.POSITION.MIN_MOVEMENT && rawPos.accuracy >= state.currentPosition.accuracy) {
+  // Skip tiny movements but still update marker
+  if (distanceMeters < CONFIG.POSITION.MIN_MOVEMENT && rawPos.accuracy >= (lastRawPos?.accuracy || 0)) {
+    // Update marker to raw position even if we skip smoothing
+    if (state.userMarker) {
+      state.userMarker.setLatLng([rawPos.lat, rawPos.lng]);
+    }
+    state.lastRawPosition = rawPos;
     return;
   }
 
+  // Calculate velocity and speed from raw positions
   let velocity = { lat: 0, lng: 0 };
   let filteredSpeed = rawPos.speed > 0 ? rawPos.speed : (distanceMeters / Math.max(0.1, dtSec));
   
@@ -1743,10 +1749,11 @@ function processPositionCore(position) {
     filteredSpeed = CONFIG.SPEED.MAX_REASONABLE;
   }
 
+  // Acceleration calculation
   if (dtSec > 0 && dtSec < 10) {
     velocity = {
-      lat: (rawPos.lat - state.currentPosition.lat) / dtSec,
-      lng: (rawPos.lng - state.currentPosition.lng) / dtSec,
+      lat: (rawPos.lat - (lastRawPos?.lat || state.currentPosition.lat)) / dtSec,
+      lng: (rawPos.lng - (lastRawPos?.lng || state.currentPosition.lng)) / dtSec,
     };
 
     if (filteredSpeed > 8 && state.positionBuffer?.size >= 3) {
@@ -1774,6 +1781,7 @@ function processPositionCore(position) {
     }
   }
 
+  // Apply minimal smoothing for viewport stability
   PositionFilter.adaptToSpeed(filteredSpeed);
   const filtered = PositionFilter.update(rawPos);
   
@@ -1781,11 +1789,15 @@ function processPositionCore(position) {
   state.positionBuffer.push(filtered);
   const smoothed = state.positionBuffer.size >= 2 ? state.positionBuffer.getAverage() : filtered;
 
-  // Update marker IMMEDIATELY with raw position to eliminate lag
+  // CRITICAL: Set marker to RAW position immediately - no interpolation
   if (state.userMarker) {
     state.userMarker.setLatLng([rawPos.lat, rawPos.lng]);
   }
 
+  // Store raw position for next velocity calculation
+  state.lastRawPosition = rawPos;
+  
+  // Use smoothed position for viewport calculations only
   state.lastPosition = state.currentPosition;
   state.currentPosition = smoothed;
   state.velocity = velocity;
@@ -1800,6 +1812,7 @@ function processPositionCore(position) {
     A11yManager.announce('GPS signal restored', 'polite');
   }
 
+  // Update marker appearance based on speed/mode
   const icon = DOM_CACHE.userMarkerIcon;
   if (icon) {
     icon.classList.toggle('moving-roaming', UltraSmoothMovementSystem.mode === 'roaming');
@@ -1807,6 +1820,7 @@ function processPositionCore(position) {
     icon.classList.toggle('moving-very-fast', state.speedMph >= 25);
   }
 
+  // Update map inertia based on mode
   if (state.map) {
     const shouldDisableInertia = UltraSmoothMovementSystem.mode === 'centered';
     if (state.map.options.inertia !== !shouldDisableInertia) {
@@ -1815,6 +1829,7 @@ function processPositionCore(position) {
     }
   }
 
+  // Update viewport using smoothed position (maintains roaming/centered behavior)
   try {
     if (!isPopupOpen() && state.map) {
       ViewportManager.updateViewport(smoothed, filteredSpeed, velocity);
@@ -1822,6 +1837,7 @@ function processPositionCore(position) {
     }
     updateDistanceBox();
     PerformanceMonitor.recordPositionUpdate();
+    PerformanceMonitor.recordRawPositionUpdate(); // Track raw updates
   } catch (error) {
     console.error('[Position] Side effects error:', error);
   }
@@ -1830,6 +1846,7 @@ function processPositionCore(position) {
 function initializePosition(position) {
   state.currentPosition = position;
   state.lastPosition = position;
+  state.lastRawPosition = position;
   state.positionBuffer = new CircularPositionBuffer(CONFIG.POSITION.BUFFER_SIZE);
   state.positionBuffer.push(position);
   state.velocity = { lat: 0, lng: 0 };
@@ -1847,6 +1864,7 @@ function initializePosition(position) {
   
   PositionFilter.reset(position);
   
+  // Set marker to raw position
   if (state.userMarker) {
     state.userMarker.setLatLng([position.lat, position.lng]);
     state.userMarker.setOpacity(1);
@@ -2099,6 +2117,12 @@ function initGeolocation() {
     return;
   }
   
+  // Clear any existing watch to prevent duplicates
+  if (state.geolocationWatchId) {
+    navigator.geolocation.clearWatch(state.geolocationWatchId);
+    state.geolocationWatchId = null;
+  }
+  
   state.geolocationWatchId = navigator.geolocation.watchPosition(
     processPosition,
     (error) => {
@@ -2134,17 +2158,24 @@ function initGeolocation() {
     },
     {
       enableHighAccuracy: true,
-      timeout: 25000,
-      maximumAge: 3000,
+      timeout: 10000,           // Balanced timeout (was 25000)
+      maximumAge: 0,            // CRITICAL: Use only fresh positions to prevent drift
+      distanceFilter: 0         // Receive all updates for accurate speed calculation
     }
   );
   
-  navigator.geolocation.getCurrentPosition(processPosition, console.warn, {
-    enableHighAccuracy: true,
-    timeout: 10000,
-  });
+  // Get immediate position with matching settings
+  navigator.geolocation.getCurrentPosition(
+    processPosition, 
+    console.warn, 
+    {
+      enableHighAccuracy: true,
+      timeout: 10000,
+      maximumAge: 0
+    }
+  );
 }
-
+    
 // ============================================================================
 // TOUR LOGIC 
 // ============================================================================
