@@ -589,7 +589,7 @@ const CONFIG = Object.freeze({
   },
   
   POSITION: {
-    BUFFER_SIZE: 12,
+    BUFFER_SIZE: 8,
     BUFFER_MAX_AGE_MS: 30000,
     MIN_ACCURACY: 65,
     MIN_MOVEMENT: 0.3,
@@ -786,6 +786,9 @@ const state = {
     startPos: null,
     targetPos: null,
   },
+
+  smoothedViewportPosition: null,  
+  lastRawPosition: null,            
   subPixelPosition: { x: 0, y: 0 },
   lastRenderedPosition: null,
 };
@@ -1379,31 +1382,35 @@ const ViewportManager = {
     };
   },
   
-  updateViewport(position, speed, velocity) {
-    if (!state.map || !state.userMarker) return;
+updateViewport(position, speed, velocity) {
+  if (!state.map || !state.userMarker) return;
 
-    const speedMph = metersPerSecondToMph(speed);
-    state.speedMph = speedMph;
+  const speedMph = metersPerSecondToMph(speed);
+  state.speedMph = speedMph;
 
-    const now = Date.now();
-    if (state.isUserInteracting || state.isPinchingZooming || now < state.gestureCooldownEndTime) {
-      state.followUser = false;
-      return;
-    }
+  const now = Date.now();
+  if (state.isUserInteracting || state.isPinchingZooming || now < state.gestureCooldownEndTime) {
+    state.followUser = false;
+    return;
+  }
 
-    if (now - this.lastViewportUpdate < this.minViewportInterval) return;
-    this.lastViewportUpdate = now;
+  if (now - this.lastViewportUpdate < this.minViewportInterval) return;
+  this.lastViewportUpdate = now;
 
-    UltraSmoothMovementSystem.updateMode(speedMph);
-    
-    if (UltraSmoothMovementSystem.mode === 'centered') {
-      this.centerMarkerUltraSmooth(position, velocity, speedMph, state.acceleration);
-    } else {
-      this.handleRoamingUltraSmooth(position, speed, velocity, state.acceleration);
-    }
-    
-    state.followUser = true;
-  },
+  UltraSmoothMovementSystem.updateMode(speedMph);
+  
+  // Add this for silky-smooth mode transitions:
+  const transitionFactor = UltraSmoothMovementSystem.getTransitionFactor();
+  speedMph *= (0.5 + transitionFactor * 0.5); // Smooth speed transitions
+  
+  if (UltraSmoothMovementSystem.mode === 'centered') {
+    this.centerMarkerUltraSmooth(position, velocity, speedMph, state.acceleration);
+  } else {
+    this.handleRoamingUltraSmooth(position, speed, velocity, state.acceleration);
+  }
+  
+  state.followUser = true;
+},
   
   centerMarkerUltraSmooth(position, velocity, speedMph, acceleration) {
     const now = Date.now();
@@ -1531,97 +1538,101 @@ const ViewportManager = {
 function startAnimationLoop() {
   let lastFrame = 0;
   let lastHeadingUpdate = 0;
-  let headingUpdateInterval = 40;
+  const headingUpdateInterval = 40; // Update heading every 40ms for smooth rotation
   
   function animate(timestamp) {
     state.animationFrameId = requestAnimationFrame(animate);
     
-    // Skip if no marker or position data
+    // Early exit conditions
     if (!state.userMarker || !state.currentPosition) {
       return;
     }
     
+    // Pause animation when page is hidden to save battery
     if (document.hidden) {
       cancelAnimationFrame(state.animationFrameId);
       state.animationFrameId = null;
       return;
     }
     
+    // Calculate time deltas
     const now = Date.now();
     const elapsedSec = (now - state.lastUpdateTime) / 1000;
     const deltaTime = timestamp - lastFrame;
     lastFrame = timestamp;
     
+    // Track activity for sleep detection
     state.lastSleepCheckTime = now;
     
-    // CRITICAL: Marker position is set DIRECTLY in processPositionCore()
-    // This animation loop only handles dead reckoning fallback and heading rotation
+    // ============================================================================
+    // DEAD RECKONING: Predict position when GPS is lost (4+ seconds)
+    // ============================================================================
     
     if (elapsedSec > CONFIG.DEAD_RECKONING.TIMEOUT / 1000) {
+      // Announce GPS loss once
       if (!state.inDeadReckoning) {
         state.inDeadReckoning = true;
         A11yManager.announce('GPS signal lost, using estimated position', 'polite');
       }
       
-      // Minimize prediction drift - use minimal decay and shortest possible prediction time
+      // Calculate predicted position with exponential decay
       const decay = Math.exp(-elapsedSec * CONFIG.DEAD_RECKONING.DECAY_RATE);
-      const predictSec = Math.min(elapsedSec, 0.15); // Cap prediction time to 150ms max
+      const predictSec = Math.min(elapsedSec, 0.15); // Cap at 150ms to minimize drift
       
       const predicted = {
         lat: state.currentPosition.lat + state.velocity.lat * predictSec * decay,
         lng: state.currentPosition.lng + state.velocity.lng * predictSec * decay,
       };
       
-      // Only update marker with predicted position as last resort when GPS is truly lost
-      // This prevents the "thinking it's elsewhere" issue
-      if (elapsedSec > 8) {
+      // Update marker IMMEDIATELY during dead reckoning (not after 8s)
+      if (state.inDeadReckoning) {
         state.userMarker.setLatLng([predicted.lat, predicted.lng]);
       }
       
       state.predictedPosition = predicted;
-    } else if (elapsedSec < 2.5 && !state.isUpdating) {
+      
+    } else {
+      // GPS is available - clear dead reckoning state
       if (state.inDeadReckoning) {
         state.inDeadReckoning = false;
         A11yManager.announce('GPS signal restored', 'polite');
       }
       
-      // CRITICAL: NO interpolation for marker position - it's set directly in processPositionCore()
-      // This eliminates the "thinking it's elsewhere" problem
+      // Sync predicted position with actual position
+      state.predictedPosition = state.currentPosition;
       
-      // Only handle heading rotation and sub-pixel positioning here
-      const speedMph = metersPerSecondToMph(state.speed);
-      
-      // Update sub-pixel rendering for smoother appearance at low speeds
-      if (speedMph < 15 && state.currentPosition) {
-        updateSubPixelPosition(state.currentPosition.lat, state.currentPosition.lng);
-      }
-      
-      state.predictedPosition = state.currentPosition; // Sync with raw position
     }
     
-    // Handle heading rotation independently of position updates
+    // ============================================================================
+    // HEADING ROTATION: Independent of position (smooth compass behavior)
+    // ============================================================================
+    
     const icon = DOM_CACHE.userMarkerIcon;
     if (icon && state.heading !== null && !isNaN(state.heading)) {
-      if (now - lastHeadingUpdate > headingUpdateInterval) {
+      // Throttle heading updates to reduce CPU load
+      if (now - lastHeadingUpdate >= headingUpdateInterval) {
+        // Smooth heading changes to prevent jarring rotations
         const smoothHeadingValue = smoothHeading(
           state.heading, 
-          state.smoothHeading || state.heading, 
+          state.smoothHeading ?? state.heading, 
           state.speedMph,
           deltaTime / 1000
         );
         
-        // Apply rotation without affecting position accuracy
+        // ONLY rotate - NO translate3d offset that causes drift
         icon.style.willChange = 'transform';
-        icon.style.transform = `rotate(${smoothHeadingValue}deg) translate3d(${state.subPixelPosition.x}px, ${state.subPixelPosition.y}px, 0)`;
+        icon.style.transform = `rotate(${smoothHeadingValue}deg)`;
         icon.style.transition = `transform ${CONFIG.ANIMATION.HEADING}s ${UltraSmoothMovementSystem.easingFunctions.smooth}`;
         
         lastHeadingUpdate = now;
       }
     }
     
+    // Store frame time for performance monitoring
     state.frameTime = deltaTime;
   }
   
+  // Start the animation loop
   state.animationFrameId = requestAnimationFrame(animate);
 }
 
@@ -1646,16 +1657,6 @@ function calculateAdvancedInterpolation(position, velocity, acceleration, elapse
     lat: position.lat + velocity.lat * predictSec,
     lng: position.lng + velocity.lng * predictSec,
   };
-}
-
-function updateSubPixelPosition(lat, lng) {
-  if (!state.map) return;
-  
-  // Sub-pixel positioning for smoother visual appearance without affecting accuracy
-  const point = state.map.latLngToContainerPoint([lat, lng]);
-  state.subPixelPosition.x = point.x - Math.floor(point.x);
-  state.subPixelPosition.y = point.y - Math.floor(point.y);
-  state.lastRenderedPosition = { lat, lng };
 }
 
 let positionUpdateLastTime = 0;
@@ -1694,7 +1695,7 @@ function processPositionCore(position) {
     return;
   }
 
-  // RAW GPS position - this is the TRUTH for marker placement
+  // RAW GPS position - the absolute truth for marker placement
   const rawPos = {
     lat: latitude,
     lng: longitude,
@@ -1704,35 +1705,33 @@ function processPositionCore(position) {
     timestamp: Date.now(),
   };
 
-  // Accuracy filtering
+  // Accuracy filtering - reject poor quality data
   if (rawPos.accuracy > CONFIG.POSITION.MIN_ACCURACY) {
     console.debug(`[Position] Skipped: accuracy = ${rawPos.accuracy.toFixed(1)} > ${CONFIG.POSITION.MIN_ACCURACY}`);
     return;
   }
 
-  // First position
+  // First position - initialize everything
   if (!state.currentPosition) {
     console.info('[Position] Initializing from first GPS fix');
     initializePosition(rawPos);
     return;
   }
 
-  // Calculate velocity using raw positions
+  // Calculate time delta
   const dtSec = Math.max(0, (Date.now() - state.lastUpdateTime) / 1000);
   const lastRawPos = state.lastRawPosition || state.currentPosition;
   const distanceMeters = calculateDistance(lastRawPos, rawPos);
 
-  // Teleport detection
+  // Teleport detection - GPS glitch or actual movement?
   if (distanceMeters > CONFIG.POSITION.MAX_TELEPORT) {
-    console.warn(`[Position] Teleport detected (${distanceMeters.toFixed(1)}m). Resetting filter.`);
+    console.warn(`[Position] Teleport detected (${distanceMeters.toFixed(1)}m). Resetting.`);
     PositionFilter.reset(rawPos);
-    initializePosition(rawPos);
-    return;
   }
 
-  // Skip tiny movements but still update marker
+  // Skip imperceptible movements
   if (distanceMeters < CONFIG.POSITION.MIN_MOVEMENT && rawPos.accuracy >= (lastRawPos?.accuracy || 0)) {
-    // Update marker to raw position even if we skip smoothing
+    // Still update marker to raw position for accuracy
     if (state.userMarker) {
       state.userMarker.setLatLng([rawPos.lat, rawPos.lng]);
     }
@@ -1740,31 +1739,49 @@ function processPositionCore(position) {
     return;
   }
 
-  // Calculate velocity and speed from raw positions
-  let velocity = { lat: 0, lng: 0 };
-  let filteredSpeed = rawPos.speed > 0 ? rawPos.speed : (distanceMeters / Math.max(0.1, dtSec));
+  // ============================================================================
+  // VELOCITY & SPEED CALCULATION (using raw positions for accuracy)
+  // ============================================================================
   
+  let velocity = { lat: 0, lng: 0 };
+  let calculatedSpeed = distanceMeters / Math.max(0.1, dtSec);
+  
+  // Prefer device-reported speed if available and reasonable
+  let filteredSpeed = (rawPos.speed > 0 && rawPos.speed < CONFIG.SPEED.MAX_REASONABLE) 
+    ? rawPos.speed 
+    : calculatedSpeed;
+  
+  // Clamp unreasonable speeds
   if (filteredSpeed > CONFIG.SPEED.MAX_REASONABLE) {
     console.debug(`[Position] Speed clamped: ${filteredSpeed.toFixed(1)} → ${CONFIG.SPEED.MAX_REASONABLE}`);
     filteredSpeed = CONFIG.SPEED.MAX_REASONABLE;
   }
 
-  // Acceleration calculation
+  // Calculate velocity vector
   if (dtSec > 0 && dtSec < 10) {
     velocity = {
-      lat: (rawPos.lat - (lastRawPos?.lat || state.currentPosition.lat)) / dtSec,
-      lng: (rawPos.lng - (lastRawPos?.lng || state.currentPosition.lng)) / dtSec,
+      lat: (rawPos.lat - lastRawPos.lat) / dtSec,
+      lng: (rawPos.lng - lastRawPos.lng) / dtSec,
     };
 
+    // Acceleration calculation for predictive smoothing
     if (filteredSpeed > 8 && state.positionBuffer?.size >= 3) {
       const buf = state.positionBuffer.toArray();
       const [p0, p1, p2] = [buf[buf.length - 3], buf[buf.length - 2], buf[buf.length - 1]];
+      
       if (p0 && p1 && p2) {
         const dt1 = (p1.timestamp - p0.timestamp) / 1000;
         const dt2 = (p2.timestamp - p1.timestamp) / 1000;
-        if (dt1 >= 0.1 && dt2 >= 0.1 && dt1 < 3 && dt2 < 3 && (dt1 + dt2) > 0) {
-          const accLat = (((p2.lat - p1.lat) / dt2) - ((p1.lat - p0.lat) / dt1)) / ((dt1 + dt2) / 2);
-          const accLng = (((p2.lng - p1.lng) / dt2) - ((p1.lng - p0.lng) / dt1)) / ((dt1 + dt2) / 2);
+        
+        if (dt1 >= 0.1 && dt2 >= 0.1 && dt1 < 3 && dt2 < 3) {
+          const v1Lat = (p1.lat - p0.lat) / dt1;
+          const v1Lng = (p1.lng - p0.lng) / dt1;
+          const v2Lat = (p2.lat - p1.lat) / dt2;
+          const v2Lng = (p2.lng - p1.lng) / dt2;
+          
+          const avgDt = (dt1 + dt2) / 2;
+          const accLat = (v2Lat - v1Lat) / avgDt;
+          const accLng = (v2Lng - v1Lng) / avgDt;
 
           const MAX_ACCEL = 15;
           state.acceleration = {
@@ -1772,34 +1789,49 @@ function processPositionCore(position) {
             lng: clamp(accLng, -MAX_ACCEL, MAX_ACCEL),
           };
 
-          const boostLat = state.acceleration.lat * dt2 * 0.6;
-          const boostLng = state.acceleration.lng * dt2 * 0.6;
-          velocity.lat += boostLat;
-          velocity.lng += boostLng;
+          // Apply acceleration boost to velocity for smoother prediction
+          velocity.lat += state.acceleration.lat * dt2 * 0.6;
+          velocity.lng += state.acceleration.lng * dt2 * 0.6;
         }
       }
     }
   }
 
-  // Apply minimal smoothing for viewport stability
+  // ============================================================================
+  // POSITION SMOOTHING (for viewport only - marker stays raw)
+  // ============================================================================
+  
+  // Adapt filter responsiveness based on speed
   PositionFilter.adaptToSpeed(filteredSpeed);
   const filtered = PositionFilter.update(rawPos);
   
+  // Maintain position buffer for averaging
   state.positionBuffer = state.positionBuffer || new CircularPositionBuffer(CONFIG.POSITION.BUFFER_SIZE);
   state.positionBuffer.push(filtered);
-  const smoothed = state.positionBuffer.size >= 2 ? state.positionBuffer.getAverage() : filtered;
+  
+  // Get smoothed position for viewport calculations
+  const smoothedForViewport = state.positionBuffer.size >= 2 
+    ? state.positionBuffer.getAverage() 
+    : filtered;
 
-  // CRITICAL: Set marker to RAW position immediately - no interpolation
+  // ============================================================================
+  // CRITICAL SEPARATION: Marker vs Viewport Positions
+  // ============================================================================
+  
+  // 1. MARKER: Always use exact raw GPS position (no lag, no smoothing)
   if (state.userMarker) {
     state.userMarker.setLatLng([rawPos.lat, rawPos.lng]);
   }
 
-  // Store raw position for next velocity calculation
+  // 2. STATE: Store raw position as "current" for all calculations
   state.lastRawPosition = rawPos;
-  
-  // Use smoothed position for viewport calculations only
   state.lastPosition = state.currentPosition;
-  state.currentPosition = smoothed;
+  state.currentPosition = rawPos;  // ← KEY CHANGE: Use raw, not smoothed
+  
+  // 3. VIEWPORT: Store separate smoothed position for map panning
+  state.smoothedViewportPosition = smoothedForViewport;
+  
+  // Update derived state
   state.velocity = velocity;
   state.speed = filteredSpeed;
   state.speedMph = metersPerSecondToMph(filteredSpeed);
@@ -1807,12 +1839,17 @@ function processPositionCore(position) {
   state.lastUpdateTime = Date.now();
   state.errorCount = 0;
   
+  // Clear dead reckoning flag
   if (state.inDeadReckoning) {
     state.inDeadReckoning = false;
     A11yManager.announce('GPS signal restored', 'polite');
   }
 
-  // Update marker appearance based on speed/mode
+  // ============================================================================
+  // VISUAL UPDATES
+  // ============================================================================
+  
+  // Update marker appearance based on movement mode
   const icon = DOM_CACHE.userMarkerIcon;
   if (icon) {
     icon.classList.toggle('moving-roaming', UltraSmoothMovementSystem.mode === 'roaming');
@@ -1820,7 +1857,7 @@ function processPositionCore(position) {
     icon.classList.toggle('moving-very-fast', state.speedMph >= 25);
   }
 
-  // Update map inertia based on mode
+  // Adjust map inertia based on mode
   if (state.map) {
     const shouldDisableInertia = UltraSmoothMovementSystem.mode === 'centered';
     if (state.map.options.inertia !== !shouldDisableInertia) {
@@ -1829,15 +1866,18 @@ function processPositionCore(position) {
     }
   }
 
-  // Update viewport using smoothed position (maintains roaming/centered behavior)
+  // ============================================================================
+  // VIEWPORT MANAGEMENT (uses smoothed position to prevent map jitter)
+  // ============================================================================
+  
   try {
     if (!isPopupOpen() && state.map) {
-      ViewportManager.updateViewport(smoothed, filteredSpeed, velocity);
+      ViewportManager.updateViewport(smoothedForViewport, filteredSpeed, velocity);
       optimizeTileRendering();
     }
     updateDistanceBox();
     PerformanceMonitor.recordPositionUpdate();
-    PerformanceMonitor.recordRawPositionUpdate(); // Track raw updates
+    PerformanceMonitor.recordRawPositionUpdate();
   } catch (error) {
     console.error('[Position] Side effects error:', error);
   }
@@ -2159,7 +2199,7 @@ function initGeolocation() {
     {
       enableHighAccuracy: true,
       timeout: 10000,           // Balanced timeout (was 25000)
-      maximumAge: 0,            // CRITICAL: Use only fresh positions to prevent drift
+      maximumAge: 0,            // Use only fresh positions to prevent drift
       distanceFilter: 0         // Receive all updates for accurate speed calculation
     }
   );
