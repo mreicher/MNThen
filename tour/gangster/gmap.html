@@ -1434,7 +1434,8 @@ centerMarkerUltraSmooth(position, velocity, speedMph, acceleration) {
 
   // Use RAW current position for centering - no prediction needed
   // The marker's 60fps interpolation provides all the smoothness
-  const centerTarget = state.currentPosition || position;
+  const centerTarget = state.currentPosition || state.lastPosition || state.renderedPosition;
+if (!centerTarget) return; // bail if no usable position yet
   
   // Faster panning at very high speeds for responsiveness
   const duration = speedMph > 30 ? CONFIG.ANIMATION.HIGH_SPEED_PAN : 0.20;
@@ -1545,122 +1546,128 @@ handleRoamingUltraSmooth(position, speed, velocity, acceleration) {
 function startAnimationLoop() {
   let lastFrame = 0;
   let lastHeadingUpdate = 0;
-  const headingUpdateInterval = 40; // Update heading every 40ms for smooth rotation
-  
+  const HEADING_UPDATE_INTERVAL = 40; // ms
+
   function animate(timestamp) {
+    // Re-schedule the next frame first (RAF best practice)
     state.animationFrameId = requestAnimationFrame(animate);
-    
-    // Early exit conditions
-    if (!state.userMarker || !state.targetPosition || !state.renderedPosition) {
+
+    // SAFETY GUARDS
+    if (
+      !state.userMarker ||
+      !state.targetPosition ||
+      !state.renderedPosition ||
+      !state.currentPosition
+    ) {
+      // Wait until all core positions are initialized
       return;
     }
-    
-    // Pause animation when page is hidden to save battery
+
+    // PAUSE when hidden (battery + privacy)
     if (document.hidden) {
-      cancelAnimationFrame(state.animationFrameId);
-      state.animationFrameId = null;
+      if (state.animationFrameId) {
+        cancelAnimationFrame(state.animationFrameId);
+        state.animationFrameId = null;
+      }
       return;
     }
-    
-    // Calculate time deltas
+
+    // Timing
     const now = Date.now();
-    const elapsedSec = (now - state.lastUpdateTime) / 1000;
-    const deltaTime = timestamp - lastFrame;
+    const elapsedSec = Math.max(0, (now - state.lastUpdateTime) / 1000);
+    const frameDelta = timestamp - lastFrame;
     lastFrame = timestamp;
-    
-    // Track activity for sleep detection
     state.lastSleepCheckTime = now;
-    
+
     // ============================================================================
-    // SMOOTH MARKER INTERPOLATION (60fps)
+    // INTERPOLATED MARKER MOVEMENT (60fps visual smoothness)
     // ============================================================================
-    
-    // Calculate distance to target
     const distToTarget = calculateDistance(state.renderedPosition, state.targetPosition);
     const speedMph = state.speedMph || 0;
-    
-    // Speed-adaptive interpolation factor
-    let interpSpeed = speedMph > 30 ? 0.35 :
-                     speedMph > 15 ? 0.25 :
-                     speedMph > 5  ? 0.18 :
-                     distToTarget > 2 ? 0.30 : 0.12;
-    
-    // Apply cubic-bezier easing for ultra-smooth interpolation
+
+    // Adaptive interpolation: faster catch-up at high speed or large error
+    let t = 0.15; // base (responsive but stable)
+    if (speedMph > 30) {
+      t = clamp(distToTarget > 5 ? 0.45 : 0.25, 0.2, 0.5);
+    } else if (speedMph > 15) {
+      t = clamp(distToTarget > 2 ? 0.35 : 0.20, 0.15, 0.35);
+    } else {
+      // Roaming mode: prioritize smoothness over responsiveness
+      t = distToTarget > 3 ? 0.3 : (distToTarget > 1 ? 0.18 : 0.10);
+    }
+
     const interpolated = UltraSmoothMovementSystem.interpolatePosition(
       state.renderedPosition,
       state.targetPosition,
-      interpSpeed,
+      t,
       'smooth'
     );
-    
-    // Update rendered position
+
+    // Update rendered state & marker
     state.renderedPosition = interpolated;
-    
-    // Set marker to interpolated position (THIS RUNS AT 60fps)
     state.userMarker.setLatLng([interpolated.lat, interpolated.lng]);
-    
+
     // ============================================================================
-    // DEAD RECKONING: Predict target position when GPS is lost (4+ seconds)
+    // DEAD RECKONING (when GPS lost > 4s)
     // ============================================================================
-    
     if (elapsedSec > CONFIG.DEAD_RECKONING.TIMEOUT / 1000) {
-      // Announce GPS loss once
       if (!state.inDeadReckoning) {
         state.inDeadReckoning = true;
         A11yManager.announce('GPS signal lost, using estimated position', 'polite');
       }
-      
-      // Calculate predicted position with exponential decay
+
+      // Predict forward, but decay strongly to prevent runaway drift
       const decay = Math.exp(-elapsedSec * CONFIG.DEAD_RECKONING.DECAY_RATE);
-      const predictSec = Math.min(elapsedSec, 0.15); // Cap at 150ms to minimize drift
-      
+      const dt = Math.min(elapsedSec, 0.12); // Cap predict time to 120ms
+
       const predicted = {
-        lat: state.currentPosition.lat + state.velocity.lat * predictSec * decay,
-        lng: state.currentPosition.lng + state.velocity.lng * predictSec * decay,
+        lat: state.currentPosition.lat + state.velocity.lat * dt * decay,
+        lng: state.currentPosition.lng + state.velocity.lng * dt * decay,
       };
-      
-      // Update target position during dead reckoning (interpolation continues)
+
+      // Feed prediction back into target (visual interpolation continues seamlessly)
       state.targetPosition = predicted;
       state.predictedPosition = predicted;
-      
-    } else {
-      // GPS is available - clear dead reckoning state
-      if (state.inDeadReckoning) {
-        state.inDeadReckoning = false;
-        A11yManager.announce('GPS signal restored', 'polite');
-      }
+
+    } else if (state.inDeadReckoning) {
+      // GPS restored
+      state.inDeadReckoning = false;
+      state.predictedPosition = null;
+      A11yManager.announce('GPS signal restored', 'polite');
     }
-    
+
     // ============================================================================
-    // HEADING ROTATION: Independent of position (smooth compass behavior)
+    // HEADING (throttled + smoothed)
     // ============================================================================
-    
     const icon = DOM_CACHE.userMarkerIcon;
-    if (icon && state.heading !== null && !isNaN(state.heading)) {
-      // Throttle heading updates to reduce CPU load
-      if (now - lastHeadingUpdate >= headingUpdateInterval) {
-        // Smooth heading changes to prevent jarring rotations
+    if (icon && state.heading != null && !isNaN(state.heading)) {
+      if (now - lastHeadingUpdate >= HEADING_UPDATE_INTERVAL) {
         const smoothHeadingValue = smoothHeading(
-          state.heading, 
-          state.smoothHeading ?? state.heading, 
+          state.heading,
+          state.smoothHeading ?? state.heading,
           state.speedMph,
-          deltaTime / 1000
+          frameDelta / 1000
         );
-        
-        // ONLY rotate - NO translate3d that causes drift
+
+        // *Only* rotate — do NOT interfere with marker position
         icon.style.willChange = 'transform';
         icon.style.transform = `rotate(${smoothHeadingValue}deg)`;
-        icon.style.transition = `transform ${CONFIG.ANIMATION.HEADING}s ${UltraSmoothMovementSystem.easingFunctions.smooth}`;
-        
+        // Avoid `transition` here — it fights RAF interpolation; rely on `smoothHeading()` instead
+        // icon.style.transition = `transform ${CONFIG.ANIMATION.HEADING}s cubic-bezier(0.25, 0.1, 0.25, 1)`;
+
+        state.smoothHeading = smoothHeadingValue;
         lastHeadingUpdate = now;
       }
     }
-    
-    // Store frame time for performance monitoring
-    state.frameTime = deltaTime;
+
+    // MONITORING
+    PerformanceMonitor.endTime('frame');
+    PerformanceMonitor.startTime('frame');
+    state.frameTime = frameDelta;
   }
-  
-  // Start the animation loop
+
+  // START
+  PerformanceMonitor.startTime('frame');
   state.animationFrameId = requestAnimationFrame(animate);
 }
 
@@ -1919,11 +1926,18 @@ function processPositionCore(position) {
 }
 
 function initializePosition(position) {
-  state.currentPosition = position;
-  state.lastPosition = position;
-  state.lastRawPosition = position;
+  // Guard against invalid/malformed position
+  if (!position || typeof position.lat !== 'number' || typeof position.lng !== 'number') {
+    console.error('[initializePosition] Invalid position:', position);
+    return;
+  }
+
+  // Initialize state
+  state.currentPosition = { ...position }; // clone to avoid mutation side effects
+  state.lastPosition = { ...position };
+  state.lastRawPosition = { ...position };
   state.positionBuffer = new CircularPositionBuffer(CONFIG.POSITION.BUFFER_SIZE);
-  state.positionBuffer.push(position);
+  state.positionBuffer.push({ ...position });
   state.velocity = { lat: 0, lng: 0 };
   state.acceleration = { lat: 0, lng: 0 };
   state.speed = 0;
@@ -1935,24 +1949,69 @@ function initializePosition(position) {
   state.errorCount = 0;
   state.predictedPosition = null;
   state.inDeadReckoning = false;
-  state.lastRenderedPosition = null;
+  state.lastRenderedPosition = { ...position };
   
+  // Reset filters
   PositionFilter.reset(position);
-  
-  // Set marker to raw position
+
+  // Update marker
   if (state.userMarker) {
     state.userMarker.setLatLng([position.lat, position.lng]);
     state.userMarker.setOpacity(1);
-    DOM_CACHE.userMarkerIcon = state.userMarker.getElement()?.querySelector('.user-marker-icon');
-  }
-  
-  if (state.map) {
-    state.map.setView([position.lat, position.lng], CONFIG.MAP.DEFAULT_ZOOM, {
-      animate: false,
+    requestAnimationFrame(() => {
+      DOM_CACHE.userMarkerIcon = state.userMarker.getElement()?.querySelector('.user-marker-icon');
     });
-    state.hasCenteredInitially = true;
   }
-  
+
+  // Ensure map is centered *and* marker is fully in view
+  if (state.map) {
+    const safeZoom = Math.min(CONFIG.MAP.DEFAULT_ZOOM, state.map.getMaxZoom());
+    
+    // Step 1: Force immediate hard center (no animation — avoids initial drift)
+    state.map.setView([position.lat, position.lng], safeZoom, { animate: false });
+    
+    // Step 2: After layout settles (~1 frame), recheck containment
+    requestAnimationFrame(() => {
+      if (!state.map) return;
+
+      const bounds = state.map.getBounds();
+      const markerLatLng = L.latLng(position.lat, position.lng);
+
+      // If somehow still outside (e.g., due to tile load delay), pan into safe inset
+      if (!bounds.contains(markerLatLng)) {
+        const paddingRatio = 0.15; // keep marker 15% away from any edge
+        const latSpan = bounds.getNorth() - bounds.getSouth();
+        const lngSpan = bounds.getEast() - bounds.getWest();
+        const targetLat = clamp(
+          position.lat,
+          bounds.getSouth() + latSpan * paddingRatio,
+          bounds.getNorth() - latSpan * paddingRatio
+        );
+        const targetLng = clamp(
+          position.lng,
+          bounds.getWest() + lngSpan * paddingRatio,
+          bounds.getEast() - lngSpan * paddingRatio
+        );
+        state.map.panTo([targetLat, targetLng], {
+          animate: true,
+          duration: CONFIG.ANIMATION.FAST,
+          noMoveStart: true
+        });
+      }
+
+      // Final state sync
+      state.hasCenteredInitially = true;
+
+      // Initialize smoothed viewport position (needed for roaming mode)
+      state.smoothedViewportPosition = { ...position };
+
+      // Initialize interpolation positions
+      state.targetPosition = { ...position };
+      state.renderedPosition = { ...position };
+    });
+  }
+
+  // Accessibility
   A11yManager.announce('Your location has been found', 'polite');
 }
 
