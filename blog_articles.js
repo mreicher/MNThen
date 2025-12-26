@@ -1,5 +1,15 @@
 const blogArticles = [
   {
+  "headline": "The Ambush of St. Paul Police Officer James Sackett (May 22, 1970)",
+  "blurb": "A fake emergency call lured 27-year-old Patrolman James Sackett into a deadly ambush on Hague Avenue. The murder remained unsolved for 34 years until a cold case breakthrough.",
+  "icon": "fa-calendar",
+  "author": "Matt Reicher",
+  "date": "December 26, 2025",
+  "image": "https://www.mnthen.com/images/sackett.jpg",
+  "url": "https://www.mnthen.com/blog/event/sackett.html",
+  "keywords": ["james sackett", "st. paul police", "officer down", "1970 ambush", "cold case", "ronald reed", "larry clark", "connie trimble", "black panther", "hague avenue", "event", "all"]
+},
+  {
   "headline": "Minnesota's Second State Capitol (1883 - 1938)",
   "blurb": "After the 1881 fire, Minnesota's second capitol opened in 1883. Criticized for design flaws and space issues, it served until 1905 and was razed in 1938.",
   "icon": "fa-building",
