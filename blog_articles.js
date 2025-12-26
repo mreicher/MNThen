@@ -1,6 +1,6 @@
 const blogArticles = [
   {
-  "headline": "The Ambush of St. Paul Police Officer James Sackett (May 22, 1970)",
+  "headline": "Ambush of St. Paul Police Officer James Sackett (May 22, 1970)",
   "blurb": "A fake emergency call lured 27-year-old Patrolman James Sackett into a deadly ambush on Hague Avenue. The murder remained unsolved for 34 years until a cold case breakthrough.",
   "icon": "fa-calendar",
   "author": "Matt Reicher",
@@ -90,7 +90,7 @@ const blogArticles = [
   "keywords": ["George Herrold", "Interstate 94", "Rondo neighborhood", "urban planning", "St. Paul history", "freeway construction", "Northern Route", "Minnesota transportation", "place", "all"]
 },
   {
-  "headline": "The Assassination of Walter Liggett (December 9, 1935)",
+  "headline": "Assassination of Walter Liggett (December 9, 1935)",
   "blurb": "On December 9, 1935, investigative journalist Walter Liggett was murdered in a Minneapolis alley after publishing allegations linking organized crime figures, including Kid Cann, to political figures such as Governor Floyd B. Olson.",
   "icon": "fa-calendar",
   "author": "Matt Reicher",
