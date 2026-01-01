@@ -3386,7 +3386,7 @@ function getSpeedBasedZoom(speedMPS, closestDistance = Infinity) {
     
     // Constants
     const WALKING_THRESHOLD = 3.0;
-    const ROAMING_TO_CENTERED_THRESHOLD = 15.0; // Key threshold for transition
+    const ROAMING_TO_CENTERED_THRESHOLD = 15.0;
     const SIGNIFICANT_TRAVEL_THRESHOLD = 10.0;
     const TEMPORARY_STOP_MAX = 90000;
     const ARRIVAL_DELAY = 20000;
@@ -3395,6 +3395,7 @@ function getSpeedBasedZoom(speedMPS, closestDistance = Infinity) {
     const STATIONARY_CONFIDENCE_MAX = 10;
     const MIN_ZOOM_UPDATE_INTERVAL = 2000;
     const ZOOM_INTERPOLATION_SPEED = 0.15;
+    const HYSTERESIS_MPH = 1.5; // Single hysteresis value
     
     const now = Date.now();
     
@@ -3454,7 +3455,7 @@ function getSpeedBasedZoom(speedMPS, closestDistance = Infinity) {
         state.destinationArrivalTime = null;
     }
     
-    // DISCOVERY ZOOM with 15 MPH threshold
+    // DISCOVERY ZOOM - determine target zoom level
     let targetZoom;
     
     if (CONFIG.DISABLE_DISCOVERY_ZOOM) {
@@ -3484,31 +3485,57 @@ function getSpeedBasedZoom(speedMPS, closestDistance = Infinity) {
             targetZoom = 17;
         }
     } else {
-        // Moving: use 15 MPH as the key threshold
+        // Moving above walking speed
         state.lowSpeedStartTime = null;
         state.destinationArrivalTime = null;
         
         const prevZoom = state.previousZoom || 17;
         
-        // Enhanced hysteresis: +2 mph to zoom out, -1 mph to zoom back in
-        const hysteresisOffset = targetZoom >= prevZoom ? -2.0 : 1.0;
+        // Determine if we're zooming out (going to higher speed/lower zoom) or in
+        const isZoomingOut = prevZoom > 17;
         
-        if (medianSpeed < ROAMING_TO_CENTERED_THRESHOLD + hysteresisOffset) {
-            // Below 15 MPH → stay at zoom 17
+        // Apply hysteresis only at the 15 MPH boundary
+        let effectiveThreshold = ROAMING_TO_CENTERED_THRESHOLD;
+        if (isZoomingOut) {
+            // Coming back down from higher speeds, require dropping below 15 - hysteresis
+            effectiveThreshold = ROAMING_TO_CENTERED_THRESHOLD - HYSTERESIS_MPH;
+        }
+        // When accelerating past 15 for the first time, no hysteresis needed
+        
+        if (medianSpeed < effectiveThreshold) {
+            // Below 15 MPH threshold → zoom 17
             targetZoom = 17;
         } else {
-            // 15+ MPH → use CONFIG thresholds (your existing 65→15, 50→16, etc.)
+            // At or above 15 MPH → check CONFIG speed tiers
             let found = false;
-            for (let i = CONFIG.SPEED_ZOOM_THRESHOLDS.length - 1; i >= 0; i--) {
-                const thresh = CONFIG.SPEED_ZOOM_THRESHOLDS[i];
-                const threshHysteresis = thresh.zoom >= prevZoom ? -2.0 : 1.0;
-                if (medianSpeed >= thresh.speed + threshHysteresis) {
+            
+            // Sort thresholds by speed descending to check from highest to lowest
+            const sortedThresholds = [...CONFIG.SPEED_ZOOM_THRESHOLDS].sort((a, b) => b.speed - a.speed);
+            
+            for (let i = 0; i < sortedThresholds.length; i++) {
+                const thresh = sortedThresholds[i];
+                
+                // Apply hysteresis for each tier
+                let effectiveTierSpeed = thresh.speed;
+                if (prevZoom !== null && prevZoom < thresh.zoom) {
+                    // We're at a more zoomed-in level, require extra speed to zoom out
+                    effectiveTierSpeed = thresh.speed + HYSTERESIS_MPH;
+                } else if (prevZoom !== null && prevZoom > thresh.zoom) {
+                    // We're at a more zoomed-out level, can zoom in sooner
+                    effectiveTierSpeed = thresh.speed - HYSTERESIS_MPH;
+                }
+                
+                if (medianSpeed >= effectiveTierSpeed) {
                     targetZoom = thresh.zoom;
                     found = true;
                     break;
                 }
             }
-            if (!found) targetZoom = 17;
+            
+            // If no threshold matched, default to zoom 17
+            if (!found) {
+                targetZoom = 17;
+            }
         }
     }
     
@@ -3791,7 +3818,7 @@ const SPEED_THRESHOLDS = {
     WALKING: 3,
     JOGGING: 5, 
     TRANSITION_START: 10,    // Start blending roaming/look-ahead
-    HIGH_SPEED: 14          // Full look-ahead mode
+    HIGH_SPEED: 15          // Full look-ahead mode
 };
 
 const HIGH_SPEED_THRESHOLD_MPH = SPEED_THRESHOLDS.HIGH_SPEED;
@@ -4760,55 +4787,165 @@ function _calculateRoamingTarget(userPos, bounds, speedMPH) {
  * This creates the illusion of movement by keeping the marker centered
  */
 function _panMapToCenter(target, speedTier, directionChangeFactor, eastWestMovement, speedMPH, lookAheadFactor = 0) {
-    if (!map || !target) return;
+    // Early guards - check map and bounds first
+    if (!map) return;
     
-    // Apply look-ahead bias when provided
-    let centerLat = target.lat;
-    let centerLng = target.lng;
+    const bounds = map.getBounds?.();
+    if (!bounds) return;
     
-    if (lookAheadFactor > 0 && window.smoothedVelocity) {
-        // Use smoothed velocity for stability
-        const biasScale = 0.00002; // Tune this: ~2-5m ahead at 15 mph
-        const biasLat = window.smoothedVelocity.lat * lookAheadFactor * biasScale;
-        const biasLng = window.smoothedVelocity.lng * lookAheadFactor * biasScale;
-        centerLat += biasLat;
-        centerLng += biasLng;
+    // Validate target coordinates
+    if (
+        !target ||
+        typeof target.lat !== 'number' ||
+        typeof target.lng !== 'number' ||
+        !isFinite(target.lat) ||
+        !isFinite(target.lng)
+    ) {
+        console.warn('[PanCenter] Invalid target coordinates:', target);
+        return;
     }
     
-    const centerTarget = [centerLat, centerLng];
+    // Initialize centering state if needed
+    if (typeof window.centeringState === 'undefined') {
+        window.centeringState = {
+            isCentered: false
+        };
+    }
+    
+    const CENTERING_THRESHOLD = 15.0; // Match zoom function
+    const HYSTERESIS_MPH = 1.5; // Match zoom function
+    const HYSTERESIS_LOWER_BOUND = CENTERING_THRESHOLD - HYSTERESIS_MPH; // 13.5 MPH
+    
+    // Determine effective threshold with hysteresis and update state ONCE
+    let effectiveThreshold;
+    if (window.centeringState.isCentered) {
+        // Already centered - require dropping below 13.5 MPH to release
+        effectiveThreshold = HYSTERESIS_LOWER_BOUND;
+    } else {
+        // Not centered - activate centering at 15 MPH
+        effectiveThreshold = CENTERING_THRESHOLD;
+    }
+    
+    // Update centering state based on speed (do this ONCE, before branching)
+    const shouldBeCentered = speedMPH >= effectiveThreshold;
+    const inHysteresisZone = speedMPH >= HYSTERESIS_LOWER_BOUND && speedMPH < CENTERING_THRESHOLD;
+    window.centeringState.isCentered = shouldBeCentered;
+    
     const currentCenter = map.getCenter();
-    const distToTarget = Math.sqrt(
-        Math.pow(centerTarget[0] - currentCenter.lat, 2) + 
-        Math.pow(centerTarget[1] - currentCenter.lng, 2)
-    );
     
-    // Only pan if significantly off-center
-    const MIN_PAN_THRESHOLD = 0.00001; // ~1 meter
-    if (distToTarget < MIN_PAN_THRESHOLD) return;
-    
-    // Calculate adaptive pan duration
-    let panDuration = speedTier.panDuration * directionChangeFactor;
-    
-    // Faster panning at higher speeds
-    if (speedMPH >= 30) {
-        panDuration *= 0.70;
-    } else if (speedMPH >= 20) {
-        panDuration *= 0.80;
-    } else if (speedMPH >= 15) {
-        panDuration *= 0.90;
+    // CENTERED MODE (15+ MPH with hysteresis): Apply look-ahead and always pan to center
+    if (shouldBeCentered) {
+        // Apply look-ahead bias for high-speed centering ONLY
+        let centerLat = target.lat;
+        let centerLng = target.lng;
+        
+        if (lookAheadFactor > 0 && window.smoothedVelocity) {
+            // Base bias scale
+            const biasScale = 0.00002; // ~2-5m ahead at 15 mph
+            
+            // Apply latitude bias normally
+            const biasLat = window.smoothedVelocity.lat * lookAheadFactor * biasScale;
+            centerLat += biasLat;
+            
+            // Reduce longitude bias for east-west movement (more sensitive to distortion)
+            const biasLng = window.smoothedVelocity.lng * lookAheadFactor * biasScale * (eastWestMovement ? 0.85 : 1.0);
+            centerLng += biasLng;
+        }
+        
+        const centerTarget = [centerLat, centerLng];
+        
+        // Calculate adaptive pan duration for high-speed centering
+        let panDuration = speedTier.panDuration * directionChangeFactor;
+        
+        // Faster panning at higher speeds
+        if (speedMPH >= 30) {
+            panDuration *= 0.70;
+        } else if (speedMPH >= 20) {
+            panDuration *= 0.80;
+        } else if (speedMPH >= 15) {
+            panDuration *= 0.90;
+        }
+        
+        // Adjust for east-west movement
+        if (eastWestMovement) {
+            panDuration *= 0.90;
+        }
+        
+        // Adaptive easing - more linear at high speeds
+        let easeLinearity = speedTier.easeLinearity;
+        if (speedMPH >= 20) {
+            easeLinearity = Math.min(0.25, easeLinearity * 1.4);
+        } else if (speedMPH >= 15) {
+            easeLinearity = Math.min(0.20, easeLinearity * 1.2);
+        }
+        
+        // HYSTERESIS ZONE OPTIMIZATION: Extra smooth transition
+        if (inHysteresisZone) {
+            panDuration *= 0.85; // 15% faster for smooth handoff
+            easeLinearity = Math.min(0.18, easeLinearity * 1.3);
+        }
+        
+        // Execute smooth pan - NO THRESHOLD CHECK in centered mode
+        map.panTo(centerTarget, {
+            animate: true,
+            duration: panDuration,
+            easeLinearity: easeLinearity,
+            noMoveStart: true
+        });
+        
+        return; // Exit after high-speed pan
     }
+    
+    // ROAMING MODE (below 13.5 MPH with hysteresis): Use viewport-based threshold
+    // NO look-ahead in roaming mode - that's what _panMapToLookAhead is for
+    const centerTarget = [target.lat, target.lng];
+    
+    const latDiff = Math.abs(target.lat - currentCenter.lat);
+    const lngDiff = Math.abs(target.lng - currentCenter.lng);
+    
+    const viewportWidth = bounds.getEast() - bounds.getWest();
+    const viewportHeight = bounds.getNorth() - bounds.getSouth();
+    
+    // Relaxed threshold for roaming speeds
+    let panThresholdPercent;
+    if (speedMPH >= 10) {
+        panThresholdPercent = 0.18; // Moderate during approach
+    } else if (speedMPH >= 5) {
+        panThresholdPercent = 0.25; // Relaxed when moving slowly
+    } else {
+        panThresholdPercent = 0.30; // Very relaxed when nearly stationary
+    }
+    
+    // Check if target is within acceptable centering threshold
+    const latThreshold = viewportHeight * panThresholdPercent;
+    const lngThreshold = viewportWidth * panThresholdPercent;
+    
+    if (latDiff < latThreshold && lngDiff < lngThreshold) {
+        // Already centered enough for roaming speed
+        return;
+    }
+    
+    // Calculate adaptive pan duration for roaming speeds
+    let panDuration = speedTier.panDuration * directionChangeFactor;
     
     // Adjust for east-west movement
     if (eastWestMovement) {
         panDuration *= 0.90;
     }
     
-    // Adaptive easing - more linear at high speeds
+    // For very small corrections at low speeds, speed up the pan
+    const normalizedDist = Math.max(latDiff / viewportHeight, lngDiff / viewportWidth);
+    if (normalizedDist < 0.20) {
+        panDuration *= 0.75; // Quick corrections for minor off-centering
+    }
+    
+    // Standard easing for roaming speeds
     let easeLinearity = speedTier.easeLinearity;
-    if (speedMPH >= 20) {
-        easeLinearity = Math.min(0.25, easeLinearity * 1.4);
-    } else if (speedMPH >= 15) {
-        easeLinearity = Math.min(0.20, easeLinearity * 1.2);
+    
+    // HYSTERESIS ZONE OPTIMIZATION: Extra smooth when leaving centered mode
+    if (inHysteresisZone) {
+        panDuration *= 0.85; // 15% faster for smooth handoff
+        easeLinearity = Math.min(0.18, easeLinearity * 1.3);
     }
     
     // Execute smooth pan
