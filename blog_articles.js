@@ -1,5 +1,15 @@
 const blogArticles = [
   {
+  "headline": "Faust, Flick, and Belmont Club: St. Paul Buys Out its Own 'Vice Triangle' (1989)",
+  "blurb": "In 1989, St. Paul spent $1.83 million to shut down the Faust Theatre, The Flick, and the Belmont Club—ending a decade of vice, crime, and blight at University & Dale.",
+  "icon": "fa-building",
+  "author": "Matt Reicher",
+  "date": "January 2, 2026",
+  "image": "https://www.mnthen.com/images/faust.jpg",
+  "url": "https://www.mnthen.com/blog/place/triangle.html",
+  "keywords": ["faust theatre", "belmont club", "the flick", "vice triangle", "st. paul buyout", "george latimer", "frogtown", "thomas-dale", "university avenue", "rondo library", "deja vu", "place", "all"]
+},
+  {
   "headline": "Ambush of St. Paul Police Officer James Sackett (May 22, 1970)",
   "blurb": "A fake emergency call lured 27-year-old Patrolman James Sackett into a deadly ambush on Hague Avenue. The murder remained unsolved for 34 years until a cold case breakthrough.",
   "icon": "fa-calendar",
