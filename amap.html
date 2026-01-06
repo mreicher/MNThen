@@ -4513,6 +4513,237 @@ async function updateUserLocation(position, forceUpdate = false) {
     }
 }
 
+/**
+ * Calculate where the map should center during roaming mode
+ * Returns the current map center (no adjustment) unless near edge
+ */
+function _calculateRoamingTarget(userPos, bounds, speedMPH) {
+    const currentCenter = map.getCenter();
+    
+    // If not near edge, keep current center (let marker roam)
+    if (!_isNearViewportEdge(userPos, bounds, speedMPH)) {
+        return {
+            lat: currentCenter.lat,
+            lng: currentCenter.lng
+        };
+    }
+    
+    // Near edge: calculate adjusted center to keep user in view
+    const viewportWidth = bounds.getEast() - bounds.getWest();
+    const viewportHeight = bounds.getNorth() - bounds.getSouth();
+    
+    // Define comfortable margins (20% from edge triggers recentering)
+    const marginLat = viewportHeight * 0.20;
+    const marginLng = viewportWidth * 0.20;
+    
+    let adjustedLat = currentCenter.lat;
+    let adjustedLng = currentCenter.lng;
+    
+    // Calculate how far user is from edges
+    const distFromNorth = bounds.getNorth() - userPos.lat;
+    const distFromSouth = userPos.lat - bounds.getSouth();
+    const distFromEast = bounds.getEast() - userPos.lng;
+    const distFromWest = userPos.lng - bounds.getWest();
+    
+    // Adjust center if user is too close to any edge
+    if (distFromNorth < marginLat) {
+        adjustedLat = userPos.lat + (viewportHeight * 0.30); // Pan to keep user 30% from top
+    } else if (distFromSouth < marginLat) {
+        adjustedLat = userPos.lat - (viewportHeight * 0.30); // Pan to keep user 30% from bottom
+    }
+    
+    if (distFromEast < marginLng) {
+        adjustedLng = userPos.lng + (viewportWidth * 0.30); // Pan to keep user 30% from right
+    } else if (distFromWest < marginLng) {
+        adjustedLng = userPos.lng - (viewportWidth * 0.30); // Pan to keep user 30% from left
+    }
+    
+    return {
+        lat: adjustedLat,
+        lng: adjustedLng
+    };
+}
+
+/**
+ * Pan map to center on target position (used for 15+ MPH and transition blending)
+ * This creates the illusion of movement by keeping the marker centered
+ */
+function _panMapToCenter(target, speedTier, directionChangeFactor, eastWestMovement, speedMPH, lookAheadFactor = 0) {
+    // === ALIDATE DEPENDENCIES ===
+    if (!map) {
+        console.warn('[PanCenter] Map not available');
+        return;
+    }
+    
+    const bounds = map.getBounds?.();
+    if (!bounds) {
+        console.warn('[PanCenter] Bounds not available');
+        return;
+    }
+    
+    // === VALIDATE TARGET COORDINATES ===
+    if (
+        !target ||
+        typeof target.lat !== 'number' ||
+        typeof target.lng !== 'number' ||
+        !isFinite(target.lat) ||
+        !isFinite(target.lng)
+    ) {
+        console.warn('[PanCenter] Invalid target coordinates:', target);
+        return;
+    }
+    
+    // === DETERMINE MODE (NO HYSTERESIS) ===
+    const isInCenteredMode = speedMPH >= ROAMING_MAX_MPH;
+    
+    // Update global state immediately
+    if (!window.centeringState) {
+        window.centeringState = { isCentered: false };
+    }
+    window.centeringState.isCentered = isInCenteredMode;
+    
+    // === BRANCH BY MODE ===
+    if (isInCenteredMode) {
+        _executeCenteredModePan(target, speedTier, directionChangeFactor, eastWestMovement, speedMPH, lookAheadFactor);
+    } else {
+        _executeRoamingModePan(target, speedTier, directionChangeFactor, eastWestMovement, speedMPH, bounds);
+    }
+}
+
+/**
+ * CENTERED MODE (≥15 MPH): Always keep marker at exact center with look-ahead
+ */
+function _executeCenteredModePan(target, speedTier, directionChangeFactor, eastWestMovement, speedMPH, lookAheadFactor) {
+    let centerLat = target.lat;
+    let centerLng = target.lng;
+    
+    // === APPLY LOOK-AHEAD BIAS ===
+    if (lookAheadFactor > 0 && window.smoothedVelocity) {
+        const biasScale = 0.00002; // ~2-5m ahead at 15 mph
+        
+        // Latitude bias (normal)
+        const biasLat = window.smoothedVelocity.lat * lookAheadFactor * biasScale;
+        centerLat += biasLat;
+        
+        // Longitude bias (reduced for east-west to minimize distortion)
+        const lngMultiplier = eastWestMovement ? 0.85 : 1.0;
+        const biasLng = window.smoothedVelocity.lng * lookAheadFactor * biasScale * lngMultiplier;
+        centerLng += biasLng;
+    }
+    
+    // === CALCULATE ADAPTIVE PAN DURATION ===
+    let panDuration = (speedTier?.panDuration ?? 0.2) * (directionChangeFactor ?? 1.0);
+    
+    // Speed-based duration adjustments
+    if (speedMPH >= 30) {
+        panDuration *= 0.70; // Very fast
+    } else if (speedMPH >= 20) {
+        panDuration *= 0.80; // Fast
+    } else if (speedMPH >= 15) {
+        panDuration *= 0.90; // Moderate
+    }
+    
+    // East-west adjustment
+    if (eastWestMovement) {
+        panDuration *= 0.90;
+    }
+    
+    // Clamp to safe range
+    panDuration = Math.max(0.05, Math.min(0.5, panDuration));
+    
+    // === CALCULATE ADAPTIVE EASING ===
+    let easeLinearity = speedTier?.easeLinearity ?? 0.15;
+    
+    // More linear at higher speeds for smoother tracking
+    if (speedMPH >= 20) {
+        easeLinearity = Math.min(0.25, easeLinearity * 1.4);
+    } else if (speedMPH >= 15) {
+        easeLinearity = Math.min(0.20, easeLinearity * 1.2);
+    }
+    
+    // Clamp to safe range
+    easeLinearity = Math.max(0.1, Math.min(0.5, easeLinearity));
+    
+    // === EXECUTE PAN ===
+    const centerTarget = [centerLat, centerLng];
+    
+    map.panTo(centerTarget, {
+        animate: true,
+        duration: panDuration,
+        easeLinearity: easeLinearity,
+        noMoveStart: true
+    });
+    
+    console.debug(`[Centered] Pan to center: speed=${speedMPH.toFixed(1)}mph, duration=${(panDuration*1000).toFixed(0)}ms`);
+}
+
+/**
+ * ROAMING MODE (<15 MPH): Only pan when near viewport edges
+ */
+function _executeRoamingModePan(target, speedTier, directionChangeFactor, eastWestMovement, speedMPH, bounds) {
+    const currentCenter = map.getCenter();
+    
+    // === CHECK IF PAN IS NEEDED ===
+    const latDiff = Math.abs(target.lat - currentCenter.lat);
+    const lngDiff = Math.abs(target.lng - currentCenter.lng);
+    
+    const viewportWidth = bounds.getEast() - bounds.getWest();
+    const viewportHeight = bounds.getNorth() - bounds.getSouth();
+    
+    // Speed-based threshold (more relaxed at lower speeds)
+    let panThresholdPercent;
+    if (speedMPH >= 10) {
+        panThresholdPercent = 0.18; // Moderate - approaching transition
+    } else if (speedMPH >= 5) {
+        panThresholdPercent = 0.25; // Relaxed - slow movement
+    } else {
+        panThresholdPercent = 0.30; // Very relaxed - nearly stationary
+    }
+    
+    const latThreshold = viewportHeight * panThresholdPercent;
+    const lngThreshold = viewportWidth * panThresholdPercent;
+    
+    // Exit if already well-centered
+    if (latDiff < latThreshold && lngDiff < lngThreshold) {
+        return;
+    }
+    
+    // === CALCULATE ADAPTIVE PAN DURATION ===
+    let panDuration = (speedTier?.panDuration ?? 0.3) * (directionChangeFactor ?? 1.0);
+    
+    // East-west adjustment
+    if (eastWestMovement) {
+        panDuration *= 0.90;
+    }
+    
+    // Speed up for small corrections
+    const normalizedDist = Math.max(latDiff / viewportHeight, lngDiff / viewportWidth);
+    if (normalizedDist < 0.20) {
+        panDuration *= 0.75; // Quick correction for minor drift
+    }
+    
+    // Clamp to safe range
+    panDuration = Math.max(0.1, Math.min(1.0, panDuration));
+    
+    // === CALCULATE EASING ===
+    let easeLinearity = speedTier?.easeLinearity ?? 0.2;
+    
+    // Clamp to safe range
+    easeLinearity = Math.max(0.1, Math.min(0.4, easeLinearity));
+    
+    // === EXECUTE PAN ===
+    const centerTarget = [target.lat, target.lng];
+    
+    map.panTo(centerTarget, {
+        animate: true,
+        duration: panDuration,
+        easeLinearity: easeLinearity,
+        noMoveStart: true
+    });
+    
+    console.debug(`[Roaming] Pan near edge: speed=${speedMPH.toFixed(1)}mph, dist=${normalizedDist.toFixed(2)}, duration=${(panDuration*1000).toFixed(0)}ms`);
+}
+
 // --- CLEANUP FUNCTION  ---
 function disposeMapLoop() {
     if (window._nextLocationUpdateRAF) {
