@@ -4980,6 +4980,191 @@ function _clearStationaryState() {
   }
 }
 
+function _getProximityStateForLocation(locationId) {
+    return window.proximityLocationStates[locationId] || {
+        zoomedIn: false,
+        lastZoomInTime: 0,
+        lastZoomOutTime: 0
+    };
+}
+
+function _setProximityStateForLocation(locationId, updates) {
+    window.proximityLocationStates[locationId] = {
+        ..._getProximityStateForLocation(locationId),
+        ...updates
+    };
+}
+
+function _clearProximityStateForLocation(locationId) {
+    delete window.proximityLocationStates[locationId];
+}
+
+// CLEANUP
+function _cleanupProximityZoomState() {
+    if (window.zoomedInState && window.zoomController?.getState?.()?.currentSource === 'proximity') {
+        window.zoomController.release('proximity');
+    }
+    window.zoomedInState = false;
+    window.isNearLocation = false;
+    window.currentProximityLocationId = null;
+    window.blockSpeedZoom = false;
+    window.lastProximityZoomOutLocationId = null;
+    window.lastProximityZoomOutTime = 0;
+}
+
+// PROXIMITY ZOOM HANDLER
+function _handleProximityZoom(speedMPH, eastWestMovement) {
+    // Rate limiting
+    const now = Date.now();
+    if (!window.lastProximityCheck) window.lastProximityCheck = 0;
+    if (now - window.lastProximityCheck < 150) return;
+    window.lastProximityCheck = now;
+
+    // Early exit for high speed or missing data
+    if (speedMPH >= 10) return;
+    if (!window.proximityState?.closestLocation) {
+        _cleanupProximityZoomState();
+        return;
+    }
+
+    const { closestLocation, distanceMeters } = window.proximityState;
+    if (distanceMeters === Infinity || !closestLocation?.lat || !closestLocation?.lng) {
+        _cleanupProximityZoomState();
+        return;
+    }
+
+    // Don't interfere with other UI states
+    if (window.isLocationHuntVisible || !window.zoomController) return;
+
+    // Identify the location
+    const locationId = closestLocation.id || `${closestLocation.lat},${closestLocation.lng}`;
+    const locState = _getProximityStateForLocation(locationId);
+
+    // Distance & thresholds
+    const distanceFeet = distanceMeters * 3.28084;
+    const ZOOM_IN_THRESHOLD_FEET = 45;
+    const ZOOM_OUT_THRESHOLD_FEET = 70;
+    const PROXIMITY_ZOOM_IN_LEVEL = 19;
+    const PROXIMITY_ZOOM_OUT_LEVEL = 17;
+
+    const timeSinceLastZoomIn = now - locState.lastZoomInTime;
+    const timeSinceLastZoomOut = now - locState.lastZoomOutTime;
+
+    // FIX #1: Check if we've switched to a different location
+    if (window.currentProximityLocationId && window.currentProximityLocationId !== locationId) {
+        // We're approaching a NEW location - reset the old one's state
+        const oldLocationId = window.currentProximityLocationId;
+        _clearProximityStateForLocation(oldLocationId);
+        
+        // If zoom is still held by proximity from the old location, release it
+        const zoomState = window.zoomController.getState?.();
+        if (zoomState?.currentSource === 'proximity') {
+            window.zoomController.release('proximity');
+        }
+        
+        // Reset global state for the new location
+        window.zoomedInState = false;
+        window.isNearLocation = false;
+        window.currentProximityLocationId = null;
+        window.blockSpeedZoom = false;
+    }
+
+    // Per-location anti-flicker: only blocks *this* location
+    if (locState.zoomedIn && timeSinceLastZoomOut < 3000) return;
+
+    // ZOOM IN: Narrative-focused framing
+    if (!locState.zoomedIn && distanceFeet <= ZOOM_IN_THRESHOLD_FEET) {
+        if (timeSinceLastZoomIn < 1500) return; // Cooldown
+
+        const zoomState = window.zoomController.getState?.();
+        if (zoomState?.currentSource && !['proximity', 'speed'].includes(zoomState.currentSource)) return;
+
+        const zoomGranted = window.zoomController.request('proximity', PROXIMITY_ZOOM_IN_LEVEL, 3);
+        if (!zoomGranted) return;
+
+        // Update per-location state
+        _setProximityStateForLocation(locationId, {
+            zoomedIn: true,
+            lastZoomInTime: now
+        });
+
+        // global state sync
+        window.zoomedInState = true;
+        window.isNearLocation = true;
+        window.currentProximityLocationId = locationId;
+        window.lastProximityZoomInTime = now;
+        window.lastProximityZoomTime = now;
+        window.blockSpeedZoom = true;
+
+        // Smooth, biased zoom-in (narrative framing)
+        if (!window.isMapInteracting && map?.flyTo && window.userMarker) {
+            const userPos = window.userMarker.getLatLng();
+            const poiPos = L.latLng(closestLocation.lat, closestLocation.lng);
+            if (!userPos?.lat || !poiPos?.lat) return;
+
+            const biasedCenter = L.latLng(
+                userPos.lat + (poiPos.lat - userPos.lat) * 0.20,  // 20% toward POI
+                userPos.lng + (poiPos.lng - userPos.lng) * 0.20
+            );
+
+            map.flyTo(biasedCenter, PROXIMITY_ZOOM_IN_LEVEL, {
+                duration: 2.0,
+                easeLinearity: eastWestMovement ? 0.10 : 0.12,
+                noMoveStart: true
+            });
+        }
+    }
+
+    // ZOOM OUT: Return to situational awareness
+    else if (locState.zoomedIn && distanceFeet >= ZOOM_OUT_THRESHOLD_FEET) {
+        const zoomState = window.zoomController.getState?.();
+        if (zoomState?.currentSource !== 'proximity') {
+            _clearProximityStateForLocation(locationId);
+            _cleanupProximityZoomState(); // Clean global state too
+            return;
+        }
+
+        if (timeSinceLastZoomOut >= 3000) {
+            window.zoomController.release('proximity');
+
+            // Clear per-location state
+            _clearProximityStateForLocation(locationId);
+
+            // FIX #2: More thorough global state cleanup
+            window.zoomedInState = false;
+            window.isNearLocation = false;
+            window.currentProximityLocationId = null;
+            window.lastProximityZoomOutLocationId = locationId;
+            window.lastProximityZoomOutTime = now;
+            window.lastProximityZoomTime = now;
+            window.blockSpeedZoom = false;
+
+            // Smooth zoom-out
+            if (map && !window.isMapInteracting && map.flyTo) {
+                const currentZoom = map.getZoom();
+                if (Math.abs(currentZoom - PROXIMITY_ZOOM_OUT_LEVEL) > 0.5) {
+                    map.flyTo(map.getCenter(), PROXIMITY_ZOOM_OUT_LEVEL, {
+                        duration: 1.4,
+                        easeLinearity: eastWestMovement ? 0.13 : 0.15,
+                        noMoveStart: true
+                    });
+                }
+            }
+        }
+    }
+
+    // Lightweight memory hygiene 
+    if (Math.random() < 0.02) { // ~once every 7.5 seconds
+        const cutoff = now - 10 * 60 * 1000; // 10 minutes
+        Object.keys(window.proximityLocationStates || {}).forEach(id => {
+            const s = window.proximityLocationStates[id];
+            if (Math.max(s.lastZoomInTime, s.lastZoomOutTime) < cutoff) {
+                delete window.proximityLocationStates[id];
+            }
+        });
+    }
+}
+
 function _cleanupMarkerStyles() {
     try {
         const markerEl = userMarker?.getElement?.();
