@@ -2091,29 +2091,6 @@ function hideGPSSearchingState() {
     });
 }
 
-function hideGPSSearchingState() {
-    // Remove any CSS classes that show searching state
-    document.body.classList.remove('gps-searching');
-    
-    // Hide any loading spinners or overlays
-    const loadingOverlay = document.querySelector('.gps-loading-overlay');
-    if (loadingOverlay) {
-        loadingOverlay.style.display = 'none';
-    }
-    
-    const searchingIndicator = document.getElementById('gps-searching-indicator');
-    if (searchingIndicator) {
-        searchingIndicator.style.display = 'none';
-    }
-    
-    // Re-enable any UI elements that were disabled during search
-    const disabledElements = document.querySelectorAll('[data-disabled-during-gps-search]');
-    disabledElements.forEach(el => {
-        el.disabled = false;
-        el.classList.remove('disabled');
-    });
-}
-
 let _idleProximityCheckInterval;
 
 function startIdleProximityCheck() {
@@ -3864,38 +3841,57 @@ function updatePositionBuffer(newPosition) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function setupMapInteractionHandlers() {
+    // -----------------------------------------------------------------
+    // Guard – only attach once
+    // -----------------------------------------------------------------
     if (!map || window._interactionHandlersSetup) return;
     window._interactionHandlersSetup = true;
 
-    // Initialize flag if undefined
+    // -----------------------------------------------------------------
+    // Initialise flag (if another script touched it first, we keep that value)
+    // -----------------------------------------------------------------
     if (typeof window.isMapInteracting === 'undefined') {
         window.isMapInteracting = false;
     }
 
-    // Handle Pinch/Pan Start
-    map.on('movestart', () => {
+    // -----------------------------------------------------------------
+    // 1️⃣ Interaction start – lock map & cancel 30 s timer
+    // -----------------------------------------------------------------
+    const onInteractionStart = () => {
         window.isMapInteracting = true;
-        _resetInactivityTimer(); // User manually moving map, cancel reset countdown
-    });
+        _resetInactivityTimer();               // cancel any pending snap‑back
+    };
+    map.on('movestart', onInteractionStart);
+    map.on('zoomstart', onInteractionStart);
 
-    map.on('zoomstart', () => {
-        window.isMapInteracting = true;
-        _resetInactivityTimer(); // User manually zooming, cancel reset countdown
-    });
+    // -----------------------------------------------------------------
+    // 2️⃣ Interaction end – unlock instantly, then decide about timer
+    // -----------------------------------------------------------------
+    const STATIONARY_SPEED_MPH = 1.0;           // threshold for “parked”
 
-    // Handle Pinch/Pan End
     const onInteractionEnd = () => {
-        // Delay setting this to false to give the map a moment to settle
-        // and prevent the auto-centering logic from snapping back instantly
-        setTimeout(() => {
-            window.isMapInteracting = false;
-            // If we are stationary after interaction, start the inactivity countdown
-            if (window.lastPosition && window.lastPosition.speedMPS < 1) {
-                _startInactivityTimer();
-            }
-        }, 500);
+        // Immediate unlock – eliminates the 500 ms lag
+        window.isMapInteracting = false;
+
+        // Determine current speed (fallback to 0 if we have no fix yet)
+        const speedMPH = window.lastPosition?.speedMPS
+            ? window.lastPosition.speedMPS * 2.23694
+            : 0;
+
+        if (speedMPH < STATIONARY_SPEED_MPH) {
+            // User is effectively stopped → start the 30 s snap‑back timer
+            _startInactivityTimer();
+        } else {
+            // Driving – keep following GPS, do **not** start the timer
+            // (the timer remains cleared)
+        }
     };
 
+    // Remove any stale listeners that might have been added earlier
+    map.off('moveend', onInteractionEnd);
+    map.off('zoomend', onInteractionEnd);
+
+    // Attach the fresh handlers
     map.on('moveend', onInteractionEnd);
     map.on('zoomend', onInteractionEnd);
 }
@@ -5431,76 +5427,108 @@ function _panMapToLookAhead(lookAheadPosition, speedTier, directionChangeFactor,
     }
 }
 
-function _panMapIfNearEdge(userPos, speedTier, directionChangeFactor, eastWestMovement, bounds, speedMPH) {
-    if (!userPos || !bounds) return;
+/**
+ * Smoothly pan the map when the user marker gets too close to the viewport edge.
+ * Maintains backwards compatibility with original version while improving readability.
+ */
+function _panMapIfNearEdge(
+  userPos,
+  speedTier,
+  directionChangeFactor,
+  eastWestMovement,
+  bounds,
+  speedMPH
+) {
+  // Guard clauses – bail out early if nothing to do
+  if (!userPos || !bounds) return;
+
+  // Is the marker actually near an edge? (helper lives elsewhere)
+  if (!_isNearViewportEdge(userPos, bounds, speedMPH || 0)) return;
+
+  // Prevent overlapping pans – a previous animation may still be finishing
+  if (window.isPanning) return;
+
+  // Throttle repeated pans to ~8 Hz (120 ms) to avoid jitter
+  const now = performance.now();
+  const MIN_PAN_INTERVAL = 120; // ms
+  
+  // BACKWARDS COMPATIBILITY: Use original variable name
+  if (now - (window.lastCenteringTime || 0) < MIN_PAN_INTERVAL) {
+    return;
+  }
+
+  // Compute pan timing & easing (clamped to sensible ranges)
+  const basePanDuration = (speedTier?.panDuration ?? 0.2) * 0.8;
+  const rawDuration = basePanDuration * (directionChangeFactor || 1) * (eastWestMovement ? 0.9 : 1);
+  const panDuration = Math.max(0.05, Math.min(0.8, rawDuration)); // seconds
+
+  const baseEase = speedTier?.easeLinearity ?? 0.25;
+  const easeLinearity = Math.max(
+    0.1,
+    Math.min(0.9, baseEase * (eastWestMovement ? 0.8 : 1))
+  );
+
+  // Prepare the map container for GPU‑accelerated transforms
+  const mapContainer = map?.getContainer?.();
+  if (mapContainer) {
+    mapContainer.style.willChange = 'transform';
+  }
+
+  window.isPanning = true;
+
+  // Cleanup helper – idempotent, can be called from any exit path
+  let cleanupExecuted = false;
+  const cleanup = () => {
+    if (cleanupExecuted) return;
+    cleanupExecuted = true;
+
+    // Reset the panning flag
+    window.isPanning = false;
     
-    if (!_isNearViewportEdge(userPos, bounds, speedMPH || 0)) return;
-    
-    if (window.isPanning) return;
-    
-    const now_center = performance.now();
-    const minCenteringInterval = 120;
-    
-    if (now_center - (window.lastCenteringTime || 0) < minCenteringInterval) {
-        return;
-    }
-    
-    window.isPanning = true;
-    
-    const basePanDuration = (speedTier?.panDuration ?? 0.2) * 0.8;
-    const rawDuration = basePanDuration * (directionChangeFactor || 1) * (eastWestMovement ? 0.9 : 1);
-    const panDuration = Math.max(0.05, Math.min(0.8, rawDuration));
-    
-    const baseEase = speedTier?.easeLinearity ?? 0.25;
-    const easeLinearity = Math.max(0.1, Math.min(0.9, baseEase * (eastWestMovement ? 0.8 : 1)));
-    
-    const mapContainer = map.getContainer();
+    // Remove the GPU hint
     if (mapContainer) {
-        mapContainer.style.willChange = 'transform';
+      mapContainer.style.willChange = 'auto';
     }
-    
-    let cleanupExecuted = false;
-    let timeoutId = null;
-    let moveendHandler = null;
-    
-    const cleanup = () => {
-        if (cleanupExecuted) return;
-        cleanupExecuted = true;
-        
-        if (timeoutId !== null) {
-            clearTimeout(timeoutId);
-            timeoutId = null;
-        }
-        
-        if (moveendHandler) {
-            map.off('moveend', moveendHandler);
-            moveendHandler = null;
-        }
-        
-        window.isPanning = false;
-        if (mapContainer) {
-            mapContainer.style.willChange = 'auto';
-        }
-        window.lastCenteringTime = performance.now();
-    };
-    
-    moveendHandler = cleanup;
-    
-    try {
-        map.panTo(userPos, {
-            animate: true,
-            duration: panDuration,
-            easeLinearity: easeLinearity,
-            noMoveStart: true
-        });
-        
-        timeoutId = setTimeout(cleanup, (panDuration * 1000) + 50);
-        map.once('moveend', moveendHandler);
-        
-    } catch (err) {
-        console.warn('[Pan] Error during panTo:', err);
-        cleanup();
+
+    window.lastCenteringTime = performance.now();
+
+    // Remove the temporary `moveend` listener
+    if (moveEndHandler) {
+      map.off('moveend', moveEndHandler);
+      moveEndHandler = null;
     }
+
+    // Clear the safety timeout
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId);
+      timeoutId = null;
+    }
+  };
+
+  // Execute the pan and schedule cleanup
+  let timeoutId = null;
+  let moveEndHandler = null;
+
+  try {
+    // Perform the animated pan
+    map.panTo(userPos, {
+      animate: true,
+      duration: panDuration,
+      easeLinearity: easeLinearity,
+      noMoveStart: true
+    });
+
+    // Safety timeout in case map never fires `moveend`
+    timeoutId = setTimeout(cleanup, panDuration * 1000 + 50);
+
+    // Clean up when map finishes moving
+    moveEndHandler = cleanup;
+    map.once('moveend', moveEndHandler);
+
+  } catch (err) {
+    console.warn('[Pan] Unexpected error during panTo():', err);
+    cleanup(); // Ensure we never leave the flag stuck
+  }
 }
 
 function _applyIntelligentZoom(speedMPS, speedTier, directionChangeFactor, speedMPH) {
@@ -9202,557 +9230,656 @@ function optimizeImages(root = document) {
   });
 }
 
+/* EVENT LISTENER SETUP */
 function setupEventListeners() {
-    // Enhanced state management with anti-jumping controls
-    const interactionState = {
-        followUser: true,
-        isMapInteracting: false,
-        inactivityTimer: null,
-        touch: {
-            startTime: 0,
-            startPos: null,
-            isMoving: false,
-            isPinching: false,
-            initialPinchDistance: 0,
-            initialZoom: 0,
-            // Anti-jumping additions
-            lastUpdateTime: 0,
-            velocityBuffer: [],
-            smoothedPosition: null,
-            jumpThreshold: 50 // pixels - sudden movement detection
-        }
-    };
-
-    // Anti-jumping configuration
-    const ANTI_JUMP_CONFIG = {
-        MIN_DRAG_DISTANCE: 12,
-        MAX_VELOCITY: 2000,        // pixels/second - filters impossible speeds
-        VELOCITY_SAMPLES: 3,       // Number of velocity readings to average
-        UPDATE_THROTTLE: 16,       // ~60fps max updates
-        COORDINATE_SMOOTHING: 0.7, // Smoothing factor (0.5-0.9)
-        PINCH_DEADZONE: 5,         // Minimum pinch distance change
-        MOMENTUM_DECAY: 0.8        // iOS momentum scrolling decay
-    };
-
-    // Anti-jumping marker management
-    const markerAntiJumpSystem = {
-        // Store original marker positions during interaction
-        originalMarkerPositions: new Map(),
-        isInteractionActive: false,
-        
-        // Preserve marker positions before interaction
-        preserveMarkerPositions: () => {
-            if (userMarker) {
-                const currentPos = userMarker.getLatLng();
-                markerAntiJumpSystem.originalMarkerPositions.set('userMarker', {
-                    lat: currentPos.lat,
-                    lng: currentPos.lng
-                });
-            }
-            
-            // Add other markers if needed
-            if (window.gameMarkers) {
-                for (const [key, marker] of Object.entries(window.gameMarkers)) {
-                    if (marker && marker.getLatLng) {
-                        const pos = marker.getLatLng();
-                        markerAntiJumpSystem.originalMarkerPositions.set(key, {
-                            lat: pos.lat,
-                            lng: pos.lng
-                        });
-                    }
-                }
-            }
-        },
-        
-        // Restore marker positions after interaction
-        restoreMarkerPositions: () => {
-            // Only restore if the marker's current position is *still* the one saved.
-            // If GPS has moved the marker, don't snap it back.
-            if (userMarker && markerAntiJumpSystem.originalMarkerPositions.has('userMarker')) {
-                const originalPos = markerAntiJumpSystem.originalMarkerPositions.get('userMarker');
-                const currentPos = userMarker.getLatLng();
-                // Check if the current position matches the saved one (with a tiny tolerance)
-                if (Math.abs(currentPos.lat - originalPos.lat) < 1e-6 && Math.abs(currentPos.lng - originalPos.lng) < 1e-6) {
-                    userMarker.setLatLng([originalPos.lat, originalPos.lng], { animate: false });
-                    console.debug("User marker restored to original position after interaction.");
-                } else {
-                    console.debug("User marker position changed during interaction, skipping restore.");
-                }
-            }
-
-            // Apply same logic to other markers if needed
-            if (window.gameMarkers) {
-                for (const [key, marker] of Object.entries(window.gameMarkers)) {
-                    if (marker && marker.getLatLng && markerAntiJumpSystem.originalMarkerPositions.has(key)) {
-                        const originalPos = markerAntiJumpSystem.originalMarkerPositions.get(key);
-                        const currentPos = marker.getLatLng();
-                        if (Math.abs(currentPos.lat - originalPos.lat) < 1e-6 && Math.abs(currentPos.lng - originalPos.lng) < 1e-6) {
-                            marker.setLatLng([originalPos.lat, originalPos.lng], { animate: false });
-                        }
-                    }
-                }
-            }
-
-            markerAntiJumpSystem.originalMarkerPositions.clear();
-        },
-        
-        // Handle interaction start
-        startInteraction: () => {
-            markerAntiJumpSystem.isInteractionActive = true;
-            markerAntiJumpSystem.preserveMarkerPositions();
-        },
-        
-        // Handle interaction end
-        endInteraction: () => {
-            markerAntiJumpSystem.isInteractionActive = false;
-            markerAntiJumpSystem.restoreMarkerPositions(); 
-        }
-    };
-
-    // Enhanced velocity and position tracking
-    const trackTouchVelocity = (currentPos, timestamp) => {
-        const state = interactionState.touch;
-        
-        if (state.smoothedPosition && timestamp > state.lastUpdateTime) {
-            const deltaTime = timestamp - state.lastUpdateTime;
-            const deltaX = currentPos.x - state.smoothedPosition.x;
-            const deltaY = currentPos.y - state.smoothedPosition.y;
-            const velocity = Math.sqrt(deltaX * deltaX + deltaY * deltaY) / deltaTime * 1000;
-            
-            // Add to velocity buffer
-            state.velocityBuffer.push(velocity);
-            if (state.velocityBuffer.length > ANTI_JUMP_CONFIG.VELOCITY_SAMPLES) {
-                state.velocityBuffer.shift();
-            }
-            
-            // Calculate average velocity
-            const avgVelocity = state.velocityBuffer.reduce((a, b) => a + b, 0) / state.velocityBuffer.length;
-            
-            // Reject impossible velocities (likely GPS jumps)
-            if (avgVelocity > ANTI_JUMP_CONFIG.MAX_VELOCITY) {
-                console.debug('High velocity detected, smoothing movement:', avgVelocity);
-                return false; 
-            }
-        }
-        
-        // Apply coordinate smoothing
-        if (state.smoothedPosition) {
-            const smoothing = ANTI_JUMP_CONFIG.COORDINATE_SMOOTHING;
-            state.smoothedPosition = {
-                x: state.smoothedPosition.x * smoothing + currentPos.x * (1 - smoothing),
-                y: state.smoothedPosition.y * smoothing + currentPos.y * (1 - smoothing)
-            };
-        } else {
-            state.smoothedPosition = { ...currentPos };
-        }
-        
-        state.lastUpdateTime = timestamp;
-        return true;
-    };
-
-const handleInteractionStart = (source) => {
-    // Update GLOBAL state (what your tracking code actually uses)
-    window.followUser = false;
-    window.isMapInteracting = true;
+  // GLOBAL INTERACTION STATE (Single Source of Truth)
+  const interactionState = {
+    followUser: true,
+    isMapInteracting: false, // Primary interaction flag
+    inactivityTimer: null,
     
-    // Keep your existing logic if needed
-    interactionState.followUser = false;
-    interactionState.isMapInteracting = true;
-    
+    // Touch-specific tracking with anti-jump protection
+    touch: {
+      startTime: 0,
+      startPos: null,
+      isMoving: false,
+      isPinching: false,
+      initialPinchDistance: 0,
+      initialZoom: 0,
+      lastUpdateTime: 0,
+      velocityBuffer: [],
+      smoothedPosition: null,
+      jumpThreshold: 50 // pixels for sudden movement detection
+    }
+  };
+
+  // ANTI-JUMP CONFIGURATION
+  const ANTI_JUMP_CONFIG = {
+    MIN_DRAG_DISTANCE: 12,      // Minimum drag to trigger interaction
+    MAX_VELOCITY: 2000,         // pixels/second - filters impossible speeds
+    VELOCITY_SAMPLES: 3,        // Number of velocity readings to average
+    UPDATE_THROTTLE: 16,        // ~60fps maximum update rate
+    COORDINATE_SMOOTHING: 0.7,  // Smoothing factor (0.5-0.9)
+    PINCH_DEADZONE: 5,          // Minimum pinch distance change to process
+    MOMENTUM_DECAY: 0.8         // iOS-style momentum decay factor
+  };
+
+  // INACTIVITY TIMER HANDLER
+  function resetInactivityTimer() {
+    // Clear existing timer
     if (interactionState.inactivityTimer) {
-        clearTimeout(interactionState.inactivityTimer);
-        interactionState.inactivityTimer = null;
+      clearTimeout(interactionState.inactivityTimer);
+      interactionState.inactivityTimer = null;
+    }
+    
+    // Set new timer (30 seconds)
+    interactionState.inactivityTimer = setTimeout(() => {
+      if (interactionState.followUser && window.userMarker && window.map) {
+        const userPos = window.userMarker.getLatLng();
+        window.map.setView(userPos, window.map.getZoom(), { animate: true });
+        console.debug('Auto-recentered after 30 seconds of inactivity');
+      }
+    }, 30000);
+  }
+
+  // MARKER ANTI-JUMP SYSTEM
+  const markerAntiJumpSystem = {
+    originalMarkerPositions: new Map(),
+    isInteractionActive: false,
+    
+    preserveMarkerPositions() {
+      // User marker
+      if (window.userMarker) {
+        const pos = window.userMarker.getLatLng();
+        this.originalMarkerPositions.set('userMarker', { 
+          lat: pos.lat, 
+          lng: pos.lng 
+        });
+      }
+      
+      // Game markers
+      if (window.gameMarkers) {
+        for (const [key, marker] of Object.entries(window.gameMarkers)) {
+          if (marker && marker.getLatLng) {
+            const pos = marker.getLatLng();
+            this.originalMarkerPositions.set(key, { 
+              lat: pos.lat, 
+              lng: pos.lng 
+            });
+          }
+        }
+      }
+    },
+    
+    restoreMarkerPositions() {
+      // User marker restoration (conditional)
+      if (window.userMarker && this.originalMarkerPositions.has('userMarker')) {
+        const savedPos = this.originalMarkerPositions.get('userMarker');
+        const currentPos = window.userMarker.getLatLng();
+        
+        // Only restore if position hasn't changed significantly (GPS hasn't moved it)
+        const latDiff = Math.abs(currentPos.lat - savedPos.lat);
+        const lngDiff = Math.abs(currentPos.lng - savedPos.lng);
+        
+        if (latDiff < 1e-6 && lngDiff < 1e-6) {
+          window.userMarker.setLatLng([savedPos.lat, savedPos.lng], { 
+            animate: false 
+          });
+          console.debug('User marker restored to original position');
+        } else {
+          console.debug('User marker position changed during interaction, skipping restore');
+        }
+      }
+      
+      // Game markers restoration
+      if (window.gameMarkers) {
+        for (const [key, marker] of Object.entries(window.gameMarkers)) {
+          if (marker && marker.getLatLng && this.originalMarkerPositions.has(key)) {
+            const savedPos = this.originalMarkerPositions.get(key);
+            const currentPos = marker.getLatLng();
+            
+            const latDiff = Math.abs(currentPos.lat - savedPos.lat);
+            const lngDiff = Math.abs(currentPos.lng - savedPos.lng);
+            
+            if (latDiff < 1e-6 && lngDiff < 1e-6) {
+              marker.setLatLng([savedPos.lat, savedPos.lng], { 
+                animate: false 
+              });
+            }
+          }
+        }
+      }
+      
+      this.originalMarkerPositions.clear();
+    },
+    
+    startInteraction() {
+      this.isInteractionActive = true;
+      this.preserveMarkerPositions();
+    },
+    
+    endInteraction() {
+      this.isInteractionActive = false;
+      this.restoreMarkerPositions();
+    }
+  };
+
+  // VELOCITY TRACKING & SMOOTHING
+  function trackTouchVelocity(currentPos, timestamp) {
+    const touchState = interactionState.touch;
+    
+    // Calculate velocity if we have previous position
+    if (touchState.smoothedPosition && timestamp > touchState.lastUpdateTime) {
+      const deltaTime = timestamp - touchState.lastUpdateTime;
+      const deltaX = currentPos.x - touchState.smoothedPosition.x;
+      const deltaY = currentPos.y - touchState.smoothedPosition.y;
+      const velocity = Math.sqrt(deltaX * deltaX + deltaY * deltaY) / deltaTime * 1000;
+      
+      // Add to velocity buffer
+      touchState.velocityBuffer.push(velocity);
+      if (touchState.velocityBuffer.length > ANTI_JUMP_CONFIG.VELOCITY_SAMPLES) {
+        touchState.velocityBuffer.shift();
+      }
+      
+      // Calculate average velocity
+      const avgVelocity = touchState.velocityBuffer.reduce((a, b) => a + b, 0) / 
+                         touchState.velocityBuffer.length;
+      
+      // Filter unrealistic velocities (likely GPS jumps)
+      if (avgVelocity > ANTI_JUMP_CONFIG.MAX_VELOCITY) {
+        console.debug('High velocity detected and filtered:', avgVelocity.toFixed(0), 'px/s');
+        return false;
+      }
+    }
+    
+    // Apply coordinate smoothing
+    const smoothing = ANTI_JUMP_CONFIG.COORDINATE_SMOOTHING;
+    if (touchState.smoothedPosition) {
+      touchState.smoothedPosition = {
+        x: touchState.smoothedPosition.x * smoothing + currentPos.x * (1 - smoothing),
+        y: touchState.smoothedPosition.y * smoothing + currentPos.y * (1 - smoothing)
+      };
+    } else {
+      touchState.smoothedPosition = { ...currentPos };
+    }
+    
+    touchState.lastUpdateTime = timestamp;
+    return true;
+  }
+
+  // INTERACTION START/END HANDLERS
+  function handleInteractionStart(source) {
+    // Update both local and global states for backwards compatibility
+    interactionState.isMapInteracting = true;
+    interactionState.followUser = false;
+    
+    window.isMapInteracting = true;
+    window.followUser = false;
+    
+    // Clear any existing inactivity timer
+    if (interactionState.inactivityTimer) {
+      clearTimeout(interactionState.inactivityTimer);
+      interactionState.inactivityTimer = null;
     }
     
     // Start marker protection
     markerAntiJumpSystem.startInteraction();
     
     console.debug(`Interaction started: ${source}`);
-};
+  }
 
-const handleInteractionEnd = (source) => {
-    // Update GLOBAL state
+  function handleInteractionEnd(source) {
+    // Update both local and global states
+    interactionState.isMapInteracting = false;
     window.isMapInteracting = false;
     
-    // Keep your existing logic if needed  
-    interactionState.isMapInteracting = false;
-    
-    // End marker protection and restore positions
+    // End marker protection
     markerAntiJumpSystem.endInteraction();
     
-    // Reset anti-jumping state
+    // Reset anti-jump tracking
     interactionState.touch.velocityBuffer = [];
     interactionState.touch.smoothedPosition = null;
     
+    // Restart inactivity timer
     resetInactivityTimer();
-    console.debug(`Interaction ended: ${source}`);
-};
-
-    // Enhanced map events with marker protection
-    const setupMapEvents = () => {
-        if (!map) {
-            console.error('Map not available for event setup');
-            return;
-        }
-
-        try {
-            // Store original marker positions before interaction
-            map.on('movestart', () => {
-                if (!markerAntiJumpSystem.isInteractionActive) {
-                    markerAntiJumpSystem.startInteraction();
-                }
-            });
-            
-            map.on('dragstart', () => handleInteractionStart('drag'));
-            map.on('dragend', () => handleInteractionEnd('drag'));
-            map.on('zoomstart', () => handleInteractionStart('zoom'));
-            map.on('zoomend', () => handleInteractionEnd('zoom'));
-            
-            // Restore marker positions after interaction ends
-            map.on('moveend', () => {
-                if (!interactionState.isMapInteracting && markerAntiJumpSystem.isInteractionActive) {
-                    markerAntiJumpSystem.endInteraction();
-                }
-            });
-            
-        } catch (error) {
-            console.error('Error setting up map events:', error);
-        }
-    };
-
-    // Enhanced touch events with maximum anti-jumping
-    const setupTouchEvents = () => {
-        let updateThrottle = null;
-
-        const touchHandlers = {
-            start: (e) => {
-                try {
-                    if (!e.touches || e.touches.length === 0) return;
-
-                    const now = Date.now();
-                    const touch = e.touches[0];
-                    
-                    if (e.touches.length === 1) {
-                        // Single touch - reset anti-jumping state
-                        interactionState.touch.startTime = now;
-                        interactionState.touch.startPos = {
-                            x: touch.clientX,
-                            y: touch.clientY
-                        };
-                        interactionState.touch.isMoving = false;
-                        interactionState.touch.velocityBuffer = [];
-                        interactionState.touch.smoothedPosition = {
-                            x: touch.clientX,
-                            y: touch.clientY
-                        };
-                        interactionState.touch.lastUpdateTime = now;
-                    } else if (e.touches.length === 2) {
-                        // Pinch start
-                        interactionState.touch.isPinching = true;
-                        handleInteractionStart('pinch');
-                        
-                        const touch1 = e.touches[0];
-                        const touch2 = e.touches[1];
-                        
-                        interactionState.touch.initialPinchDistance = Math.hypot(
-                            touch2.clientX - touch1.clientX,
-                            touch2.clientY - touch1.clientY
-                        );
-                        
-                        if (map) {
-                            interactionState.touch.initialZoom = map.getZoom();
-                        }
-                        
-                        e.preventDefault();
-                    }
-                } catch (error) {
-                    console.error('Touch start error:', error);
-                }
-            },
-
-            move: (e) => {
-                try {
-                    if (!e.touches || e.touches.length === 0) return;
-
-                    const now = Date.now();
-                    
-                    // Throttle updates to prevent overwhelming the system
-                    if (updateThrottle && now - updateThrottle < ANTI_JUMP_CONFIG.UPDATE_THROTTLE) {
-                        return;
-                    }
-                    updateThrottle = now;
-
-                    if (e.touches.length === 1 && interactionState.touch.startPos) {
-                        // Single touch move with anti-jumping
-                        const touch = e.touches[0];
-                        const currentPos = {
-                            x: touch.clientX,
-                            y: touch.clientY
-                        };
-                        
-                        // Track velocity and smooth position
-                        const validMovement = trackTouchVelocity(currentPos, now);
-                        if (!validMovement) return;
-
-                        // Use smoothed position for distance calculation
-                        const smoothedPos = interactionState.touch.smoothedPosition;
-                        const dx = smoothedPos.x - interactionState.touch.startPos.x;
-                        const dy = smoothedPos.y - interactionState.touch.startPos.y;
-                        const distance = Math.sqrt(dx * dx + dy * dy);
-                        
-                        // Check for sudden jumps
-                        const rawDx = currentPos.x - interactionState.touch.startPos.x;
-                        const rawDy = currentPos.y - interactionState.touch.startPos.y;
-                        const rawDistance = Math.sqrt(rawDx * rawDx + rawDy * rawDy);
-                        
-                        if (rawDistance > interactionState.touch.jumpThreshold && distance < ANTI_JUMP_CONFIG.MIN_DRAG_DISTANCE) {
-                            console.debug('Touch jump detected and filtered');
-                            return;
-                        }
-                        
-                        if (distance > ANTI_JUMP_CONFIG.MIN_DRAG_DISTANCE && !interactionState.touch.isMoving) {
-                            interactionState.touch.isMoving = true;
-                            handleInteractionStart('touch-drag');
-                        }
-                    } else if (e.touches.length === 2 && interactionState.touch.isPinching) {
-                        // Enhanced pinch zoom with deadzone
-                        const touch1 = e.touches[0];
-                        const touch2 = e.touches[1];
-                        
-                        const currentPinchDistance = Math.hypot(
-                            touch2.clientX - touch1.clientX,
-                            touch2.clientY - touch1.clientY
-                        );
-                        
-                        // Apply deadzone to prevent micro-adjustments
-                        const distanceChange = Math.abs(currentPinchDistance - interactionState.touch.initialPinchDistance);
-                        if (distanceChange < ANTI_JUMP_CONFIG.PINCH_DEADZONE) {
-                            return;
-                        }
-                        
-                        if (map && interactionState.touch.initialPinchDistance > 0) {
-                            const pinchRatio = currentPinchDistance / interactionState.touch.initialPinchDistance;
-                            
-                            // Limit pinch sensitivity to prevent jumping
-                            const cappedRatio = Math.max(0.5, Math.min(2.0, pinchRatio));
-                            const zoomDelta = Math.log2(cappedRatio) * 1.5; 
-                            const newZoom = Math.max(7, Math.min(18, interactionState.touch.initialZoom + zoomDelta));
-                            
-                            try {
-                                // Check if userMarker exists and has a valid position
-                                if (window.userMarker && window.userMarker.getLatLng) { 
-                                    const userMarkerLatLng = window.userMarker.getLatLng(); 
-                                    // Use setView with the user's position as the center
-                                    map.setView(userMarkerLatLng, newZoom, {
-                                        animate: false // Keep animate false for direct pinch control
-                                    });
-                                } else {
-                                    // If user marker isn't ready, zoom around current map center
-                                    console.debug("User marker not available during pinch, zooming around map center");
-                                    const currentCenter = map.getCenter();
-                                    map.setView(currentCenter, newZoom, { animate: false });
-                                }
-                            } catch (mapError) {
-                                console.debug('Map view update during pinch failed:', mapError);
-                            }
-                        }
-                        
-                        e.preventDefault();
-                    }
-                } catch (error) {
-                    console.error('Touch move error:', error);
-                }
-            },
-
-            end: (e) => {
-                try {
-                    const touchEndTime = Date.now();
-                    const touchDuration = touchEndTime - interactionState.touch.startTime;
-                    
-                    if (interactionState.touch.isPinching) {
-                        interactionState.touch.isPinching = false;
-                        handleInteractionEnd('pinch');
-                        
-                        if (e.touches.length < 2) {
-                            e.preventDefault();
-                        }
-                    } else if (interactionState.touch.startPos) {
-                        // Apply momentum decay for iOS
-                        if (ANTI_JUMP_CONFIG.MOMENTUM_DECAY < 1 && interactionState.touch.isMoving) {
-                            setTimeout(() => {
-                                if (interactionState.isMapInteracting) {
-                                    handleInteractionEnd('touch-momentum');
-                                }
-                            }, 100);
-                        }
-                        
-                        if (touchDuration >= 300 || interactionState.touch.isMoving) {
-                            handleInteractionEnd('touch-drag');
-                        }
-                    }
-                    
-                    // Complete state reset
-                    interactionState.touch.startPos = null;
-                    interactionState.touch.isMoving = false;
-                    interactionState.touch.velocityBuffer = [];
-                    interactionState.touch.smoothedPosition = null;
-                    updateThrottle = null;
-                } catch (error) {
-                    console.error('Touch end error:', error);
-                }
-            }
-        };
-
-        // Listeners with enhanced error handling
-        try {
-            document.addEventListener('touchstart', touchHandlers.start, { passive: false });
-            document.addEventListener('touchmove', touchHandlers.move, { passive: false });
-            document.addEventListener('touchend', touchHandlers.end, { passive: false });
-            
-            // Additional jump prevention for problematic devices
-            document.addEventListener('touchcancel', touchHandlers.end, { passive: false });
-        } catch (error) {
-            console.error('Error setting up touch events:', error);
-        }
-    };
-
-    const setupButtonEvents = () => {
-        const buttonConfigs = [
-            { id: 'recenterButton', handler: recenterMap, required: true },
-            { id: 'returnButton', handler: returnToIndex, required: true },
-            { id: 'tipsButton', handler: showNavigationTips, required: false }
-        ];
-
-        buttonConfigs.forEach(config => {
-            try {
-                const element = document.getElementById(config.id);
-                if (element) {
-                    element.addEventListener('click', config.handler);
-                    console.debug(`${config.id} event listener attached`);
-                } else if (config.required) {
-                    console.error(`Required button element not found: ${config.id}`);
-                } else {
-                    console.warn(`Optional button element not found: ${config.id}`);
-                }
-            } catch (error) {
-                console.error(`Error setting up ${config.id} event:`, error);
-            }
-        });
-    };
-
-    const setupAccessibilityEvents = () => {
-        try {
-            const contrastToggle = cachedElements?.contrastToggle;
-            if (contrastToggle && typeof toggleHighContrast === 'function') {
-                contrastToggle.addEventListener('click', toggleHighContrast);
-                
-                if (typeof accessibilityState !== 'undefined' && accessibilityState.highContrast) {
-                    document.body.classList.add('high-contrast');
-                }
-                
-                console.debug('Accessibility events setup complete');
-            } else {
-                console.warn('Contrast toggle or handler not available');
-            }
-        } catch (error) {
-            console.error('Error setting up accessibility events:', error);
-        }
-    };
-
-    const setupSystemEvents = () => {
-        try {
-            document.addEventListener('visibilitychange', () => {
-                try {
-                    if (typeof handleVisibilityChange === 'function') {
-                        handleVisibilityChange();
-                    }
-                } catch (error) {
-                    console.error('Visibility change handler error:', error);
-                }
-            });
-
-            let resizeTimeout;
-            window.addEventListener('resize', () => {
-                try {
-                    clearTimeout(resizeTimeout);
-                    resizeTimeout = setTimeout(() => {
-                        if (map) {
-                            map.invalidateSize();
-                        }
-                        if (typeof updateDistanceBox === 'function') {
-                            updateDistanceBox();
-                        }
-                    }, 250);
-                } catch (error) {
-                    console.error('Resize handler error:', error);
-                }
-            });
-
-            console.debug('System events setup complete');
-        } catch (error) {
-            console.error('Error setting up system events:', error);
-        }
-    };
-
-    try {
-        setupMapEvents();
-        setupTouchEvents(); 
-        setupButtonEvents();
-        setupAccessibilityEvents();
-        setupSystemEvents();
-        
-        console.log('All event listeners setup complete with anti-jumping protection (marker restore conditional, pinch center fixed)');
-    } catch (error) {
-        console.error('Critical error in setupEventListeners:', error);
-    }
-}
-
-document.addEventListener('DOMContentLoaded', () => {
-    console.log('DOM loaded, initializing application...');
     
-    const initSteps = [
-        { name: 'Cache Elements', fn: () => cacheElements() },
-        { name: 'Initialize Map', fn: () => initMap() },
-        { name: 'Setup Event Listeners', fn: () => setupEventListeners() },
-        { name: 'Optimize Images', fn: () => optimizeImages() },
-        { name: 'Initialize UI', fn: () => initializeUI() }
+    console.debug(`Interaction ended: ${source}`);
+  }
+
+  // MAP EVENT SETUP
+  function setupMapEvents() {
+    if (!window.map) {
+      console.error('Map object not available for event setup');
+      return;
+    }
+    
+    try {
+      // Preserve markers before any user-initiated movement
+      map.on('movestart', () => {
+        if (!markerAntiJumpSystem.isInteractionActive) {
+          markerAntiJumpSystem.startInteraction();
+        }
+      });
+      
+      // Drag interactions
+      map.on('dragstart', () => handleInteractionStart('drag'));
+      map.on('dragend', () => handleInteractionEnd('drag'));
+      
+      // Zoom interactions
+      map.on('zoomstart', () => handleInteractionStart('zoom'));
+      map.on('zoomend', () => handleInteractionEnd('zoom'));
+      
+      // Final cleanup after map settles
+      map.on('moveend', () => {
+        if (!interactionState.isMapInteracting && 
+            markerAntiJumpSystem.isInteractionActive) {
+          markerAntiJumpSystem.endInteraction();
+        }
+      });
+      
+    } catch (error) {
+      console.error('Error setting up map events:', error);
+    }
+  }
+
+  // TOUCH EVENT SETUP (Pinch-Zoom & Drag)
+  function setupTouchEvents() {
+    let updateThrottle = null;
+    
+    const touchHandlers = {
+      start(e) {
+        try {
+          if (!e.touches || e.touches.length === 0) return;
+          
+          const now = Date.now();
+          const touch = e.touches[0];
+          
+          if (e.touches.length === 1) {
+            // Single touch - initialize anti-jump state
+            const touchState = interactionState.touch;
+            touchState.startTime = now;
+            touchState.startPos = { 
+              x: touch.clientX, 
+              y: touch.clientY 
+            };
+            touchState.isMoving = false;
+            touchState.velocityBuffer = [];
+            touchState.smoothedPosition = { 
+              x: touch.clientX, 
+              y: touch.clientY 
+            };
+            touchState.lastUpdateTime = now;
+          } 
+          else if (e.touches.length === 2) {
+            // Two-finger pinch start
+            interactionState.touch.isPinching = true;
+            handleInteractionStart('pinch');
+            
+            const touch1 = e.touches[0];
+            const touch2 = e.touches[1];
+            
+            interactionState.touch.initialPinchDistance = Math.hypot(
+              touch2.clientX - touch1.clientX,
+              touch2.clientY - touch1.clientY
+            );
+            
+            if (window.map) {
+              interactionState.touch.initialZoom = window.map.getZoom();
+            }
+            
+            e.preventDefault();
+          }
+        } catch (error) {
+          console.error('Touch start error:', error);
+        }
+      },
+      
+      move(e) {
+        try {
+          if (!e.touches || e.touches.length === 0) return;
+          
+          const now = Date.now();
+          
+          // Throttle updates to prevent performance issues
+          if (updateThrottle && (now - updateThrottle < ANTI_JUMP_CONFIG.UPDATE_THROTTLE)) {
+            return;
+          }
+          updateThrottle = now;
+          
+          // Single touch drag
+          if (e.touches.length === 1 && interactionState.touch.startPos) {
+            const touch = e.touches[0];
+            const currentPos = { 
+              x: touch.clientX, 
+              y: touch.clientY 
+            };
+            
+            // Apply velocity filtering and smoothing
+            const validMovement = trackTouchVelocity(currentPos, now);
+            if (!validMovement) return;
+            
+            // Calculate smoothed distance for interaction detection
+            const smoothedPos = interactionState.touch.smoothedPosition;
+            const dx = smoothedPos.x - interactionState.touch.startPos.x;
+            const dy = smoothedPos.y - interactionState.touch.startPos.y;
+            const distance = Math.sqrt(dx * dx + dy * dy);
+            
+            // Detect and filter sudden jumps
+            const rawDx = currentPos.x - interactionState.touch.startPos.x;
+            const rawDy = currentPos.y - interactionState.touch.startPos.y;
+            const rawDistance = Math.sqrt(rawDx * rawDx + rawDy * rawDy);
+            
+            if (rawDistance > interactionState.touch.jumpThreshold && 
+                distance < ANTI_JUMP_CONFIG.MIN_DRAG_DISTANCE) {
+              console.debug('Touch jump detected and filtered');
+              return;
+            }
+            
+            // Start interaction if minimum drag distance reached
+            if (distance > ANTI_JUMP_CONFIG.MIN_DRAG_DISTANCE && 
+                !interactionState.touch.isMoving) {
+              interactionState.touch.isMoving = true;
+              handleInteractionStart('touch-drag');
+            }
+          }
+          // Two-finger pinch
+          else if (e.touches.length === 2 && interactionState.touch.isPinching) {
+            const touch1 = e.touches[0];
+            const touch2 = e.touches[1];
+            
+            const currentPinchDistance = Math.hypot(
+              touch2.clientX - touch1.clientX,
+              touch2.clientY - touch1.clientY
+            );
+            
+            // Apply deadzone to prevent micro-adjustments
+            const distanceChange = Math.abs(
+              currentPinchDistance - interactionState.touch.initialPinchDistance
+            );
+            
+            if (distanceChange < ANTI_JUMP_CONFIG.PINCH_DEADZONE) {
+              return;
+            }
+            
+            if (window.map && interactionState.touch.initialPinchDistance > 0) {
+              const pinchRatio = currentPinchDistance / interactionState.touch.initialPinchDistance;
+              
+              // Clamp ratio to prevent extreme zoom jumps
+              const clampedRatio = Math.max(0.5, Math.min(2.0, pinchRatio));
+              const zoomDelta = Math.log2(clampedRatio) * 1.5;
+              const newZoom = Math.max(
+                7, 
+                Math.min(18, interactionState.touch.initialZoom + zoomDelta)
+              );
+              
+              try {
+                // Center on user marker if available, otherwise use map center
+                const center = window.userMarker?.getLatLng?.() || window.map.getCenter();
+                window.map.setView(center, newZoom, { animate: false });
+              } catch (mapError) {
+                console.debug('Map view update during pinch failed:', mapError);
+              }
+            }
+            
+            e.preventDefault();
+          }
+        } catch (error) {
+          console.error('Touch move error:', error);
+        }
+      },
+      
+      end(e) {
+        try {
+          const touchEndTime = Date.now();
+          const touchDuration = touchEndTime - interactionState.touch.startTime;
+          
+          // Pinch end
+          if (interactionState.touch.isPinching) {
+            interactionState.touch.isPinching = false;
+            handleInteractionEnd('pinch');
+            
+            if (e.touches.length < 2) {
+              e.preventDefault();
+            }
+          }
+          // Single touch end
+          else if (interactionState.touch.startPos) {
+            // Handle iOS-style momentum decay
+            if (ANTI_JUMP_CONFIG.MOMENTUM_DECAY < 1 && interactionState.touch.isMoving) {
+              setTimeout(() => {
+                if (interactionState.isMapInteracting) {
+                  handleInteractionEnd('touch-momentum');
+                }
+              }, 100);
+            }
+            
+            // End interaction if it was a drag or long press
+            if (touchDuration >= 300 || interactionState.touch.isMoving) {
+              handleInteractionEnd('touch-drag');
+            }
+          }
+          
+          // Reset touch state
+          interactionState.touch.startPos = null;
+          interactionState.touch.isMoving = false;
+          interactionState.touch.velocityBuffer = [];
+          interactionState.touch.smoothedPosition = null;
+          updateThrottle = null;
+        } catch (error) {
+          console.error('Touch end error:', error);
+        }
+      }
+    };
+    
+    // Bind touch event listeners
+    try {
+      document.addEventListener('touchstart', touchHandlers.start, { passive: false });
+      document.addEventListener('touchmove', touchHandlers.move, { passive: false });
+      document.addEventListener('touchend', touchHandlers.end, { passive: false });
+      document.addEventListener('touchcancel', touchHandlers.end, { passive: false });
+    } catch (error) {
+      console.error('Error binding touch events:', error);
+    }
+  }
+
+  // BUTTON EVENT SETUP
+  function setupButtonEvents() {
+    const buttonConfigs = [
+      { 
+        id: 'recenterButton', 
+        handler: recenterMap, 
+        required: true,
+        description: 'Recenter map on user'
+      },
+      { 
+        id: 'returnButton', 
+        handler: returnToIndex, 
+        required: true,
+        description: 'Return to index page'
+      },
+      { 
+        id: 'tipsButton', 
+        handler: showNavigationTips, 
+        required: false,
+        description: 'Show navigation tips'
+      }
     ];
 
-    let successCount = 0;
-    
-    initSteps.forEach((step, index) => {
-        try {
-            if (typeof step.fn === 'function') {
-                step.fn();
-                successCount++;
-                console.debug(`✓ ${step.name} completed`);
-            } else {
-                console.warn(`⚠ ${step.name} function not available`);
-            }
-        } catch (error) {
-            console.error(`✗ ${step.name} failed:`, error);
+    buttonConfigs.forEach(config => {
+      try {
+        const element = document.getElementById(config.id);
+        
+        if (element) {
+          element.addEventListener('click', config.handler);
+          console.debug(`${config.id} event listener attached (${config.description})`);
+        } 
+        else if (config.required) {
+          console.error(`Required button element not found: ${config.id}`);
+        } 
+        else {
+          console.warn(`Optional button element not found: ${config.id}`);
         }
+      } catch (error) {
+        console.error(`Error setting up ${config.id} event:`, error);
+      }
     });
+  }
 
-    console.log(`Application initialization: ${successCount}/${initSteps.length} steps completed`);
-});
-
-function initializeUI() {
+  // ACCESSIBILITY EVENT SETUP
+  function setupAccessibilityEvents() {
     try {
-        const additionalInfoContainer = cachedElements?.additionalInfoContainer;
-        if (additionalInfoContainer) {
-            additionalInfoContainer.style.display = 'none';
+      const contrastToggle = cachedElements?.contrastToggle;
+      
+      if (contrastToggle && typeof toggleHighContrast === 'function') {
+        contrastToggle.addEventListener('click', toggleHighContrast);
+        
+        // Apply initial high contrast state if enabled
+        if (window.accessibilityState?.highContrast) {
+          document.body.classList.add('high-contrast');
         }
         
-        const lochuntContainer = cachedElements?.lochuntContainer;
-        if (lochuntContainer) {
-            lochuntContainer.style.display = 'none';
-        }
-
-        console.debug('UI initialization complete');
+        console.debug('Accessibility contrast toggle setup complete');
+      } else {
+        console.warn('Contrast toggle element or handler not available');
+      }
     } catch (error) {
-        console.error('UI initialization error:', error);
+      console.error('Error setting up accessibility events:', error);
     }
+  }
+
+  // 11. SYSTEM EVENT SETUP
+  function setupSystemEvents() {
+    try {
+      // Page visibility changes
+      document.addEventListener('visibilitychange', () => {
+        try {
+          if (typeof handleVisibilityChange === 'function') {
+            handleVisibilityChange();
+          }
+        } catch (error) {
+          console.error('Visibility change handler error:', error);
+        }
+      });
+
+      // Window resize with debouncing
+      let resizeTimeout;
+      window.addEventListener('resize', () => {
+        try {
+          clearTimeout(resizeTimeout);
+          resizeTimeout = setTimeout(() => {
+            // Update map size
+            if (window.map) {
+              window.map.invalidateSize();
+            }
+            
+            // Update distance display if function exists
+            if (typeof updateDistanceBox === 'function') {
+              updateDistanceBox();
+            }
+          }, 250); // 250ms debounce
+        } catch (error) {
+          console.error('Resize handler error:', error);
+        }
+      });
+
+      console.debug('System events setup complete');
+    } catch (error) {
+      console.error('Error setting up system events:', error);
+    }
+  }
+
+  // 12. MAIN INITIALIZATION
+  try {
+    // Initialize all event listeners
+    setupMapEvents();
+    setupTouchEvents();
+    setupButtonEvents();
+    setupAccessibilityEvents();
+    setupSystemEvents();
+    
+    // Start inactivity timer
+    resetInactivityTimer();
+    
+    console.log('✓ All event listeners setup complete with anti-jump protection');
+  } catch (error) {
+    console.error('✗ Critical error in setupEventListeners:', error);
+  }
+}
+
+// APPLICATION BOOTSTRAP
+document.addEventListener('DOMContentLoaded', () => {
+  console.log('DOM loaded, initializing application...');
+  
+  const initializationSteps = [
+    { 
+      name: 'Cache Elements', 
+      fn: () => cacheElements(),
+      description: 'Cache DOM elements for faster access'
+    },
+    { 
+      name: 'Initialize Map', 
+      fn: () => initMap(),
+      description: 'Initialize Leaflet map with tiles and markers'
+    },
+    { 
+      name: 'Setup Event Listeners', 
+      fn: () => setupEventListeners(),
+      description: 'Setup all UI, touch, and system event listeners'
+    },
+    { 
+      name: 'Optimize Images', 
+      fn: () => optimizeImages(),
+      description: 'Optimize images for performance'
+    },
+    { 
+      name: 'Initialize UI', 
+      fn: () => initializeUI(),
+      description: 'Initialize UI elements to default states'
+    }
+  ];
+
+  let successfulSteps = 0;
+  let totalSteps = initializationSteps.length;
+  
+  initializationSteps.forEach((step, index) => {
+    const stepNumber = index + 1;
+    
+    try {
+      if (typeof step.fn === 'function') {
+        step.fn();
+        successfulSteps++;
+        console.debug(`✓ [${stepNumber}/${totalSteps}] ${step.name}: ${step.description}`);
+      } else {
+        console.warn(`⚠ [${stepNumber}/${totalSteps}] ${step.name}: Function not available`);
+      }
+    } catch (error) {
+      console.error(`✗ [${stepNumber}/${totalSteps}] ${step.name} failed:`, error);
+    }
+  });
+
+  const successRate = Math.round((successfulSteps / totalSteps) * 100);
+  console.log(`Application initialization complete: ${successfulSteps}/${totalSteps} steps (${successRate}%)`);
+});
+
+/* Initialize UI elements that should start hidden. */
+function initializeUI() {
+  try {
+    const additionalInfoContainer = cachedElements?.additionalInfoContainer;
+    if (additionalInfoContainer) {
+      additionalInfoContainer.style.display = 'none';
+    }
+    
+    // ----- Lochunt Container -----
+    const lochuntContainer = cachedElements?.lochuntContainer;
+    if (lochuntContainer) {
+      lochuntContainer.style.display = 'none';
+    }
+    
+    // Add other UI elements that need initialization here
+    console.debug('UI initialization complete');
+  } catch (error) {
+    console.error('UI initialization error:', error);
+  }
 }
     </script>
 </body>
