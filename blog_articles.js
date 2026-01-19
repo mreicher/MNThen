@@ -1,4 +1,14 @@
 const blogArticles = [
+{
+  "headline": "Selby Avenue Line (1888 – 1953)",
+  "blurb": "How Saint Paul overcame Cathedral Hill's treacherous 16% grade by building a 1,472-foot streetcar tunnel in 1907—transforming transit, commerce, and neighborhood development along the Selby–Lake corridor.",
+  "icon": "fa-building",
+  "author": "Matt Reicher",
+  "date": "January 20, 2026",
+  "image": "https://www.mnthen.com/images/selby_line.jpg",
+  "url": "https://www.mnthen.com/blog/place/selby_line.html",
+  "keywords": ["selby avenue streetcar", "selby-lake line", "cathedral hill tunnel", "twin city rapid transit", "tcrt", "st. paul streetcars", "selby avenue history", "streetcar tunnel", "merriam park", "crocus hill", "place", "all"]
+},
   {
   "headline": "Faust, Flick, and Belmont Club: St. Paul Buys Out its Own 'Vice Triangle' (1989)",
   "blurb": "In 1989, St. Paul spent $1.83 million to shut down the Faust Theatre, The Flick, and the Belmont Club—ending a decade of vice, crime, and blight at University & Dale.",
