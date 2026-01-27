@@ -4967,8 +4967,8 @@ function panMapInRoaming(
     eastWestMovement,
     speedMPH
 ) {
-    /* Throttle – limit calls to roughly 20 fps. */
-    const PAN_THROTTLE_MS = 50;                     // ~20 fps
+    /* Throttle – limit calls to roughly 20 fps. */
+    const PAN_THROTTLE_MS = 50;                     // ~20 fps
     const now = Date.now();
 
     if (window._lastPanTime && now - window._lastPanTime < PAN_THROTTLE_MS) {
@@ -5026,21 +5026,50 @@ function panMapInRoaming(
         window.centeringState.isCentered = false;
     }
 
-    /* Cheap edge detection – bail out early if no pan needed. */
-    const pixelBounds = map.getPixelBounds();               // cheap, no projection
+    /* IMPROVED edge detection with speed-scaled margins and critical zone */
+    const mapSize = map.getSize();
+    if (!mapSize || !mapSize.x || !mapSize.y) return;
+    
     const targetPixel = map.latLngToContainerPoint(target);
+    if (!targetPixel || typeof targetPixel.x !== 'number' || typeof targetPixel.y !== 'number') {
+        return;
+    }
 
-    const VIEWPORT_EDGE_PCT = 0.15;                         // 15 % from any edge
-    const vw = pixelBounds.getSize().x;
-    const vh = pixelBounds.getSize().y;
+    // Dynamic margin calculation (matches _isNearViewportEdge)
+    const MIN_MARGIN = 150;
+    const SPEED_FACTOR = 2.0;
+    const CRITICAL_MARGIN = 40;
+    
+    const safeSpeed = isFinite(speedMPH) && speedMPH > 0 ? speedMPH : 0;
+    const dynamicMargin = MIN_MARGIN + (safeSpeed * SPEED_FACTOR);
+    const maxSafeMargin = Math.min(mapSize.x, mapSize.y) * 0.45;
+    const marginPx = Math.max(Math.min(dynamicMargin, maxSafeMargin), CRITICAL_MARGIN);
 
-    const leftPct   = targetPixel.x / vw;
-    const rightPct  = 1 - leftPct;
-    const topPct    = targetPixel.y / vh;
-    const bottomPct = 1 - topPct;
+    // Check if near edge
+    const nearLeft   = targetPixel.x < marginPx;
+    const nearRight  = targetPixel.x > (mapSize.x - marginPx);
+    const nearTop    = targetPixel.y < marginPx;
+    const nearBottom = targetPixel.y > (mapSize.y - marginPx);
+    
+    const isNearEdge = nearLeft || nearRight || nearTop || nearBottom;
+    
+    // Check if in CRITICAL zone (emergency territory)
+    const criticalLeft   = targetPixel.x < CRITICAL_MARGIN;
+    const criticalRight  = targetPixel.x > (mapSize.x - CRITICAL_MARGIN);
+    const criticalTop    = targetPixel.y < CRITICAL_MARGIN;
+    const criticalBottom = targetPixel.y > (mapSize.y - CRITICAL_MARGIN);
+    
+    const isInCriticalZone = criticalLeft || criticalRight || criticalTop || criticalBottom;
+    
+    // Check if completely off screen (absolute emergency)
+    const isOffScreen = (
+        targetPixel.x < 0 ||
+        targetPixel.x > mapSize.x ||
+        targetPixel.y < 0 ||
+        targetPixel.y > mapSize.y
+    );
 
-    const minDist = Math.min(leftPct, rightPct, topPct, bottomPct);
-    if (minDist > VIEWPORT_EDGE_PCT) {
+    if (!isNearEdge && !isInCriticalZone && !isOffScreen) {
         // Target comfortably inside the view – nothing to do.
         window.centeringState.lastPanPosition = null;
         return;
@@ -5055,7 +5084,7 @@ function panMapInRoaming(
             const deltaPx = targetPixel.subtract(window.centeringState.lastPanPosition);
             const velocity = deltaPx.divideBy(elapsedMs / 1000); // px/s
 
-            // Exponential smoothing (70 % old, 30 % new)
+            // Exponential smoothing (70 % old, 30 % new)
             window.centeringState.panVelocity = {
                 x: velocity.x * 0.3 + window.centeringState.panVelocity.x * 0.7,
                 y: velocity.y * 0.3 + window.centeringState.panVelocity.y * 0.7
@@ -5070,24 +5099,40 @@ function panMapInRoaming(
     try {
         const start = performance.now();
 
-        _executeRoamingModePan(
-            target,
-            speedTier,
-            directionChangeFactor * panIntensity, // apply intensity boost
-            eastWestMovement,
-            speedMPH,
-            bounds
-        );
+        // EMERGENCY: If off screen or in critical zone, bypass normal pan and force immediate correction
+        if (isOffScreen || isInCriticalZone) {
+            console.warn('[PanRoaming] ' + (isOffScreen ? 'OFF SCREEN' : 'CRITICAL ZONE') + ' - forcing immediate pan');
+            
+            // Force instant pan to recenter
+            map.panTo(target, { 
+                animate: false, 
+                noMoveStart: true 
+            });
+            
+            // Skip throttle for emergency
+            window._lastPanTime = 0;
+        } else {
+            // Normal roaming mode pan
+            _executeRoamingModePan(
+                target,
+                speedTier,
+                directionChangeFactor * panIntensity, // apply intensity boost
+                eastWestMovement,
+                speedMPH,
+                bounds
+            );
+            
+            window._lastPanTime = now;
+        }
 
         // Telemetry (debug only) 
         if (window.DEBUG_PANNING) {
             const dur = performance.now() - start;
-            console.debug(`[PanRoaming] Executed in ${dur.toFixed(1)} ms`);
+            console.debug(`[PanRoaming] Executed in ${dur.toFixed(1)} ms`);
         }
 
         // Update state for the next frame
         window.centeringState.lastPanPosition = targetPixel;
-        window._lastPanTime = now;
     } catch (err) {
         console.error('[PanRoaming] Pan execution failed:', err);
 
@@ -5156,46 +5201,103 @@ function cleanupRoamingState() {
 
 /*ROAMING MODE (< HIGH_SPEED MPH): Only pan when near viewport edges */
 function _executeRoamingModePan(target, speedTier, directionChangeFactor, eastWestMovement, speedMPH, bounds) {
-    const currentCenter = map.getCenter();
+    // Validate inputs
+    if (!map || !target || !isFinite(target.lat) || !isFinite(target.lng)) return;
     
-    const latDiff = Math.abs(target.lat - currentCenter.lat);
-    const lngDiff = Math.abs(target.lng - currentCenter.lng);
+    const mapSize = map.getSize();
+    if (!mapSize || !mapSize.x || !mapSize.y) return;
     
-    const viewportWidth = bounds.getEast() - bounds.getWest();
-    const viewportHeight = bounds.getNorth() - bounds.getSouth();
-    
-    let panThresholdPercent;
-    if (speedMPH >= 10) {
-        panThresholdPercent = 0.18;
-    } else if (speedMPH >= 5) {
-        panThresholdPercent = 0.25;
-    } else {
-        panThresholdPercent = 0.30;
-    }
-    
-    const latThreshold = viewportHeight * panThresholdPercent;
-    const lngThreshold = viewportWidth * panThresholdPercent;
-    
-    if (latDiff < latThreshold && lngDiff < lngThreshold) {
+    // Convert target to screen pixels (VIEWPORT check, not geographical)
+    const targetPixel = map.latLngToContainerPoint(target);
+    if (!targetPixel || typeof targetPixel.x !== 'number' || typeof targetPixel.y !== 'number') {
         return;
     }
     
+    // Speed-scaled margin calculation (matches other functions)
+    const MIN_MARGIN = 150;
+    const SPEED_FACTOR = 2.0;
+    const CRITICAL_MARGIN = 40;
+    
+    const safeSpeed = isFinite(speedMPH) && speedMPH > 0 ? speedMPH : 0;
+    const dynamicMargin = MIN_MARGIN + (safeSpeed * SPEED_FACTOR);
+    const maxSafeMargin = Math.min(mapSize.x, mapSize.y) * 0.45;
+    const marginPx = Math.max(Math.min(dynamicMargin, maxSafeMargin), CRITICAL_MARGIN);
+    
+    // Check if near any edge (VIEWPORT-based)
+    const nearLeft   = targetPixel.x < marginPx;
+    const nearRight  = targetPixel.x > (mapSize.x - marginPx);
+    const nearTop    = targetPixel.y < marginPx;
+    const nearBottom = targetPixel.y > (mapSize.y - marginPx);
+    
+    const isNearEdge = nearLeft || nearRight || nearTop || nearBottom;
+    
+    // Check if in CRITICAL zone
+    const criticalLeft   = targetPixel.x < CRITICAL_MARGIN;
+    const criticalRight  = targetPixel.x > (mapSize.x - CRITICAL_MARGIN);
+    const criticalTop    = targetPixel.y < CRITICAL_MARGIN;
+    const criticalBottom = targetPixel.y > (mapSize.y - CRITICAL_MARGIN);
+    
+    const isInCriticalZone = criticalLeft || criticalRight || criticalTop || criticalBottom;
+    
+    // Check if completely off screen
+    const isOffScreen = (
+        targetPixel.x < 0 ||
+        targetPixel.x > mapSize.x ||
+        targetPixel.y < 0 ||
+        targetPixel.y > mapSize.y
+    );
+    
+    // Early return if not near edge and not in danger
+    if (!isNearEdge && !isInCriticalZone && !isOffScreen) {
+        return;
+    }
+    
+    // Calculate distance from center for duration adjustment
+    const currentCenter = map.getCenter();
+    const centerPixel = map.latLngToContainerPoint(currentCenter);
+    
+    const pixelDistance = Math.sqrt(
+        Math.pow(targetPixel.x - centerPixel.x, 2) + 
+        Math.pow(targetPixel.y - centerPixel.y, 2)
+    );
+    
+    // Normalize distance (0 to 1, where 1 = half screen width/height)
+    const maxDistance = Math.sqrt(
+        Math.pow(mapSize.x / 2, 2) + 
+        Math.pow(mapSize.y / 2, 2)
+    );
+    const normalizedDist = Math.min(1.0, pixelDistance / maxDistance);
+    
+    // EMERGENCY: If off screen or critical, force instant pan
+    if (isOffScreen || isInCriticalZone) {
+        console.warn('[Roaming] ' + (isOffScreen ? 'OFF SCREEN' : 'CRITICAL') + ' - instant pan');
+        
+        map.panTo([target.lat, target.lng], {
+            animate: false,
+            noMoveStart: true
+        });
+        return;
+    }
+    
+    // Calculate animation duration
     let panDuration = (speedTier?.panDuration ?? 0.3) * (directionChangeFactor ?? 1.0);
     
     if (eastWestMovement) {
         panDuration *= 0.90;
     }
     
-    const normalizedDist = Math.max(latDiff / viewportHeight, lngDiff / viewportWidth);
+    // Adjust duration based on distance - closer to edge = faster response
     if (normalizedDist < 0.20) {
         panDuration *= 0.75;
     }
     
     panDuration = Math.max(0.1, Math.min(1.0, panDuration));
     
+    // Calculate easing
     let easeLinearity = speedTier?.easeLinearity ?? 0.2;
     easeLinearity = Math.max(0.1, Math.min(0.4, easeLinearity));
     
+    // Execute pan
     const centerTarget = [target.lat, target.lng];
     
     map.panTo(centerTarget, {
@@ -5205,7 +5307,9 @@ function _executeRoamingModePan(target, speedTier, directionChangeFactor, eastWe
         noMoveStart: true
     });
     
-    console.debug(`[Roaming] Pan near edge: speed=${speedMPH.toFixed(1)}mph, dist=${normalizedDist.toFixed(2)}, duration=${(panDuration*1000).toFixed(0)}ms`);
+    if (window.DEBUG_PANNING) {
+        console.debug(`[Roaming] Pan near edge: speed=${safeSpeed.toFixed(1)}mph, dist=${normalizedDist.toFixed(2)}, duration=${(panDuration*1000).toFixed(0)}ms`);
+    }
 }
 
 /* CENTERED MODE (≥ HIGH_SPEED MPH): Always keep marker at exact center with look-ahead */
@@ -5790,14 +5894,15 @@ function _handleProximityZoom(speedMPH, eastWestMovement) {
     }
 }
         
-/* Returns true when the target position (usually the user) is within a speed‑scaled margin of any viewport edge. */
+/* Returns true when the target position (usually the user) is within a speed-scaled margin of any viewport edge. */
 function _isNearViewportEdge(targetPos, bounds, speedMPH) {
     // Safety Checks
     if (!window.map || !targetPos) return false;
 
-    // Configuration
-    const MIN_MARGIN   = 80;   // Base buffer in pixels
-    const SPEED_FACTOR = 1.5;  // Pixels added per MPH (Linear expansion)
+    // Configuration - More aggressive to catch edge approaches earlier
+    const MIN_MARGIN   = 150;  // Increased from 80 - catch it earlier
+    const SPEED_FACTOR = 2.0;  // Increased from 1.5 - more buffer at speed
+    const CRITICAL_ZONE = 60;  // Absolute minimum distance from edge
 
     // Calculate Dynamic Margin
     const mapSize = window.map.getSize();
@@ -5807,10 +5912,13 @@ function _isNearViewportEdge(targetPos, bounds, speedMPH) {
 
     const safeSpeed = isFinite(speedMPH) && speedMPH > 0 ? speedMPH : 0;
     
-    // Calculate margin, but clamp it to half the screen size to avoid over-panning
+    // Calculate margin with speed scaling, clamp to 45% of smaller dimension
     const dynamicMargin = MIN_MARGIN + (safeSpeed * SPEED_FACTOR);
-    const maxSafeMargin = Math.min(mapSize.x, mapSize.y) / 2;
+    const maxSafeMargin = Math.min(mapSize.x, mapSize.y) * 0.45;
     const marginPx = Math.min(dynamicMargin, maxSafeMargin);
+    
+    // Always enforce minimum critical zone
+    const effectiveMargin = Math.max(marginPx, CRITICAL_ZONE);
 
     // Convert Lat/Lng to Screen Pixels
     const pixel = window.map.latLngToContainerPoint(targetPos);
@@ -5820,13 +5928,36 @@ function _isNearViewportEdge(targetPos, bounds, speedMPH) {
         return false;
     }
 
-    // Check Boundaries
-    const nearLeft   = pixel.x < marginPx;
-    const nearRight  = pixel.x > (mapSize.x - marginPx);
-    const nearTop    = pixel.y < marginPx;
-    const nearBottom = pixel.y > (mapSize.y - marginPx);
+    // Check Boundaries - use effective margin
+    const nearLeft   = pixel.x < effectiveMargin;
+    const nearRight  = pixel.x > (mapSize.x - effectiveMargin);
+    const nearTop    = pixel.y < effectiveMargin;
+    const nearBottom = pixel.y > (mapSize.y - effectiveMargin);
 
     return nearLeft || nearRight || nearTop || nearBottom;
+}
+
+/* Returns true if position is in CRITICAL danger zone (very close to edge) */
+function _isAtCriticalEdge(targetPos) {
+    if (!window.map || !targetPos) return false;
+    
+    const mapSize = window.map.getSize();
+    if (!mapSize || !mapSize.x || !mapSize.y) return false;
+    
+    const pixel = window.map.latLngToContainerPoint(targetPos);
+    if (!pixel || typeof pixel.x !== 'number' || typeof pixel.y !== 'number') {
+        return false;
+    }
+    
+    // Critical zone is 40px from edge - EMERGENCY territory
+    const CRITICAL_PX = 40;
+    
+    const atLeft   = pixel.x < CRITICAL_PX;
+    const atRight  = pixel.x > (mapSize.x - CRITICAL_PX);
+    const atTop    = pixel.y < CRITICAL_PX;
+    const atBottom = pixel.y > (mapSize.y - CRITICAL_PX);
+    
+    return atLeft || atRight || atTop || atBottom;
 }
         
 function _emergencyCenterMap(position, speedTier, directionChangeFactor, eastWestMovement, speedMPH) {
@@ -6021,7 +6152,8 @@ function _panMapToLookAhead(lookAheadPosition, speedTier, directionChangeFactor,
     }
 }
         
-/* Smoothly pan the map when the user marker gets too close to the viewport edge. */
+/* Smoothly pan the map when the user marker gets too close to the viewport edge.
+ * CRITICAL: This is the PRIMARY safety mechanism to keep user icon in viewport during roaming mode. */
 function _panMapIfNearEdge(
   userPos,
   speedTier,
@@ -6045,22 +6177,36 @@ function _panMapIfNearEdge(
   // Only auto-pan if tracking is enabled
   if (!window.followUser) return;
   
-  // Edge Detection
-  if (!_isNearViewportEdge(userPos, bounds, speedMPH || 0)) return;
+  // CRITICAL: Check if in danger zone FIRST, bypass all throttling if so
+  const isInCriticalZone = _isAtCriticalEdge(userPos);
+  
+  // Edge Detection - check if near edge at all
+  const isNearEdge = _isNearViewportEdge(userPos, bounds, speedMPH || 0);
+  
+  if (!isNearEdge && !isInCriticalZone) return;
   
   // State Management - Prevent overlapping animations
-  if (window.isPanning) return;
+  if (window.isPanning) {
+    // EXCEPTION: If in critical zone, we MUST pan even if already panning
+    // Cancel current pan and force new one
+    if (isInCriticalZone) {
+      window.isPanning = false; // Force reset
+    } else {
+      return; // Normal case: wait for current pan to finish
+    }
+  }
   
-  // Throttle repeated pans to ~8 Hz (120 ms) to avoid jitter
+  // Throttle repeated pans - BUT reduce interval and skip throttle in critical zone
   const now = performance.now();
-  const MIN_PAN_INTERVAL = 120; // ms
+  const MIN_PAN_INTERVAL = isInCriticalZone ? 0 : 80; // Reduced from 120ms, bypass in critical
   
   if (now - (window.lastCenteringTime || 0) < MIN_PAN_INTERVAL) {
     return;
   }
   
-  // Animation Dynamics
-  const basePanDuration = (speedTier?.panDuration ?? 0.2) * 0.8;
+  // Animation Dynamics - faster response for critical zone
+  const urgencyMultiplier = isInCriticalZone ? 0.6 : 0.8;
+  const basePanDuration = (speedTier?.panDuration ?? 0.2) * urgencyMultiplier;
   const rawDuration = basePanDuration * (directionChangeFactor || 1) * (eastWestMovement ? 0.9 : 1);
   const panDuration = Math.max(0.05, Math.min(0.8, rawDuration)); // seconds
   
@@ -6070,7 +6216,7 @@ function _panMapIfNearEdge(
     Math.min(0.9, baseEase * (eastWestMovement ? 0.8 : 1))
   );
   
-  // Prepare the map container for GPU‑accelerated transforms
+  // Prepare the map container for GPU-accelerated transforms
   const mapContainer = window.map?.getContainer?.();
   if (!mapContainer) {
       return;
@@ -6115,26 +6261,35 @@ function _panMapIfNearEdge(
   
   // Execute Pan
   try {
-    // Perform the animated pan
-    window.map.panTo(userPos, {
-      animate: true,
-      duration: panDuration,
-      easeLinearity: easeLinearity,
-      noMoveStart: true
-    });
-    
-    // Safety timeout in case map never fires `moveend`
-    timeoutId = setTimeout(cleanup, panDuration * 1000 + 100);
-    
-    // Clean up when map finishes moving
-    moveEndHandler = cleanup;
-    window.map.once('moveend', moveEndHandler);
+    // In critical zone, use instant pan to guarantee safety
+    if (isInCriticalZone) {
+      window.map.panTo(userPos, {
+        animate: false,
+        noMoveStart: true
+      });
+      cleanup(); // Immediate cleanup
+    } else {
+      // Normal animated pan
+      window.map.panTo(userPos, {
+        animate: true,
+        duration: panDuration,
+        easeLinearity: easeLinearity,
+        noMoveStart: true
+      });
+      
+      // Safety timeout in case map never fires `moveend`
+      timeoutId = setTimeout(cleanup, panDuration * 1000 + 100);
+      
+      // Clean up when map finishes moving
+      moveEndHandler = cleanup;
+      window.map.once('moveend', moveEndHandler);
+    }
   } catch (err) {
     console.warn('[Pan Near Edge] Unexpected error during panTo():', err);
     cleanup(); // Ensure we never leave the flag stuck
   }
 }
-
+        
 /* Applies speed‑adaptive zoom based on the current motion context.*/
 function _applyIntelligentZoom(speedMPS, speedTier, directionChangeFactor, speedMPH) {
     // Guard clauses: exit early if conditions aren't met
@@ -6253,10 +6408,9 @@ function _enforceViewportSafety(speedMPH, currentMarkerPos) {
     const marker = window.userMarker;
     
     if (!map || !marker) return;
-
     const pos = currentMarkerPos || (marker.getLatLng ? marker.getLatLng() : null);
     if (!pos || !isFinite(pos.lat) || !isFinite(pos.lng)) return;
-
+    
     // Only enforce if ModeManager exists and functions are defined
     if (typeof ModeManager !== 'undefined' && typeof ModeManager.isCentered === 'function') {
         if (ModeManager.isCentered()) {
@@ -6269,11 +6423,28 @@ function _enforceViewportSafety(speedMPH, currentMarkerPos) {
             }
         }
     }
-
-    // Emergency boundary check
-    const bounds = map.getBounds ? map.getBounds() : null;
-    if (bounds && bounds.contains && !bounds.contains(pos)) {
-        console.error('[Viewport] CRITICAL: Marker outside bounds - forcing correction');
+    
+    // Emergency VIEWPORT check (screen visibility, not geographical bounds)
+    const mapSize = map.getSize ? map.getSize() : null;
+    if (!mapSize || !mapSize.x || !mapSize.y) return;
+    
+    // Convert marker position to screen pixels
+    const markerPixel = map.latLngToContainerPoint ? map.latLngToContainerPoint(pos) : null;
+    if (!markerPixel || typeof markerPixel.x !== 'number' || typeof markerPixel.y !== 'number') {
+        return;
+    }
+    
+    // Check if marker is actually OFF SCREEN (not just outside bounds)
+    const isOffScreen = (
+        markerPixel.x < 0 ||
+        markerPixel.x > mapSize.x ||
+        markerPixel.y < 0 ||
+        markerPixel.y > mapSize.y
+    );
+    
+    if (isOffScreen) {
+        console.error('[Viewport] CRITICAL: Marker off screen at pixel (' + 
+                      markerPixel.x + ',' + markerPixel.y + ') - forcing correction');
         
         try {
             map.setView([pos.lat, pos.lng], map.getZoom(), {
