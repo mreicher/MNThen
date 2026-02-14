@@ -11,7 +11,7 @@ const blogArticles = [
 },
   {
   "headline": "Faust, Flick, and Belmont Club: St. Paul Buys Out its Own 'Vice Triangle' (1989)",
-  "blurb": "In 1989, St. Paul spent $1.83 million to shut down the Faust Theatre, The Flick, and the Belmont Club—ending a decade of vice, crime, and blight at University & Dale.",
+  "blurb": "In 1989, St. Paul spent $1.83 million to shut down the Faust Theatre, The Flick, and the Belmont Club—ending a decade of vice and blight at University & Dale.",
   "icon": "fa-building",
   "author": "Matt Reicher",
   "date": "January 2, 2026",
@@ -47,7 +47,7 @@ const blogArticles = [
   "date": "December 20, 2025",
   "image": "https://www.mnthen.com/tour/NE/gallery/NE_johns_bar1.jpg",
   "url": "https://www.mnthen.com/blog/event/johnsbar.html",
-  "keywords": ["john's bar", "funhouse scandal", "mann act", "gawron brothers", "northeast minneapolis", "prostitution scandal", "tony jaros", "river garden", "1950s crime", "event", "all"]
+  "keywords": ["john's bar", "funhouse scandal", "mann act", "gawron brothers", "northeast minneapolis", "prostitution scandal", "tony jaros", "river garden", "1950s", "event", "all"]
 },
   {
   "headline": "Life and Death of Daniel 'Dapper Dan' Hogan (1880–1928)",
