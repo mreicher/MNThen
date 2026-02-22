@@ -4418,15 +4418,18 @@ async function updateUserLocation(position, forceUpdate = false) {
         speedMPS: Math.max(0, speedMPS)
     };
 
-    // SPEED CALCULATION (DUAL EMA)
+// SPEED CALCULATION
+    // _emaSpeedMode: used exclusively for roaming/centered mode switching.
+    window._emaSpeedMode = window._emaSpeedMode ?? newPosition.speedMPS;
+    window._emaSpeedMode = 0.50 * newPosition.speedMPS + 0.50 * window._emaSpeedMode;
+
+    // _emaSpeedFast: used for zoom and pan responsiveness.
+    // alpha=0.60 stays as-is — correct for its purpose.
     window._emaSpeedFast = window._emaSpeedFast ?? newPosition.speedMPS;
-    window._emaSpeedFast = 0.90 * newPosition.speedMPS + 0.10 * window._emaSpeedFast;
+    window._emaSpeedFast = 0.60 * newPosition.speedMPS + 0.40 * window._emaSpeedFast;
 
-    window._emaSpeedSlow = window._emaSpeedSlow ?? newPosition.speedMPS;
-    window._emaSpeedSlow = 0.35 * newPosition.speedMPS + 0.65 * window._emaSpeedSlow;
-
-    const modeSpeedMPH = Math.min(window._emaSpeedFast * 2.23694, 90);
-    const speedMPH = Math.min(window._emaSpeedSlow * 2.23694, 90);
+    const modeSpeedMPH = Math.min(window._emaSpeedMode * 2.23694, 90);
+    const speedMPH     = Math.min(window._emaSpeedFast * 2.23694, 90);
 
     // MODE MANAGER UPDATE
     const modeChanged = ModeManager?.update?.(modeSpeedMPH) || false;
@@ -5662,7 +5665,6 @@ function _handleLargeDistanceJump(newPosition, currentTime) {
 }
 
 function _confirmStationary(newPosition, currentTime) {
-    // Fix #3: Fire proximity check before locking stationary state
     if (typeof handleProximityAndAutoOpen === 'function' && 
         window.lastClosestLocation && 
         window.lastClosestDistance !== undefined) {
@@ -5676,9 +5678,22 @@ function _confirmStationary(newPosition, currentTime) {
 
     window.isStationary = true;
     window.stationaryLockPosition = { lat: newPosition.lat, lng: newPosition.lng };
+    
+    // Cancel any pending RAF marker updates before setting final position
+    if (window._markerRAFPending) {
+        cancelAnimationFrame(window._markerRAFPending);
+        window._markerRAFPending = null;
+    }
+    if (window._markerFallbackTimer) {
+        clearTimeout(window._markerFallbackTimer);
+        window._markerFallbackTimer = null;
+    }
+    window._pendingMarkerUpdate = null;
+    
     const currentLatLng = userMarker.getLatLng();
     const targetLatLng = L.latLng(newPosition.lat, newPosition.lng);
     const finalDistance = currentLatLng.distanceTo(targetLatLng);
+    
     if (finalDistance > 0.5) {
         userMarker.setLatLng([newPosition.lat, newPosition.lng], {
             animate: true,
@@ -5688,6 +5703,7 @@ function _confirmStationary(newPosition, currentTime) {
     } else {
         userMarker.setLatLng([newPosition.lat, newPosition.lng]);
     }
+    
     window.lastPosition = newPosition;
     window.positionBuffer = [newPosition];
     window.lastUpdateTime = currentTime;
@@ -7868,27 +7884,27 @@ document.addEventListener('DOMContentLoaded', () => {
 });
         
 function showLocationHunt(location) {
+    // Guard against re-entry before any async or DOM work begins.
+    if (window.isLocationHuntVisible) return;
+
     const now = Date.now();
-    const isTouchDevice = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
-    
-    // Define debounce time with fallback
     const DEBOUNCE_TIME = (typeof CONFIG !== 'undefined' && CONFIG.DEBOUNCE_TIME) ? CONFIG.DEBOUNCE_TIME : 300;
-    
-    // Initialize lastFunctionCall if it doesn't exist
+
     if (typeof window.lastFunctionCall === 'undefined') {
         window.lastFunctionCall = 0;
     }
-    
-    // Debounce check
+
     if (now - window.lastFunctionCall < DEBOUNCE_TIME) {
         return;
     }
     window.lastFunctionCall = now;
 
-    // Set location state
-    window.lastVisitedLocationId = location.id;
+    // Set ALL gate flags synchronously before any DOM changes so every
+    // subsequent GPS tick sees the closed state immediately.
     window.isLocationHuntVisible = true;
-    window.isMapInteracting = true;
+    window.lastVisitedLocationId = location.id;
+    lastVisitedLocationId        = location.id;
+    window.isMapInteracting      = true;
     
     // Get or create container
     const lochuntContainer = cachedElements.lochuntContainer || document.querySelector('.lochunt-container');
@@ -8787,65 +8803,74 @@ function showAdditionalInfo() {
 
 function handleContinueClick() {
     const FADE_DURATION_MS = 300;
-    
-    // Set cooldown FIRST
-    if (window.cooldownManager && lastVisitedLocationId != null) {
-        window.cooldownManager.leaveLocation(lastVisitedLocationId);
-    }
-    
-    // Reset location hunt state
-    isLocationHuntVisible = false;
-    
-    // Clear stationary state
-    clearStationaryState();
-    
-    // **COMPREHENSIVE STATE RESET**
-    window.zoomedInState = false;
-    window.isNearLocation = false;
-    window.blockSpeedZoom = false;
-    window.currentProximityLocationId = null;
-    
-    // Set cooldown for the specific location we're leaving
-    const now = Date.now();
-    window.lastProximityZoomOutTime = now;
-    window.lastProximityZoomOutLocationId = lastVisitedLocationId; 
-    window.lastProximityZoomInTime = now - 2000;
-    window.lastProximityZoomTime = now;
-    window._didPrefetch19 = false;
-    
-    // Release any active zoom control
-    if (window.zoomController) {
-        const currentSource = window.zoomController.getState()?.source;
-        if (currentSource) {
-            window.zoomController.release(currentSource);
-        }
+
+    if (window._continueClickInProgress) return;
+    window._continueClickInProgress = true;
+
+    // leaveLocation() must fire first so cooldownManager's currentLocationId
+    // is cleared before anything else reads or writes proximity state.
+    const departingId = window.lastVisitedLocationId ?? lastVisitedLocationId ?? null;
+    if (window.cooldownManager && departingId != null) {
+        window.cooldownManager.leaveLocation(departingId);
     }
 
-    _resetProximityZoom('modal_closed');
-    
-    // Center on user (keep current zoom)
+    // Set this synchronously so _handleTriggerZone's re-entry guard fires
+    // immediately on the next GPS update, before the fade animation completes.
+    window.isLocationHuntVisible = false;
+    isLocationHuntVisible = false;
+
+    if (window.zoomController) {
+        const activeSource = window.zoomController.getState()?.source;
+        if (activeSource) window.zoomController.release(activeSource);
+    }
+
+    // Null out _pzState entirely so the next approach to ANY location — including
+    // the same one — is treated as a completely fresh entry. This is the fix for
+    // proximity zoom never resetting between visits.
+    window._pzState                          = null;
+    window._prefetchState                    = null;
+    window._lastProximityTriggerByLocation   = {};
+    window.preloadedLocation                 = null;
+    window.proximityState                    = null;
+    window.lastClosestDistance               = undefined;
+    window.lastClosestLocation               = null;
+
+    window.zoomedInState                     = false;
+    window.isNearLocation                    = false;
+    window.blockSpeedZoom                    = false;
+    window.currentProximityLocationId        = null;
+    window._didPrefetch19                    = false;
+
+    // Do this after zoom flags so any pending stationary proximity check
+    // doesn't fire against the wiped state.
+    clearStationaryState();
+
+    window.isMapInteracting = false;
+    window.followUser       = true;
+
     if (map && window.lastPosition) {
-        window.isMapInteracting = false;
-        window.followUser = true;
+        // Brief block prevents the restored GPS feed from fighting the
+        // return-to-user pan during the animation window.
         window._blockAutoMapUpdates = true;
-        
+
         map.setView(
-            [window.lastPosition.lat, window.lastPosition.lng], 
+            [window.lastPosition.lat, window.lastPosition.lng],
             map.getZoom(),
-            {
-                animate: true,
-                duration: 0.6,
-                easeLinearity: 0.18
-            }
+            { animate: true, duration: 0.6, easeLinearity: 0.18 }
         );
-        
+
         setTimeout(() => {
             window._blockAutoMapUpdates = false;
         }, 800);
     }
-    
+
     ensureGPSActive();
-    closeModalWithAnimation(FADE_DURATION_MS);
+
+    // Release the re-entry guard after the full animation cycle so a rapid
+    // double-tap can't queue a second close while the first is still fading.
+    closeModalWithAnimation(FADE_DURATION_MS, () => {
+        window._continueClickInProgress = false;
+    });
 }
 
 function clearStationaryState() {
@@ -8887,29 +8912,31 @@ function ensureGPSActive() {
     }
 }
 
-function closeModalWithAnimation(fadeDuration) {
-    const additionalInfoContainer = cachedElements.additionalInfoContainer || 
+function closeModalWithAnimation(fadeDuration, onComplete) {
+    const additionalInfoContainer =
+        cachedElements.additionalInfoContainer ??
         document.querySelector('.additional-info-container');
-    const lochuntContainer = cachedElements.lochuntContainer || 
+    const lochuntContainer =
+        cachedElements.lochuntContainer ??
         document.querySelector('.lochunt-container');
 
-    // Fade out additional info
     additionalInfoContainer.classList.add('fade-out');
-    
+
     setTimeout(() => {
         additionalInfoContainer.style.display = 'none';
         additionalInfoContainer.classList.remove('fade-out', 'fade-in');
 
-        // Fade out location hunt container
         lochuntContainer.classList.add('fade-out');
-        
+
         setTimeout(() => {
             lochuntContainer.style.display = 'none';
             lochuntContainer.classList.remove('fade-out');
-            
-            // Cleanup and restore tracking AFTER animations complete
+
             finalizeModalClose();
-            
+
+            // Fire the completion callback (releases re-entry guard, etc.)
+            if (typeof onComplete === 'function') onComplete();
+
         }, fadeDuration);
     }, fadeDuration);
 }
