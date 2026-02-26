@@ -3947,380 +3947,454 @@ function _handleInactivityReset() {
     window.inactivityTimer = null;
 }
 
-/* Proximity Detection & Auto-Open System */
-function handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, closestDistance) {
-    // === GUARD: Invalid data ===
-    if (!closestLocation?.id || closestDistance === Infinity || !isFinite(closestDistance)) {
-        // Clear proximity state
-        window.proximityState = {
-            closestLocation: null,
-            distanceMeters: Infinity,
-            isOnCooldown: false,
-            lastUpdateTime: currentTime
-        };
-        
-        // Reset zoom state if we had a previous location
-        if (window._pzState?.locationId) {
-            _resetProximityZoom('invalid_data');
-        }
-        return;
+(function() {
+  'use strict';
+
+  // CONFIGURATION
+  const CONFIG = {
+    PREFETCH_DISTANCE: 80,        // Start prefetch at this distance (feet)
+    TRIGGER_DISTANCE: 20,         // Auto-open at this distance (feet)
+    TRIGGER_DEBOUNCE_MS: 800,     // Default debounce for auto-open
+    TRIGGER_DEBOUNCE_RUN_MS: 2000, // Debounce when running/cycling
+    RUN_SPEED_FPS: 8,             // Threshold between walking and running
+    CACHE_CLEAR_DIST: 120,        // Clear cache when this far (feet)
+    CACHE_RESTORE_DIST: 100,      // Re-enable cache when this close (feet)
+    TILE_PREFETCH_ZOOM: 19,       // Zoom level for tile prefetch
+    TILE_GRID_SIZE: 3,            // 3x3 grid of tiles
+    TILE_STAGGER_MS: 50,          // Delay between tile requests
+    DEBUG: false
+  };
+
+  // STATE
+  const state = {
+    prefetchState: {},            // Per-location prefetch tracking
+    lastTriggerByLocation: {},    // Per-location debounce timestamps
+    markerUpdatePending: null,
+    markerRAFId: null,
+    markerFallbackId: null
+  };
+
+
+  // PRIVATE UTILITIES
+  function _debug(...args) {
+    if (CONFIG.DEBUG) {
+      console.log('[Proximity]', ...args);
     }
+  }
 
-    // === Distance tracking ===
-    window.lastClosestDistance = closestDistance;
-    window.lastClosestLocation = closestLocation;
-    
-    const distanceFeet = closestDistance * 3.28084;
-    const PROXIMITY_THRESHOLD = CONFIG?.DISTANCE_THRESHOLD || 20;
+  function _meters2Feet(meters) {
+    return meters * 3.28084;
+  }
 
-    // === CACHE MANAGEMENT: Preload cleanup ===
-    const CACHE_CLEAR_DIST = 120;
-    const CACHE_RESTORE_DIST = 100;
-    
+  function _isValidLocation(location) {
+    return location && typeof location.id !== 'undefined' && 
+           isFinite(location.lat) && isFinite(location.lng);
+  }
+
+  function _isValidDistance(distance) {
+    return isFinite(distance) && distance !== Infinity;
+  }
+
+  function _isLocationHuntOpen() {
+    try {
+      const container = document.querySelector('.lochunt-container');
+      return container && container.style.display !== 'none';
+    } catch (error) {
+      return false;
+    }
+  }
+
+  // CACHE MANAGEMENT
+  function _handleCacheManagement(distanceFeet) {
+    const CACHE_CLEAR_DIST = CONFIG.CACHE_CLEAR_DIST;
+    const CACHE_RESTORE_DIST = CONFIG.CACHE_RESTORE_DIST;
+
     if (distanceFeet > CACHE_CLEAR_DIST) {
-        if (window.preloadedLocation) {
-            console.debug('[Proximity] Clearing preload cache:', distanceFeet.toFixed(1) + 'ft');
-            window.preloadedLocation = null;
-        }
-        window._prefetchState = null; // Full reset when far away
+      if (window.preloadedLocation) {
+        _debug('Clearing preload cache');
+        window.preloadedLocation = null;
+      }
+      state.prefetchState = {};
     } else if (distanceFeet < CACHE_RESTORE_DIST && !window.preloadedLocation) {
-        window._needsPreload = true;
+      state.markerUpdatePending = { needsPreload: true };
+    }
+  }
+
+  // COOLDOWN MANAGEMENT
+  function _checkCooldown(locationId) {
+    if (!window.cooldownManager?.checkCooldown) {
+      return false;
     }
 
-    // === COOLDOWN CHECK ===
-    let isOnCooldown = false;
-    
-    if (window.cooldownManager?.checkCooldown) {
-        try {
-            const status = window.cooldownManager.checkCooldown(closestLocation.id);
-            isOnCooldown = status.isOnCooldown || false;
-        } catch (err) {
-            console.warn('[Proximity] Cooldown check failed:', err);
+    try {
+      const status = window.cooldownManager.checkCooldown(locationId);
+      return status?.isOnCooldown || false;
+    } catch (error) {
+      console.warn('[Proximity] Cooldown check failed:', error);
+      return false;
+    }
+  }
+
+  // PREFETCH ZONE
+  function _prefetchLocationData(location) {
+    if (typeof window.preloadLocationData !== 'function') {
+      _debug('preloadLocationData not available');
+      return;
+    }
+
+    try {
+      window.preloadLocationData(location);
+    } catch (error) {
+      console.warn('[Prefetch] Data preload failed:', error);
+    }
+  }
+
+  function _prefetchMapTiles(location) {
+    if (!window.map?.getCenter || !window.map?.getZoom) {
+      _debug('Map not ready for tile prefetch');
+      return;
+    }
+
+    try {
+      const currentZoom = window.map.getZoom();
+      if (currentZoom >= CONFIG.TILE_PREFETCH_ZOOM) {
+        _debug('Zoom already high, skipping tile prefetch');
+        return;
+      }
+
+      const targetZoom = CONFIG.TILE_PREFETCH_ZOOM;
+      const tileUrl = window.currentTileLayer?._url || 
+        'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
+
+      // Calculate tile coordinates
+      const lat = location.lat;
+      const lng = location.lng;
+      const latRad = lat * Math.PI / 180;
+      const n = Math.pow(2, targetZoom);
+      const x = Math.floor((lng + 180) / 360 * n);
+      const y = Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n);
+
+      const subdomains = ['a', 'b', 'c'];
+      const urls = [];
+
+      // Build 3x3 grid
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          const tx = x + dx;
+          const ty = y + dy;
+          if (tx < 0 || tx >= n || ty < 0 || ty >= n) continue;
+
+          const s = subdomains[(tx + ty) % 3];
+          urls.push(tileUrl
+            .replace('{z}', targetZoom)
+            .replace('{x}', tx)
+            .replace('{y}', ty)
+            .replace('{s}', s));
         }
+      }
+
+      // Staggered load
+      urls.forEach((url, i) => {
+        setTimeout(() => {
+          const img = new Image();
+          img.src = url;
+        }, i * CONFIG.TILE_STAGGER_MS);
+      });
+
+      _debug(`Prefetched ${urls.length} tiles for ${location.name || location.id}`);
+    } catch (error) {
+      console.warn('[Prefetch] Tile prefetch failed:', error);
     }
+  }
 
-    // === Update global proximity state ===
-    window.proximityState = {
-        closestLocation: closestLocation,
-        distanceMeters: closestDistance,
-        isOnCooldown: isOnCooldown,
-        lastUpdateTime: currentTime
-    };
-
-    // === ZONE LOGIC ===
-    const PREFETCH_DISTANCE = 80;
-    const TRIGGER_DISTANCE = PROXIMITY_THRESHOLD;
-
-    // Zone 1: Prefetch (80ft - 20ft)
-    if (distanceFeet <= PREFETCH_DISTANCE && distanceFeet > TRIGGER_DISTANCE) {
-        _handlePrefetchZone(closestLocation, distanceFeet, currentTime);
-        return;
-    }
-
-    // Zone 2: Trigger (≤ 20ft)
-    if (distanceFeet <= TRIGGER_DISTANCE) {
-        _handleTriggerZone(closestLocation, distanceFeet, currentTime, isOnCooldown);
-        return;
-    }
-
-    // Outside all zones
-    console.debug('[Proximity] Outside zones:', distanceFeet.toFixed(1) + 'ft');
-}
-
-/* Preloads data and tiles before user arrives */
-function _handlePrefetchZone(location, distanceFeet, currentTime) {
+  function _handlePrefetchZone(location, distanceFeet, currentTime) {
     const locationId = location.id;
-    
-    // Initialize state storage
-    if (!window._prefetchState) window._prefetchState = {};
-    
-    // Skip if already completed this approach
-    const state = window._prefetchState[locationId];
-    if (state?.completed) return;
 
-    console.log(`[Prefetch] Entering zone: ${distanceFeet.toFixed(1)}ft from ${location.name || locationId}`);
+    // Initialize state for this location
+    if (!state.prefetchState[locationId]) {
+      state.prefetchState[locationId] = {
+        startTime: currentTime,
+        startDistance: distanceFeet,
+        dataDone: false,
+        tilesDone: false,
+        completed: false
+      };
 
-    // Initialize new state
-    if (!state) {
-        window._prefetchState[locationId] = {
-            startTime: currentTime,
-            startDistance: distanceFeet,
-            dataDone: false,
-            tilesDone: false,
-            completed: false
-        };
+      _debug(`Entering prefetch zone: ${distanceFeet.toFixed(1)}ft from ${location.name || locationId}`);
     }
 
-    const ps = window._prefetchState[locationId];
+    const ps = state.prefetchState[locationId];
 
     // Data preload (once per approach)
     if (!ps.dataDone) {
-        if (!window.preloadedLocation || window.preloadedLocation.id !== locationId) {
-            window.preloadedLocation = location;
-            
-            if (typeof preloadLocationData === 'function') {
-                try {
-                    preloadLocationData(location);
-                    ps.dataDone = true;
-                } catch (err) {
-                    console.warn('[Prefetch] Data preload failed:', err);
-                    ps.dataDone = true; // Don't retry
-                }
-            } else {
-                ps.dataDone = true;
-            }
-        } else {
-            ps.dataDone = true;
-        }
+      if (!window.preloadedLocation || window.preloadedLocation.id !== locationId) {
+        window.preloadedLocation = location;
+        _prefetchLocationData(location);
+      }
+      ps.dataDone = true;
     }
 
     // Tile prefetch at 50ft or closer
     if (distanceFeet <= 50 && !ps.tilesDone) {
-        _prefetchMapTiles(location, currentTime);
-        ps.tilesDone = true;
+      _prefetchMapTiles(location);
+      ps.tilesDone = true;
     }
 
-    // Mark complete
+    // Mark complete when both done
     if (ps.dataDone && ps.tilesDone) {
-        ps.completed = true;
-        console.debug('[Prefetch] Completed for', locationId);
+      ps.completed = true;
+      _debug(`Prefetch completed for ${locationId}`);
     }
-}
+  }
 
-/* Auto-opens location with debouncing and cooldown checks */
-function _handleTriggerZone(location, distanceFeet, currentTime, isOnCooldown) {
+  // DEBOUNCE CALCULATION
+  function _calculateDebounceMs(locationId, distanceFeet) {
+    const approach = state.prefetchState[locationId];
+
+    // No movement data, use default
+    if (!approach || !approach.startTime || approach.startDistance === distanceFeet) {
+      return CONFIG.TRIGGER_DEBOUNCE_MS;
+    }
+
+    const traveled = approach.startDistance - distanceFeet;
+    const elapsed = performance.now() - (approach.startTime || 0);
+
+    if (elapsed <= 0 || traveled <= 0) {
+      return CONFIG.TRIGGER_DEBOUNCE_MS;
+    }
+
+    // Speed in feet per second
+    const speedFps = traveled / (elapsed / 1000);
+
+    // Running/cycling detection
+    if (speedFps > CONFIG.RUN_SPEED_FPS) {
+      return CONFIG.TRIGGER_DEBOUNCE_RUN_MS;
+    }
+
+    return CONFIG.TRIGGER_DEBOUNCE_MS;
+  }
+
+  // TRIGGER ZONE
+  function _handleTriggerZone(location, distanceFeet, currentTime, isOnCooldown) {
     const locationId = location.id;
 
-    console.log(`[Trigger] Within ${distanceFeet.toFixed(1)}ft of ${location.name || locationId}`);
+    _debug(`Within trigger zone: ${distanceFeet.toFixed(1)}ft from ${location.name || locationId}`);
 
     // Guard: Location hunt already open
-    const lochuntContainer = document.querySelector('.lochunt-container');
-    const huntOpen = lochuntContainer && lochuntContainer.style.display !== 'none';
-    if (huntOpen) {
-        console.log('[Trigger] Skipped: location page already open');
-        return;
+    if (_isLocationHuntOpen()) {
+      _debug('Location page already open, skipping trigger');
+      return;
     }
 
-    // Guard: Cooldown check happens BEFORE debounce so we never waste
-    // a debounce slot on a location the user can't open anyway
+    // Guard: On cooldown
     if (isOnCooldown) {
-        console.log('[Trigger] Skipped: location on cooldown');
-        return;
+      _debug('Location on cooldown, skipping trigger');
+      return;
     }
 
-    // Debounce tracking — keyed by location so different locations
-    // don't share a single timestamp
-    if (!window._lastProximityTriggerByLocation) {
-        window._lastProximityTriggerByLocation = {};
-    }
-
+    // Debounce check
     const now = performance.now();
-    const lastTrigger = window._lastProximityTriggerByLocation[locationId] || 0;
+    const lastTrigger = state.lastTriggerByLocation[locationId] || 0;
+    const debounceMs = _calculateDebounceMs(locationId, distanceFeet);
     const timeSince = now - lastTrigger;
 
-    let debounceMs = 800; // default — covers normal walk-up re-entry
-
-    const approach = window._prefetchState?.[locationId];
-    if (approach?.startTime && approach.startDistance > distanceFeet) {
-        const elapsed  = currentTime - approach.startTime;           // ms
-        const traveled = approach.startDistance - distanceFeet;      // feet
-
-        if (elapsed > 0 && traveled > 0) {
-            const speedFps = traveled / (elapsed / 1000);
-
-            if (speedFps > 8) {
-                // Running / cycling — give a longer gap so we don't fire
-                // the instant a cyclist clips the boundary
-                debounceMs = 2000;
-            } else {
-                // Walking (any pace) → short, predictable debounce
-                // Old code: up to 10 000 ms for slow walk. New: max 800 ms.
-                debounceMs = 800;
-            }
-        }
-    }
-
     if (timeSince < debounceMs) {
-        console.log(`[Trigger] Debounced: ${(timeSince / 1000).toFixed(1)}s ago, ` +
-                    `need ${(debounceMs / 1000).toFixed(1)}s`);
-        return;
+      _debug(`Debounced: ${(timeSince / 1000).toFixed(1)}s ago, need ${(debounceMs / 1000).toFixed(1)}s`);
+      return;
     }
 
-    // If we reach here, we have a valid, unthrottled trigger.
-    console.log('[Trigger] 🎯 Opening location...');
+    // Stamp trigger BEFORE calling showLocationHunt to prevent re-entrant calls
+    state.lastTriggerByLocation[locationId] = now;
 
-    // Ensure location data is available — preload should have run
-    // already in the prefetch zone, but guard against the case where
-    // the user walked in without passing through prefetch range
+    // Ensure data is preloaded
     if (!window.preloadedLocation || window.preloadedLocation.id !== locationId) {
-        console.warn('[Trigger] Prefetch was skipped — emergency preload');
-        window.preloadedLocation = location;
-        if (typeof preloadLocationData === 'function') {
-            try { preloadLocationData(location); } catch (e) {
-                console.warn('[Trigger] preloadLocationData threw:', e);
-            }
-        }
+      _debug('Emergency preload (skipped prefetch zone)');
+      window.preloadedLocation = location;
+      _prefetchLocationData(location);
     }
 
-    // Haptic feedback (best-effort)
-    try { navigator.vibrate?.([80, 40, 80]); } catch (_) {}
-
-    // Stamp the trigger time BEFORE calling showLocationHunt so that any
-    // re-entrant call (e.g. from the cooldown manager patch) is also blocked
-    window._lastProximityTriggerByLocation[locationId] = now;
+    // Haptic feedback
+    try {
+      navigator.vibrate?.([80, 40, 80]);
+    } catch (_) {
+      // Ignore
+    }
 
     const target = window.preloadedLocation || location;
 
-    if (typeof showLocationHunt !== 'function') {
-        console.error('[Trigger] showLocationHunt is not defined');
-        return;
+    if (typeof window.showLocationHunt !== 'function') {
+      console.error('[Proximity] showLocationHunt is not defined');
+      state.lastTriggerByLocation[locationId] = 0; // Reset on error
+      return;
     }
 
     try {
-        showLocationHunt(target);
+      _debug('🎯 Opening location');
+      window.showLocationHunt(target);
 
-        // Cleanup prefetch state for this location only
-        window.preloadedLocation = null;
-        if (window._prefetchState) {
-            delete window._prefetchState[locationId];
-        }
+      // Cleanup
+      window.preloadedLocation = null;
+      delete state.prefetchState[locationId];
 
-        console.log('[Trigger] ✅ Opened successfully');
-    } catch (err) {
-        console.error('[Trigger] showLocationHunt threw an error:', err);
-
-        // Roll back the trigger timestamp so the user can retry
-        // without waiting for the debounce to expire
-        delete window._lastProximityTriggerByLocation[locationId];
+      _debug('✅ Opened successfully');
+    } catch (error) {
+      console.error('[Proximity] showLocationHunt threw error:', error);
+      // Reset on error so user can retry
+      delete state.lastTriggerByLocation[locationId];
     }
-}
+  }
 
-/* Tile Prefetch Utility */
-function _prefetchMapTiles(location, currentTime) {
-    const key = `_prefetchedTiles_${location.id}`;
-    
-    // Skip if already done
-    if (window[key]) {
-        console.debug('[Tiles] Already prefetched for', location.id);
-        return;
+
+  // MARKER UPDATE SCHEDULING
+  function _cancelMarkerUpdate() {
+    if (state.markerRAFId) {
+      cancelAnimationFrame(state.markerRAFId);
+      state.markerRAFId = null;
     }
-
-    if (!window.map?.getCenter || !window.map?.getZoom) {
-        console.warn('[Tiles] Map not ready');
-        return;
+    if (state.markerFallbackId) {
+      clearTimeout(state.markerFallbackId);
+      state.markerFallbackId = null;
     }
+  }
 
-    try {
-        const currentZoom = window.map.getZoom();
-        if (currentZoom >= 18) {
-            window[key] = true; // Mark to prevent retry
-            return;
-        }
-
-        const targetZoom = 19;
-        const tileUrl = window.currentTileLayer?._url || 
-            'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
-
-        // Use location coordinates for accuracy
-        const lat = location.lat;
-        const lng = location.lng;
-        
-        const latRad = lat * Math.PI / 180;
-        const n = Math.pow(2, targetZoom);
-        const x = Math.floor((lng + 180) / 360 * n);
-        const y = Math.floor((1 - Math.log(Math.tan(latRad) + 1/Math.cos(latRad)) / Math.PI) / 2 * n);
-
-        const subdomains = ['a', 'b', 'c'];
-        const urls = [];
-
-        // 3x3 grid
-        for (let dx = -1; dx <= 1; dx++) {
-            for (let dy = -1; dy <= 1; dy++) {
-                const tx = x + dx;
-                const ty = y + dy;
-                if (tx < 0 || tx >= n || ty < 0 || ty >= n) continue;
-                
-                const s = subdomains[(tx + ty) % 3];
-                urls.push(tileUrl
-                    .replace('{z}', targetZoom)
-                    .replace('{x}', tx)
-                    .replace('{y}', ty)
-                    .replace('{s}', s));
-            }
-        }
-
-        // Staggered load
-        urls.forEach((url, i) => {
-            setTimeout(() => {
-                const img = new Image();
-                img.src = url;
-            }, i * 50);
-        });
-
-        window[key] = true;
-        console.log(`[Tiles] Prefetched ${urls.length} tiles for`, location.name || location.id);
-
-    } catch (err) {
-        console.warn('[Tiles] Prefetch failed:', err);
+  function _applyMarkerUpdate(lat, lng, opts) {
+    if (typeof window.userMarker?.setLatLng === 'function') {
+      try {
+        window.userMarker.setLatLng([lat, lng], opts);
+      } catch (error) {
+        console.warn('[Marker] Update failed:', error);
+      }
     }
-}
+  }
 
-/**
- * Cleanup marker styles
- */
-function _cleanupMarkerStyles() {
-    try {
-        const el = userMarker?.getElement?.();
-        if (el?.style) el.style.willChange = 'auto';
-    } catch (e) {}
-}
-
-/* Schedule marker update with RAF */
-function scheduleMarkerUpdate(lat, lng, options = {}) {
+  function _scheduleMarkerUpdate(lat, lng, options = {}) {
     const opts = {
-        animate: true,
-        duration: 0.12,
-        easeLinearity: 0.08,
-        ...options
+      animate: true,
+      duration: 0.12,
+      easeLinearity: 0.08,
+      ...options
     };
 
-    // Cancel pending update
-    if (window._markerRAFPending) {
-        cancelAnimationFrame(window._markerRAFPending);
-        window._markerRAFPending = null;
-    }
-    if (window._markerFallbackTimer) {
-        clearTimeout(window._markerFallbackTimer);
-        window._markerFallbackTimer = null;
-    }
+    _cancelMarkerUpdate();
 
-    // Schedule new update
-    window._pendingMarkerUpdate = { lat, lng, opts };
-    
-    window._markerRAFPending = requestAnimationFrame(() => {
-        if (window._pendingMarkerUpdate && userMarker) {
-            const { lat, lng, opts } = window._pendingMarkerUpdate;
-            userMarker.setLatLng([lat, lng], opts);
-        }
-        window._markerRAFPending = null;
-        window._pendingMarkerUpdate = null;
-        if (window._markerFallbackTimer) {
-            clearTimeout(window._markerFallbackTimer);
-            window._markerFallbackTimer = null;
-        }
+    state.markerUpdatePending = { lat, lng, opts };
+
+    state.markerRAFId = requestAnimationFrame(() => {
+      if (state.markerUpdatePending) {
+        const { lat, lng, opts } = state.markerUpdatePending;
+        _applyMarkerUpdate(lat, lng, opts);
+      }
+      state.markerRAFId = null;
+      state.markerUpdatePending = null;
     });
 
     // Fallback
-    window._markerFallbackTimer = setTimeout(() => {
-        if (window._pendingMarkerUpdate && userMarker) {
-            const { lat, lng, opts } = window._pendingMarkerUpdate;
-            userMarker.setLatLng([lat, lng], opts);
-        }
-        window._markerRAFPending = null;
-        window._pendingMarkerUpdate = null;
-        window._markerFallbackTimer = null;
+    state.markerFallbackId = setTimeout(() => {
+      if (state.markerUpdatePending) {
+        const { lat, lng, opts } = state.markerUpdatePending;
+        _applyMarkerUpdate(lat, lng, opts);
+      }
+      state.markerRAFId = null;
+      state.markerUpdatePending = null;
+      state.markerFallbackId = null;
     }, 100);
-}
+  }
+
+  function _cleanupMarkerStyles() {
+    try {
+      const el = window.userMarker?.getElement?.();
+      if (el?.style) {
+        el.style.willChange = 'auto';
+      }
+    } catch (_) {
+      // Ignore
+    }
+  }
+
+
+  // CLEANUP
+  function _cleanup() {
+    _cancelMarkerUpdate();
+    _cleanupMarkerStyles();
+    state.prefetchState = {};
+    state.lastTriggerByLocation = {};
+    state.markerUpdatePending = null;
+  }
+
+
+  // MAIN HANDLER
+  function handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, closestDistance) {
+    // Guard: Invalid data
+    if (!_isValidLocation(closestLocation) || !_isValidDistance(closestDistance)) {
+      window.proximityState = {
+        closestLocation: null,
+        distanceMeters: Infinity,
+        isOnCooldown: false,
+        lastUpdateTime: currentTime
+      };
+
+      if (state.prefetchState[closestLocation?.id]) {
+        delete state.prefetchState[closestLocation.id];
+      }
+
+      return;
+    }
+
+    // Cache tracking
+    window.lastClosestDistance = closestDistance;
+    window.lastClosestLocation = closestLocation;
+
+    const distanceFeet = _meters2Feet(closestDistance);
+    const isOnCooldown = _checkCooldown(closestLocation.id);
+
+    // Cache management
+    _handleCacheManagement(distanceFeet);
+
+    // Update global proximity state
+    window.proximityState = {
+      closestLocation: closestLocation,
+      distanceMeters: closestDistance,
+      isOnCooldown: isOnCooldown,
+      lastUpdateTime: currentTime
+    };
+
+    // Zone logic
+    const PREFETCH_DISTANCE = CONFIG.PREFETCH_DISTANCE;
+    const TRIGGER_DISTANCE = CONFIG.TRIGGER_DISTANCE;
+
+    // Zone 1: Prefetch (80ft - 20ft)
+    if (distanceFeet <= PREFETCH_DISTANCE && distanceFeet > TRIGGER_DISTANCE) {
+      _handlePrefetchZone(closestLocation, distanceFeet, currentTime);
+      return;
+    }
+
+    // Zone 2: Trigger (≤ 20ft)
+    if (distanceFeet <= TRIGGER_DISTANCE) {
+      _handleTriggerZone(closestLocation, distanceFeet, currentTime, isOnCooldown);
+      return;
+    }
+
+    // Outside all zones
+    _debug(`Outside zones: ${distanceFeet.toFixed(1)}ft`);
+  }
+
+
+  // INITIALIZATION & EXPORTS
+  if (typeof window !== 'undefined') {
+    window.handleProximityAndAutoOpen = handleProximityAndAutoOpen;
+    window.scheduleMarkerUpdate = _scheduleMarkerUpdate;
+
+    // Backwards compatibility aliases
+    window._handlePrefetchZone = _handlePrefetchZone;
+    window._handleTriggerZone = _handleTriggerZone;
+    window._prefetchMapTiles = _prefetchMapTiles;
+    window._cleanupMarkerStyles = _cleanupMarkerStyles;
+
+    // Cleanup on unload
+    window.addEventListener('beforeunload', _cleanup);
+  }
+
+})();
         
 // MAIN UPDATE LOOP
 async function updateUserLocation(position, forceUpdate = false) {
