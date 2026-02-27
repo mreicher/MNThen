@@ -5953,122 +5953,250 @@ function _clearProximityStateForLocation(locationId) {
     }
   }
 
-  // Main handler
-  function _handleProximityZoom(speedMPH, eastWestMovement) {
-    // Guard: Dependencies
-    if (!window.map || !window.zoomController) return;
+ (function () {
+    'use strict';
 
-    if (document.querySelector('.lochunt-container')?.style.display === 'flex') {
-      if (state.isZoomedIn) _resetProximityZoom('location_hunt_active');
-      return;
+    // ── CONFIG ────────────────────────────────────────────────────────────────
+    const PZ_CONFIG = {
+        SPEED_GATE_MPH:          14,
+        ZOOM_IN_THRESHOLD_FEET:  45,
+        ZOOM_OUT_THRESHOLD_FEET: 70,
+        ZOOM_IN_LEVEL:           19,
+        ZOOM_OUT_LEVEL:          17,
+        // DEBOUNCE_MS prevents re-triggering the same transition repeatedly.
+        // Keep at 1500 — it only guards the zoom-in and zoom-out actions,
+        // not the approach itself.
+        DEBOUNCE_MS:             1500,
+        // HYSTERESIS_MS was previously applied after EVERY reset including
+        // location changes, causing a mandatory 2s dead zone on every new POI.
+        // Now only applied after an actual zoom transition (in or out).
+        HYSTERESIS_MS:           2000,
+        // RATE_LIMIT_MS throttles the RAF-driven calls to ~6/sec. Fine.
+        RATE_LIMIT_MS:           150,
+        DEBUG:                   false,
+    };
+
+    // ── CLOSURE STATE ─────────────────────────────────────────────────────────
+    // Single source of truth. window.proximityLocationStates (outside this
+    // IIFE) was dead code — it was never read here. Removed.
+    const state = {
+        locationId:     null,
+        isZoomedIn:     false,
+        lastTransition: 0,   // time of last actual zoom-in or zoom-out
+        lastZoomIn:     0,
+        lastZoomOut:    0,
+        lastCheck:      0,
+    };
+
+    // ── ZOOM IN ───────────────────────────────────────────────────────────────
+    function _performProximityZoomIn(location, eastWestMovement, zoomLevel) {
+        if (!window.map?.flyTo || window.isMapInteracting) return;
+        try {
+            const userPos = window.userMarker?.getLatLng?.();
+            if (!userPos || !isFinite(userPos.lat) || !isFinite(userPos.lng)) return;
+
+            // Pan slightly toward the POI so both user dot and destination
+            // are visible at the zoomed-in level.
+            const target = {
+                lat: userPos.lat + (location.lat - userPos.lat) * 0.2,
+                lng: userPos.lng + (location.lng - userPos.lng) * 0.2,
+            };
+            if (!isFinite(target.lat) || !isFinite(target.lng)) return;
+
+            window.map.flyTo(target, zoomLevel, {
+                duration:      2.0,
+                easeLinearity: eastWestMovement ? 0.10 : 0.12,
+                noMoveStart:   true,
+            });
+        } catch (err) {
+            console.warn('[PZ] Zoom in failed:', err);
+        }
     }
 
-    // Guard: Rate limiting
-    const now = performance.now();
-    if (now - state.lastCheck < PZ_CONFIG.RATE_LIMIT_MS) return;
-    state.lastCheck = now;
+    // ── ZOOM OUT ──────────────────────────────────────────────────────────────
+    function _performProximityZoomOut(eastWestMovement, zoomLevel) {
+        if (!window.map?.flyTo || window.isMapInteracting) return;
+        try {
+            const currentZoom = window.map.getZoom?.();
+            if (!isFinite(currentZoom)) return;
+            // Don't animate if we're already at or near the target zoom.
+            if (Math.abs(currentZoom - zoomLevel) < 0.5) return;
 
-    // Guard: Speed gate
-    if (speedMPH >= PZ_CONFIG.SPEED_GATE_MPH) {
-      if (state.isZoomedIn) _resetProximityZoom('speed_gate');
-      return;
+            const center = window.map.getCenter?.();
+            if (!center || !isFinite(center.lat) || !isFinite(center.lng)) return;
+
+            window.map.flyTo(center, zoomLevel, {
+                duration:      1.4,
+                easeLinearity: eastWestMovement ? 0.13 : 0.15,
+                noMoveStart:   true,
+            });
+        } catch (err) {
+            console.warn('[PZ] Zoom out failed:', err);
+        }
     }
 
-    // Guard: Location hunt
-    if (window.isLocationHuntVisible) {
-      if (state.isZoomedIn) _resetProximityZoom('location_hunt_active');
-      return;
+    // ── RESET ─────────────────────────────────────────────────────────────────
+    // Clears zoom lock and global flags. Does NOT reset lastTransition —
+    // callers that need hysteresis set it themselves after calling this.
+    function _resetProximityZoom(reason = 'unknown') {
+        try {
+            if (state.isZoomedIn && window.zoomController) {
+                try {
+                    const zoomState = window.zoomController.getState();
+                    if (zoomState?.source === 'proximity') {
+                        window.zoomController.release('proximity');
+                    }
+                } catch (_) {}
+            }
+
+            state.isZoomedIn = false;
+            // Note: locationId is intentionally NOT cleared here in the common
+            // path — see location-change handling below.
+            window.zoomedInState  = false;
+            window.isNearLocation = false;
+            window.blockSpeedZoom = false;
+
+            if (PZ_CONFIG.DEBUG) console.log(`[PZ] Reset: ${reason}`);
+        } catch (err) {
+            console.error('[PZ] Reset error:', err);
+            window.zoomedInState  = false;
+            window.isNearLocation = false;
+            window.blockSpeedZoom = false;
+        }
     }
 
-    // Get proximity data
-    const proximity = window.proximityState;
-    if (!proximity?.closestLocation || proximity.distanceMeters === Infinity) {
-      if (state.isZoomedIn || state.locationId) _resetProximityZoom('no_proximity_data');
-      return;
+    // ── MAIN HANDLER ──────────────────────────────────────────────────────────
+    function _handleProximityZoom(speedMPH, eastWestMovement) {
+        // Guard: dependencies
+        if (!window.map || !window.zoomController) return;
+
+        // Guard: location hunt UI is open — release zoom and do nothing
+        if (
+            document.querySelector('.lochunt-container')?.style.display === 'flex' ||
+            window.isLocationHuntVisible
+        ) {
+            if (state.isZoomedIn) {
+                _resetProximityZoom('location_hunt_active');
+                state.locationId = null;
+            }
+            return;
+        }
+
+        // Guard: rate limit — this runs every RAF frame; 150ms is ~6/sec
+        const now = performance.now();
+        if (now - state.lastCheck < PZ_CONFIG.RATE_LIMIT_MS) return;
+        state.lastCheck = now;
+
+        // Guard: speed gate
+        if (speedMPH >= PZ_CONFIG.SPEED_GATE_MPH) {
+            if (state.isZoomedIn) {
+                _resetProximityZoom('speed_gate');
+                state.locationId    = null;
+                state.lastTransition = now;
+            }
+            return;
+        }
+
+        // Guard: valid proximity data
+        // window.proximityState is written by handleProximityAndAutoOpen with
+        // shape { closestLocation, distanceMeters, isOnCooldown, lastUpdateTime }
+        const proximity = window.proximityState;
+        if (!proximity?.closestLocation || proximity.distanceMeters === Infinity) {
+            if (state.isZoomedIn || state.locationId) {
+                _resetProximityZoom('no_proximity_data');
+                state.locationId    = null;
+                state.lastTransition = now;
+            }
+            return;
+        }
+
+        const location    = proximity.closestLocation;
+        const distanceFeet = proximity.distanceMeters * 3.28084;
+        const locationId  = String(
+            location.id ?? `${location.lat.toFixed(6)},${location.lng.toFixed(6)}`
+        );
+
+        // ── LOCATION CHANGE ───────────────────────────────────────────────────
+        // Previous code: reset → null locationId → return. Next call would set
+        // locationId then immediately hit HYSTERESIS_MS. Result: 2s dead zone
+        // on every POI approach.
+        //
+        // Fix: set the new locationId BEFORE returning so the very next call
+        // skips this branch and proceeds to zoom-in evaluation. Hysteresis is
+        // set so we don't snap to a new POI instantly if the user is between two.
+        if (state.locationId && state.locationId !== locationId) {
+            if (PZ_CONFIG.DEBUG) console.log(`[PZ] Location changed: ${state.locationId} → ${locationId}`);
+            _resetProximityZoom('location_change');
+            state.locationId     = locationId; // ← set new id now, not next call
+            state.lastTransition = now;
+            return;
+        }
+
+        if (!state.locationId) state.locationId = locationId;
+
+        // ── HYSTERESIS ────────────────────────────────────────────────────────
+        // Only applied after an actual zoom transition, not after an init or
+        // location change that didn't zoom. Previously this blocked first
+        // approach if called right after any reset.
+        if (state.lastTransition > 0 && (now - state.lastTransition) < PZ_CONFIG.HYSTERESIS_MS) return;
+
+        // ── ZOOM IN ───────────────────────────────────────────────────────────
+        if (!state.isZoomedIn && distanceFeet <= PZ_CONFIG.ZOOM_IN_THRESHOLD_FEET) {
+            if (now - state.lastZoomIn < PZ_CONFIG.DEBOUNCE_MS) return;
+
+            const zoomState = window.zoomController.getState();
+            if (zoomState?.source && zoomState.source !== 'proximity' && zoomState.source !== 'speed') return;
+
+            const granted = window.zoomController.request('proximity', PZ_CONFIG.ZOOM_IN_LEVEL, 3);
+            if (!granted) return;
+
+            state.isZoomedIn     = true;
+            state.lastZoomIn     = now;
+            state.lastTransition = now; // arm hysteresis for zoom-out
+            window.zoomedInState  = true;
+            window.isNearLocation = true;
+            window.blockSpeedZoom = true;
+
+            if (PZ_CONFIG.DEBUG) console.log(`[PZ] Zoom IN: ${locationId} (${Math.round(distanceFeet)}ft)`);
+            _performProximityZoomIn(location, eastWestMovement, PZ_CONFIG.ZOOM_IN_LEVEL);
+            return;
+        }
+
+        // ── ZOOM OUT ──────────────────────────────────────────────────────────
+        if (state.isZoomedIn && distanceFeet >= PZ_CONFIG.ZOOM_OUT_THRESHOLD_FEET) {
+            if (now - state.lastZoomOut < PZ_CONFIG.DEBOUNCE_MS) return;
+
+            const zoomState = window.zoomController.getState();
+
+            // Original code: if source !== 'proximity', clear flags and return
+            // WITHOUT calling _performProximityZoomOut. Map stayed zoomed in.
+            // Fix: always animate out, then release if we own it.
+            if (zoomState?.source === 'proximity') {
+                window.zoomController.release('proximity');
+            }
+
+            state.isZoomedIn     = false;
+            state.locationId     = null; // ready for next approach
+            state.lastZoomOut    = now;
+            state.lastTransition = now; // arm hysteresis for re-entry
+            window.zoomedInState  = false;
+            window.isNearLocation = false;
+            window.blockSpeedZoom = false;
+
+            if (PZ_CONFIG.DEBUG) console.log(`[PZ] Zoom OUT: ${locationId} (${Math.round(distanceFeet)}ft)`);
+            _performProximityZoomOut(eastWestMovement, PZ_CONFIG.ZOOM_OUT_LEVEL);
+        }
     }
 
-    const location = proximity.closestLocation;
-    const distanceFeet = proximity.distanceMeters * 3.28084;
-    const locationId = String(location.id || `${location.lat.toFixed(6)},${location.lng.toFixed(6)}`);
+    // ── EXPORTS ───────────────────────────────────────────────────────────────
+    if (typeof window !== 'undefined') {
+        window._handleProximityZoom      = _handleProximityZoom;
+        window._resetProximityZoom       = _resetProximityZoom;
+        window._performProximityZoomIn   = _performProximityZoomIn;
+        window._performProximityZoomOut  = _performProximityZoomOut;
 
-    // Handle location change
-    if (state.locationId && state.locationId !== locationId) {
-      if (PZ_CONFIG.DEBUG) console.log(`[PZ] Location changed: ${state.locationId} → ${locationId}`);
-      _resetProximityZoom('location_change');
-      state.locationId = locationId;
-      state.lastTransition = now;
-      return;
+        window.addEventListener('beforeunload', () => _resetProximityZoom('unload'));
     }
-
-    if (!state.locationId) state.locationId = locationId;
-
-    // Guard: Hysteresis
-    if (now - state.lastTransition < PZ_CONFIG.HYSTERESIS_MS) return;
-
-    // ZOOM IN
-    if (!state.isZoomedIn && distanceFeet <= PZ_CONFIG.ZOOM_IN_THRESHOLD_FEET) {
-      if (now - state.lastZoomIn < PZ_CONFIG.DEBOUNCE_MS) return;
-
-      const zoomState = window.zoomController.getState();
-      if (zoomState?.source && zoomState.source !== 'proximity' && zoomState.source !== 'speed') return;
-
-      const granted = window.zoomController.request('proximity', PZ_CONFIG.ZOOM_IN_LEVEL, 3);
-      if (!granted) return;
-
-      state.isZoomedIn = true;
-      state.lastZoomIn = now;
-      state.lastTransition = now;
-      window.zoomedInState = true;
-      window.isNearLocation = true;
-      window.blockSpeedZoom = true;
-
-      if (PZ_CONFIG.DEBUG) console.log(`[PZ] Zoom IN: ${locationId} (${Math.round(distanceFeet)}ft)`);
-
-      _performProximityZoomIn(location, eastWestMovement, PZ_CONFIG.ZOOM_IN_LEVEL);
-      return;
-    }
-
-    // ZOOM OUT
-    if (state.isZoomedIn && distanceFeet >= PZ_CONFIG.ZOOM_OUT_THRESHOLD_FEET) {
-      if (now - state.lastZoomOut < PZ_CONFIG.DEBOUNCE_MS) return;
-
-      const zoomState = window.zoomController.getState();
-      if (zoomState?.source !== 'proximity') {
-        state.isZoomedIn = false;
-        state.locationId = null;
-        window.zoomedInState = false;
-        window.isNearLocation = false;
-        window.blockSpeedZoom = false;
-        return;
-      }
-
-      window.zoomController.release('proximity');
-
-      state.isZoomedIn = false;
-      state.lastZoomOut = now;
-      state.lastTransition = now;
-      window.zoomedInState = false;
-      window.isNearLocation = false;
-      window.blockSpeedZoom = false;
-
-      if (PZ_CONFIG.DEBUG) console.log(`[PZ] Zoom OUT: ${locationId} (${Math.round(distanceFeet)}ft)`);
-
-      _performProximityZoomOut(eastWestMovement, PZ_CONFIG.ZOOM_OUT_LEVEL);
-    }
-  }
-
-  // Expose globally
-  if (typeof window !== 'undefined') {
-    window._handleProximityZoom = _handleProximityZoom;
-    window._resetProximityZoom = _resetProximityZoom;
-    window._performProximityZoomIn = _performProximityZoomIn;
-    window._performProximityZoomOut = _performProximityZoomOut;
-
-    window.addEventListener('beforeunload', () => {
-      _resetProximityZoom('unload');
-    });
-  }
-
 })();
         
 /* Returns true when the target position (usually the user) is within a speed-scaled margin of any viewport edge. */
