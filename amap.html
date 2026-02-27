@@ -4489,6 +4489,26 @@ if (!window._batteryPollerStarted) {
 }
 
 
+// ─── BATTERY POLLER ──────────────────────────────────────────────────────────
+// Moved off the hot path. The main loop reads window._batteryCache
+// synchronously — same globals as the original, same 60s schedule, zero await.
+// Guard prevents double-registration if the file is re-evaluated.
+if (!window._batteryPollerStarted) {
+    window._batteryPollerStarted = true;
+    (async function pollBattery() {
+        if (typeof navigator.getBattery !== 'function') return;
+        async function run() {
+            try {
+                window._batteryCache     = await navigator.getBattery();
+                window._batteryCacheTime = Date.now();
+            } catch (_) {}
+        }
+        await run();
+        setInterval(run, 60000);
+    })();
+}
+
+
 // ─── MAIN UPDATE LOOP ─────────────────────────────────────────────────────────
 function updateUserLocation(position, forceUpdate = false) {
     const now = performance.now();
@@ -4612,8 +4632,10 @@ function updateUserLocation(position, forceUpdate = false) {
 
     // FIX: Initialize and maintain _emaSpeedSlow so dead reckoning uses a
     // properly smoothed velocity instead of raw distance/time on every frame.
+    // Alpha 0.25 reacts over ~4-5 seconds, absorbing potholes and GPS bursts
+    // without reacting instantly to every spike (unlike _emaSpeedFast at 0.60).
     window._emaSpeedSlow = window._emaSpeedSlow ?? newPosition.speedMPS;
-    window._emaSpeedSlow = 0.70 * newPosition.speedMPS + 0.30 * window._emaSpeedSlow;
+    window._emaSpeedSlow = 0.25 * newPosition.speedMPS + 0.75 * window._emaSpeedSlow;
 
     const modeSpeedMPH = Math.min(window._emaSpeedMode * 2.23694, 90);
     const speedMPH     = Math.min(window._emaSpeedFast * 2.23694, 90);
@@ -4879,8 +4901,24 @@ function updateUserLocation(position, forceUpdate = false) {
     };
 
     // ── QUALITY GATES ─────────────────────────────────────────────────────────
+    // FIX: Never hard-reject on poor accuracy alone — that freezes the map in
+    // urban canyons at highway speed. Instead, compute a smoothing penalty
+    // proportional to how far over threshold the accuracy reading is.
+    // The penalty is applied to smoothFactor later, increasing lag/stability
+    // while keeping the map moving. Distance and impossible-speed guards are
+    // still hard rejections because those indicate genuinely bad data.
+    let accuracyPenalty = 0;
     if (!forceUpdate) {
-        if (newPosition.accuracy > speedTier.maxAccuracy)                        return;
+        if (newPosition.accuracy > speedTier.maxAccuracy) {
+            // Scale penalty: 0 at threshold, up to 0.35 at 3x threshold.
+            const ratio = newPosition.accuracy / speedTier.maxAccuracy; // > 1.0
+            accuracyPenalty = Math.min(0.35, (ratio - 1) * 0.20);
+            // Throttle the log to once per 5s rather than every GPS frame.
+            if (!window._lastAccuracyWarnTime || (currentTime - window._lastAccuracyWarnTime) > 5000) {
+                console.warn(`Low GPS accuracy (${newPosition.accuracy.toFixed(0)}m > ${speedTier.maxAccuracy}m), boosting smoothing lag by ${accuracyPenalty.toFixed(2)}`);
+                window._lastAccuracyWarnTime = currentTime;
+            }
+        }
         if (distance < speedTier.minDistanceThreshold)                           return;
         if (timeDelta > 0 && distance / timeDelta > speedTier.maxSpeedThreshold) return;
     }
@@ -4919,10 +4957,20 @@ function updateUserLocation(position, forceUpdate = false) {
     }
 
     // ── DEAD RECKONING ────────────────────────────────────────────────────────
-    // FIX: Use window._emaSpeedSlow (now always initialized) for stable
-    // dead reckoning prediction. The fallback to distance/time is a safety net
-    // for the first-ever call only.
-    const headingRad = (validatedHeading || 0) * Math.PI / 180;
+    // FIX #1: If GPS heading is null (common at low speed or on first fix),
+    // derive it from the smoothed velocity vector instead of defaulting to 0
+    // (North), which causes a "rubber band" glitch southward then back.
+    let effectiveHeading = validatedHeading;
+    if (effectiveHeading == null && window.smoothedVelocity) {
+        const vLat = window.smoothedVelocity.lat;
+        const vLng = window.smoothedVelocity.lng;
+        if (Math.abs(vLat) > 1e-9 || Math.abs(vLng) > 1e-9) {
+            effectiveHeading = Math.atan2(vLng, vLat) * (180 / Math.PI);
+            if (effectiveHeading < 0) effectiveHeading += 360;
+        }
+    }
+    // True last-resort fallback: 0 only if we have no direction information at all.
+    const headingRad = (effectiveHeading ?? 0) * Math.PI / 180;
     const R          = 111111;
     const predWindow = Math.min(0.8, 0.3 + (speedFactor * 0.5));
     const cosLat     = Math.cos(lat * Math.PI / 180);
@@ -4984,6 +5032,9 @@ function updateUserLocation(position, forceUpdate = false) {
     if (timeDelta > 0) smoothFactor += Math.min(0.03, Math.max(-0.015, (timeDelta - 0.35) * 0.045));
     if (headingDiff > 20 && speedMPH < 45) smoothFactor -= Math.max(0, 0.04 - (headingDiff / 200) * 0.06);
     if (eastWestMovement) smoothFactor += 0.018;
+    // FIX #4: Reduce smoothFactor on poor accuracy so the position lags behind
+    // (trusts history more than the noisy fix) without stopping updates entirely.
+    smoothFactor = Math.max(0.05, smoothFactor - accuracyPenalty);
     smoothFactor = Math.min(0.52, Math.max(0.11, smoothFactor)) * directionChangeFactor;
 
     // ── SMOOTHED POSITION ─────────────────────────────────────────────────────
@@ -5029,6 +5080,19 @@ function updateUserLocation(position, forceUpdate = false) {
     lookAhead -= headingDiff > 25 ? Math.min(0.14, headingDiff / 200 * 0.22) : 0;
     lookAhead += (speedMPH < 15 && eastWestMovement) ? Math.min(0.055, distance * 0.0013) : 0;
     lookAhead  = Math.max(0.01, lookAhead);
+
+    // ── SYNCHRONOUS STATE COMMIT ──────────────────────────────────────────────
+    // FIX #3: Commit calculation-state variables synchronously, before the RAF
+    // closure is created. If RAF is delayed (slow device, background tab), the
+    // next GPS tick must see up-to-date lastPosition and lastVelocity or it will
+    // compute smoothedVelocity from stale data, causing jitter.
+    // Visual-only side-effects (marker, map pan, zoom) remain inside RAF.
+    window.lastPosition   = smoothedPos;
+    window.lastVelocity   = {
+        lat: timeDelta > 0 ? (lat - lastPos.lat) / timeDelta : 0,
+        lng: timeDelta > 0 ? (lng - lastPos.lng) / timeDelta : 0
+    };
+    window.lastUpdateTime = currentTime;
 
     // ── VISUAL UPDATE (RAF) ───────────────────────────────────────────────────
     if (window._nextLocationUpdateRAF) {
@@ -5122,13 +5186,8 @@ function updateUserLocation(position, forceUpdate = false) {
                 if (markerPos) _enforceViewportSafety(speedMPH, markerPos);
             }
 
-            // ── STATE COMMIT ──────────────────────────────────────────────────
-            window.lastPosition   = smoothedPos;
-            window.lastVelocity   = {
-                lat: timeDelta > 0 ? (lat - lastPos.lat) / timeDelta : 0,
-                lng: timeDelta > 0 ? (lng - lastPos.lng) / timeDelta : 0
-            };
-            window.lastUpdateTime = currentTime;
+            // ── STATE COMMIT (moved to synchronous scope above RAF) ───────────
+            // lastPosition, lastVelocity, lastUpdateTime are already committed.
 
             if (typeof updateDistanceBox === 'function') updateDistanceBox(forceUpdate);
 
