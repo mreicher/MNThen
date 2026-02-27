@@ -4501,6 +4501,10 @@ function updateUserLocation(position, forceUpdate = false) {
         return;
     }
 
+    // FIX: Check _blockAutoMapUpdates before anything else — prevents GPS
+    // updates from fighting handleContinueClick's return-to-map animation.
+    if (window._blockAutoMapUpdates && !forceUpdate) return;
+
     if (!map || !userMarker) {
         console.debug("updateUserLocation: Map not ready, deferring");
         window.pendingPosition    = position;
@@ -4553,8 +4557,6 @@ function updateUserLocation(position, forceUpdate = false) {
     // ── TIME GATE (PRIMARY THROUGHPUT CAP) ────────────────────────────────────
     // Caps processing at ~30fps (33ms). This is the guard that prevents RAF
     // queue backup at high GPS rates (10Hz phones in high-accuracy mode).
-    // Reduced from original 50ms (20fps) to 33ms (30fps) — meaningfully better
-    // at high speeds where every frame matters, still safe on slow hardware.
     if (!forceUpdate && (now - (window.lastDebounceTime || 0)) < 33) {
         if (window.debounceTimeoutId) clearTimeout(window.debounceTimeoutId);
         window.pendingPosition    = position;
@@ -4600,13 +4602,18 @@ function updateUserLocation(position, forceUpdate = false) {
     };
 
     // ── SPEED EMAs ────────────────────────────────────────────────────────────
-    // Both unchanged. Symmetric 0.50 for mode is correct — asymmetric alphas
-    // cause GPS-noise-driven mode jitter on rise and 5s+ exit lag on fall.
+    // Three EMAs: slow (dead reckoning), mode (tier selection), fast (display).
+    // Symmetric 0.50 for mode prevents GPS-noise-driven mode jitter.
     window._emaSpeedMode = window._emaSpeedMode ?? newPosition.speedMPS;
     window._emaSpeedMode = 0.50 * newPosition.speedMPS + 0.50 * window._emaSpeedMode;
 
     window._emaSpeedFast = window._emaSpeedFast ?? newPosition.speedMPS;
     window._emaSpeedFast = 0.60 * newPosition.speedMPS + 0.40 * window._emaSpeedFast;
+
+    // FIX: Initialize and maintain _emaSpeedSlow so dead reckoning uses a
+    // properly smoothed velocity instead of raw distance/time on every frame.
+    window._emaSpeedSlow = window._emaSpeedSlow ?? newPosition.speedMPS;
+    window._emaSpeedSlow = 0.70 * newPosition.speedMPS + 0.30 * window._emaSpeedSlow;
 
     const modeSpeedMPH = Math.min(window._emaSpeedMode * 2.23694, 90);
     const speedMPH     = Math.min(window._emaSpeedFast * 2.23694, 90);
@@ -4687,16 +4694,38 @@ function updateUserLocation(position, forceUpdate = false) {
     }
 
     // ── PROXIMITY STATE UPDATE (SYNCHRONOUS) ──────────────────────────────────
+    // Run before velocity smoothing so auto-open triggers at the correct frame.
     if (typeof handleProximityAndAutoOpen === 'function') {
         handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, closestDistance);
     }
 
+    // ── VELOCITY SMOOTHING (EARLY — used for E/W detection below) ─────────────
+    // Must be computed before eastWestMovement so the direction flag is derived
+    // from smoothed velocity rather than a potentially noisy raw GPS delta.
+    window.lastVelocity     = window.lastVelocity     || { lat: 0, lng: 0 };
+    window.smoothedVelocity = window.smoothedVelocity || { lat: 0, lng: 0 };
+
+    if (lastPos && timeDelta > 0) {
+        const instantVelLat = (lat - lastPos.lat) / timeDelta;
+        const instantVelLng = (lng - lastPos.lng) / timeDelta;
+        const velSmooth = Math.max(0.25, Math.min(0.5, 0.4 - (speedMPH * 0.003)));
+        window.smoothedVelocity = {
+            lat: window.smoothedVelocity.lat * velSmooth + instantVelLat * (1 - velSmooth),
+            lng: window.smoothedVelocity.lng * velSmooth + instantVelLng * (1 - velSmooth)
+        };
+    }
+
     // ── MOVEMENT DIRECTION ────────────────────────────────────────────────────
+    // FIX: Derive from smoothedVelocity, not raw position delta, to avoid
+    // transient GPS noise falsely triggering east-west mode and wrong animation curves.
     let eastWestMovement = false;
-    if (lastPos) {
-        const latDelta = Math.abs(lat - lastPos.lat);
-        const lngDelta = Math.abs(lng - lastPos.lng);
-        eastWestMovement = lngDelta > latDelta * 1.2;
+    if (window.smoothedVelocity) {
+        const absLat = Math.abs(window.smoothedVelocity.lat);
+        const absLng = Math.abs(window.smoothedVelocity.lng);
+        // Only assert E/W if velocity is non-trivial (avoids noise at standstill)
+        if (absLat + absLng > 1e-9) {
+            eastWestMovement = absLng > absLat * 1.2;
+        }
     }
 
     // ── ENTERPRISE CACHE (ASYNC, NON-BLOCKING) ────────────────────────────────
@@ -4889,22 +4918,10 @@ function updateUserLocation(position, forceUpdate = false) {
         }
     }
 
-    // ── VELOCITY SMOOTHING ────────────────────────────────────────────────────
-    window.lastVelocity     = window.lastVelocity     || { lat: 0, lng: 0 };
-    window.smoothedVelocity = window.smoothedVelocity || { lat: 0, lng: 0 };
-
-    const instantVel = {
-        lat: timeDelta > 0 ? (lat - lastPos.lat) / timeDelta : 0,
-        lng: timeDelta > 0 ? (lng - lastPos.lng) / timeDelta : 0
-    };
-
-    const velSmooth = Math.max(0.25, Math.min(0.5, 0.4 - (speedMPH * 0.003)));
-    window.smoothedVelocity = {
-        lat: window.smoothedVelocity.lat * velSmooth + instantVel.lat * (1 - velSmooth),
-        lng: window.smoothedVelocity.lng * velSmooth + instantVel.lng * (1 - velSmooth)
-    };
-
     // ── DEAD RECKONING ────────────────────────────────────────────────────────
+    // FIX: Use window._emaSpeedSlow (now always initialized) for stable
+    // dead reckoning prediction. The fallback to distance/time is a safety net
+    // for the first-ever call only.
     const headingRad = (validatedHeading || 0) * Math.PI / 180;
     const R          = 111111;
     const predWindow = Math.min(0.8, 0.3 + (speedFactor * 0.5));
@@ -5068,10 +5085,15 @@ function updateUserLocation(position, forceUpdate = false) {
                             _panMapToCenter(smoothedPos, speedTier, directionChangeFactor, eastWestMovement, speedMPH, lookAhead);
                         }
                     } else {
+                        // FIX: In roaming mode, if forceMapThisFrame is true (mode transition),
+                        // always pan to center so the map doesn't freeze while the marker jumps.
                         if (typeof _isNearViewportEdge === 'function' && _isNearViewportEdge(smoothedPos, bounds, speedMPH)) {
                             if (typeof _panMapIfNearEdge === 'function') {
                                 _panMapIfNearEdge(smoothedPos, speedTier, directionChangeFactor, eastWestMovement, bounds, speedMPH);
                             }
+                        } else if (forceMapThisFrame && typeof _panMapToCenter === 'function') {
+                            // Mode transition in roaming mode — ensure map keeps up with the marker.
+                            _panMapToCenter(smoothedPos, speedTier, directionChangeFactor, eastWestMovement, speedMPH, lookAhead);
                         }
                     }
                 }
@@ -5079,10 +5101,11 @@ function updateUserLocation(position, forceUpdate = false) {
             }
 
             // ── PROXIMITY ZOOM ────────────────────────────────────────────────
-            // Runs unconditionally — not gated on shouldUpdateMap.
-            // A stationary user near a POI boundary needs smooth zoom
-            // interpolation even when shouldUpdateMap is false.
-            if (typeof _handleProximityZoom === 'function' && window.proximityState) {
+            // FIX: Guard with !window.isMapInteracting so we don't waste cycles
+            // (and fight the user's pinch gesture) during manual interaction.
+            // Runs outside shouldUpdateMap gate — a stationary user near a POI
+            // boundary still needs smooth zoom interpolation every frame.
+            if (!window.isMapInteracting && typeof _handleProximityZoom === 'function' && window.proximityState) {
                 _handleProximityZoom(modeSpeedMPH, eastWestMovement);
             }
 
@@ -5101,7 +5124,10 @@ function updateUserLocation(position, forceUpdate = false) {
 
             // ── STATE COMMIT ──────────────────────────────────────────────────
             window.lastPosition   = smoothedPos;
-            window.lastVelocity   = instantVel;
+            window.lastVelocity   = {
+                lat: timeDelta > 0 ? (lat - lastPos.lat) / timeDelta : 0,
+                lng: timeDelta > 0 ? (lng - lastPos.lng) / timeDelta : 0
+            };
             window.lastUpdateTime = currentTime;
 
             if (typeof updateDistanceBox === 'function') updateDistanceBox(forceUpdate);
@@ -5116,7 +5142,8 @@ function updateUserLocation(position, forceUpdate = false) {
                     duration:      animDur.toFixed(2),
                     mode:          isInCenteredMode ? 'centered' : 'edge',
                     proximity:     closestDistance !== Infinity ? closestDistance.toFixed(0) + 'm' : 'N/A',
-                    forceMapFrame: forceMapThisFrame
+                    forceMapFrame: forceMapThisFrame,
+                    eastWest:      eastWestMovement
                 });
             }
         } catch (error) {
