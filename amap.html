@@ -1566,23 +1566,29 @@ class EnterpriseBackgroundSync {
 // ZOOM CONTROLLER - Drop-in replacement with full proximity zoom support
 (function() {
   'use strict';
-  
-  const DEFAULT_ZOOM = 17;
+
+  const DEFAULT_ZOOM             = 17;
   const DEFAULT_LOCK_DURATION_MS = 2000;
-  const QUEUE_CLEANUP_AGE_MS = 5000;
+  const QUEUE_CLEANUP_AGE_MS     = 5000;
+
+  // Speed gate mirrors PZ_CONFIG.SPEED_GATE_MPH in the proximity module.
+  // When the controller detects speed zoom taking over, it animates out
+  // rather than snapping or leaving the map stuck at proximity zoom level.
+  const PROXIMITY_SOURCE         = 'proximity';
+  const PROXIMITY_ZOOM_OUT_LEVEL = 17;
 
   class ZoomController {
     constructor(options = {}) {
       const {
-        defaultZoom = DEFAULT_ZOOM,
-        lockDurationMs = DEFAULT_LOCK_DURATION_MS,
+        defaultZoom      = DEFAULT_ZOOM,
+        lockDurationMs   = DEFAULT_LOCK_DURATION_MS,
         animationOptions = {}
       } = options;
 
       this.state = {
-        source: null,
-        priority: 0,
-        level: defaultZoom,
+        source:      null,
+        priority:    0,
+        level:       defaultZoom,
         lockedUntil: 0
       };
 
@@ -1592,59 +1598,62 @@ class EnterpriseBackgroundSync {
         animationOptions
       };
 
-      this.requestQueue = [];
+      this.requestQueue      = [];
       this.isProcessingQueue = false;
-      
+
       console.debug('[ZoomController] Initialized with defaults:', {
-        defaultZoom: this.config.defaultZoom,
+        defaultZoom:    this.config.defaultZoom,
         lockDurationMs: this.config.lockDurationMs
       });
     }
 
     /**
-     * Request zoom control
-     * @param {string} source - Identifier for the requesting system (e.g., 'proximity', 'speed')
-     * @param {number} level - Desired zoom level
-     * @param {number} priority - Priority (higher = more important, default: 1)
-     * @returns {boolean} - True if request was accepted/queued, false if rejected
+     * Request zoom control.
+     *
+     * FIX: Original always returned true ("queued or accepted"). The proximity
+     * module gates on this return value — returning true when control was NOT
+     * actually granted caused it to set isZoomedIn = true and blockSpeedZoom =
+     * true even though the zoom never fired, desynchronising all state.
+     *
+     * Now returns true only when THIS source has active control after the call.
+     *
+     * @param {string} source   - Identifier ('proximity', 'speed', etc.)
+     * @param {number} level    - Desired zoom level
+     * @param {number} priority - Higher = more important (default: 1)
+     * @returns {boolean} True only if this source now has active control
      */
     request(source, level, priority = 1) {
-      // Validate inputs
       if (!source || typeof source !== 'string') {
         console.error('[ZoomController] Invalid source:', source);
         return false;
       }
-      
       if (!Number.isFinite(level) || level < 0) {
         console.error('[ZoomController] Invalid zoom level:', level);
         return false;
       }
-      
       if (!Number.isFinite(priority) || priority < 0) {
         console.error('[ZoomController] Invalid priority:', priority);
         return false;
       }
 
-      const now = Date.now();
-      
-      // Add to queue
-      this.requestQueue.push({ 
-        source, 
-        level, 
-        priority, 
-        timestamp: now 
-      });
-      
+      this.requestQueue.push({ source, level, priority, timestamp: Date.now() });
       console.debug(`[ZoomController] Request queued: ${source} (level: ${level}, priority: ${priority})`);
-      
-      // Process immediately
+
       this._processQueue();
-      
-      // Return true if this source now has control or is queued
-      return true;
+
+      // FIX: return true only when caller actually won control
+      return this.state.source === source;
     }
 
-    /* Release zoom control */
+    /**
+     * Release zoom control.
+     *
+     * FIX: When the proximity source releases (e.g. speed gate fires, user
+     * walks away), the original code cleared state flags and returned — leaving
+     * the map visually stuck at the proximity zoom level if no other source
+     * immediately took over. Now animates back to the default zoom out level
+     * before releasing, so the map always returns to a sane state.
+     */
     release(source) {
       if (!source) {
         console.warn('[ZoomController] Release called without source');
@@ -1653,18 +1662,24 @@ class EnterpriseBackgroundSync {
 
       if (this.state.source === source) {
         console.debug(`[ZoomController] Authority released by ${source}`);
-        this._setState({ 
-          source: null, 
-          priority: 0, 
-          lockedUntil: 0 
-        });
+
+        // FIX: animate back out when proximity releases so map isn't left
+        // stuck at zoom 19. Other sources snap back via _applyZoom normally.
+        if (source === PROXIMITY_SOURCE) {
+          this._animateProximityZoomOut();
+        }
+
+        this._setState({ source: null, priority: 0, lockedUntil: 0 });
         this._processQueue();
       } else {
-        console.debug(`[ZoomController] Release ignored - ${source} does not have control (current: ${this.state.source || 'none'})`);
+        console.debug(
+          `[ZoomController] Release ignored - ${source} does not have control ` +
+          `(current: ${this.state.source || 'none'})`
+        );
       }
     }
 
-    /* Apply any pending zoom operation */
+    /** Apply any pending zoom operation. */
     applyPendingZoom() {
       if (this.state.source && Number.isFinite(this.state.level)) {
         console.debug(`[ZoomController] Applying pending zoom for ${this.state.source}`);
@@ -1672,92 +1687,88 @@ class EnterpriseBackgroundSync {
       }
     }
 
-    /* Get current state (returns a copy) */
+    /** Get current state (returns a copy). */
     getState() {
       return { ...this.state };
     }
 
-    /* Stop all zoom operations and clear queue */
+    /** Stop all zoom operations and clear queue. */
     stop() {
-      this.requestQueue = [];
+      this.requestQueue      = [];
       this.isProcessingQueue = false;
-      this._setState({ 
-        source: null, 
-        priority: 0, 
-        lockedUntil: 0 
-      });
+      this._setState({ source: null, priority: 0, lockedUntil: 0 });
       console.log('[ZoomController] Stopped and reset');
     }
 
-    /* Process the request queue */
-    _processQueue() {
-      // Prevent concurrent processing
-      if (this.isProcessingQueue || this.requestQueue.length === 0) {
-        return;
-      }
+    // ── PRIVATE ───────────────────────────────────────────────────────────────
 
+    _processQueue() {
+      if (this.isProcessingQueue || this.requestQueue.length === 0) return;
       this.isProcessingQueue = true;
 
       try {
         const now = Date.now();
-        
-        // Check if current lock has expired
-        const hasActiveLock = now < this.state.lockedUntil;
 
+        // Expire active lock if time has passed
+        const hasActiveLock = now < this.state.lockedUntil;
         if (!hasActiveLock && this.state.source) {
           console.debug('[ZoomController] Active lock expired, releasing');
-          this._setState({ 
-            source: null, 
-            priority: 0, 
-            lockedUntil: 0 
-          });
+          // FIX: animate out if proximity lock expired without an explicit release
+          if (this.state.source === PROXIMITY_SOURCE) {
+            this._animateProximityZoomOut();
+          }
+          this._setState({ source: null, priority: 0, lockedUntil: 0 });
         }
 
-        // No current controller - assign to highest priority request
         if (!this.state.source) {
-          const nextRequest = this.requestQueue.reduce((highest, current) =>
-            current.priority > highest.priority ? current : highest
+          // No current holder — grant to highest priority queued request
+          const next = this.requestQueue.reduce((best, cur) =>
+            cur.priority > best.priority ? cur : best
           , this.requestQueue[0]);
 
-          if (nextRequest) {
-            console.debug(`[ZoomController] Granting control to ${nextRequest.source} (priority: ${nextRequest.priority})`);
+          if (next) {
+            console.debug(`[ZoomController] Granting control to ${next.source} (priority: ${next.priority})`);
             this._setState({
-              source: nextRequest.source,
-              priority: nextRequest.priority,
-              level: nextRequest.level,
+              source:      next.source,
+              priority:    next.priority,
+              level:       next.level,
               lockedUntil: now + this.config.lockDurationMs
             });
-            this._applyZoom(nextRequest.level);
+            this._applyZoom(next.level);
           }
-        } 
-        // Active lock exists - check for higher priority override
-        else if (hasActiveLock) {
-          const highestPriorityRequest = this.requestQueue.reduce((highest, current) =>
-            current.priority > highest.priority ? current : highest
+        } else if (hasActiveLock) {
+          // Active lock — only a strictly higher priority can override
+          const best = this.requestQueue.reduce((b, cur) =>
+            cur.priority > b.priority ? cur : b
           , { priority: 0 });
 
-          if (highestPriorityRequest.priority > this.state.priority) {
-            console.debug(`[ZoomController] ${highestPriorityRequest.source} (priority ${highestPriorityRequest.priority}) overriding ${this.state.source} (priority ${this.state.priority})`);
+          if (best.priority > this.state.priority) {
+            console.debug(
+              `[ZoomController] ${best.source} (priority ${best.priority}) ` +
+              `overriding ${this.state.source} (priority ${this.state.priority})`
+            );
+            // FIX: if proximity is being overridden, animate it out first
+            if (this.state.source === PROXIMITY_SOURCE) {
+              this._animateProximityZoomOut();
+            }
             this._setState({
-              source: highestPriorityRequest.source,
-              priority: highestPriorityRequest.priority,
-              level: highestPriorityRequest.level,
+              source:      best.source,
+              priority:    best.priority,
+              level:       best.level,
               lockedUntil: now + this.config.lockDurationMs
             });
-            this._applyZoom(highestPriorityRequest.level);
+            this._applyZoom(best.level);
           }
         }
 
-        // Clean up old requests from queue
-        const beforeCleanup = this.requestQueue.length;
-        this.requestQueue = this.requestQueue.filter(req => 
-          req.timestamp > now - QUEUE_CLEANUP_AGE_MS
+        // Clean stale queue entries
+        const before = this.requestQueue.length;
+        this.requestQueue = this.requestQueue.filter(
+          req => req.timestamp > now - QUEUE_CLEANUP_AGE_MS
         );
-        
-        if (beforeCleanup !== this.requestQueue.length) {
-          console.debug(`[ZoomController] Cleaned ${beforeCleanup - this.requestQueue.length} stale requests from queue`);
+        if (before !== this.requestQueue.length) {
+          console.debug(`[ZoomController] Cleaned ${before - this.requestQueue.length} stale requests`);
         }
-
       } catch (error) {
         console.error('[ZoomController] Error processing queue:', error);
       } finally {
@@ -1765,48 +1776,86 @@ class EnterpriseBackgroundSync {
       }
     }
 
-    /* Update internal state */
     _setState(newState) {
       this.state = { ...this.state, ...newState };
     }
 
-    /* Apply zoom to the map */
-    _applyZoom(level) {
+    /**
+     * Apply zoom to the map.
+     *
+     * FIX: Original used map.setZoom() which snaps instantly with no animation.
+     * All controller-internal grants and overrides now animate via flyTo so
+     * every zoom transition is smooth regardless of which path triggered it.
+     * animationOptions from the constructor are merged in, letting callers
+     * override duration/easing at instantiation time if needed.
+     */
+    _applyZoom(level, options = {}) {
       if (!window.map) {
-        console.error('[ZoomController] Cannot apply zoom - map object not found');
+        console.error('[ZoomController] Cannot apply zoom - map not found');
         return;
       }
-
       if (!Number.isFinite(level)) {
         console.error('[ZoomController] Cannot apply zoom - invalid level:', level);
         return;
       }
 
       try {
-        const options = { 
-          noMoveStart: true, 
-          ...this.config.animationOptions 
-        };
-        
-        window.map.setZoom(level, options);
+        const center = window.map.getCenter?.();
+        if (!center || !isFinite(center.lat) || !isFinite(center.lng)) {
+          console.warn('[ZoomController] Cannot apply zoom - invalid map center');
+          return;
+        }
+
+        window.map.flyTo(center, level, {
+          duration:      1.2,
+          easeLinearity: 0.15,
+          noMoveStart:   true,
+          ...this.config.animationOptions,  // constructor-level overrides
+          ...options                         // per-call overrides win
+        });
+
         console.debug(`[ZoomController] Applied zoom ${level} for ${this.state.source}`);
       } catch (error) {
         console.error('[ZoomController] Failed to apply zoom:', error);
       }
     }
+
+    /**
+     * Animate the map back to the default zoom-out level when proximity zoom
+     * releases. Uses a slightly longer, gentler ease than standard so the pull-
+     * back feels intentional rather than abrupt.
+     */
+    _animateProximityZoomOut() {
+      if (!window.map?.flyTo || window.isMapInteracting) return;
+      try {
+        const currentZoom = window.map.getZoom?.();
+        if (!isFinite(currentZoom)) return;
+        if (Math.abs(currentZoom - PROXIMITY_ZOOM_OUT_LEVEL) < 0.5) return;
+
+        const center = window.map.getCenter?.();
+        if (!center || !isFinite(center.lat) || !isFinite(center.lng)) return;
+
+        window.map.flyTo(center, PROXIMITY_ZOOM_OUT_LEVEL, {
+          duration:      1.4,
+          easeLinearity: 0.15,
+          noMoveStart:   true,
+          ...this.config.animationOptions
+        });
+
+        console.debug('[ZoomController] Proximity zoom-out animation triggered');
+      } catch (err) {
+        console.warn('[ZoomController] Proximity zoom-out animation failed:', err);
+      }
+    }
   }
 
-  // Initialize and expose globally
+  // ── INIT & EXPORT ──────────────────────────────────────────────────────────
   if (typeof window !== 'undefined') {
-    // Expose the class for manual instantiation if needed
     window.ZoomController = ZoomController;
-    
-    // Create and expose the default instance
     window.zoomController = new ZoomController();
-    
     console.log('[ZoomController] Ready - Instance available at window.zoomController');
   } else {
-    console.warn('[ZoomController] Window object not available - running in non-browser environment?');
+    console.warn('[ZoomController] Window object not available');
   }
 })();
 
@@ -6449,7 +6498,7 @@ function _panMapToLookAhead(lookAheadPosition, speedTier, directionChangeFactor,
         cleanup();
     }
 }
-
+/*
 function calculateDistance(pos1, pos2) {
     if (!pos1 || !pos2) return Infinity;
     
@@ -6480,7 +6529,7 @@ function calculateDistance(pos1, pos2) {
     
     return R * c;
 }
-
+*/
 function _isValidCoords(lat, lng) {
   return Number.isFinite(lat) && Number.isFinite(lng) &&
     lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180;
