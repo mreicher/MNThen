@@ -1571,9 +1571,6 @@ class EnterpriseBackgroundSync {
   const DEFAULT_LOCK_DURATION_MS = 2000;
   const QUEUE_CLEANUP_AGE_MS     = 5000;
 
-  // Speed gate mirrors PZ_CONFIG.SPEED_GATE_MPH in the proximity module.
-  // When the controller detects speed zoom taking over, it animates out
-  // rather than snapping or leaving the map stuck at proximity zoom level.
   const PROXIMITY_SOURCE         = 'proximity';
   const PROXIMITY_ZOOM_OUT_LEVEL = 17;
 
@@ -1610,12 +1607,13 @@ class EnterpriseBackgroundSync {
     /**
      * Request zoom control.
      *
-     * FIX: Original always returned true ("queued or accepted"). The proximity
-     * module gates on this return value — returning true when control was NOT
-     * actually granted caused it to set isZoomedIn = true and blockSpeedZoom =
-     * true even though the zoom never fired, desynchronising all state.
+     * Returns true only when THIS source has active control after the call.
      *
-     * Now returns true only when THIS source has active control after the call.
+     * PROXIMITY SPECIAL CASE: proximity locks are held indefinitely (lockedUntil
+     * = Infinity) because proximity zoom has no fixed duration — it stays active
+     * until the user walks away and release() is called explicitly. Using a
+     * 2-second lock caused the controller to auto-expire and zoom back out while
+     * the user was still standing at the POI.
      *
      * @param {string} source   - Identifier ('proximity', 'speed', etc.)
      * @param {number} level    - Desired zoom level
@@ -1641,18 +1639,20 @@ class EnterpriseBackgroundSync {
 
       this._processQueue();
 
-      // FIX: return true only when caller actually won control
       return this.state.source === source;
     }
 
     /**
      * Release zoom control.
      *
-     * FIX: When the proximity source releases (e.g. speed gate fires, user
-     * walks away), the original code cleared state flags and returned — leaving
-     * the map visually stuck at the proximity zoom level if no other source
-     * immediately took over. Now animates back to the default zoom out level
-     * before releasing, so the map always returns to a sane state.
+     * NOTE: This no longer calls _animateProximityZoomOut() internally.
+     * The proximity module's _handleProximityZoom is responsible for triggering
+     * its own zoom-out animation BEFORE calling release(). Having the controller
+     * also animate caused two competing flyTo() calls that fought each other.
+     *
+     * The split of responsibilities is now:
+     *   - Proximity module: decides WHEN to zoom in/out, triggers the animation
+     *   - ZoomController: manages the lock so other zoom sources are blocked/unblocked
      */
     release(source) {
       if (!source) {
@@ -1662,13 +1662,6 @@ class EnterpriseBackgroundSync {
 
       if (this.state.source === source) {
         console.debug(`[ZoomController] Authority released by ${source}`);
-
-        // FIX: animate back out when proximity releases so map isn't left
-        // stuck at zoom 19. Other sources snap back via _applyZoom normally.
-        if (source === PROXIMITY_SOURCE) {
-          this._animateProximityZoomOut();
-        }
-
         this._setState({ source: null, priority: 0, lockedUntil: 0 });
         this._processQueue();
       } else {
@@ -1709,14 +1702,14 @@ class EnterpriseBackgroundSync {
       try {
         const now = Date.now();
 
-        // Expire active lock if time has passed
-        const hasActiveLock = now < this.state.lockedUntil;
+        // Expire active lock if time has passed.
+        // Proximity locks use Infinity so they never auto-expire here.
+        const hasActiveLock = this.state.lockedUntil === Infinity
+          ? true
+          : now < this.state.lockedUntil;
+
         if (!hasActiveLock && this.state.source) {
           console.debug('[ZoomController] Active lock expired, releasing');
-          // FIX: animate out if proximity lock expired without an explicit release
-          if (this.state.source === PROXIMITY_SOURCE) {
-            this._animateProximityZoomOut();
-          }
           this._setState({ source: null, priority: 0, lockedUntil: 0 });
         }
 
@@ -1728,13 +1721,28 @@ class EnterpriseBackgroundSync {
 
           if (next) {
             console.debug(`[ZoomController] Granting control to ${next.source} (priority: ${next.priority})`);
+
+            // Proximity holds indefinitely; all other sources use lockDurationMs.
+            const lockUntil = next.source === PROXIMITY_SOURCE
+              ? Infinity
+              : now + this.config.lockDurationMs;
+
             this._setState({
               source:      next.source,
               priority:    next.priority,
               level:       next.level,
-              lockedUntil: now + this.config.lockDurationMs
+              lockedUntil: lockUntil
             });
-            this._applyZoom(next.level);
+
+            // Remove the granted entry from the queue so it can't re-fire.
+            this.requestQueue = this.requestQueue.filter(r => r !== next);
+
+            // Only _applyZoom for non-proximity sources. Proximity module
+            // calls map.flyTo() directly with its own pan-toward-POI logic,
+            // so letting the controller also call flyTo would cause a conflict.
+            if (next.source !== PROXIMITY_SOURCE) {
+              this._applyZoom(next.level);
+            }
           }
         } else if (hasActiveLock) {
           // Active lock — only a strictly higher priority can override
@@ -1747,21 +1755,29 @@ class EnterpriseBackgroundSync {
               `[ZoomController] ${best.source} (priority ${best.priority}) ` +
               `overriding ${this.state.source} (priority ${this.state.priority})`
             );
-            // FIX: if proximity is being overridden, animate it out first
-            if (this.state.source === PROXIMITY_SOURCE) {
-              this._animateProximityZoomOut();
-            }
+
+            const lockUntil = best.source === PROXIMITY_SOURCE
+              ? Infinity
+              : now + this.config.lockDurationMs;
+
             this._setState({
               source:      best.source,
               priority:    best.priority,
               level:       best.level,
-              lockedUntil: now + this.config.lockDurationMs
+              lockedUntil: lockUntil
             });
-            this._applyZoom(best.level);
+
+            // Remove the granted entry from the queue.
+            this.requestQueue = this.requestQueue.filter(r => r !== best);
+
+            if (best.source !== PROXIMITY_SOURCE) {
+              this._applyZoom(best.level);
+            }
           }
         }
 
-        // Clean stale queue entries
+        // Clean stale queue entries (non-proximity only; proximity entries are
+        // one-shot and removed when granted, so this is mostly for speed/other).
         const before = this.requestQueue.length;
         this.requestQueue = this.requestQueue.filter(
           req => req.timestamp > now - QUEUE_CLEANUP_AGE_MS
@@ -1781,13 +1797,8 @@ class EnterpriseBackgroundSync {
     }
 
     /**
-     * Apply zoom to the map.
-     *
-     * FIX: Original used map.setZoom() which snaps instantly with no animation.
-     * All controller-internal grants and overrides now animate via flyTo so
-     * every zoom transition is smooth regardless of which path triggered it.
-     * animationOptions from the constructor are merged in, letting callers
-     * override duration/easing at instantiation time if needed.
+     * Apply zoom to the map (used for non-proximity sources).
+     * Proximity module handles its own flyTo with pan-toward-POI logic.
      */
     _applyZoom(level, options = {}) {
       if (!window.map) {
@@ -1810,8 +1821,8 @@ class EnterpriseBackgroundSync {
           duration:      1.2,
           easeLinearity: 0.15,
           noMoveStart:   true,
-          ...this.config.animationOptions,  // constructor-level overrides
-          ...options                         // per-call overrides win
+          ...this.config.animationOptions,
+          ...options
         });
 
         console.debug(`[ZoomController] Applied zoom ${level} for ${this.state.source}`);
@@ -1821,9 +1832,9 @@ class EnterpriseBackgroundSync {
     }
 
     /**
-     * Animate the map back to the default zoom-out level when proximity zoom
-     * releases. Uses a slightly longer, gentler ease than standard so the pull-
-     * back feels intentional rather than abrupt.
+     * Kept for backwards compatibility — external code may call this directly.
+     * The proximity module no longer triggers this internally (release() no
+     * longer calls it either) to avoid double-animation races.
      */
     _animateProximityZoomOut() {
       if (!window.map?.flyTo || window.isMapInteracting) return;
@@ -6012,7 +6023,7 @@ function _clearStationaryState() {
     }
 }
 
- (function () {
+(function () {
     'use strict';
 
     // ── CONFIG ────────────────────────────────────────────────────────────────
@@ -6023,28 +6034,26 @@ function _clearStationaryState() {
         ZOOM_IN_LEVEL:           19,
         ZOOM_OUT_LEVEL:          17,
         // DEBOUNCE_MS prevents re-triggering the same transition repeatedly.
-        // Keep at 1500 — it only guards the zoom-in and zoom-out actions,
-        // not the approach itself.
+        // Only guards zoom-in and zoom-out actions, not approach evaluation.
         DEBOUNCE_MS:             1500,
-        // HYSTERESIS_MS was previously applied after EVERY reset including
-        // location changes, causing a mandatory 2s dead zone on every new POI.
-        // Now only applied after an actual zoom transition (in or out).
-        HYSTERESIS_MS:           2000,
-        // RATE_LIMIT_MS throttles the RAF-driven calls to ~6/sec. Fine.
+        // POST_ZOOM_IN_HYSTERESIS_MS: short window after zoom-in fires to prevent
+        // an immediate double-fire if the RAF delivers two rapid calls. This is
+        // intentionally small — it is NOT a dead zone on approach or exit.
+        // The old HYSTERESIS_MS (2000ms) was applied after zoom-out and location
+        // changes too, creating a mandatory 2s blind spot. That is gone.
+        POST_ZOOM_IN_HYSTERESIS_MS: 600,
+        // RATE_LIMIT_MS throttles RAF-driven calls to ~6/sec.
         RATE_LIMIT_MS:           150,
         DEBUG:                   false,
     };
 
     // ── CLOSURE STATE ─────────────────────────────────────────────────────────
-    // Single source of truth. window.proximityLocationStates (outside this
-    // IIFE) was dead code — it was never read here. Removed.
     const state = {
-        locationId:     null,
-        isZoomedIn:     false,
-        lastTransition: 0,   // time of last actual zoom-in or zoom-out
-        lastZoomIn:     0,
-        lastZoomOut:    0,
-        lastCheck:      0,
+        locationId:       null,
+        isZoomedIn:       false,
+        lastZoomIn:       0,   // timestamp of last zoom-in — used for debounce + hysteresis
+        lastZoomOut:      0,   // timestamp of last zoom-out — used for debounce only
+        lastCheck:        0,
     };
 
     // ── ZOOM IN ───────────────────────────────────────────────────────────────
@@ -6078,7 +6087,7 @@ function _clearStationaryState() {
         try {
             const currentZoom = window.map.getZoom?.();
             if (!isFinite(currentZoom)) return;
-            // Don't animate if we're already at or near the target zoom.
+            // Don't animate if already at or near the target zoom.
             if (Math.abs(currentZoom - zoomLevel) < 0.5) return;
 
             const center = window.map.getCenter?.();
@@ -6095,8 +6104,8 @@ function _clearStationaryState() {
     }
 
     // ── RESET ─────────────────────────────────────────────────────────────────
-    // Clears zoom lock and global flags. Does NOT reset lastTransition —
-    // callers that need hysteresis set it themselves after calling this.
+    // Clears zoom lock and global flags. Does NOT touch lastZoomIn / lastZoomOut
+    // — callers read those independently for debounce/hysteresis decisions.
     function _resetProximityZoom(reason = 'unknown') {
         try {
             if (state.isZoomedIn && window.zoomController) {
@@ -6109,8 +6118,6 @@ function _clearStationaryState() {
             }
 
             state.isZoomedIn = false;
-            // Note: locationId is intentionally NOT cleared here in the common
-            // path — see location-change handling below.
             window.zoomedInState  = false;
             window.isNearLocation = false;
             window.blockSpeedZoom = false;
@@ -6141,7 +6148,7 @@ function _clearStationaryState() {
             return;
         }
 
-        // Guard: rate limit — this runs every RAF frame; 150ms is ~6/sec
+        // Guard: rate limit
         const now = performance.now();
         if (now - state.lastCheck < PZ_CONFIG.RATE_LIMIT_MS) return;
         state.lastCheck = now;
@@ -6149,69 +6156,63 @@ function _clearStationaryState() {
         // Guard: speed gate
         if (speedMPH >= PZ_CONFIG.SPEED_GATE_MPH) {
             if (state.isZoomedIn) {
+                _performProximityZoomOut(eastWestMovement, PZ_CONFIG.ZOOM_OUT_LEVEL);
                 _resetProximityZoom('speed_gate');
-                state.locationId    = null;
-                state.lastTransition = now;
+                state.locationId = null;
             }
             return;
         }
 
         // Guard: valid proximity data
-        // window.proximityState is written by handleProximityAndAutoOpen with
-        // shape { closestLocation, distanceMeters, isOnCooldown, lastUpdateTime }
         const proximity = window.proximityState;
         if (!proximity?.closestLocation || proximity.distanceMeters === Infinity) {
             if (state.isZoomedIn || state.locationId) {
+                _performProximityZoomOut(eastWestMovement, PZ_CONFIG.ZOOM_OUT_LEVEL);
                 _resetProximityZoom('no_proximity_data');
-                state.locationId    = null;
-                state.lastTransition = now;
+                state.locationId = null;
             }
             return;
         }
 
-        const location    = proximity.closestLocation;
+        const location     = proximity.closestLocation;
         const distanceFeet = proximity.distanceMeters * 3.28084;
-        const locationId  = String(
+        const locationId   = String(
             location.id ?? `${location.lat.toFixed(6)},${location.lng.toFixed(6)}`
         );
 
         // ── LOCATION CHANGE ───────────────────────────────────────────────────
-        // Previous code: reset → null locationId → return. Next call would set
-        // locationId then immediately hit HYSTERESIS_MS. Result: 2s dead zone
-        // on every POI approach.
-        //
-        // Fix: set the new locationId BEFORE returning so the very next call
-        // skips this branch and proceeds to zoom-in evaluation. Hysteresis is
-        // set so we don't snap to a new POI instantly if the user is between two.
+        // Set the new locationId immediately (not next call) so we don't hit an
+        // extra round-trip. If we were zoomed in on the old POI, zoom out first.
         if (state.locationId && state.locationId !== locationId) {
             if (PZ_CONFIG.DEBUG) console.log(`[PZ] Location changed: ${state.locationId} → ${locationId}`);
+            if (state.isZoomedIn) {
+                _performProximityZoomOut(eastWestMovement, PZ_CONFIG.ZOOM_OUT_LEVEL);
+            }
             _resetProximityZoom('location_change');
-            state.locationId     = locationId; // ← set new id now, not next call
-            state.lastTransition = now;
+            state.locationId = locationId;
+            // No lastZoomIn reset here — we don't want hysteresis to block
+            // zoom-in on the new POI if the user is already inside the threshold.
             return;
         }
 
         if (!state.locationId) state.locationId = locationId;
 
-        // ── HYSTERESIS ────────────────────────────────────────────────────────
-        // Only applied after an actual zoom transition, not after an init or
-        // location change that didn't zoom. Previously this blocked first
-        // approach if called right after any reset.
-        if (state.lastTransition > 0 && (now - state.lastTransition) < PZ_CONFIG.HYSTERESIS_MS) return;
-
         // ── ZOOM IN ───────────────────────────────────────────────────────────
         if (!state.isZoomedIn && distanceFeet <= PZ_CONFIG.ZOOM_IN_THRESHOLD_FEET) {
+            // Debounce: prevent double-fire from rapid calls
             if (now - state.lastZoomIn < PZ_CONFIG.DEBOUNCE_MS) return;
 
+            // POST_ZOOM_IN_HYSTERESIS: short guard immediately after a zoom-in
+            // to prevent the zoom-out branch from firing before the flyTo settles.
+            // Only blocks zoom-out evaluation, not zoom-in (handled by isZoomedIn).
             const zoomState = window.zoomController.getState();
             if (zoomState?.source && zoomState.source !== 'proximity' && zoomState.source !== 'speed') return;
 
             const granted = window.zoomController.request('proximity', PZ_CONFIG.ZOOM_IN_LEVEL, 3);
             if (!granted) return;
 
-            state.isZoomedIn     = true;
-            state.lastZoomIn     = now;
-            state.lastTransition = now; // arm hysteresis for zoom-out
+            state.isZoomedIn  = true;
+            state.lastZoomIn  = now;
             window.zoomedInState  = true;
             window.isNearLocation = true;
             window.blockSpeedZoom = true;
@@ -6223,27 +6224,34 @@ function _clearStationaryState() {
 
         // ── ZOOM OUT ──────────────────────────────────────────────────────────
         if (state.isZoomedIn && distanceFeet >= PZ_CONFIG.ZOOM_OUT_THRESHOLD_FEET) {
+            // Debounce: prevent double-fire
             if (now - state.lastZoomOut < PZ_CONFIG.DEBOUNCE_MS) return;
 
-            const zoomState = window.zoomController.getState();
+            // Short hysteresis after zoom-in: don't zoom back out immediately
+            // if the user momentarily drifted past the exit threshold right
+            // after arriving. The flyTo animation itself takes ~2s, so 2500ms
+            // ensures the animation finishes before we consider zooming out.
+            if (now - state.lastZoomIn < PZ_CONFIG.POST_ZOOM_IN_HYSTERESIS_MS + 2000) return;
 
-            // Original code: if source !== 'proximity', clear flags and return
-            // WITHOUT calling _performProximityZoomOut. Map stayed zoomed in.
-            // Fix: always animate out, then release if we own it.
+            if (PZ_CONFIG.DEBUG) console.log(`[PZ] Zoom OUT: ${locationId} (${Math.round(distanceFeet)}ft)`);
+
+            // Animate out BEFORE releasing the controller lock, so the animation
+            // fires while we still own the lock. release() no longer triggers its
+            // own animation, so there is exactly one flyTo call here.
+            _performProximityZoomOut(eastWestMovement, PZ_CONFIG.ZOOM_OUT_LEVEL);
+
+            // Now release the lock and clean state.
+            const zoomState = window.zoomController.getState();
             if (zoomState?.source === 'proximity') {
                 window.zoomController.release('proximity');
             }
 
-            state.isZoomedIn     = false;
-            state.locationId     = null; // ready for next approach
-            state.lastZoomOut    = now;
-            state.lastTransition = now; // arm hysteresis for re-entry
+            state.isZoomedIn  = false;
+            state.locationId  = null; // ready for next approach
+            state.lastZoomOut = now;
             window.zoomedInState  = false;
             window.isNearLocation = false;
             window.blockSpeedZoom = false;
-
-            if (PZ_CONFIG.DEBUG) console.log(`[PZ] Zoom OUT: ${locationId} (${Math.round(distanceFeet)}ft)`);
-            _performProximityZoomOut(eastWestMovement, PZ_CONFIG.ZOOM_OUT_LEVEL);
         }
     }
 
