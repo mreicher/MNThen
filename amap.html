@@ -4575,10 +4575,8 @@ if (!window._batteryPollerStarted) {
     })();
 }
 
-
 // ─── BATTERY POLLER ──────────────────────────────────────────────────────────
-// Moved off the hot path. The main loop reads window._batteryCache
-// synchronously — same globals as the original, same 60s schedule, zero await.
+// Runs off the hot path. Main loop reads window._batteryCache synchronously.
 // Guard prevents double-registration if the file is re-evaluated.
 if (!window._batteryPollerStarted) {
     window._batteryPollerStarted = true;
@@ -4597,10 +4595,33 @@ if (!window._batteryPollerStarted) {
 
 
 // ─── MAIN UPDATE LOOP ─────────────────────────────────────────────────────────
+//
+// DESIGN PRINCIPLES (why this version works):
+//
+//  1. MARKER PLACEMENT  — always uses raw GPS coords (lat/lng) so the icon
+//     mirrors the device position exactly at every speed. No smoothing lag,
+//     no dead-reckoning offset on the icon itself.
+//
+//  2. MAP PANNING       — uses a smoothed/predicted position so the viewport
+//     glides ahead of the user rather than snapping. Smoothing only affects
+//     where the camera looks, never where the icon sits.
+//
+//  3. ROAMING MODE      — map pans only when the icon approaches the viewport
+//     edge, using a look-ahead offset so the pan anticipates movement direction.
+//     The user can freely pinch/pan/zoom anywhere on the full map; auto-pan
+//     resumes only on edge-proximity.
+//
+//  4. CENTERED MODE     — map always keeps the icon centred with a look-ahead
+//     offset in the direction of travel.
+//
+//  5. ALL ORIGINAL GUARDS preserved: throttle, debounce, stationary lock,
+//     motion validation, accuracy gates, battery saver, GPS timeout, jump
+//     handling, proximity calculation, enterprise cache, RAF + fallback.
+//
 function updateUserLocation(position, forceUpdate = false) {
     const now = performance.now();
 
-    validatePositionBuffer();
+    validatePositionBuffer?.();
 
     // ── CRITICAL GUARDS ───────────────────────────────────────────────────────
     if (window.mapFatalError) {
@@ -4608,14 +4629,13 @@ function updateUserLocation(position, forceUpdate = false) {
         return;
     }
 
-    // Reset the visual error counter on every successful entry into the function 
+    // Reset visual error counter on every clean entry
     window._visualErrorCount = 0;
 
     if (window._blockAutoMapUpdates && !forceUpdate) return;
 
     if (!map || !userMarker) {
         console.debug("updateUserLocation: Map not ready, deferring");
-
         window.pendingPosition    = position;
         window.pendingForceUpdate = forceUpdate;
         if (!window._mapReadyRetryId) {
@@ -4638,7 +4658,9 @@ function updateUserLocation(position, forceUpdate = false) {
         window._interactionHandlersSetup = true;
     }
 
-    // ── ENTRY THROTTLE (RAF COALESCING) ───────────────────────────
+    // ── ENTRY THROTTLE (RAF COALESCING) ───────────────────────────────────────
+    // On 10 Hz GPS devices rapid-fire calls cancel each RAF before it fires.
+    // Coalesce into one processing tick; forceUpdate always bypasses.
     if (!forceUpdate && (now - (window._lastUpdateLoopTime || 0)) < 20) {
         if (window._updateLoopTimeoutId) clearTimeout(window._updateLoopTimeoutId);
         window._updateLoopTimeoutId = setTimeout(() => {
@@ -4668,20 +4690,61 @@ function updateUserLocation(position, forceUpdate = false) {
         speed:     speedMPS = 0
     } = coords;
 
-    // Note: isFinite check here is now redundant given the Number.isFinite guard
-    // above, but retained for safety and to preserve original structure exactly.
     if (!isFinite(lat) || !isFinite(lng)) {
         console.warn("Invalid coordinates", { lat, lng });
         return;
     }
 
+    // ── IMMEDIATE PROXIMITY CHECK (before all throttles) ─────────────────────
+    // Runs on every raw GPS tick — no debounce, no distance gate — so the
+    // location page opens and proximity zoom fires the instant the threshold
+    // is crossed, regardless of frame rate or movement speed.
+    // Uses a lightweight cache so the loop only re-scans when coords change.
+    {
+        const _pLat = coords?.latitude;
+        const _pLng = coords?.longitude;
+        if (Number.isFinite(_pLat) && Number.isFinite(_pLng)) {
+            const _posChanged = (_pLat !== window._proxLastLat) || (_pLng !== window._proxLastLng);
+            if (_posChanged) {
+                window._proxLastLat = _pLat;
+                window._proxLastLng = _pLng;
+                let _closest = Infinity, _closestLoc = null;
+                if (Array.isArray(window.gameLocations)) {
+                    for (const _loc of window.gameLocations) {
+                        if (!_loc?.lat || !_loc?.lng) continue;
+                        const _d = calculateDistance({ lat: _pLat, lng: _pLng }, _loc);
+                        if (_d < _closest) { _closest = _d; _closestLoc = _loc; }
+                    }
+                }
+                if (typeof handleProximityAndAutoOpen === 'function') {
+                    handleProximityAndAutoOpen(
+                        { lat: _pLat, lng: _pLng, accuracy: coords?.accuracy ?? 20,
+                          heading: coords?.heading ?? null, timestamp: Date.now(),
+                          speedMPS: Math.max(0, coords?.speed ?? 0) },
+                        Date.now(), _closestLoc, _closest
+                    );
+                }
+                // Proximity zoom also fires immediately, independent of map update cadence
+                if (!window.isMapInteracting &&
+                    typeof _handleProximityZoom === 'function' &&
+                    window.proximityState) {
+                    const _mph = Math.min((window._emaSpeedMode ?? 0) * 2.23694, 90);
+                    const _ew  = !!(window.smoothedVelocity &&
+                        Math.abs(window.smoothedVelocity.lng) > Math.abs(window.smoothedVelocity.lat) * 1.2);
+                    _handleProximityZoom(_mph, _ew);
+                }
+            }
+        }
+    }
+
     // ── POSITION-DELTA PRE-FILTER ─────────────────────────────────────────────
+    // Reject pure sensor jitter before any heavier work.
     if (!forceUpdate && window.lastPosition) {
         const jitterM = calculateDistance(window.lastPosition, { lat, lng });
         if (jitterM < 0.10) return;
     }
 
-    // ── TIME GATE (PRIMARY THROUGHPUT CAP) ────────────────────────────────────
+    // ── TIME GATE (PRIMARY THROUGHPUT CAP ~30 fps) ────────────────────────────
     if (!forceUpdate && (now - (window.lastDebounceTime || 0)) < 33) {
         if (window.debounceTimeoutId) clearTimeout(window.debounceTimeoutId);
         window.pendingPosition    = position;
@@ -4713,26 +4776,23 @@ function updateUserLocation(position, forceUpdate = false) {
     }, 30000);
 
     // ── TIME & POSITION SETUP ─────────────────────────────────────────────────
-    // Two time domains, each used for the right purpose:
-    const physicsTime   = performance.now();
-    const wallClockTime = Date.now();
+    const physicsTime   = performance.now();   // monotonic — used for all dt
+    const wallClockTime = Date.now();          // epoch ms  — used for timestamps
+    const currentTime   = physicsTime;         // alias keeps downstream readable
     const lastPos       = window.lastPosition;
     const timeDelta     = lastPos ? (physicsTime - window.lastUpdateTime) / 1000 : 0;
 
-    // currentTime aliases physicsTime for all internal calculations below,
-    // keeping the rest of the function readable without a find/replace churn.
-    const currentTime = physicsTime;
-
+    // newPosition always holds raw GPS — this is what drives the marker.
     const newPosition = {
         lat,
         lng,
         accuracy,
         heading,
-        timestamp: wallClockTime,   // epoch ms — safe for all external consumers
+        timestamp: wallClockTime,
         speedMPS:  Math.max(0, speedMPS)
     };
 
-    // ── SPEED EMAs ────────────────────────────────────────────────────────────
+    // ── SPEED EMAs (for tier/mode decisions only — not marker placement) ───────
     window._emaSpeedMode = window._emaSpeedMode ?? newPosition.speedMPS;
     window._emaSpeedMode = 0.50 * newPosition.speedMPS + 0.50 * window._emaSpeedMode;
 
@@ -4749,10 +4809,12 @@ function updateUserLocation(position, forceUpdate = false) {
     const modeChanged      = ModeManager?.update?.(modeSpeedMPH) || false;
     const isInCenteredMode = ModeManager?.isCentered?.()         || false;
 
-    // ── FORCED UPDATE FLAG ────────────────────────────────────────
-    if (modeChanged) window._forceMapUpdateTime = currentTime;  // physicsTime ← enforce on all write sites
+    // Timestamp-based forced-update flag so rapid GPS ticks don't silently
+    // drop a mode-transition forced update before the RAF consumes it.
+    if (modeChanged) window._forceMapUpdateTime = currentTime;
     const forceMapThisFrame = !!(window._forceMapUpdateTime &&
-        (currentTime - window._forceMapUpdateTime) < 500);      // physicsTime - physicsTime ✓
+        (currentTime - window._forceMapUpdateTime) < 500);
+    // Cleared only inside doVisualUpdate, not here.
 
     // ── INACTIVITY TIMER ──────────────────────────────────────────────────────
     if (speedMPH >= 1.0) {
@@ -4771,6 +4833,7 @@ function updateUserLocation(position, forceUpdate = false) {
     }
 
     if (isLowPowerMode) {
+        // Minimal update: move marker to raw GPS, skip all map work.
         if (typeof scheduleMarkerUpdate === 'function') scheduleMarkerUpdate(lat, lng);
         window.lastPosition   = newPosition;
         window.lastUpdateTime = currentTime;
@@ -4790,9 +4853,9 @@ function updateUserLocation(position, forceUpdate = false) {
         if (typeof hideGPSSearchingState === 'function') hideGPSSearchingState();
     }
 
-    // ── VELOCITY SMOOTHING MOVED EARLIER ──────────────────────────
-    // Computed before E/W detection and all downstream logic so every consumer
-    // in this frame uses the current velocity, not the previous frame's value.
+    // ── VELOCITY SMOOTHING (PAN/ZOOM USE ONLY) ────────────────────────────────
+    // Computed before E/W detection so both use the current frame's velocity.
+    // Does NOT affect marker placement.
     window.lastVelocity     = window.lastVelocity     || { lat: 0, lng: 0 };
     window.smoothedVelocity = window.smoothedVelocity || { lat: 0, lng: 0 };
 
@@ -4816,33 +4879,9 @@ function updateUserLocation(position, forceUpdate = false) {
         }
     }
 
-    // ── INITIALIZATION ────────────────────────────────────────────────────────
-    if (!lastPos) {
-        if (Array.isArray(window.gameLocations) && window.gameLocations.length > 0) {
-            let firstClosestDist = Infinity;
-            let firstClosestLoc  = null;
-            for (const loc of window.gameLocations) {
-                if (!loc?.lat || !loc?.lng) continue;
-                const dist = calculateDistance(newPosition, loc);
-                if (dist < firstClosestDist) { firstClosestDist = dist; firstClosestLoc = loc; }
-            }
-            window.lastClosestDistance = firstClosestDist;
-            window.lastClosestLocation = firstClosestLoc;
-            if (typeof handleProximityAndAutoOpen === 'function') {
-                handleProximityAndAutoOpen(newPosition, wallClockTime, firstClosestLoc, firstClosestDist);
-            }
-        }
-        if (typeof _initializeUserLocationState === 'function') {
-            // wallClockTime: downstream state may persist this as a real timestamp.
-            _initializeUserLocationState(newPosition, wallClockTime, forceUpdate);
-        }
-        return;
-    }
-
-    // ── PROXIMITY CALCULATION (SYNCHRONOUS, RAW GPS) ──────────────────────────
-    // Intentionally uses newPosition (raw GPS), not smoothed position.
-    // This preserves the original proximity trigger timing exactly.
-    // Runs after the !lastPos guard — never wasted on the first GPS tick.
+    // ── PROXIMITY CALCULATION (RAW GPS) ───────────────────────────────────────
+    // Intentionally on raw GPS so proximity triggers fire at device position,
+    // not at a smoothed camera position.
     let closestDistance = Infinity;
     let closestLocation = null;
     const locationsWithDistance = [];
@@ -4865,26 +4904,35 @@ function updateUserLocation(position, forceUpdate = false) {
         window.lastClosestLocation = closestLocation;
     }
 
-    // Track raw GPS so posChanged works correctly on the next tick.
-    // Must use the raw coords (lat/lng), never the smoothed position.
     window.lastRawLat = lat;
     window.lastRawLng = lng;
 
-    // ── PROXIMITY STATE UPDATE (SYNCHRONOUS) ──────────────────────────────────
+    // ── INITIALIZATION ────────────────────────────────────────────────────────
+    if (!lastPos) {
+        if (Array.isArray(window.gameLocations) && window.gameLocations.length > 0) {
+            if (typeof handleProximityAndAutoOpen === 'function') {
+                handleProximityAndAutoOpen(newPosition, wallClockTime, closestLocation, closestDistance);
+            }
+        }
+        if (typeof _initializeUserLocationState === 'function') {
+            _initializeUserLocationState(newPosition, wallClockTime, forceUpdate);
+        }
+        return;
+    }
+
+    // ── PROXIMITY STATE UPDATE ────────────────────────────────────────────────
     if (typeof handleProximityAndAutoOpen === 'function') {
-        // wallClockTime: external consumer expects a Unix epoch value here.
         handleProximityAndAutoOpen(newPosition, wallClockTime, closestLocation, closestDistance);
     }
 
-    // ── ENTERPRISE CACHE (ASYNC, NON-BLOCKING) ────────────────────────────────
+    // ── ENTERPRISE CACHE (NON-BLOCKING) ───────────────────────────────────────
     if (locationsWithDistance.length > 0) {
         const cacheNow = performance.now();
         if (!window.lastCacheUpdate || (cacheNow - window.lastCacheUpdate) > 5000) {
             const cacheFn = window.enterpriseCacheManager?.cacheLocationData;
             if (typeof cacheFn === 'function') {
-                for (const { location, distance } of locationsWithDistance) {
-                    if (distance <= 100) {
-
+                for (const { location, distance: d } of locationsWithDistance) {
+                    if (d <= 100) {
                         try { cacheFn(location, newPosition); } catch (e) { /* non-fatal */ }
                     }
                 }
@@ -4921,6 +4969,7 @@ function updateUserLocation(position, forceUpdate = false) {
         if (window.isStationary) {
             const distFromLock = calculateDistance(window.stationaryLockPosition || newPosition, newPosition);
             if (distFromLock < STATIONARY_LOCK_THRESHOLD && newPosition.accuracy < lastPos.accuracy * 0.85) {
+                // Even while stationary, place marker at exact GPS position.
                 if (typeof scheduleMarkerUpdate === 'function') scheduleMarkerUpdate(lat, lng);
                 window.lastPosition           = newPosition;
                 window.stationaryLockPosition = { lat, lng };
@@ -4934,7 +4983,7 @@ function updateUserLocation(position, forceUpdate = false) {
             const tgt = L.latLng(lat, lng);
             if (cur.distanceTo(tgt) > 0.3) {
                 if (typeof scheduleMarkerUpdate === 'function') {
-                    scheduleMarkerUpdate(lat, lng, { animate: true, duration: 1.2, easeLinearity: 0.05 });
+                    scheduleMarkerUpdate(lat, lng, { animate: true, duration: 0.3, easeLinearity: 0.05 });
                 }
                 window.lastPosition   = newPosition;
                 window.lastUpdateTime = currentTime;
@@ -4944,7 +4993,7 @@ function updateUserLocation(position, forceUpdate = false) {
         return;
     }
 
-    // Clear stationary state
+    // Clear stationary state on meaningful movement
     window.stationaryStartTime    = null;
     window.isStationary           = false;
     window.stationaryLockPosition = null;
@@ -4956,7 +5005,7 @@ function updateUserLocation(position, forceUpdate = false) {
     // ── MOTION VALIDATION ─────────────────────────────────────────────────────
     if (timeDelta > 0 && timeDelta < 5) {
         const lastSpeedMPH = (lastPos.speedMPS || 0) * 2.23694;
-        const accel = Math.abs(speedMPH - lastSpeedMPH) / timeDelta;
+        const accel        = Math.abs(speedMPH - lastSpeedMPH) / timeDelta;
         if      (speedMPH < 3  && accel > 25) { console.warn(`Rejecting acceleration ${accel.toFixed(1)} mph/s at very low speed`);  return; }
         else if (speedMPH < 8  && accel > 22) { console.warn(`Rejecting acceleration ${accel.toFixed(1)} mph/s at low speed`);       return; }
         else if (speedMPH < 15 && accel > 18) { console.warn(`Rejecting acceleration ${accel.toFixed(1)} mph/s at medium speed`);    return; }
@@ -4969,7 +5018,6 @@ function updateUserLocation(position, forceUpdate = false) {
         if (diff > 180) diff = 360 - diff;
         if (newPosition.speedMPS < 2 && diff > 90) validatedHeading = lastPos.heading;
     }
-
     validatedHeading = validatedHeading ?? lastPos.heading ?? 0;
 
     let headingDiff           = 0;
@@ -5030,7 +5078,7 @@ function updateUserLocation(position, forceUpdate = false) {
             const ratio = newPosition.accuracy / speedTier.maxAccuracy;
             accuracyPenalty = Math.min(0.35, (ratio - 1) * 0.20);
             if (!window._lastAccuracyWarnTime || (currentTime - window._lastAccuracyWarnTime) > 5000) {
-                console.warn(`Low GPS accuracy (${newPosition.accuracy.toFixed(0)}m > ${speedTier.maxAccuracy}m), boosting smoothing lag by ${accuracyPenalty.toFixed(2)}`);
+                console.warn(`Low GPS accuracy (${newPosition.accuracy.toFixed(0)}m > ${speedTier.maxAccuracy}m)`);
                 window._lastAccuracyWarnTime = currentTime;
             }
         }
@@ -5050,6 +5098,7 @@ function updateUserLocation(position, forceUpdate = false) {
         return;
     }
 
+    // Large accuracy improvement or jump — snap marker and reset buffer.
     const accuracyImproved = newPosition.accuracy < lastPos.accuracy * 0.6;
     if (distance > 8 || accuracyImproved) {
         if (typeof scheduleMarkerUpdate === 'function') scheduleMarkerUpdate(lat, lng);
@@ -5071,7 +5120,11 @@ function updateUserLocation(position, forceUpdate = false) {
         }
     }
 
-    // ── DEAD RECKONING ────────────────────────────────────────────────────────
+    // ── PAN-ONLY SMOOTHING (camera position, NOT marker position) ─────────────
+    // We build a smoothed + look-ahead position solely for deciding where to pan
+    // the map. The marker will always be placed at raw lat/lng (see RAF below).
+
+    // Derive effective heading for look-ahead direction
     let effectiveHeading = validatedHeading;
     if (effectiveHeading == null && window.smoothedVelocity) {
         const vLat = window.smoothedVelocity.lat;
@@ -5081,27 +5134,50 @@ function updateUserLocation(position, forceUpdate = false) {
             if (effectiveHeading < 0) effectiveHeading += 360;
         }
     }
+
     const headingRad = (effectiveHeading ?? 0) * Math.PI / 180;
     const R          = 111111;
-    const predWindow = Math.min(0.8, 0.3 + (speedFactor * 0.5));
-    // Guard against division by zero at geographic poles (lat ±90°).
+    // Guard against poles
     const cosLat     = Math.max(1e-10, Math.abs(Math.cos(lat * Math.PI / 180)));
 
-    // ── DEAD RECKONING STARTUP ────────────────────────────────────
+    // Effective speed for look-ahead: blend fast and slow EMAs
     let effSpeed;
     if (window._emaSpeedFast != null && window._emaSpeedSlow != null &&
         (window._emaSpeedFast >= 0.05 || window._emaSpeedSlow >= 0.05)) {
         effSpeed = (window._emaSpeedFast * 0.70) + (window._emaSpeedSlow * 0.30);
     } else if (timeDelta > 0) {
-        effSpeed = distance / timeDelta * 0.1;   // reuses distance, no redundant calculateDistance call
+        effSpeed = distance / timeDelta * 0.1;
     } else {
         effSpeed = 0;
     }
 
-    const predLat = lat + (effSpeed * Math.cos(headingRad) / R)            * predWindow;
-    const predLng = lng + (effSpeed * Math.sin(headingRad) / (R * cosLat)) * predWindow;
+    // Look-ahead window scales with speed
+    const LA_BRACKETS = [
+        { base: 0,     mult: 0.020, max: 0.028 },
+        { base: 0,     mult: 0.038, max: 0.060 },
+        { base: 0.028, mult: 0.090, max: 0.160 },
+        { base: 0.060, mult: 0.120, max: 0.180 },
+        { base: 0.045, mult: 0.090, max: 0.135 },
+        { base: 0.030, mult: 0.060, max: 0.090 },
+        { base: 0.020, mult: 0.040, max: 0.060 },
+        { base: 0.012, mult: 0.022, max: 0.034 },
+        { base: 0.008, mult: 0.015, max: 0.023 },
+        { base: 0.004, mult: 0.008, max: 0.020 }
+    ];
 
-    // ── POSITION BUFFER ───────────────────────────────────────────────────────
+    const lab     = LA_BRACKETS[tierIndex];
+    let lookAhead = Math.min(lab.max, lab.base + (speedFactor * lab.mult));
+    lookAhead += (speedMPH < 15) ? Math.min(0.08, distance * 0.0055) : 0;
+    lookAhead -= headingDiff > 25 ? Math.min(0.14, headingDiff / 200 * 0.22) : 0;
+    lookAhead += (speedMPH < 15 && eastWestMovement) ? Math.min(0.055, distance * 0.0013) : 0;
+    lookAhead  = Math.max(0.01, lookAhead);
+
+    // Predict position one look-ahead step ahead of raw GPS for camera target
+    const predWindow = Math.min(0.8, 0.3 + (speedFactor * 0.5));
+    const predLat    = lat + (effSpeed * Math.cos(headingRad) / R)            * predWindow;
+    const predLng    = lng + (effSpeed * Math.sin(headingRad) / (R * cosLat)) * predWindow;
+
+    // Smooth the camera target (not the marker) through position buffer
     if (!window.positionBuffer) window.positionBuffer = [];
     window.positionBuffer.push({
         lat:       predLat,
@@ -5123,16 +5199,9 @@ function updateUserLocation(position, forceUpdate = false) {
         totalW += w;
     }
 
-    const bufferedPos = {
-        lat:       wLat / totalW,
-        lng:       wLng / totalW,
-        accuracy:  newPosition.accuracy,
-        heading:   validatedHeading,
-        timestamp: currentTime,
-        speedMPS:  effSpeed
-    };
+    const bufferedPanPos = { lat: wLat / totalW, lng: wLng / totalW };
 
-    // ── SMOOTHING FACTOR ──────────────────────────────────────────────────────
+    // Apply EMA smoothing to get final camera target
     const BRACKETS = [
         { base: 0.15, mult: 0.10, max: 0.28, min: 0.11 },
         { base: 0.23, mult: 0.12, max: 0.38, min: 0.18 },
@@ -5155,17 +5224,13 @@ function updateUserLocation(position, forceUpdate = false) {
     smoothFactor = Math.max(0.05, smoothFactor - accuracyPenalty);
     smoothFactor = Math.min(0.52, Math.max(0.11, smoothFactor)) * directionChangeFactor;
 
-    // ── SMOOTHED POSITION ─────────────────────────────────────────────────────
-    const smoothedPos = {
-        lat:       lastPos.lat * (1 - smoothFactor) + bufferedPos.lat * smoothFactor,
-        lng:       lastPos.lng * (1 - smoothFactor) + bufferedPos.lng * smoothFactor,
-        accuracy:  bufferedPos.accuracy,
-        heading:   bufferedPos.heading,
-        timestamp: currentTime,
-        speedMPS:  bufferedPos.speedMPS
+    // panTarget is the smoothed camera aim point — never used for marker placement
+    const panTarget = {
+        lat: lastPos.lat * (1 - smoothFactor) + bufferedPanPos.lat * smoothFactor,
+        lng: lastPos.lng * (1 - smoothFactor) + bufferedPanPos.lng * smoothFactor
     };
 
-    // ── ANIMATION PARAMS ──────────────────────────────────────────────────────
+    // ── ANIMATION DURATION (for map pan, not marker) ──────────────────────────
     let animDur = speedTier.panDuration;
     animDur -= Math.min(0.02, distance * 0.001);
     animDur += timeDelta > 0 ? Math.max(-0.01, Math.min(0.02, (0.25 - timeDelta) * 0.04)) : 0;
@@ -5178,36 +5243,18 @@ function updateUserLocation(position, forceUpdate = false) {
         ? Math.max(0.07, Math.min(0.19, (0.13 - (speedMPH * 0.0006)) * directionChangeFactor))
         : Math.max(0.08, Math.min(0.23, (0.15 - (speedMPH * 0.0011)) * directionChangeFactor));
 
-    // ── LOOK-AHEAD ────────────────────────────────────────────────────────────
-    const LA_BRACKETS = [
-        { base: 0,     mult: 0.020, max: 0.028 },
-        { base: 0,     mult: 0.038, max: 0.060 },
-        { base: 0.028, mult: 0.090, max: 0.160 },
-        { base: 0.060, mult: 0.120, max: 0.180 },
-        { base: 0.045, mult: 0.090, max: 0.135 },
-        { base: 0.030, mult: 0.060, max: 0.090 },
-        { base: 0.020, mult: 0.040, max: 0.060 },
-        { base: 0.012, mult: 0.022, max: 0.034 },
-        { base: 0.008, mult: 0.015, max: 0.023 },
-        { base: 0.004, mult: 0.008, max: 0.020 }
-    ];
-
-    const lab     = LA_BRACKETS[tierIndex];
-    let lookAhead = Math.min(lab.max, lab.base + (speedFactor * lab.mult));
-    lookAhead += (speedMPH < 15) ? Math.min(0.08, distance * 0.0055) : 0;
-    lookAhead -= headingDiff > 25 ? Math.min(0.14, headingDiff / 200 * 0.22) : 0;
-    lookAhead += (speedMPH < 15 && eastWestMovement) ? Math.min(0.055, distance * 0.0013) : 0;
-    lookAhead  = Math.max(0.01, lookAhead);
-
-    // ── SYNCHRONOUS STATE COMMIT ──────────────────────────────────
-    window.lastPosition   = smoothedPos;
+    // ── SYNCHRONOUS STATE COMMIT ──────────────────────────────────────────────
+    // Commit lastPosition as newPosition (raw GPS) so the next tick computes
+    // velocity from real device coordinates. panTarget is NOT stored as
+    // lastPosition — it is only used ephemerally for camera decisions below.
+    window.lastPosition   = newPosition;
     window.lastVelocity   = {
         lat: timeDelta > 0 ? (lat - lastPos.lat) / timeDelta : 0,
         lng: timeDelta > 0 ? (lng - lastPos.lng) / timeDelta : 0
     };
     window.lastUpdateTime = currentTime;
 
-    // ── VISUAL UPDATE (RAF) ───────────────────────────────────────────────────
+    // ── VISUAL UPDATE (RAF + FALLBACK) ────────────────────────────────────────
     if (window._nextLocationUpdateRAF) {
         cancelAnimationFrame(window._nextLocationUpdateRAF);
         window._nextLocationUpdateRAF = null;
@@ -5217,9 +5264,15 @@ function updateUserLocation(position, forceUpdate = false) {
         window._visualUpdateFallbackTimer = null;
     }
 
-    // ── RAF CLOSURE STALE CAPTURE ─────────────────────────────────
+    // Snapshot everything the RAF closure needs. If the next GPS tick arrives
+    // before this RAF fires it must not corrupt these values.
     const snap = {
-        smoothedPos,
+        // RAW GPS — drives marker placement
+        lat,
+        lng,
+        // Smoothed camera target — drives map panning only
+        panTarget,
+        // Everything else
         lastPos,
         speedTier,
         forceMapThisFrame,
@@ -5236,10 +5289,11 @@ function updateUserLocation(position, forceUpdate = false) {
         tierIndex,
         smoothFactor,
         closestDistance,
-        distance
+        distance,
+        validatedHeading
     };
 
-    // ── ATOMIC EXECUTION GUARD ────────────────────────
+    // Atomic guard — exactly one of RAF or fallback fires.
     let visualHasExecuted = false;
 
     const doVisualUpdate = (source) => {
@@ -5252,28 +5306,32 @@ function updateUserLocation(position, forceUpdate = false) {
         } else {
             cancelAnimationFrame(window._nextLocationUpdateRAF);
             window._nextLocationUpdateRAF = null;
-            console.warn('[Performance] RAF blocked - executing fallback');
+            console.warn('[Performance] RAF blocked — executing visual fallback');
         }
 
-        // ── consume forced-update timestamp ───────────
         if (snap.forceMapThisFrame) window._forceMapUpdateTime = null;
 
-        // Circuit breaker on repeated visual update errors.
+        // Circuit breaker — suspend rendering after 5 consecutive errors
         if ((window._visualErrorCount || 0) >= 5) {
             if (!window.mapFatalError) {
                 window.mapFatalError = true;
-                console.error("updateUserLocation: Too many consecutive visual errors — rendering suspended. Reload to recover.");
+                console.error("updateUserLocation: Too many visual errors — rendering suspended. Reload to recover.");
             }
             return;
         }
 
         try {
-            // ── MARKER ───────────────────────────────────────────────────────
+            // ── MARKER: always raw GPS ────────────────────────────────────────
+            // This is the core change: marker placement uses snap.lat/snap.lng
+            // (raw device coordinates), never the smoothed panTarget.
+            // At very low speeds a brief CSS transition keeps it from teleporting
+            // on jittery GPS; at higher speeds it snaps immediately.
+            const markerAnimDur = snap.speedMPH < 2 ? 0.25 : 0;
             if (typeof scheduleMarkerUpdate === 'function') {
-                scheduleMarkerUpdate(snap.smoothedPos.lat, snap.smoothedPos.lng, {
-                    animate:       true,
-                    duration:      snap.animDur,
-                    easeLinearity: snap.easeLin
+                scheduleMarkerUpdate(snap.lat, snap.lng, {
+                    animate:       markerAnimDur > 0,
+                    duration:      markerAnimDur,
+                    easeLinearity: 0.5
                 });
             }
 
@@ -5295,33 +5353,50 @@ function updateUserLocation(position, forceUpdate = false) {
                 (window._driftHysteresisCounter >= 2);
 
             // ── PAN ───────────────────────────────────────────────────────────
+            // Uses snap.panTarget (smoothed) for the camera, so panning is
+            // fluid. The marker itself is already at raw GPS above.
             if (shouldUpdateMap && !window.isMapInteracting && window.followUser && map && !window.isPanning) {
                 const bounds = map.getBounds();
                 if (bounds) {
                     if (snap.isInCenteredMode) {
+                        // Centered mode: always keep icon in view with look-ahead.
                         if (typeof _panMapToLookAhead === 'function') {
                             const lookAheadPosition = {
-                                lat: snap.smoothedPos.lat + (snap.smoothedPos.lat - snap.lastPos.lat) * snap.lookAhead,
-                                lng: snap.smoothedPos.lng + (snap.smoothedPos.lng - snap.lastPos.lng) * snap.lookAhead,
+                                lat: snap.panTarget.lat + (snap.panTarget.lat - snap.lastPos.lat) * snap.lookAhead,
+                                lng: snap.panTarget.lng + (snap.panTarget.lng - snap.lastPos.lng) * snap.lookAhead
                             };
                             _panMapToLookAhead(lookAheadPosition, snap.speedTier, snap.directionChangeFactor, snap.eastWestMovement, snap.speedMPH, bounds);
                         } else if (typeof _panMapToCenter === 'function') {
-                            _panMapToCenter(snap.smoothedPos, snap.speedTier, snap.directionChangeFactor, snap.eastWestMovement, snap.speedMPH, snap.lookAhead);
+                            _panMapToCenter(snap.panTarget, snap.speedTier, snap.directionChangeFactor, snap.eastWestMovement, snap.speedMPH, snap.lookAhead);
                         }
                     } else {
-                        if (typeof _isNearViewportEdge === 'function' && _isNearViewportEdge(snap.smoothedPos, bounds, snap.speedMPH)) {
+                        // Roaming mode: pan when icon nears the viewport edge.
+                        // Falls back to centering when no edge-pan helper exists,
+                        // so the icon is never stranded off-screen.
+                        // The user can freely pan/zoom the full map; auto-pan
+                        // only re-engages when the icon reaches the edge threshold.
+                        const nearEdge = typeof _isNearViewportEdge === 'function'
+                            && _isNearViewportEdge({ lat: snap.lat, lng: snap.lng }, bounds, snap.speedMPH);
+
+                        if (nearEdge) {
                             if (typeof _panMapIfNearEdge === 'function') {
-                                _panMapIfNearEdge(snap.smoothedPos, snap.speedTier, snap.directionChangeFactor, snap.eastWestMovement, bounds, snap.speedMPH);
+                                _panMapIfNearEdge(snap.panTarget, snap.speedTier, snap.directionChangeFactor, snap.eastWestMovement, bounds, snap.speedMPH);
                             }
                         } else if (snap.forceMapThisFrame && typeof _panMapToCenter === 'function') {
-                            _panMapToCenter(snap.smoothedPos, snap.speedTier, snap.directionChangeFactor, snap.eastWestMovement, snap.speedMPH, snap.lookAhead);
+                            // Mode-transition forced frame: re-centre immediately.
+                            _panMapToCenter(snap.panTarget, snap.speedTier, snap.directionChangeFactor, snap.eastWestMovement, snap.speedMPH, snap.lookAhead);
                         }
+                        // No pan when mid-viewport and not forced — user controls camera.
                     }
                 }
                 window.lastMapUpdateTime = snap.currentTime;
             }
 
             // ── PROXIMITY ZOOM ────────────────────────────────────────────────
+            // Runs every frame regardless of shouldUpdateMap — proximity zoom
+            // must respond immediately when threshold is crossed, and the
+            // immediate pre-throttle check above already handles the open trigger.
+            // This call handles the ongoing smooth zoom interpolation.
             if (!window.isMapInteracting && typeof _handleProximityZoom === 'function' && window.proximityState) {
                 _handleProximityZoom(snap.modeSpeedMPH, snap.eastWestMovement);
             }
@@ -5333,8 +5408,11 @@ function updateUserLocation(position, forceUpdate = false) {
                 }
             }
 
-            // ── VIEWPORT SAFETY ───────────────────────────────────────────────
-            if (typeof _enforceViewportSafety === 'function' && userMarker) {
+            // ── VIEWPORT SAFETY (unconditional when not interacting) ──────────
+            // Runs every RAF frame — not gated by shouldUpdateMap — so the icon
+            // can never drift off-screen between throttled map update intervals.
+            // Skipped during pinch/pan/zoom so the user can traverse the full map.
+            if (!window.isMapInteracting && typeof _enforceViewportSafety === 'function' && userMarker) {
                 const markerPos = userMarker.getLatLng();
                 if (markerPos) _enforceViewportSafety(snap.speedMPH, markerPos);
             }
@@ -5351,8 +5429,12 @@ function updateUserLocation(position, forceUpdate = false) {
                     modeSpeed:     snap.modeSpeedMPH.toFixed(1),
                     tier:          snap.tierIndex,
                     smoothing:     snap.smoothFactor.toFixed(3),
-                    duration:      snap.animDur.toFixed(2),
-                    mode:          snap.isInCenteredMode ? 'centered' : 'edge',
+                    panDuration:   snap.animDur.toFixed(2),
+                    markerLat:     snap.lat.toFixed(7),
+                    markerLng:     snap.lng.toFixed(7),
+                    panLat:        snap.panTarget.lat.toFixed(7),
+                    panLng:        snap.panTarget.lng.toFixed(7),
+                    mode:          snap.isInCenteredMode ? 'centered' : 'roaming',
                     proximity:     snap.closestDistance !== Infinity ? snap.closestDistance.toFixed(0) + 'm' : 'N/A',
                     forceMapFrame: snap.forceMapThisFrame,
                     eastWest:      snap.eastWestMovement,
@@ -5370,6 +5452,7 @@ function updateUserLocation(position, forceUpdate = false) {
         doVisualUpdate('raf');
     });
 
+    // Fallback fires only if RAF stalls (hidden tab, background throttling).
     window._visualUpdateFallbackTimer = setTimeout(() => {
         window._visualUpdateFallbackTimer = null;
         doVisualUpdate('fallback');
