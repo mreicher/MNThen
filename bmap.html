@@ -4591,6 +4591,14 @@ if (!window._smoothMovementInit) {
     window._lastOpenedPOI            = null;
     window._lastOpenedPOITime        = 0;
     window._lastAppliedZoomLevel     = null;
+    
+    // User intent tracking for smart follow-resume
+    window.userIntent = {
+        mode: 'following',           // 'following', 'browsing', 'navigating'
+        lastManualPan: 0,
+        lastManualZoom: 0,
+        lastPOIInteraction: 0
+    };
 }
 
 
@@ -4701,7 +4709,43 @@ function updateUserLocation(position, forceUpdate = false) {
     }
 
     if (!window._interactionHandlersSetup) {
-        setupMapInteractionHandlers?.();
+        if (typeof setupMapInteractionHandlers === 'function') {
+            setupMapInteractionHandlers();
+        } else {
+            // Fallback: define minimal interaction handlers with user intent tracking
+            const startInteraction = () => {
+                window.isMapInteracting = true;
+                window._interactionStartTime = Date.now();
+            };
+            const endInteraction = () => {
+                setTimeout(() => {
+                    if (Date.now() - (window._interactionStartTime || 0) >= 500) {
+                        window.isMapInteracting = false;
+                    }
+                }, 500);
+            };
+            
+            // Track user intent for smart follow-resume
+            const trackManualPan = () => {
+                if (window.userIntent) {
+                    window.userIntent.lastManualPan = Date.now();
+                    window.userIntent.mode = 'browsing';
+                }
+                window.isPanning = true;
+            };
+            const trackManualZoom = () => {
+                if (window.userIntent) {
+                    window.userIntent.lastManualZoom = Date.now();
+                    window.userIntent.mode = 'browsing';
+                }
+            };
+            
+            map.on('dragstart zoomstart touchstart mousedown', startInteraction);
+            map.on('dragend zoomend touchend mouseup', endInteraction);
+            map.on('movestart', trackManualPan);
+            map.on('moveend', () => { setTimeout(() => { window.isPanning = false; }, 100); });
+            map.on('zoomstart', trackManualZoom);
+        }
         window._interactionHandlersSetup = true;
     }
 
@@ -4866,11 +4910,13 @@ function updateUserLocation(position, forceUpdate = false) {
 
     // ── PROXIMITY ZOOM TARGET CALCULATION ─────────────────────────────────────
     // Calculates the target zoom level and animation duration based on distance.
-    // Does NOT apply the zoom here — that happens in doVisualUpdate for frame sync.
+    // Uses hysteresis to prevent thrashing at boundary (240m in, 260m out).
+    const PROXIMITY_HYSTERESIS = { zoomIn: 240, zoomOut: 260 };
+    
     if (closestLocation && closestDistance < Infinity) {
-        const distanceChanged = Math.abs(closestDistance - (window._lastProximityDistance || Infinity)) > 5;
+        const prevDistance = window._lastProximityDistance || Infinity;
         
-        if (closestDistance < 250 && (distanceChanged || window._lastProximityDistance === Infinity)) {
+        if (closestDistance < PROXIMITY_HYSTERESIS.zoomIn && window._targetZoomLevel !== 19) {
             // Entering proximity zone — zoom in
             window._targetZoomLevel       = 19;
             window._proximityZoomEaseStart = currentTime;
@@ -4879,8 +4925,8 @@ function updateUserLocation(position, forceUpdate = false) {
                                             closestDistance < 40  ? 300 :
                                             closestDistance < 75  ? 400 :
                                             closestDistance < 150 ? 600 : 900;
-        } else if (closestDistance >= 250 && window._targetZoomLevel !== window._baseZoomLevel && distanceChanged) {
-            // Leaving proximity zone — zoom out
+        } else if (closestDistance > PROXIMITY_HYSTERESIS.zoomOut && window._targetZoomLevel === 19) {
+            // Leaving proximity zone — zoom out (uses higher threshold for hysteresis)
             window._targetZoomLevel       = window._baseZoomLevel;
             window._proximityZoomEaseStart = currentTime;
             window._proximityZoomDuration = 800;
@@ -4915,13 +4961,34 @@ function updateUserLocation(position, forceUpdate = false) {
     }
 
     // ── POI AUTO-OPEN ─────────────────────────────────────────────────────────
-    // Debounced auto-open: fires once when entering 30m radius, won't re-fire
-    // for same POI for 30 seconds. Different POI opens immediately.
-    if (closestLocation && closestDistance <= 30 && closestDistance > 0) {
+    // Debounced auto-open with intentionality gates:
+    // - 30m radius, 30s debounce for same POI
+    // - Velocity gate: won't open if moving > 25 MPH (safety)
+    // - Viewport check: POI must be visible on screen
+    // - Dwell time: 800ms approach required (prevents flutter)
+    const POI_VELOCITY_GATE_MPH = 25;
+    const POI_DWELL_TIME_MS = 800;
+    
+    if (closestLocation && closestDistance <= 30 && closestDistance > 0 && speedMPH < POI_VELOCITY_GATE_MPH) {
         const timeSinceLastOpen = currentTime - (window._lastOpenedPOITime || 0);
         const isDifferentPOI    = window._lastOpenedPOI !== closestLocation.id;
         
-        if (isDifferentPOI || timeSinceLastOpen > 30000) {
+        // Track approach start time for dwell check
+        if (closestDistance <= 30 && !window._poiApproachStartTime) {
+            window._poiApproachStartTime = currentTime;
+            window._approachingPOI = closestLocation.id;
+        }
+        
+        // Check if still approaching same POI
+        const isSameApproach = window._approachingPOI === closestLocation.id;
+        const dwellTimeMet = isSameApproach && 
+                            window._poiApproachStartTime && 
+                            (currentTime - window._poiApproachStartTime) >= POI_DWELL_TIME_MS;
+        
+        // Viewport check: is POI visible on screen?
+        const poiInView = map && map.getBounds().contains(L.latLng(closestLocation.lat, closestLocation.lng));
+        
+        if ((isDifferentPOI || timeSinceLastOpen > 60000) && dwellTimeMet && poiInView) {
             if (typeof window.showPOIDetail === 'function') {
                 window.showPOIDetail(closestLocation);
             } else if (typeof window.openLocationDetail === 'function') {
@@ -4929,6 +4996,14 @@ function updateUserLocation(position, forceUpdate = false) {
             }
             window._lastOpenedPOI     = closestLocation.id;
             window._lastOpenedPOITime = currentTime;
+            window._poiApproachStartTime = null;
+            window._approachingPOI = null;
+        }
+    } else {
+        // Reset approach tracking if leaving proximity
+        if (closestDistance > 35 || !closestLocation) {
+            window._poiApproachStartTime = null;
+            window._approachingPOI = null;
         }
     }
 
@@ -4938,8 +5013,10 @@ function updateUserLocation(position, forceUpdate = false) {
     }
 
     // ── MOVEMENT DIRECTION ────────────────────────────────────────────────────
+    // Velocity-gated to prevent false positives from GPS noise at low speeds
     let eastWestMovement = false;
-    if (lastPos) {
+    const MIN_VELOCITY_FOR_EW_DETECTION = 0.5; // m/s (~1.1 MPH)
+    if (lastPos && newPosition.speedMPS > MIN_VELOCITY_FOR_EW_DETECTION) {
         const latDelta = Math.abs(lat - lastPos.lat);
         const lngDelta = Math.abs(lng - lastPos.lng);
         eastWestMovement = lngDelta > latDelta * 1.2;
@@ -5151,6 +5228,8 @@ function updateUserLocation(position, forceUpdate = false) {
     };
 
     // ── DEAD RECKONING ────────────────────────────────────────────────────────
+    // Heading is clockwise from North (0=North, 90=East, 180=South, 270=West)
+    // Standard math: cos(0)=East, sin(0)=North. So we swap sin/cos for lat/lng.
     const headingRad = (validatedHeading || 0) * Math.PI / 180;
     const R          = 111111;
     const predWindow = Math.min(0.8, 0.3 + (speedFactor * 0.5));
@@ -5159,8 +5238,9 @@ function updateUserLocation(position, forceUpdate = false) {
     let effSpeed = window._emaSpeedSlow || 0;
     if (!effSpeed && timeDelta > 0) effSpeed = calculateDistance(lastPos, newPosition) / timeDelta;
 
-    const predLat = lat + (effSpeed * Math.cos(headingRad) / R)            * predWindow;
-    const predLng = lng + (effSpeed * Math.sin(headingRad) / (R * cosLat)) * predWindow;
+    // Lat changes with North/South movement (sin for heading), Lng with East/West (cos)
+    const predLat = lat + (effSpeed * Math.sin(headingRad) / R)            * predWindow;
+    const predLng = lng + (effSpeed * Math.cos(headingRad) / (R * cosLat)) * predWindow;
 
     // ── POSITION BUFFER ───────────────────────────────────────────────────────
     if (!window.positionBuffer) window.positionBuffer = [];
@@ -5213,7 +5293,14 @@ function updateUserLocation(position, forceUpdate = false) {
     if (timeDelta > 0) smoothFactor += Math.min(0.03, Math.max(-0.015, (timeDelta - 0.35) * 0.045));
     if (headingDiff > 20 && speedMPH < 45) smoothFactor -= Math.max(0, 0.04 - (headingDiff / 200) * 0.06);
     if (eastWestMovement) smoothFactor += 0.018;
-    smoothFactor = Math.min(0.52, Math.max(0.11, smoothFactor)) * directionChangeFactor;
+    
+    // Creep mode: ultra-heavy smoothing when essentially stationary (< 0.5 MPH)
+    // Prevents jittery micro-movements from GPS noise when standing still
+    if (speedMPH < 0.5) {
+        smoothFactor = 0.08;
+    }
+    
+    smoothFactor = Math.min(0.52, Math.max(0.08, smoothFactor)) * directionChangeFactor;
 
     // ── SMOOTHED POSITION ─────────────────────────────────────────────────────
     const smoothedPos = {
@@ -5296,10 +5383,11 @@ function updateUserLocation(position, forceUpdate = false) {
                 const now         = Date.now();
                 const timeSinceLastZoom = now - (window._lastZoomChangeTime || 0);
                 
-                // ZOOM_THRASH_GUARD: Minimum 1.5s between zoom changes.
-                // Prevents rapid oscillation when user is walking near the 250m boundary
-                // and GPS jitter causes distance to bounce 248m/252m.
-                const ZOOM_COOLDOWN_MS = 1500;
+                // VELOCITY-BASED ZOOM_COOLDOWN: Slower speeds = longer cooldown
+                // Walking (3mph) covers ~2m/s, can cross boundary multiple times
+                const ZOOM_COOLDOWN_MS = speedMPH < 5  ? 3000 :  // Walking: longer cooldown
+                                        speedMPH < 15 ? 2000 :  // Jogging/biking
+                                        1000;                   // Driving: quick response
                 
                 // Only trigger if:
                 // 1. Zoom difference is meaningful (>0.2 levels)
@@ -5324,6 +5412,22 @@ function updateUserLocation(position, forceUpdate = false) {
                     setTimeout(() => {
                         window._zoomAnimationInProgress = false;
                     }, lockReleaseTime + 50);  // Small buffer for animation completion
+                }
+            }
+
+            // ── SMART FOLLOW-RESUME ───────────────────────────────────────────────
+            // Auto-resume following after 8 seconds of inactivity in browsing mode
+            if (window.userIntent && window.userIntent.mode === 'browsing') {
+                const timeSinceLastInteraction = Date.now() - Math.max(
+                    window.userIntent.lastManualPan || 0,
+                    window.userIntent.lastManualZoom || 0
+                );
+                if (timeSinceLastInteraction > 8000) {
+                    window.userIntent.mode = 'following';
+                    // Smoothly return to user position
+                    if (map && userMarker && !window.isMapInteracting) {
+                        map.flyTo(userMarker.getLatLng(), map.getZoom(), { duration: 1.5 });
+                    }
                 }
             }
 
@@ -5373,7 +5477,7 @@ function updateUserLocation(position, forceUpdate = false) {
                             }
                         }
                     } else {
-                        // ROAMING MODE: User icon roams map, recenter when approaching edge
+                        // ROAMING MODE: User icon roams map, recenter progressively when approaching edge
                         const predictiveTarget = calculatePredictiveRecenterTarget(
                             smoothedPos,
                             window.smoothedVelocity || { lat: 0, lng: 0 },
@@ -5381,12 +5485,36 @@ function updateUserLocation(position, forceUpdate = false) {
                             speedMPH
                         );
                         
-                        if (predictiveTarget) {
-                            // Use custom handler if available, otherwise direct pan
+                        // Also check for progressive edge approach (smoother than sudden recenter)
+                        const markerPos = userMarker.getLatLng();
+                        const safe = getViewportSafeZone(bounds, 0.15);
+                        const width = bounds.getEast() - bounds.getWest();
+                        const height = bounds.getNorth() - bounds.getSouth();
+                        
+                        // Calculate how close marker is to edge (0 = center, 1 = at edge)
+                        let edgeProximity = 0;
+                        if (markerPos.lng < safe.west) {
+                            edgeProximity = Math.max(edgeProximity, (safe.west - markerPos.lng) / width);
+                        } else if (markerPos.lng > safe.east) {
+                            edgeProximity = Math.max(edgeProximity, (markerPos.lng - safe.east) / width);
+                        }
+                        if (markerPos.lat < safe.south) {
+                            edgeProximity = Math.max(edgeProximity, (safe.south - markerPos.lat) / height);
+                        } else if (markerPos.lat > safe.north) {
+                            edgeProximity = Math.max(edgeProximity, (markerPos.lat - safe.north) / height);
+                        }
+                        
+                        // Progressive recentering: trigger earlier for smoother experience
+                        if (predictiveTarget || edgeProximity > 0.05) {
+                            // Use custom handler if available
                             if (typeof _panMapIfNearEdge === 'function') {
                                 _panMapIfNearEdge(smoothedPos, speedTier, directionChangeFactor, eastWestMovement, bounds, speedMPH);
                             } else {
-                                map.panTo(predictiveTarget, {
+                                const target = predictiveTarget || {
+                                    lat: bounds.getCenter().lat + (markerPos.lat - bounds.getCenter().lat) * 0.3,
+                                    lng: bounds.getCenter().lng + (markerPos.lng - bounds.getCenter().lng) * 0.3
+                                };
+                                map.panTo(target, {
                                     animate:       true,
                                     duration:      speedTier.panDuration,
                                     easeLinearity: speedTier.easeLinearity
@@ -5456,7 +5584,7 @@ function updateUserLocation(position, forceUpdate = false) {
         window._visualUpdateFallbackTimer = null;
     }, 50);
 }
-        
+
 /* Calculates a new map center in roaming mode when user approaches viewport edge. */
 function _calculateRoamingTarget(userPos, bounds, speedMPH) {
     const currentCenter = map.getCenter();
