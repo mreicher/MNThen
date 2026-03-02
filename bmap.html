@@ -4587,6 +4587,7 @@ if (!window._smoothMovementInit) {
     window._proximityZoomEaseStart   = null;
     window._proximityZoomDuration    = 0;
     window._zoomAnimationInProgress  = false;
+    window._lastZoomChangeTime       = 0;      // Prevents zoom thrashing at boundary
     window._lastOpenedPOI            = null;
     window._lastOpenedPOITime        = 0;
     window._lastAppliedZoomLevel     = null;
@@ -4672,111 +4673,7 @@ function calculatePredictiveRecenterTarget(position, velocity, bounds, speedMPH)
     return { lat: targetLat, lng: targetLng };
 }
 
-// ─── BATTERY POLLER ──────────────────────────────────────────────────────────
-if (!window._batteryPollerStarted) {
-    window._batteryPollerStarted = true;
-    (async function pollBattery() {
-        if (typeof navigator.getBattery !== 'function') return;
-        async function run() {
-            try {
-                window._batteryCache = await navigator.getBattery();
-                window._batteryCacheTime = Date.now();
-            } catch (_) {}
-        }
-        await run();
-        setInterval(run, 60000);
-    })();
-}
 
-// ─── SMOOTH MOVEMENT INITIALIZATION ──────────────────────────────────────────
-if (!window._smoothMovementInit) {
-    window._smoothMovementInit = true;
-    window._baseZoomLevel = 17;
-    window._proximityZoomLevel = window._baseZoomLevel;
-    window._targetZoomLevel = window._baseZoomLevel;
-    window._lastProximityDistance = Infinity;
-    window._proximityZoomEaseStart = null;
-    window._proximityZoomDuration = 0;
-    window._lastOpenedPOI = null;
-    window._lastOpenedPOITime = 0;
-}
-
-// ─── EASING FUNCTION ────────────────────────────────────────────────────────
-function easeOutCubic(t) {
-    return 1 - Math.pow(1 - t, 3);
-}
-
-// ─── VIEWPORT HELPERS ───────────────────────────────────────────────────────
-function getViewportSafeZone(bounds, paddingFraction = 0.15) {
-    const width = bounds.getEast() - bounds.getWest();
-    const height = bounds.getNorth() - bounds.getSouth();
-    return {
-        west: bounds.getWest() + (width * paddingFraction),
-        east: bounds.getEast() - (width * paddingFraction),
-        south: bounds.getSouth() + (height * paddingFraction),
-        north: bounds.getNorth() - (height * paddingFraction)
-    };
-}
-
-function calculatePredictiveRecenterTarget(position, velocity, bounds, speedMPH) {
-    if (!bounds) return null;
-    
-    const safe = getViewportSafeZone(bounds, 0.20);
-    const width = bounds.getEast() - bounds.getWest();
-    const height = bounds.getNorth() - bounds.getSouth();
-    
-    // Check if currently outside safe zone
-    const currentlyOutside = 
-        position.lng < safe.west || position.lng > safe.east ||
-        position.lat < safe.south || position.lat > safe.north;
-    
-    if (!currentlyOutside) {
-        // Check if velocity predicts leaving safe zone
-        const velMag = Math.sqrt(velocity.lat * velocity.lat + velocity.lng * velocity.lng);
-        if (velMag < 0.00001) return null;
-        
-        const lookAheadTime = Math.min(3.0, 0.5 + (speedMPH / 45));
-        const predictedPos = {
-            lat: position.lat + (velocity.lat * lookAheadTime),
-            lng: position.lng + (velocity.lng * lookAheadTime)
-        };
-        
-        const predictedOutside =
-            predictedPos.lng < safe.west || predictedPos.lng > safe.east ||
-            predictedPos.lat < safe.south || predictedPos.lat > safe.north;
-        
-        if (!predictedOutside) return null;
-    }
-    
-    // Recenter - move opposite to movement direction
-    let targetLat = position.lat;
-    let targetLng = position.lng;
-    
-    // If moving west, recenter to show more east
-    if (position.lng < safe.west || velocity.lng < 0) {
-        targetLng = position.lng + (width * 0.15);
-    }
-    // If moving east, recenter to show more west
-    else if (position.lng > safe.east || velocity.lng > 0) {
-        targetLng = position.lng - (width * 0.15);
-    }
-    
-    // If moving south, recenter to show more north
-    if (position.lat < safe.south || velocity.lat < 0) {
-        targetLat = position.lat + (height * 0.15);
-    }
-    // If moving north, recenter to show more south
-    else if (position.lat > safe.north || velocity.lat > 0) {
-        targetLat = position.lat - (height * 0.15);
-    }
-    
-    if (targetLat === position.lat && targetLng === position.lng) {
-        return null;
-    }
-    
-    return { lat: targetLat, lng: targetLng };
-}
-        
 // ─── MAIN UPDATE LOOP ─────────────────────────────────────────────────────────
 function updateUserLocation(position, forceUpdate = false) {
     const now = performance.now();
@@ -5391,17 +5288,30 @@ function updateUserLocation(position, forceUpdate = false) {
 
             // ── PROXIMITY ZOOM (SEPARATE FROM PAN) ──────────────────────────────
             // Apply zoom independently when target changes meaningfully.
-            // Guarded against user interaction and mid-animation state.
+            // Guarded against user interaction, mid-animation state, and thrashing.
             if (!window.isMapInteracting && !window.isPanning && !window._zoomAnimationInProgress) {
                 const currentZoom = map.getZoom();
                 const targetZoom  = capturedZoomLevel ?? window._baseZoomLevel;
                 const zoomDiff    = Math.abs(targetZoom - currentZoom);
+                const now         = Date.now();
+                const timeSinceLastZoom = now - (window._lastZoomChangeTime || 0);
                 
-                // Only trigger if zoom difference is meaningful (>0.2 levels)
-                // and we haven't already applied this target
-                if (zoomDiff > 0.2 && window._lastAppliedZoomLevel !== capturedTargetZoom) {
+                // ZOOM_THRASH_GUARD: Minimum 1.5s between zoom changes.
+                // Prevents rapid oscillation when user is walking near the 250m boundary
+                // and GPS jitter causes distance to bounce 248m/252m.
+                const ZOOM_COOLDOWN_MS = 1500;
+                
+                // Only trigger if:
+                // 1. Zoom difference is meaningful (>0.2 levels)
+                // 2. We haven't already applied this target
+                // 3. Enough time has passed since last zoom (thrash guard)
+                if (zoomDiff > 0.2 && 
+                    window._lastAppliedZoomLevel !== capturedTargetZoom &&
+                    timeSinceLastZoom >= ZOOM_COOLDOWN_MS) {
+                    
                     window._zoomAnimationInProgress  = true;
                     window._lastAppliedZoomLevel     = capturedTargetZoom;
+                    window._lastZoomChangeTime       = now;
                     
                     // Use setZoom, not setView — preserves map center
                     map.setZoom(targetZoom, {
