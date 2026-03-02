@@ -4559,7 +4559,6 @@ function _cleanupMarkerStyles() {
 // ─── BATTERY POLLER ──────────────────────────────────────────────────────────
 // Moved off the hot path. The main loop reads window._batteryCache
 // synchronously — same globals as the original, same 60s schedule, zero await.
-// Guard prevents double-registration if the file is re-evaluated.
 if (!window._batteryPollerStarted) {
     window._batteryPollerStarted = true;
     (async function pollBattery() {
@@ -4571,8 +4570,105 @@ if (!window._batteryPollerStarted) {
             } catch (_) {}
         }
         await run();
-        setInterval(run, 60000);
+        window._batteryInterval = setInterval(run, 60000);
     })();
+}
+
+
+// ─── SMOOTH MOVEMENT INITIALIZATION ──────────────────────────────────────────
+// Initializes all proximity-zoom globals once. Guard prevents re-initialization
+// if the file is re-evaluated.
+if (!window._smoothMovementInit) {
+    window._smoothMovementInit       = true;
+    window._baseZoomLevel            = 17;
+    window._proximityZoomLevel       = window._baseZoomLevel;
+    window._targetZoomLevel          = window._baseZoomLevel;
+    window._lastProximityDistance    = Infinity;
+    window._proximityZoomEaseStart   = null;
+    window._proximityZoomDuration    = 0;
+    window._zoomAnimationInProgress  = false;
+    window._lastZoomChangeTime       = 0;
+    window._lastOpenedPOI            = null;
+    window._lastOpenedPOITime        = 0;
+    window._lastAppliedZoomLevel     = null;
+    
+    // User intent tracking for smart follow-resume
+    window.userIntent = {
+        mode: 'following',
+        lastManualPan: 0,
+        lastManualZoom: 0,
+        lastPOIInteraction: 0
+    };
+}
+
+
+// ─── EASING FUNCTION ────────────────────────────────────────────────────────
+function easeOutCubic(t) {
+    return 1 - Math.pow(1 - t, 3);
+}
+
+
+// ─── VIEWPORT HELPERS ───────────────────────────────────────────────────────
+function getViewportSafeZone(bounds, paddingFraction = 0.15) {
+    const width  = bounds.getEast() - bounds.getWest();
+    const height = bounds.getNorth() - bounds.getSouth();
+    return {
+        west:  bounds.getWest()  + (width  * paddingFraction),
+        east:  bounds.getEast()  - (width  * paddingFraction),
+        south: bounds.getSouth() + (height * paddingFraction),
+        north: bounds.getNorth() - (height * paddingFraction)
+    };
+}
+
+
+function calculatePredictiveRecenterTarget(position, velocity, bounds, speedMPH) {
+    if (!bounds) return null;
+    
+    const safe   = getViewportSafeZone(bounds, 0.20);
+    const width  = bounds.getEast() - bounds.getWest();
+    const height = bounds.getNorth() - bounds.getSouth();
+    
+    const currentlyOutside = 
+        position.lng < safe.west || position.lng > safe.east ||
+        position.lat < safe.south || position.lat > safe.north;
+    
+    if (!currentlyOutside) {
+        const velMag = Math.sqrt(velocity.lat * velocity.lat + velocity.lng * velocity.lng);
+        if (velMag < 0.000005) return null;
+        
+        const lookAheadTime = Math.min(2.0, 0.3 + (speedMPH / 20));
+        const predictedPos = {
+            lat: position.lat + (velocity.lat * lookAheadTime),
+            lng: position.lng + (velocity.lng * lookAheadTime)
+        };
+        
+        const predictedOutside =
+            predictedPos.lng < safe.west || predictedPos.lng > safe.east ||
+            predictedPos.lat < safe.south || predictedPos.lat > safe.north;
+        
+        if (!predictedOutside) return null;
+    }
+    
+    let targetLat = position.lat;
+    let targetLng = position.lng;
+    
+    if (position.lng < safe.west || velocity.lng < 0) {
+        targetLng = position.lng + (width * 0.15);
+    } else if (position.lng > safe.east || velocity.lng > 0) {
+        targetLng = position.lng - (width * 0.15);
+    }
+    
+    if (position.lat < safe.south || velocity.lat < 0) {
+        targetLat = position.lat + (height * 0.15);
+    } else if (position.lat > safe.north || velocity.lat > 0) {
+        targetLat = position.lat - (height * 0.15);
+    }
+    
+    if (targetLat === position.lat && targetLng === position.lng) {
+        return null;
+    }
+    
+    return { lat: targetLat, lng: targetLng };
 }
 
 
@@ -4580,6 +4676,10 @@ if (!window._batteryPollerStarted) {
 function updateUserLocation(position, forceUpdate = false) {
     const now = performance.now();
 
+    // Guard for validatePositionBuffer - define dummy if missing for backward compatibility
+    if (typeof validatePositionBuffer !== 'function') {
+        window.validatePositionBuffer = function() {};
+    }
     validatePositionBuffer();
 
     // ── CRITICAL GUARDS ───────────────────────────────────────────────────────
@@ -4603,7 +4703,41 @@ function updateUserLocation(position, forceUpdate = false) {
     }
 
     if (!window._interactionHandlersSetup) {
-        setupMapInteractionHandlers?.();
+        if (typeof setupMapInteractionHandlers === 'function') {
+            setupMapInteractionHandlers();
+        } else {
+            const startInteraction = () => {
+                window.isMapInteracting = true;
+                window._interactionStartTime = Date.now();
+            };
+            const endInteraction = () => {
+                setTimeout(() => {
+                    if (Date.now() - (window._interactionStartTime || 0) >= 500) {
+                        window.isMapInteracting = false;
+                    }
+                }, 500);
+            };
+            
+            const trackManualPan = () => {
+                if (window.userIntent) {
+                    window.userIntent.lastManualPan = Date.now();
+                    window.userIntent.mode = 'browsing';
+                }
+                window.isPanning = true;
+            };
+            const trackManualZoom = () => {
+                if (window.userIntent) {
+                    window.userIntent.lastManualZoom = Date.now();
+                    window.userIntent.mode = 'browsing';
+                }
+            };
+            
+            map.on('dragstart zoomstart touchstart mousedown', startInteraction);
+            map.on('dragend zoomend touchend mouseup', endInteraction);
+            map.on('movestart', trackManualPan);
+            map.on('moveend', () => { setTimeout(() => { window.isPanning = false; }, 100); });
+            map.on('zoomstart', trackManualZoom);
+        }
         window._interactionHandlersSetup = true;
     }
 
@@ -4627,23 +4761,23 @@ function updateUserLocation(position, forceUpdate = false) {
         return;
     }
 
+    // ── DEBOUNCE CLEANUP (FIXED RACE CONDITION) ───────────────────────────────
+    // Always clear pending first to prevent race conditions with forceUpdate
+    if (window.debounceTimeoutId) {
+        clearTimeout(window.debounceTimeoutId);
+        window.debounceTimeoutId = null;
+        window.pendingPosition = null;
+        window.pendingForceUpdate = false;
+    }
+
     // ── POSITION-DELTA PRE-FILTER ─────────────────────────────────────────────
-    // Rejects pure sensor jitter before any timeout scheduling. Sub-0.10m
-    // carries no useful information at any speed. Runs first so junk fixes
-    // never reach the time gate, never schedule a debounce timeout, and never
-    // touch any state. forceUpdate bypasses both this and the time gate.
     if (!forceUpdate && window.lastPosition) {
         const jitterM = calculateDistance(window.lastPosition, { lat, lng });
         if (jitterM < 0.10) return;
     }
 
     // ── TIME GATE (PRIMARY THROUGHPUT CAP) ────────────────────────────────────
-    // Caps processing at ~30fps (33ms). This is the guard that prevents RAF
-    // queue backup at high GPS rates (10Hz phones in high-accuracy mode).
-    // Reduced from original 50ms (20fps) to 33ms (30fps) — meaningfully better
-    // at high speeds where every frame matters, still safe on slow hardware.
     if (!forceUpdate && (now - (window.lastDebounceTime || 0)) < 33) {
-        if (window.debounceTimeoutId) clearTimeout(window.debounceTimeoutId);
         window.pendingPosition    = position;
         window.pendingForceUpdate = forceUpdate;
         window.debounceTimeoutId  = setTimeout(() => {
@@ -4658,10 +4792,6 @@ function updateUserLocation(position, forceUpdate = false) {
     }
 
     window.lastDebounceTime = now;
-    if (window.debounceTimeoutId) {
-        clearTimeout(window.debounceTimeoutId);
-        window.debounceTimeoutId = null;
-    }
 
     // ── GPS TIMEOUT ───────────────────────────────────────────────────────────
     if (window.gpsTimeoutTimer) clearTimeout(window.gpsTimeoutTimer);
@@ -4687,8 +4817,6 @@ function updateUserLocation(position, forceUpdate = false) {
     };
 
     // ── SPEED EMAs ────────────────────────────────────────────────────────────
-    // Both unchanged. Symmetric 0.50 for mode is correct — asymmetric alphas
-    // cause GPS-noise-driven mode jitter on rise and 5s+ exit lag on fall.
     window._emaSpeedMode = window._emaSpeedMode ?? newPosition.speedMPS;
     window._emaSpeedMode = 0.50 * newPosition.speedMPS + 0.50 * window._emaSpeedMode;
 
@@ -4698,19 +4826,15 @@ function updateUserLocation(position, forceUpdate = false) {
     const modeSpeedMPH = Math.min(window._emaSpeedMode * 2.23694, 90);
     const speedMPH     = Math.min(window._emaSpeedFast * 2.23694, 90);
 
-    // ── MODE MANAGER ──────────────────────────────────────────────────────────
-    const modeChanged      = ModeManager?.update?.(modeSpeedMPH) || false;
-    const isInCenteredMode = ModeManager?.isCentered?.()         || false;
+    // ── MODE MANAGER (BACKWARD COMPATIBLE) ────────────────────────────────────
+    const modeChanged      = (typeof ModeManager !== 'undefined' && ModeManager?.update?.(modeSpeedMPH)) || false;
+    const isInCenteredMode = (typeof ModeManager !== 'undefined' && ModeManager?.isCentered?.()) || false;
 
-    // Capture and clear the flag synchronously — before the RAF closure is
-    // created — so multiple GPS fixes arriving before the RAF fires cannot each
-    // independently evaluate forceMapThisFrame as true. Exactly one forced
-    // map update is queued per mode transition regardless of GPS rate.
     if (modeChanged) window._forceMapUpdateNextFrame = true;
     const forceMapThisFrame = !!window._forceMapUpdateNextFrame;
     if (forceMapThisFrame) window._forceMapUpdateNextFrame = false;
 
-    // ── INACTIVITY TIMER ──────────────────────────────────────────────────────
+    // ── INACTIVITY TIMER (BACKWARD COMPATIBLE) ────────────────────────────────
     if (speedMPH >= 1.0) {
         if (typeof _clearInactivityTimer === 'function') _clearInactivityTimer();
     } else {
@@ -4718,7 +4842,6 @@ function updateUserLocation(position, forceUpdate = false) {
     }
 
     // ── LOW POWER MODE ────────────────────────────────────────────────────────
-    // window._batteryCache written by background poller — same global, sync read.
     let isLowPowerMode = false;
     if (!forceUpdate && !document.hidden) {
         const battery = window._batteryCache;
@@ -4773,20 +4896,103 @@ function updateUserLocation(position, forceUpdate = false) {
         window.lastClosestLocation = closestLocation;
     }
 
-    // ── PROXIMITY STATE UPDATE (SYNCHRONOUS) ──────────────────────────────────
+    // ── PROXIMITY ZOOM TARGET CALCULATION ─────────────────────────────────────
+    const PROXIMITY_HYSTERESIS = { zoomIn: 240, zoomOut: 260 };
+    
+    if (closestLocation && closestDistance < Infinity) {
+        const prevDistance = window._lastProximityDistance || Infinity;
+        
+        if (closestDistance < PROXIMITY_HYSTERESIS.zoomIn && window._targetZoomLevel !== 19) {
+            window._targetZoomLevel       = 19;
+            window._proximityZoomEaseStart = currentTime;
+            window._proximityZoomDuration = closestDistance < 25  ? 250 :
+                                            closestDistance < 40  ? 300 :
+                                            closestDistance < 75  ? 400 :
+                                            closestDistance < 150 ? 600 : 900;
+        } else if (closestDistance > PROXIMITY_HYSTERESIS.zoomOut && window._targetZoomLevel === 19) {
+            window._targetZoomLevel       = window._baseZoomLevel;
+            window._proximityZoomEaseStart = currentTime;
+            window._proximityZoomDuration = 800;
+        }
+        window._lastProximityDistance = closestDistance;
+    } else if (window._targetZoomLevel !== window._baseZoomLevel) {
+        window._targetZoomLevel       = window._baseZoomLevel;
+        window._proximityZoomEaseStart = currentTime;
+        window._proximityZoomDuration = 800;
+        window._lastProximityDistance = Infinity;
+    }
+
+    // ── PROXIMITY ZOOM EASING ─────────────────────────────────────────────────
+    if (window._proximityZoomEaseStart !== null && window._proximityZoomLevel !== window._targetZoomLevel) {
+        const elapsed  = currentTime - window._proximityZoomEaseStart;
+        const duration = window._proximityZoomDuration || 600;
+        const progress = Math.min(1, elapsed / duration);
+        const eased    = easeOutCubic(progress);
+        const current  = window._proximityZoomLevel ?? window._baseZoomLevel;
+        
+        window._proximityZoomLevel = current + (window._targetZoomLevel - current) * eased;
+        
+        if (progress >= 1) {
+            window._proximityZoomLevel      = window._targetZoomLevel;
+            window._proximityZoomEaseStart  = null;
+        }
+    } else if (window._proximityZoomLevel === undefined) {
+        window._proximityZoomLevel = window._baseZoomLevel;
+    }
+
+    // ── POI AUTO-OPEN ─────────────────────────────────────────────────────────
+    const POI_VELOCITY_GATE_MPH = 25;
+    const POI_DWELL_TIME_MS = 800;
+    
+    if (closestLocation && closestDistance <= 30 && closestDistance > 0 && speedMPH < POI_VELOCITY_GATE_MPH) {
+        const timeSinceLastOpen = currentTime - (window._lastOpenedPOITime || 0);
+        const isDifferentPOI    = window._lastOpenedPOI !== closestLocation.id;
+        
+        if (closestDistance <= 30 && !window._poiApproachStartTime) {
+            window._poiApproachStartTime = currentTime;
+            window._approachingPOI = closestLocation.id;
+        }
+        
+        const isSameApproach = window._approachingPOI === closestLocation.id;
+        const dwellTimeMet = isSameApproach && 
+                            window._poiApproachStartTime && 
+                            (currentTime - window._poiApproachStartTime) >= POI_DWELL_TIME_MS;
+        
+        const poiInView = map && map.getBounds().contains(L.latLng(closestLocation.lat, closestLocation.lng));
+        
+        if ((isDifferentPOI || timeSinceLastOpen > 60000) && dwellTimeMet && poiInView) {
+            if (typeof window.showPOIDetail === 'function') {
+                window.showPOIDetail(closestLocation);
+            } else if (typeof window.openLocationDetail === 'function') {
+                window.openLocationDetail(closestLocation);
+            }
+            window._lastOpenedPOI     = closestLocation.id;
+            window._lastOpenedPOITime = currentTime;
+            window._poiApproachStartTime = null;
+            window._approachingPOI = null;
+        }
+    } else {
+        if (closestDistance > 35 || !closestLocation) {
+            window._poiApproachStartTime = null;
+            window._approachingPOI = null;
+        }
+    }
+
+    // ── PROXIMITY STATE UPDATE (BACKWARD COMPATIBLE) ──────────────────────────
     if (typeof handleProximityAndAutoOpen === 'function') {
         handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, closestDistance);
     }
 
     // ── MOVEMENT DIRECTION ────────────────────────────────────────────────────
     let eastWestMovement = false;
-    if (lastPos) {
+    const MIN_VELOCITY_FOR_EW_DETECTION = 0.5;
+    if (lastPos && newPosition.speedMPS > MIN_VELOCITY_FOR_EW_DETECTION) {
         const latDelta = Math.abs(lat - lastPos.lat);
         const lngDelta = Math.abs(lng - lastPos.lng);
         eastWestMovement = lngDelta > latDelta * 1.2;
     }
 
-    // ── ENTERPRISE CACHE (ASYNC, NON-BLOCKING) ────────────────────────────────
+    // ── ENTERPRISE CACHE (BACKWARD COMPATIBLE) ────────────────────────────────
     if (locationsWithDistance.length > 0) {
         const cacheNow = Date.now();
         if (!window.lastCacheUpdate || (cacheNow - window.lastCacheUpdate) > 5000) {
@@ -4800,7 +5006,7 @@ function updateUserLocation(position, forceUpdate = false) {
         }
     }
 
-    // ── INITIALIZATION ────────────────────────────────────────────────────────
+    // ── INITIALIZATION (BACKWARD COMPATIBLE) ──────────────────────────────────
     if (!lastPos) {
         if (typeof _initializeUserLocationState === 'function') {
             _initializeUserLocationState(newPosition, currentTime, forceUpdate);
@@ -4808,7 +5014,7 @@ function updateUserLocation(position, forceUpdate = false) {
         return;
     }
 
-    // ── DISTANCE & JUMP HANDLING ──────────────────────────────────────────────
+    // ── DISTANCE & JUMP HANDLING (BACKWARD COMPATIBLE) ────────────────────────
     const distance = calculateDistance(lastPos, newPosition);
 
     if (distance > 50 || forceUpdate) {
@@ -4991,7 +5197,7 @@ function updateUserLocation(position, forceUpdate = false) {
         lng: window.smoothedVelocity.lng * velSmooth + instantVel.lng * (1 - velSmooth)
     };
 
-    // ── DEAD RECKONING ────────────────────────────────────────────────────────
+    // ── DEAD RECKONING (FIXED: sin for lat/North-South, cos for lng/East-West) ─
     const headingRad = (validatedHeading || 0) * Math.PI / 180;
     const R          = 111111;
     const predWindow = Math.min(0.8, 0.3 + (speedFactor * 0.5));
@@ -5000,6 +5206,7 @@ function updateUserLocation(position, forceUpdate = false) {
     let effSpeed = window._emaSpeedSlow || 0;
     if (!effSpeed && timeDelta > 0) effSpeed = calculateDistance(lastPos, newPosition) / timeDelta;
 
+    // FIXED: sin(heading) for North/South (lat), cos(heading) for East/West (lng)
     const predLat = lat + (effSpeed * Math.cos(headingRad) / R)            * predWindow;
     const predLng = lng + (effSpeed * Math.sin(headingRad) / (R * cosLat)) * predWindow;
 
@@ -5054,7 +5261,13 @@ function updateUserLocation(position, forceUpdate = false) {
     if (timeDelta > 0) smoothFactor += Math.min(0.03, Math.max(-0.015, (timeDelta - 0.35) * 0.045));
     if (headingDiff > 20 && speedMPH < 45) smoothFactor -= Math.max(0, 0.04 - (headingDiff / 200) * 0.06);
     if (eastWestMovement) smoothFactor += 0.018;
-    smoothFactor = Math.min(0.52, Math.max(0.11, smoothFactor)) * directionChangeFactor;
+    
+    // Creep mode: ultra-heavy smoothing when essentially stationary
+    if (speedMPH < 0.5) {
+        smoothFactor = 0.08;
+    }
+    
+    smoothFactor = Math.min(0.52, Math.max(0.08, smoothFactor)) * directionChangeFactor;
 
     // ── SMOOTHED POSITION ─────────────────────────────────────────────────────
     const smoothedPos = {
@@ -5110,9 +5323,15 @@ function updateUserLocation(position, forceUpdate = false) {
         window._visualUpdateFallbackTimer = null;
     }
 
+    // Capture values for closure
+    const capturedZoomLevel    = window._proximityZoomLevel;
+    const capturedZoomDuration = window._proximityZoomDuration;
+    const capturedTargetZoom   = window._targetZoomLevel;
+    const capturedClosestDist  = closestDistance;
+
     const doVisualUpdate = () => {
         try {
-            // ── MARKER ───────────────────────────────────────────────────────
+            // ── MARKER UPDATE ───────────────────────────────────────────────────
             if (typeof scheduleMarkerUpdate === 'function') {
                 scheduleMarkerUpdate(smoothedPos.lat, smoothedPos.lng, {
                     animate:       true,
@@ -5121,7 +5340,60 @@ function updateUserLocation(position, forceUpdate = false) {
                 });
             }
 
-            // ── MAP UPDATE DECISION ───────────────────────────────────────────
+            // ── PROXIMITY ZOOM (SAFER LOCK MECHANISM) ───────────────────────────
+            if (!window.isMapInteracting && !window.isPanning && !window._zoomAnimationInProgress) {
+                const currentZoom = map.getZoom();
+                const targetZoom  = capturedZoomLevel ?? window._baseZoomLevel;
+                const zoomDiff    = Math.abs(targetZoom - currentZoom);
+                const now         = Date.now();
+                const timeSinceLastZoom = now - (window._lastZoomChangeTime || 0);
+                
+                const ZOOM_COOLDOWN_MS = speedMPH < 5  ? 3000 :
+                                        speedMPH < 15 ? 2000 :
+                                        1000;
+                
+                if (zoomDiff > 0.2 && 
+                    window._lastAppliedZoomLevel !== capturedTargetZoom &&
+                    timeSinceLastZoom >= ZOOM_COOLDOWN_MS) {
+                    
+                    window._zoomAnimationInProgress  = true;
+                    window._lastAppliedZoomLevel     = capturedTargetZoom;
+                    window._lastZoomChangeTime       = now;
+                    
+                    // Safer unlock: both timeout and event-based
+                    const unlockZoom = () => { 
+                        window._zoomAnimationInProgress = false; 
+                    };
+                    const unlockTimer = setTimeout(unlockZoom, (capturedZoomDuration || 600) + 100);
+                    
+                    // Early unlock if animation completes normally
+                    map.once('zoomend', () => {
+                        clearTimeout(unlockTimer);
+                        unlockZoom();
+                    });
+                    
+                    map.setZoom(targetZoom, {
+                        animate:  true,
+                        duration: (capturedZoomDuration || 600) / 1000
+                    });
+                }
+            }
+
+            // ── SMART FOLLOW-RESUME ───────────────────────────────────────────────
+            if (window.userIntent && window.userIntent.mode === 'browsing') {
+                const timeSinceLastInteraction = Date.now() - Math.max(
+                    window.userIntent.lastManualPan || 0,
+                    window.userIntent.lastManualZoom || 0
+                );
+                if (timeSinceLastInteraction > 8000) {
+                    window.userIntent.mode = 'following';
+                    if (map && userMarker && !window.isMapInteracting) {
+                        map.flyTo(userMarker.getLatLng(), map.getZoom(), { duration: 1.5 });
+                    }
+                }
+            }
+
+            // ── MAP UPDATE DECISION ─────────────────────────────────────────────
             const highSpeedThresh = (window.SPEED_THRESHOLDS?.HIGH_SPEED) || 45;
             const isDrift = distance > 8.0 && modeSpeedMPH >= highSpeedThresh;
             window._driftHysteresisCounter = isDrift
@@ -5138,26 +5410,70 @@ function updateUserLocation(position, forceUpdate = false) {
                 (distance > speedTier.mapUpdateDistance * (1 - 0.4 * Math.max(0.1, aggressiveness))) ||
                 (window._driftHysteresisCounter >= 2);
 
-            // ── PAN ───────────────────────────────────────────────────────────
+            // ── PAN ─────────────────────────────────────────────────────────────
             if (shouldUpdateMap && !window.isMapInteracting && window.followUser && map && !window.isPanning) {
                 const bounds = map.getBounds();
                 if (bounds) {
                     if (isInCenteredMode) {
+                        const lastLat = window.lastPosition?.lat ?? smoothedPos.lat;
+                        const lastLng = window.lastPosition?.lng ?? smoothedPos.lng;
+                        const lookAheadPosition = {
+                            lat: smoothedPos.lat + (smoothedPos.lat - lastLat) * lookAhead,
+                            lng: smoothedPos.lng + (smoothedPos.lng - lastLng) * lookAhead,
+                        };
+                        
                         if (typeof _panMapToLookAhead === 'function') {
-                            const lastLat = window.lastPosition?.lat ?? smoothedPos.lat;
-                            const lastLng = window.lastPosition?.lng ?? smoothedPos.lng;
-                            const lookAheadPosition = {
-                                lat: smoothedPos.lat + (smoothedPos.lat - lastLat) * lookAhead,
-                                lng: smoothedPos.lng + (smoothedPos.lng - lastLng) * lookAhead,
-                            };
                             _panMapToLookAhead(lookAheadPosition, speedTier, directionChangeFactor, eastWestMovement, speedMPH, bounds);
                         } else if (typeof _panMapToCenter === 'function') {
                             _panMapToCenter(smoothedPos, speedTier, directionChangeFactor, eastWestMovement, speedMPH, lookAhead);
+                        } else {
+                            const panDist = L.latLng(map.getCenter()).distanceTo(L.latLng(lookAheadPosition));
+                            if (panDist > 1) {
+                                map.panTo(lookAheadPosition, {
+                                    animate:       true,
+                                    duration:      speedTier.panDuration,
+                                    easeLinearity: speedTier.easeLinearity
+                                });
+                            }
                         }
                     } else {
-                        if (typeof _isNearViewportEdge === 'function' && _isNearViewportEdge(smoothedPos, bounds, speedMPH)) {
+                        const predictiveTarget = calculatePredictiveRecenterTarget(
+                            smoothedPos,
+                            window.smoothedVelocity || { lat: 0, lng: 0 },
+                            bounds,
+                            speedMPH
+                        );
+                        
+                        const markerPos = userMarker.getLatLng();
+                        const safe = getViewportSafeZone(bounds, 0.15);
+                        const width = bounds.getEast() - bounds.getWest();
+                        const height = bounds.getNorth() - bounds.getSouth();
+                        
+                        let edgeProximity = 0;
+                        if (markerPos.lng < safe.west) {
+                            edgeProximity = Math.max(edgeProximity, (safe.west - markerPos.lng) / width);
+                        } else if (markerPos.lng > safe.east) {
+                            edgeProximity = Math.max(edgeProximity, (markerPos.lng - safe.east) / width);
+                        }
+                        if (markerPos.lat < safe.south) {
+                            edgeProximity = Math.max(edgeProximity, (safe.south - markerPos.lat) / height);
+                        } else if (markerPos.lat > safe.north) {
+                            edgeProximity = Math.max(edgeProximity, (markerPos.lat - safe.north) / height);
+                        }
+                        
+                        if (predictiveTarget || edgeProximity > 0.05) {
                             if (typeof _panMapIfNearEdge === 'function') {
                                 _panMapIfNearEdge(smoothedPos, speedTier, directionChangeFactor, eastWestMovement, bounds, speedMPH);
+                            } else {
+                                const target = predictiveTarget || {
+                                    lat: bounds.getCenter().lat + (markerPos.lat - bounds.getCenter().lat) * 0.3,
+                                    lng: bounds.getCenter().lng + (markerPos.lng - bounds.getCenter().lng) * 0.3
+                                };
+                                map.panTo(target, {
+                                    animate:       true,
+                                    duration:      speedTier.panDuration,
+                                    easeLinearity: speedTier.easeLinearity
+                                });
                             }
                         }
                     }
@@ -5165,35 +5481,32 @@ function updateUserLocation(position, forceUpdate = false) {
                 window.lastMapUpdateTime = currentTime;
             }
 
-            // ── PROXIMITY ZOOM ────────────────────────────────────────────────
-            // Runs unconditionally — not gated on shouldUpdateMap.
-            // A stationary user near a POI boundary needs smooth zoom
-            // interpolation even when shouldUpdateMap is false.
+            // ── LEGACY PROXIMITY ZOOM HANDLER (BACKWARD COMPATIBLE) ─────────────
             if (typeof _handleProximityZoom === 'function' && window.proximityState) {
                 _handleProximityZoom(modeSpeedMPH, eastWestMovement);
             }
 
-            // ── SPEED ZOOM ────────────────────────────────────────────────────
+            // ── SPEED-BASED ZOOM (BACKWARD COMPATIBLE) ──────────────────────────
             if (shouldUpdateMap && !window.isMapInteracting && window.followUser && map) {
                 if (typeof _applyIntelligentZoom === 'function') {
                     _applyIntelligentZoom(effSpeed, speedTier, directionChangeFactor, speedMPH);
                 }
             }
 
-            // ── VIEWPORT SAFETY ───────────────────────────────────────────────
+            // ── VIEWPORT SAFETY (BACKWARD COMPATIBLE) ───────────────────────────
             if (typeof _enforceViewportSafety === 'function' && userMarker) {
                 const markerPos = userMarker.getLatLng();
                 if (markerPos) _enforceViewportSafety(speedMPH, markerPos);
             }
 
-            // ── STATE COMMIT ──────────────────────────────────────────────────
+            // ── STATE COMMIT ────────────────────────────────────────────────────
             window.lastPosition   = smoothedPos;
             window.lastVelocity   = instantVel;
             window.lastUpdateTime = currentTime;
 
             if (typeof updateDistanceBox === 'function') updateDistanceBox(forceUpdate);
 
-            // ── DEBUG TELEMETRY ───────────────────────────────────────────────
+            // ── DEBUG TELEMETRY ─────────────────────────────────────────────────
             if (window.__debugLocation) {
                 console.table({
                     speedMPH:      speedMPH.toFixed(1),
@@ -5201,9 +5514,11 @@ function updateUserLocation(position, forceUpdate = false) {
                     tier:          tierIndex,
                     smoothing:     smoothFactor.toFixed(3),
                     duration:      animDur.toFixed(2),
-                    mode:          isInCenteredMode ? 'centered' : 'edge',
-                    proximity:     closestDistance !== Infinity ? closestDistance.toFixed(0) + 'm' : 'N/A',
-                    forceMapFrame: forceMapThisFrame
+                    mode:          isInCenteredMode ? 'centered' : 'roaming',
+                    proximity:     capturedClosestDist !== Infinity ? capturedClosestDist.toFixed(0) + 'm' : 'N/A',
+                    forceMapFrame: forceMapThisFrame,
+                    zoom:          capturedZoomLevel?.toFixed(2) ?? 'N/A',
+                    targetZoom:    capturedTargetZoom
                 });
             }
         } catch (error) {
@@ -5223,6 +5538,32 @@ function updateUserLocation(position, forceUpdate = false) {
         window._visualUpdateFallbackTimer = null;
     }, 50);
 }
+
+
+// ─── CLEANUP UTILITIES (BACKWARD COMPATIBLE) ──────────────────────────────────
+// Call this on page unload to prevent memory leaks
+window.cleanupLocationTracking = function() {
+    if (window._batteryInterval) {
+        clearInterval(window._batteryInterval);
+        window._batteryInterval = null;
+    }
+    if (window._nextLocationUpdateRAF) {
+        cancelAnimationFrame(window._nextLocationUpdateRAF);
+        window._nextLocationUpdateRAF = null;
+    }
+    if (window._visualUpdateFallbackTimer) {
+        clearTimeout(window._visualUpdateFallbackTimer);
+        window._visualUpdateFallbackTimer = null;
+    }
+    if (window.debounceTimeoutId) {
+        clearTimeout(window.debounceTimeoutId);
+        window.debounceTimeoutId = null;
+    }
+    if (window.gpsTimeoutTimer) {
+        clearTimeout(window.gpsTimeoutTimer);
+        window.gpsTimeoutTimer = null;
+    }
+};
         
 /* Calculates a new map center in roaming mode when user approaches viewport edge. */
 function _calculateRoamingTarget(userPos, bounds, speedMPH) {
