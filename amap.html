@@ -4409,22 +4409,35 @@ async function updateUserLocation(position, forceUpdate = false) {
 
     // ============================================================
     // LOW-POWER MODE (battery < 20 %, not charging)
+    // FIX #1: Battery API is no longer awaited in the hot path.
+    // A background fire-and-forget refresh keeps the cache warm
+    // without ever yielding the update loop on a getBattery() promise.
     // ============================================================
     let isLowPowerMode = false;
     if (!forceUpdate && !document.hidden) {
-        try {
-            const BATTERY_TTL = 60000;
-            if (!window._batteryCache || (currentTime - (window._batteryCacheTime || 0)) > BATTERY_TTL) {
-                if (typeof navigator.getBattery === 'function') {
-                    window._batteryCache     = await navigator.getBattery();
-                    window._batteryCacheTime = currentTime;
-                }
-            }
-            const bat = window._batteryCache;
-            if (bat && bat.level < 0.2 && !bat.charging) isLowPowerMode = true;
-        } catch (e) {
-            console.debug("Battery API unavailable:", e.message);
+        const BATTERY_TTL = 60000;
+        const cacheStale  = !window._batteryCache ||
+                            (currentTime - (window._batteryCacheTime || 0)) > BATTERY_TTL;
+
+        if (cacheStale && typeof navigator.getBattery === 'function' && !window._batteryFetchInFlight) {
+            // Fire-and-forget — do NOT await
+            window._batteryFetchInFlight = true;
+            navigator.getBattery()
+                .then(bat => {
+                    window._batteryCache     = bat;
+                    window._batteryCacheTime = Date.now();
+                })
+                .catch(e => {
+                    console.debug("Battery API unavailable:", e.message);
+                })
+                .finally(() => {
+                    window._batteryFetchInFlight = false;
+                });
         }
+
+        // Use whatever is already cached (null on very first call — safe, defaults to normal mode)
+        const bat = window._batteryCache;
+        if (bat && bat.level < 0.2 && !bat.charging) isLowPowerMode = true;
     }
 
     if (isLowPowerMode) {
@@ -4486,25 +4499,32 @@ async function updateUserLocation(position, forceUpdate = false) {
 
     // ── POI IMMEDIATE threshold trigger
     // Fires on EVERY update so the page opens the instant the threshold is crossed.
-    // We use a tiny hysteresis flag per-location to avoid re-firing.
+    // FIX #3: _poiInRange is pruned on each pass to only IDs present in
+    // gameLocations, preventing unbounded memory growth over long sessions.
     if (
         closestLocation &&
         closestDistance !== Infinity &&
         typeof window.poiDistanceThreshold === 'number' &&
         typeof _openLocationPage === 'function'
     ) {
-        const locId   = closestLocation.id ?? closestLocation.name ?? JSON.stringify(closestLocation);
-        const inRange = closestDistance <= window.poiDistanceThreshold;
-        const wasIn   = window._poiInRange?.[locId] ?? false;
-
         window._poiInRange = window._poiInRange || {};
 
+        // Prune stale keys no longer in gameLocations
+        const knownIds = new Set(
+            (window.gameLocations || []).map(l => l.id ?? l.name ?? JSON.stringify(l))
+        );
+        for (const key of Object.keys(window._poiInRange)) {
+            if (!knownIds.has(key)) delete window._poiInRange[key];
+        }
+
+        const locId   = closestLocation.id ?? closestLocation.name ?? JSON.stringify(closestLocation);
+        const inRange = closestDistance <= window.poiDistanceThreshold;
+        const wasIn   = window._poiInRange[locId] ?? false;
+
         if (inRange && !wasIn) {
-            // Crossed threshold inbound — open immediately, synchronously
             window._poiInRange[locId] = true;
             _openLocationPage(closestLocation);
         } else if (!inRange && wasIn) {
-            // Left threshold — reset so it can trigger again next approach
             window._poiInRange[locId] = false;
         }
     }
@@ -4550,14 +4570,16 @@ async function updateUserLocation(position, forceUpdate = false) {
     }
 
     // ── Heading validation
+    // FIX #6: Wild-heading suppression threshold extended from <2 m/s to <4 m/s,
+    // covering the slow-walk / jog range where look-ahead jitter was most visible.
     let validatedHeading   = rawHeading ?? null;
     const lastHeading      = lastPos.heading ?? null;
 
     if (lastHeading != null && rawHeading != null) {
         let diff = Math.abs(rawHeading - lastHeading);
         if (diff > 180) diff = 360 - diff;
-        // Suppress wild heading flips while nearly stopped
-        if (rawSpeedMPS < 2 && diff > 90) validatedHeading = lastHeading;
+        // Suppress wild heading flips while nearly stopped (extended to 4 m/s)
+        if (rawSpeedMPS < 4 && diff > 90) validatedHeading = lastHeading;
     }
 
     let headingDiff         = 0;
@@ -4614,8 +4636,14 @@ async function updateUserLocation(position, forceUpdate = false) {
     };
 
     // ── Large-jump teleport (>50 m or forceUpdate)
+    // FIX #4: lastUpdateTime, lastUpdateTimestamp, and updateDistanceBox are now
+    // committed on this path. Previously they were skipped, leaving state stale
+    // whenever _handleLargeDistanceJump was the exit branch.
     if (distance > 50 || forceUpdate) {
         _handleLargeDistanceJump(newPosition, currentTime);
+        window.lastUpdateTime      = currentTime;
+        window.lastUpdateTimestamp = currentTime;
+        updateDistanceBox?.(forceUpdate);
         return;
     }
 
@@ -4738,11 +4766,14 @@ async function updateUserLocation(position, forceUpdate = false) {
         };
 
         // Dead-reckoning: project forward by an adaptive prediction window
+        // FIX #7: effectiveSpeedMPS uses the smoothed EMA (speedMPS) as primary.
+        // The raw distance/timeDelta fallback is only used when the EMA is genuinely
+        // zero, preventing a single noisy GPS hop from spiking the prediction window.
         const headingRad    = (validatedHeading || 0) * Math.PI / 180;
         const earthRadius   = 111111;
         const cosLat        = Math.cos(lat * Math.PI / 180);
 
-        let effectiveSpeedMPS = speedMPS;
+        let effectiveSpeedMPS = speedMPS; // smoothed EMA — preferred
         if (!effectiveSpeedMPS && timeDelta > 0) {
             effectiveSpeedMPS = calculateDistance(lastPos, newPosition) / timeDelta;
         }
@@ -4868,7 +4899,7 @@ async function updateUserLocation(position, forceUpdate = false) {
             });
 
             // ── Map pan / zoom
-            const mapInterval = speedTier.mapUpdateInterval;
+            const mapInterval  = speedTier.mapUpdateInterval;
             const highSpeedThr = SPEED_THRESHOLDS?.HIGH_SPEED ?? 45;
             const aggressiveness = typeof highSpeedAggressiveness === 'function'
                 ? Math.max(0.1, highSpeedAggressiveness(speedMPH))
@@ -4889,6 +4920,10 @@ async function updateUserLocation(position, forceUpdate = false) {
                 window._driftCounter >= 2;
 
             if (shouldUpdateMap && map) {
+                // FIX #5: lookAheadPos is now passed to the pan helpers so the
+                // computed look-ahead offset actually influences the pan target.
+                // Previously it was computed but the raw smoothedPosition was passed
+                // to both helpers instead, rendering the look-ahead calculation inert.
                 const lookAheadPos = {
                     lat: smoothedPosition.lat + (bufferedPosition.lat - lastPos.lat) * lookAheadFactor,
                     lng: smoothedPosition.lng + (bufferedPosition.lng - lastPos.lng) * lookAheadFactor
@@ -4900,24 +4935,22 @@ async function updateUserLocation(position, forceUpdate = false) {
 
                     if (isInCenteredMode) {
                         // ── VIEWPORT SAFETY: keep marker firmly inside view
-                        // Check if user is approaching edge; if so, re-center smoothly now.
-                        const markerLL   = L.latLng(smoothedPosition.lat, smoothedPosition.lng);
-                        const mapSize    = map.getSize();
+                        const markerLL = L.latLng(smoothedPosition.lat, smoothedPosition.lng);
+                        const mapSize  = map.getSize();
 
-                        // Convert to pixel space to measure edge proximity
-                        const markerPx   = map.latLngToContainerPoint(markerLL);
-                        const edgePad    = Math.max(60, mapSize.x * 0.18); // 18 % of width
-                        const edgePadY   = Math.max(80, mapSize.y * 0.20);
+                        const markerPx  = map.latLngToContainerPoint(markerLL);
+                        const edgePad   = Math.max(60, mapSize.x * 0.18);
+                        const edgePadY  = Math.max(80, mapSize.y * 0.20);
 
                         const nearEdge =
-                            markerPx.x < edgePad           ||
-                            markerPx.x > (mapSize.x - edgePad)  ||
-                            markerPx.y < edgePadY           ||
+                            markerPx.x < edgePad                 ||
+                            markerPx.x > (mapSize.x - edgePad)   ||
+                            markerPx.y < edgePadY                 ||
                             markerPx.y > (mapSize.y - edgePadY);
 
                         if (justCentered || nearEdge || window._driftCounter >= 2) {
                             _panMapToCenter(
-                                { lat: smoothedPosition.lat, lng: smoothedPosition.lng },
+                                lookAheadPos,
                                 speedTier,
                                 directionChangeFactor,
                                 eastWestMove,
@@ -4930,7 +4963,7 @@ async function updateUserLocation(position, forceUpdate = false) {
                         // Edge-follow mode
                         if (_isNearViewportEdge(smoothedPosition, bounds, speedMPH)) {
                             _panMapIfNearEdge(
-                                smoothedPosition,
+                                lookAheadPos,
                                 speedTier,
                                 directionChangeFactor,
                                 eastWestMove,
@@ -4956,13 +4989,11 @@ async function updateUserLocation(position, forceUpdate = false) {
                 const distM = window.proximityState.distanceMeters;
 
                 if (distM <= PROX_FAR_M) {
-                    // Interpolate: at NEAR → zoomIn (19), at FAR → zoomOut (17)
-                    const t           = Math.max(0, Math.min(1, (distM - PROX_NEAR_M) / (PROX_FAR_M - PROX_NEAR_M)));
-                    const targetZoom  = PROX_ZOOM_IN + t * (PROX_ZOOM_OUT - PROX_ZOOM_IN);
+                    const t          = Math.max(0, Math.min(1, (distM - PROX_NEAR_M) / (PROX_FAR_M - PROX_NEAR_M)));
+                    const targetZoom = PROX_ZOOM_IN + t * (PROX_ZOOM_OUT - PROX_ZOOM_IN);
                     const currentZoom = map.getZoom();
-                    const zoomDelta   = Math.abs(targetZoom - currentZoom);
+                    const zoomDelta  = Math.abs(targetZoom - currentZoom);
 
-                    // Only animate if the change is meaningful (≥ 0.15 zoom levels)
                     if (zoomDelta >= 0.15) {
                         const zoomDur = zoomDelta < 0.5 ? 0.4 : speedTier.zoomDuration;
                         map.setZoom(targetZoom, { animate: true, duration: zoomDur });
@@ -4971,7 +5002,6 @@ async function updateUserLocation(position, forceUpdate = false) {
                     window._inProximityZone = true;
 
                 } else if (window._inProximityZone) {
-                    // User has left the proximity zone — restore to zoom 17
                     const currentZoom = map.getZoom();
                     if (currentZoom !== PROX_ZOOM_OUT) {
                         map.setZoom(PROX_ZOOM_OUT, {
@@ -4982,7 +5012,6 @@ async function updateUserLocation(position, forceUpdate = false) {
                     window._inProximityZone = false;
                 }
             } else if (typeof _handleProximityZoom === 'function') {
-                // Fallback to existing handler if present and we have no proximityState
                 _handleProximityZoom(speedMPH, eastWestMove);
             }
 
@@ -4991,18 +5020,24 @@ async function updateUserLocation(position, forceUpdate = false) {
         };
 
         // ── Schedule visual update in next animation frame
+        // FIX #2: _visualFallbackActive flag gates the fallback timer so it can
+        // distinguish "RAF hasn't fired yet for this update" from "RAF already ran
+        // and a new update cycle replaced the handles". Closes the ~50ms race window
+        // between a debounced GPS arrival and the fallback firing simultaneously.
         if (window._nextLocationUpdateRAF) cancelAnimationFrame(window._nextLocationUpdateRAF);
+        window._visualFallbackActive  = true;
         window._nextLocationUpdateRAF = requestAnimationFrame(() => {
-            performVisualUpdates();
+            window._visualFallbackActive  = false;
             window._nextLocationUpdateRAF = null;
+            performVisualUpdates();
         });
 
-        // ── Fallback: if RAF is blocked (background tab, perf budget exceeded) run after 50 ms
         if (window._visualFallbackTimer) clearTimeout(window._visualFallbackTimer);
         window._visualFallbackTimer = setTimeout(() => {
-            if (window._nextLocationUpdateRAF) {
+            if (window._visualFallbackActive && window._nextLocationUpdateRAF) {
                 cancelAnimationFrame(window._nextLocationUpdateRAF);
                 window._nextLocationUpdateRAF = null;
+                window._visualFallbackActive  = false;
                 console.warn('[Perf] RAF blocked — running location visual update via fallback timer');
                 performVisualUpdates();
             }
@@ -5019,7 +5054,7 @@ async function updateUserLocation(position, forceUpdate = false) {
         // ── Debug telemetry (opt-in via window.__debugLocation = true)
         if (window.__debugLocation) {
             console.table({
-                speedMPH:    speedMPH.toFixed(1),
+                speedMPH:     speedMPH.toFixed(1),
                 modeSpeedMPH: modeSpeedMPH.toFixed(1),
                 tier:         currentTierIndex,
                 smoothing:    finalSF.toFixed(3),
@@ -5032,30 +5067,25 @@ async function updateUserLocation(position, forceUpdate = false) {
         }
 
     } catch (err) {
-        // ============================================================
         // FATAL ERROR HANDLER
-        // ============================================================
         console.error("updateUserLocation: fatal error:", err);
         window.mapFatalError = true;
 
         disposeMapLoop?.();
         _cleanupMarkerStyles?.();
 
-        // Notify user
         if (typeof window.showToast === 'function') {
             window.showToast("Map update failed. Please reload.", 'error');
         } else {
             console.warn("Map error — please reload the page.");
         }
 
-        // Cancel all pending animation work
         [window.animationFrameId, window._nextLocationUpdateRAF].forEach(id => {
             if (id) cancelAnimationFrame(id);
         });
         window.animationFrameId       = null;
         window._nextLocationUpdateRAF = null;
 
-        // Best-effort final marker placement
         scheduleMarkerUpdate(lat, lng, { animate: true, duration: 0.6, easeLinearity: 0.10 });
 
         window.lastPosition   = newPosition;
