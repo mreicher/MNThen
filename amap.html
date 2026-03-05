@@ -3877,13 +3877,16 @@ function _handleInactivityReset() {
 
 // PROXIMITY & PREFETCH LOGIC
 function handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, closestDistance) {
+    // Use performance.now() consistently for all internal timing
+    const now = performance.now();
+
     // ── Early Exit: Invalid Data ──
     if (closestDistance === Infinity || !closestLocation || !closestLocation.id) {
         window.proximityState = {
             closestLocation: null,
             distanceMeters: Infinity,
             isOnCooldown: false,
-            lastUpdateTime: currentTime
+            lastUpdateTime: now
         };
         if (window.currentProximityLocationId) {
             _cleanupProximityZoomState();
@@ -3902,33 +3905,34 @@ function handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, c
     // Progressive cache clearing with hysteresis
     const CACHE_CLEAR_DISTANCE = 120; // feet
     const CACHE_RESTORE_DISTANCE = 100; // feet - prevents thrashing
-    
+
     if (distanceFeet > CACHE_CLEAR_DISTANCE) {
         if (window.preloadedLocation) {
             console.debug('[Proximity] Clearing preload cache - distance:', distanceFeet.toFixed(1) + 'ft');
             window.preloadedLocation = null;
         }
     } else if (distanceFeet < CACHE_RESTORE_DISTANCE && !window.preloadedLocation) {
-        // Location re-entered range - mark for re-preload
         window._needsPreload = true;
     }
 
-    // ── Cooldown Check (Cached) ──
+    // ── Cooldown Cache (Map-based, bounded) ──
+    if (!window._cooldownCache) {
+        window._cooldownCache = new Map();
+    }
+
     let isOnCooldown = false;
-    const cooldownCacheKey = `_cooldown_${closestLocation.id}`;
-    const cooldownCacheTTL = 2000; // 2s cache
-    
-    if (window[cooldownCacheKey] && (currentTime - window[cooldownCacheKey].time) < cooldownCacheTTL) {
-        // Use cached cooldown status
-        isOnCooldown = window[cooldownCacheKey].status;
+    const cooldownCacheTTL = 2000; // 2s
+    const locationId = closestLocation.id;
+
+    const cachedCooldown = window._cooldownCache.get(locationId);
+    if (cachedCooldown && (now - cachedCooldown.time) < cooldownCacheTTL) {
+        isOnCooldown = cachedCooldown.status;
     } else {
-        // Fresh cooldown check
         if (typeof window.cooldownManager !== 'undefined' && window.cooldownManager.checkCooldown) {
             try {
-                const cooldownStatus = window.cooldownManager.checkCooldown(closestLocation.id);
+                const cooldownStatus = window.cooldownManager.checkCooldown(locationId);
                 isOnCooldown = cooldownStatus.isOnCooldown || false;
-                // Cache the result
-                window[cooldownCacheKey] = { status: isOnCooldown, time: currentTime };
+                window._cooldownCache.set(locationId, { status: isOnCooldown, time: now });
             } catch (err) {
                 console.warn('[Proximity] Cooldown check failed:', err);
             }
@@ -3940,25 +3944,24 @@ function handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, c
         closestLocation,
         distanceMeters: closestDistance,
         isOnCooldown,
-        lastUpdateTime: currentTime
+        lastUpdateTime: now
     };
 
     // Multi-stage proximity with intelligent prefetching
     const PREFETCH_DISTANCE = 80;  // Start prefetching at 80ft
     const TRIGGER_DISTANCE = PROXIMITY_THRESHOLD; // Open at configured threshold (default 20ft)
-    
+
     // ── STAGE 1: Prefetch Zone (80ft - 20ft) ──
     if (distanceFeet <= PREFETCH_DISTANCE && distanceFeet > TRIGGER_DISTANCE) {
-        _handlePrefetchZone(closestLocation, distanceFeet, currentTime);
-        return; // Don't trigger auto-open yet
+        _handlePrefetchZone(closestLocation, distanceFeet, now);
+        return;
     }
-    
+
     // ── STAGE 2: Trigger Zone (≤ 20ft) ──
     if (distanceFeet <= TRIGGER_DISTANCE && closestLocation && closestLocation.id) {
-        _handleTriggerZone(closestLocation, distanceFeet, currentTime, isOnCooldown);
+        _handleTriggerZone(closestLocation, distanceFeet, now, isOnCooldown);
     } else {
         if (distanceFeet > PREFETCH_DISTANCE) {
-            // Reset prefetch tracking when far away
             window._prefetchState = null;
         }
         console.debug(`[Proximity] Outside all zones: ${distanceFeet.toFixed(1)}ft`);
@@ -3966,39 +3969,58 @@ function handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, c
 }
 
 // PREFETCH ZONE HANDLER (80ft - 20ft)
-function _handlePrefetchZone(location, distanceFeet, currentTime) {
+function _handlePrefetchZone(location, distanceFeet, now) {
+    // Stale entry cleanup — runs at most once every 5 minutes
+    if (!window._lastPrefetchCleanup || (now - window._lastPrefetchCleanup) > 300000) {
+        if (window._prefetchState) {
+            const MAX_AGE = 10 * 60 * 1000; // 10 minutes
+            const toDelete = [];
+            for (const [id, state] of Object.entries(window._prefetchState)) {
+                if (
+                    (now - state.startTime) > MAX_AGE &&
+                    (!window.proximityState?.closestLocation ||
+                        window.proximityState.closestLocation.id !== id)
+                ) {
+                    toDelete.push(id);
+                }
+            }
+            toDelete.forEach(id => delete window._prefetchState[id]);
+        }
+        window._lastPrefetchCleanup = now;
+    }
+
     if (!window._prefetchState) {
         window._prefetchState = {};
     }
-    
+
     const locationId = location.id;
     const state = window._prefetchState[locationId];
-    
+
     // Only prefetch once per approach
     if (state && state.completed) {
-        return; // Already prefetched during this approach
+        return;
     }
-    
+
     console.log(`[Proximity] Entering prefetch zone: ${distanceFeet.toFixed(1)}ft from ${location.name || locationId}`);
-    
+
     // Initialize prefetch state for this location
     if (!state) {
         window._prefetchState[locationId] = {
-            startTime: currentTime,
+            startTime: now,
             startDistance: distanceFeet,
             dataPreloaded: false,
             tilesPreloaded: false,
             completed: false
         };
     }
-    
+
     const prefetchState = window._prefetchState[locationId];
-    
+
     // ── DATA PRELOAD (Priority 1 - at 80ft) ──
     if (!prefetchState.dataPreloaded) {
         if (!window.preloadedLocation || window.preloadedLocation.id !== locationId) {
             window.preloadedLocation = location;
-            
+
             if (typeof preloadLocationData === 'function') {
                 try {
                     console.debug('[Proximity] Preloading location data...');
@@ -4008,19 +4030,19 @@ function _handlePrefetchZone(location, distanceFeet, currentTime) {
                     console.warn('[Proximity] Data preload failed:', err);
                 }
             } else {
-                prefetchState.dataPreloaded = true; // Mark as attempted
+                prefetchState.dataPreloaded = true;
             }
         } else {
-            prefetchState.dataPreloaded = true; // Already cached
+            prefetchState.dataPreloaded = true;
         }
     }
-    
+
     // ── TILE PREFETCH (Priority 2 - at 50ft or closer) ──
     if (distanceFeet <= 50 && !prefetchState.tilesPreloaded) {
-        _prefetchMapTiles(location, currentTime);
+        _prefetchMapTiles(location, now);
         prefetchState.tilesPreloaded = true;
     }
-    
+
     // Mark as completed when both are done
     if (prefetchState.dataPreloaded && prefetchState.tilesPreloaded) {
         prefetchState.completed = true;
@@ -4028,71 +4050,66 @@ function _handlePrefetchZone(location, distanceFeet, currentTime) {
     }
 }
 
-//  STAGE 2: TRIGGER ZONE HANDLER (≤ 20ft)
-function _handleTriggerZone(location, distanceFeet, currentTime, isOnCooldown) {
+// STAGE 2: TRIGGER ZONE HANDLER (≤ 20ft)
+function _handleTriggerZone(location, distanceFeet, now, isOnCooldown) {
     const locationId = location.id;
-    
+
     console.log(`[Proximity] Within trigger zone: ${distanceFeet.toFixed(1)}ft of ${location.name || locationId}`);
-    
+
     // ── Check if location page is already open ──
     const lochuntContainer = document.querySelector('.lochunt-container');
     const locationPageOpen = lochuntContainer && lochuntContainer.style.display !== 'none';
-    
+
     // ── Debounce Check (Per-Location) ──
     if (!window._lastProximityTriggerByLocation) {
         window._lastProximityTriggerByLocation = {};
     }
-    
-    const proximityNow = performance.now();
+
     const lastTriggerForThisLocation = window._lastProximityTriggerByLocation[locationId] || 0;
-    const timeSinceLastTrigger = proximityNow - lastTriggerForThisLocation;
-    
+    const timeSinceLastTrigger = now - lastTriggerForThisLocation;
+
     // Adaptive debounce based on approach speed
-    const MIN_DEBOUNCE = 3000; // 3s minimum
+    const MIN_DEBOUNCE = 3000;  // 3s minimum
     const MAX_DEBOUNCE = 10000; // 10s maximum
-    
+
     let debounceTime = MIN_DEBOUNCE;
     if (window._prefetchState && window._prefetchState[locationId]) {
         const approach = window._prefetchState[locationId];
-        const approachTime = currentTime - approach.startTime;
+        const approachTime = now - approach.startTime;      // both performance.now()
         const distanceTraveled = approach.startDistance - distanceFeet;
-        
+
         if (approachTime > 0 && distanceTraveled > 0) {
             const approachSpeed = distanceTraveled / (approachTime / 1000); // ft/s
-            
-            // Fast approach (running/cycling) = shorter debounce
-            // Slow approach (walking/drift) = longer debounce to prevent false triggers
-            if (approachSpeed > 5) { // > 3.4 mph (fast walk/jog)
+
+            if (approachSpeed > 5) {
                 debounceTime = MIN_DEBOUNCE;
-            } else if (approachSpeed < 1) { // < 0.68 mph (GPS drift)
+            } else if (approachSpeed < 1) {
                 debounceTime = MAX_DEBOUNCE;
             } else {
-                // Linear interpolation between speeds
                 debounceTime = MIN_DEBOUNCE + (MAX_DEBOUNCE - MIN_DEBOUNCE) * (1 - approachSpeed / 5);
             }
-            
-            console.debug(`[Proximity] Approach speed: ${approachSpeed.toFixed(2)} ft/s, debounce: ${(debounceTime/1000).toFixed(1)}s`);
+
+            console.debug(`[Proximity] Approach speed: ${approachSpeed.toFixed(2)} ft/s, debounce: ${(debounceTime / 1000).toFixed(1)}s`);
         }
     }
-    
+
     // ── Gate Checks ──
     let shouldAutoOpen = !isOnCooldown && !locationPageOpen;
-    
+
     if (timeSinceLastTrigger < debounceTime) {
-        console.log(`[Proximity] Debounced - opened ${locationId} ${(timeSinceLastTrigger / 1000).toFixed(1)}s ago (need ${(debounceTime/1000).toFixed(1)}s)`);
+        console.log(`[Proximity] Debounced - opened ${locationId} ${(timeSinceLastTrigger / 1000).toFixed(1)}s ago (need ${(debounceTime / 1000).toFixed(1)}s)`);
         shouldAutoOpen = false;
     }
-    
+
     if (!shouldAutoOpen) {
         if (isOnCooldown) console.log('[Proximity] Skipped - location on cooldown');
         if (locationPageOpen) console.log('[Proximity] Skipped - page already open');
         return;
     }
-    
 
-    // AUTO-OPEN LOCATION
+    // ── AUTO-OPEN LOCATION ──
     console.log('[Proximity] 🎯 Opening location page...');
-    
+
     // ── Last-Chance Data Preload (if prefetch didn't happen) ──
     if (!window.preloadedLocation || window.preloadedLocation.id !== locationId) {
         console.warn('[Proximity] Emergency preload - prefetch zone was skipped!');
@@ -4105,34 +4122,32 @@ function _handleTriggerZone(location, distanceFeet, currentTime, isOnCooldown) {
             }
         }
     }
-    
+
     // ── Haptic Feedback ──
     if ('vibrate' in navigator) {
         try {
-            navigator.vibrate([80, 40, 80]); // Double pulse for better feel
+            navigator.vibrate([80, 40, 80]);
         } catch (err) {
             console.debug('[Proximity] Vibration failed:', err);
         }
     }
-    
+
     // ── Update Trigger Timestamp ──
-    window._lastProximityTriggerByLocation[locationId] = proximityNow;
-    
+    window._lastProximityTriggerByLocation[locationId] = now;
+
     // ── Open Location Page ──
     const locationToOpen = window.preloadedLocation || location;
-    
+
     if (typeof showLocationHunt === 'function') {
         try {
             showLocationHunt(locationToOpen);
-            
-            // Clear preload cache after successful open
+
             window.preloadedLocation = null;
-            
-            // Reset prefetch state for this location
+
             if (window._prefetchState && window._prefetchState[locationId]) {
                 delete window._prefetchState[locationId];
             }
-            
+
             console.log('[Proximity] ✅ Location opened successfully');
         } catch (err) {
             console.error('[Proximity] Failed to open location:', err);
@@ -4143,77 +4158,83 @@ function _handleTriggerZone(location, distanceFeet, currentTime, isOnCooldown) {
 }
 
 // TILE PREFETCH UTILITY
-function _prefetchMapTiles(location, currentTime) {
+function _prefetchMapTiles(location, now) {
     const prefetchKey = `_didPrefetch19_${location.id}`;
-    
-    // Check if already prefetched OR if tiles are likely cached
+
     if (window[prefetchKey]) {
         console.debug('[Proximity] Tiles already prefetched for', location.id);
         return;
     }
-    
+
     if (!window.map || typeof map.getCenter !== 'function' || typeof map.getZoom !== 'function') {
         console.warn('[Proximity] Map not available for tile prefetch');
         return;
     }
-    
+
     try {
         const currentZoom = map.getZoom();
-        
-        // Only prefetch if zooming in would be significant
+
         if (currentZoom >= 18) {
             console.debug('[Proximity] Skipping tile prefetch - already at high zoom');
-            window[prefetchKey] = true; // Mark as done to prevent retry
+            window[prefetchKey] = true;
             return;
         }
-        
+
         const center = map.getCenter();
         if (!center || typeof center.lat !== 'number' || typeof center.lng !== 'number') {
             throw new Error('Invalid map center');
         }
-        
+
         const targetZoom = 19;
         const tileUrlTemplate = window.currentTileLayer?._url || 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
-        
-        // Use location coordinates instead of map center for more accurate prefetch
+
         const targetLat = location.lat || center.lat;
         const targetLng = location.lng || center.lng;
-        
+
         const latRad = targetLat * Math.PI / 180;
         const n = Math.pow(2, targetZoom);
         const xtile = Math.floor((targetLng + 180) / 360 * n);
         const ytile = Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n);
-        
+
         const tilesToPrefetch = [];
         const subdomains = ['a', 'b', 'c'];
-        
-        //  3x3 grid centered on location (9 tiles)
+
+        // 3x3 grid centered on location (9 tiles)
         for (let dx = -1; dx <= 1; dx++) {
             for (let dy = -1; dy <= 1; dy++) {
                 const x = xtile + dx;
                 const y = ytile + dy;
-                
-                // Validate tile coordinates
+
                 if (x < 0 || x >= n || y < 0 || y >= n) continue;
-                
-                const subdomain = subdomains[(x + y) % subdomains.length]; // Deterministic subdomain selection
-                
-                let url = tileUrlTemplate
+
+                const subdomain = subdomains[(x + y) % subdomains.length];
+
+                const url = tileUrlTemplate
                     .replace('{z}', targetZoom)
                     .replace('{x}', x)
                     .replace('{y}', y)
                     .replace('{s}', subdomain);
-                
+
                 tilesToPrefetch.push(url);
             }
         }
-        
-        // Staggered prefetch to avoid network congestion
+
+        // Capture a batch ID to discard stale tile loads if location changes
+        if (!window._tilePrefetchBatchId) {
+            window._tilePrefetchBatchId = 0;
+        }
+        const batchId = ++window._tilePrefetchBatchId;
+
         let delay = 0;
-        const STAGGER_MS = 50; // 50ms between tile requests
-        
-        tilesToPrefetch.forEach((url, index) => {
+        const STAGGER_MS = 50;
+
+        tilesToPrefetch.forEach((url) => {
             setTimeout(() => {
+                // Abort if a newer prefetch batch has started
+                if (window._tilePrefetchBatchId !== batchId) {
+                    console.debug('[Prefetch] Stale batch discarded for', url);
+                    return;
+                }
                 const img = new Image();
                 img.onerror = () => {
                     console.debug('[Prefetch] Tile load failed (may already be cached):', url);
@@ -4223,18 +4244,18 @@ function _prefetchMapTiles(location, currentTime) {
                 };
                 img.src = url;
             }, delay);
-            
+
             delay += STAGGER_MS;
         });
-        
+
         window[prefetchKey] = true;
         console.log(`[Prefetch] Initiated staggered load of ${tilesToPrefetch.length} tiles at zoom ${targetZoom} for`, location.name || location.id);
-        
+
     } catch (err) {
         console.warn('[Prefetch] Failed to prefetch tiles:', err);
     }
 }
-        
+
 function _cleanupMarkerStyles() {
     try {
         const markerEl = userMarker?.getElement?.();
@@ -4247,38 +4268,44 @@ function _cleanupMarkerStyles() {
 // Proper Marker Update RAF
 function scheduleMarkerUpdate(lat, lng, options = {}) {
     const animOpts = {
-        animate: true,  
-        duration: 0.12, 
-        easeLinearity: 0.08, 
-        ...options      
+        animate: true,
+        duration: 0.12,
+        easeLinearity: 0.08,
+        ...options
     };
 
     window._pendingMarkerUpdate = { lat, lng, animOpts };
-    
+
     if (!window._markerRAFPending) {
-        // Clear any existing fallback timer
+        // Shared flag prevents both rAF and fallback from firing
+        let updateExecuted = false;
+
         if (window._markerFallbackTimer) {
             clearTimeout(window._markerFallbackTimer);
             window._markerFallbackTimer = null;
         }
 
         window._markerRAFPending = requestAnimationFrame(() => {
+            if (updateExecuted) return;
+            updateExecuted = true;
+
             if (window._pendingMarkerUpdate && userMarker) {
                 const { lat, lng, animOpts } = window._pendingMarkerUpdate;
                 userMarker.setLatLng([lat, lng], animOpts);
             }
             window._markerRAFPending = null;
             window._pendingMarkerUpdate = null;
-            
-            // Cancel fallback if it hasn't fired yet
+
             if (window._markerFallbackTimer) {
                 clearTimeout(window._markerFallbackTimer);
                 window._markerFallbackTimer = null;
             }
         });
 
-        // Set fallback only if rAF fails to run within ~2 frames
         window._markerFallbackTimer = setTimeout(() => {
+            if (updateExecuted) return;
+            updateExecuted = true;
+
             if (window._pendingMarkerUpdate && userMarker) {
                 const { lat, lng, animOpts } = window._pendingMarkerUpdate;
                 userMarker.setLatLng([lat, lng], animOpts);
@@ -4379,9 +4406,7 @@ async function updateUserLocation(position, forceUpdate = false) {
         speedMPS:  Math.max(0, rawSpeedMPS)
     };
 
-    // ============================================================
     // DUAL EMA SPEED — fast for logic, slow for visuals
-    // ============================================================
     const rawSpeedMPS_clamped = Math.max(0, rawSpeedMPS);
 
     window._emaSpeedFast = window._emaSpeedFast ?? rawSpeedMPS_clamped;
@@ -4407,12 +4432,7 @@ async function updateUserLocation(position, forceUpdate = false) {
         _startInactivityTimer();
     }
 
-    // ============================================================
     // LOW-POWER MODE (battery < 20 %, not charging)
-    // FIX #1: Battery API is no longer awaited in the hot path.
-    // A background fire-and-forget refresh keeps the cache warm
-    // without ever yielding the update loop on a getBattery() promise.
-    // ============================================================
     let isLowPowerMode = false;
     if (!forceUpdate && !document.hidden) {
         const BATTERY_TTL = 60000;
@@ -4448,9 +4468,7 @@ async function updateUserLocation(position, forceUpdate = false) {
         return;
     }
 
-    // ============================================================
     // GPS RECOVERY — flush stale buffers after searching
-    // ============================================================
     if (window.isGPSSearching) {
         window.isGPSSearching         = false;
         window.positionBuffer         = [newPosition];
@@ -4462,10 +4480,7 @@ async function updateUserLocation(position, forceUpdate = false) {
         hideGPSSearchingState?.();
     }
 
-    // ============================================================
     // PROXIMITY & DISTANCE CALCULATIONS
-    // Run on every call — drives POI threshold + proximity zoom
-    // ============================================================
     let closestDistance  = Infinity;
     let closestLocation  = null;
     const locationsWithDistance = [];
@@ -4498,9 +4513,6 @@ async function updateUserLocation(position, forceUpdate = false) {
         : null;
 
     // ── POI IMMEDIATE threshold trigger
-    // Fires on EVERY update so the page opens the instant the threshold is crossed.
-    // FIX #3: _poiInRange is pruned on each pass to only IDs present in
-    // gameLocations, preventing unbounded memory growth over long sessions.
     if (
         closestLocation &&
         closestDistance !== Infinity &&
@@ -4551,9 +4563,7 @@ async function updateUserLocation(position, forceUpdate = false) {
         return;
     }
 
-    // ============================================================
     // MOTION HELPERS
-    // ============================================================
     const distance       = calculateDistance(lastPos, newPosition);
     const latDelta       = Math.abs(lat - lastPos.lat);
     const lngDelta       = Math.abs(lng - lastPos.lng);
@@ -4570,8 +4580,6 @@ async function updateUserLocation(position, forceUpdate = false) {
     }
 
     // ── Heading validation
-    // FIX #6: Wild-heading suppression threshold extended from <2 m/s to <4 m/s,
-    // covering the slow-walk / jog range where look-ahead jitter was most visible.
     let validatedHeading   = rawHeading ?? null;
     const lastHeading      = lastPos.heading ?? null;
 
@@ -4590,9 +4598,7 @@ async function updateUserLocation(position, forceUpdate = false) {
         if (headingDiff > 12) directionChangeFactor = Math.max(0.5, 1 - headingDiff / 240);
     }
 
-    // ============================================================
     // SPEED TIER — drives all per-tier parameters
-    // ============================================================
     let currentTierIndex;
     if      (modeSpeedMPH <  1) currentTierIndex = 0;
     else if (modeSpeedMPH <  5) currentTierIndex = 1;
@@ -4636,9 +4642,6 @@ async function updateUserLocation(position, forceUpdate = false) {
     };
 
     // ── Large-jump teleport (>50 m or forceUpdate)
-    // FIX #4: lastUpdateTime, lastUpdateTimestamp, and updateDistanceBox are now
-    // committed on this path. Previously they were skipped, leaving state stale
-    // whenever _handleLargeDistanceJump was the exit branch.
     if (distance > 50 || forceUpdate) {
         _handleLargeDistanceJump(newPosition, currentTime);
         window.lastUpdateTime      = currentTime;
@@ -4647,9 +4650,7 @@ async function updateUserLocation(position, forceUpdate = false) {
         return;
     }
 
-    // ============================================================
     // STATIONARY DETECTION
-    // ============================================================
     const STAT_THRESHOLD    = 0.5;   // m — enter stationary candidate
     const STAT_LOCK         = 0.3;   // m — lock radius
     const STAT_CONFIRM_MS   = 2000;  // ms — confirm after 2 s
@@ -4745,9 +4746,7 @@ async function updateUserLocation(position, forceUpdate = false) {
         }
     }
 
-    // ============================================================
     // SMOOTHING, DEAD-RECKONING & PREDICTION
-    // ============================================================
     try {
         window.lastVelocity     = window.lastVelocity     || { lat: 0, lng: 0 };
         window.smoothedVelocity = window.smoothedVelocity || { lat: 0, lng: 0 };
@@ -4766,9 +4765,6 @@ async function updateUserLocation(position, forceUpdate = false) {
         };
 
         // Dead-reckoning: project forward by an adaptive prediction window
-        // FIX #7: effectiveSpeedMPS uses the smoothed EMA (speedMPS) as primary.
-        // The raw distance/timeDelta fallback is only used when the EMA is genuinely
-        // zero, preventing a single noisy GPS hop from spiking the prediction window.
         const headingRad    = (validatedHeading || 0) * Math.PI / 180;
         const earthRadius   = 111111;
         const cosLat        = Math.cos(lat * Math.PI / 180);
@@ -4887,9 +4883,7 @@ async function updateUserLocation(position, forceUpdate = false) {
         const laEW      = (speedMPH < 15 && eastWestMove) ? Math.min(0.055, distance * 0.0013) : 0;
         const lookAheadFactor = Math.max(0.01, Math.min(lab.max, laBase + laBoost - laDir + laEW));
 
-        // ==========================================================
         // VISUAL UPDATE (runs inside RAF for jank-free rendering)
-        // ==========================================================
         const performVisualUpdates = () => {
             // ── Marker
             scheduleMarkerUpdate(smoothedPosition.lat, smoothedPosition.lng, {
@@ -4920,10 +4914,7 @@ async function updateUserLocation(position, forceUpdate = false) {
                 window._driftCounter >= 2;
 
             if (shouldUpdateMap && map) {
-                // FIX #5: lookAheadPos is now passed to the pan helpers so the
-                // computed look-ahead offset actually influences the pan target.
-                // Previously it was computed but the raw smoothedPosition was passed
-                // to both helpers instead, rendering the look-ahead calculation inert.
+
                 const lookAheadPos = {
                     lat: smoothedPosition.lat + (bufferedPosition.lat - lastPos.lat) * lookAheadFactor,
                     lng: smoothedPosition.lng + (bufferedPosition.lng - lastPos.lng) * lookAheadFactor
@@ -4979,42 +4970,6 @@ async function updateUserLocation(position, forceUpdate = false) {
                 window.lastMapUpdateTime = currentTime;
             }
 
-            // PROXIMITY ZOOM
-         /*   const PROX_NEAR_M   = 13.716;  // 45 ft in metres
-            const PROX_FAR_M    = 21.336;  // 70 ft in metres
-            const PROX_ZOOM_IN  = 19;
-            const PROX_ZOOM_OUT = 17;
-
-            if (window.proximityState && map && !window.isMapInteracting) {
-                const distM = window.proximityState.distanceMeters;
-
-                if (distM <= PROX_FAR_M) {
-                    const t          = Math.max(0, Math.min(1, (distM - PROX_NEAR_M) / (PROX_FAR_M - PROX_NEAR_M)));
-                    const targetZoom = PROX_ZOOM_IN + t * (PROX_ZOOM_OUT - PROX_ZOOM_IN);
-                    const currentZoom = map.getZoom();
-                    const zoomDelta  = Math.abs(targetZoom - currentZoom);
-
-                    if (zoomDelta >= 0.15) {
-                        const zoomDur = zoomDelta < 0.5 ? 0.4 : speedTier.zoomDuration;
-                        map.setZoom(targetZoom, { animate: true, duration: zoomDur });
-                    }
-
-                    window._inProximityZone = true;
-
-                } else if (window._inProximityZone) {
-                    const currentZoom = map.getZoom();
-                    if (currentZoom !== PROX_ZOOM_OUT) {
-                        map.setZoom(PROX_ZOOM_OUT, {
-                            animate:  true,
-                            duration: speedTier.zoomDuration
-                        });
-                    }
-                    window._inProximityZone = false;
-                }
-            } else if (typeof _handleProximityZoom === 'function') {
-                _handleProximityZoom(speedMPH, eastWestMove);
-            }
-*/
 // PROXIMITY ZOOM
             const PROX_NEAR_M      = 13.716;   // 45 ft
             const PROX_FAR_M       = 21.336;   // 70 ft
