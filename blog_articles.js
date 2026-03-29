@@ -1,4 +1,14 @@
 const blogArticles = [
+  {
+  "headline": "Willmar 8 Bank Strike",
+  "blurb": "In 1977, eight women walked out of Citizens National Bank in Willmar, Minnesota, to fight for equal pay. Their 22-month strike through two brutal winters helped reshape Minnesota's pay equity laws.",
+  "icon": "fa-calendar",
+  "author": "Matt Reicher",
+  "date": "March 29, 2026",
+  "image": "https://www.mnthen.com/images/exhibit/w8.jpg",
+  "url": "https://www.mnthen.com/blog/event/willmar8.html",
+  "keywords": ["willmar 8", "bank strike", "1977", "equal pay", "comparable worth", "women's rights", "minnesota labor history", "citizens national bank", "leo pirsch", "event", "all"]
+},
 {
   "headline": "Selby Avenue Line (1888 – 1953)",
   "blurb": "How Saint Paul overcame Cathedral Hill's treacherous 16% grade by building a 1,472-foot streetcar tunnel in 1907—transforming transit, commerce, and neighborhood development along the Selby–Lake corridor.",
