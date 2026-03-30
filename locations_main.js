@@ -412,6 +412,24 @@ const locations = [
   "imageSource": "Street signs denoting the names of fallen veterans via Appleton Website",
   "additionalInfo": "Some streets carry not just one name, but several from the same family—like Werring and Nelson Avenues—honoring brothers and cousins who died in war.",
     difficulty: 1
+},
+{
+  "id": "1032",
+  "lat": 45.12128930601264,
+  "lng": -95.04521928886841,
+  "name": "Willmar 8 Strike (1977 - 1979)",
+  "title": "Willmar 8 Strike",
+  "image": "https://mnthen.com/images/exhibit/w8.jpg",
+  "creator": "Matt Reicher",
+  "city": "Willmar",
+  "audio": "/audio/exhibit/willmar8.mp3",
+  "tours": "place",
+  "summary": "Eight bank employees struck for equal pay in 1977, enduring two harsh Minnesota winters on the picket line.",
+  "today": "Willmar 8 Strike Site",
+  "link": "https://mnthen.com/blog/event/willmar8.html",
+  "imageSource": "https://mnthen.com/images/exhibit/w8.jpg",
+  "additionalInfo": "The Willmar 8 helped shift the conversation toward comparable worth, contributing to Minnesota passing some of the strongest pay equity laws in the country.",
+  difficulty: 1
 }
 
 
