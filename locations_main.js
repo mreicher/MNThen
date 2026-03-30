@@ -425,7 +425,7 @@ const locations = [
   "audio": "/audio/exhibit/willmar8.mp3",
   "tours": "place",
   "summary": "Eight bank employees struck for equal pay in 1977, enduring two harsh Minnesota winters on the picket line.",
-  "today": "Willmar 8 Strike Site",
+  "today": "318 2nd Street SW (US Bank)",
   "link": "https://mnthen.com/blog/event/willmar8.html",
   "imageSource": "https://mnthen.com/images/exhibit/w8.jpg",
   "additionalInfo": "The Willmar 8 helped shift the conversation toward comparable worth, contributing to Minnesota passing some of the strongest pay equity laws in the country.",
