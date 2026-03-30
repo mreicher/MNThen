@@ -11,7 +11,7 @@ const locations = [
         city: "Mahtomedi",
         audio: "/audio/exhibit/wildwood.mp3", 
         tours: "history",
-        summary: "Wildwood Amusement Park thrilled Twin Cities crowds for 30+ years with rides, shows & lakeside fun. It closed after years of financial issues. No ruins remain.",
+        summary: "Wildwood Amusement Park thrilled Twin Cities crowds for 30+ years with rides, shows & lakeside fun. It closed after years of financial issues.",
         today: "Southeast corner of White Bear Lake",
         link: "https://mnthen.com/blog/place/wildwood.html",
         imageSource: "Image of the slide at Wildwood Park c. 1905 via MPRNews",
