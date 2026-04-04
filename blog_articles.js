@@ -1,5 +1,15 @@
 const blogArticles = [
   {
+  "headline": "Harriet Island",
+  "blurb": "From sacred Dakota land Wakan Wita to Dr. Justus Ohage's 1900 public health vision: how Harriet Island evolved from spiritual crossroads to polluted riverfront, then to St. Paul's premier event space through Wigington's pavilion and 21st-century redevelopment.",
+  "icon": "fa-building",
+  "author": "Matt Reicher",
+  "date": "April 4, 2026",
+  "image": "https://www.mnthen.com/exhibit/images/harriet.hpg",
+  "url": "https://www.mnthen.com/blog/place/harriet.html",
+  "keywords": ["harriet island", "wakan wita", "justus ohage", "dakota sacred sites", "st. paul parks", "wigington pavilion", "mississippi river", "sacred island", "devils island", "harriet bishop", "clarence wigington", "ohage great lawn", "riverfront redevelopment", "fort snelling", "treaty of 1837", "place", "all"]
+},
+  {
   "headline": "Willmar 8 Bank Strike",
   "blurb": "In 1977, eight women walked out of Citizens National Bank in Willmar, Minnesota, to fight for equal pay. Their 22-month strike through two brutal winters helped reshape Minnesota's pay equity laws.",
   "icon": "fa-calendar",
