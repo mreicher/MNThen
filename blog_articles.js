@@ -5,7 +5,7 @@ const blogArticles = [
   "icon": "fa-building",
   "author": "Matt Reicher",
   "date": "April 4, 2026",
-  "image": "https://www.mnthen.com/images/exhibit/harriet.hpg",
+  "image": "https://www.mnthen.com/images/exhibit/harriet.jpg",
   "url": "https://www.mnthen.com/blog/place/harriet.html",
   "keywords": ["harriet island", "wakan wita", "justus ohage", "dakota sacred sites", "st. paul parks", "wigington pavilion", "mississippi river", "sacred island", "devils island", "harriet bishop", "clarence wigington", "ohage great lawn", "riverfront redevelopment", "fort snelling", "treaty of 1837", "place", "all"]
 },
