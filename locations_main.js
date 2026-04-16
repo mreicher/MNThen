@@ -168,7 +168,8 @@ const locations = [
         link: "https://mnthen.com/blog/place/merriam_mansion.html",
         imageSource: "William R. Merriam residence, (c.1890). via St Paul Historical",
         additionalInfo: "After serving as Minnesota's governor, Merriam was appointed by President McKinley to direct the U.S. Census Bureau in 1899.",
-        difficulty: 1
+        difficulty: 1,
+        support: "the Capitol Hill Heritage Group"
     },
     
     {
