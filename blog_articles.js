@@ -120,14 +120,14 @@ const blogArticles = [
   "keywords": ["babe rohland", "margaret rohland", "st paul", "personal narrative", "lawrence welk", "barker-karpis gang", "jfk visit minnesota", "henry ford", "history", "person", "all"]
 },
 {
-  "headline": "George Herrold’s Northern Route Proposal (Interstate 94)",
-  "blurb": "In 1945, St. Paul city planner George Herrold proposed an alternate alignment for what would become Interstate 94—one that would spare the Rondo and Prospect Park neighborhoods. His plan was rejected, and the freeway was built through the heart of Rondo.",
+  "headline": "Rondo Neighborhood and Interstate 94",
+  "blurb": "From 1920s highway planning to the 1956 Federal-Aid Highway Act, the story of how Interstate 94 was routed through the heart of Rondo—despite warnings from city planner George Herrold and a viable northern alternative—destroying hundreds of homes and businesses in one of the few neighborhoods where Black families had been allowed to settle.",
   "icon": "fa-building",
   "author": "Matt Reicher",
   "date": "December 11, 2025",
   "image": "https://www.mnthen.com/images/herrold.jpg",
   "url": "https://www.mnthen.com/blog/place/herrold.html",
-  "keywords": ["George Herrold", "Interstate 94", "Rondo neighborhood", "urban planning", "St. Paul history", "freeway construction", "Northern Route", "Minnesota transportation", "place", "all"]
+  "keywords": ["George Herrold", "Interstate 94", "Rondo neighborhood", "Northern Route", "redlining", "urban planning", "St. Paul history", "freeway construction", "Black history", "Federal-Aid Highway Act", "Minnesota transportation", "place", "all"]
 },
   {
   "headline": "Assassination of Walter Liggett (December 9, 1935)",
