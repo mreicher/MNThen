@@ -7322,42 +7322,71 @@ function recenterMap() {
 }
 
 /* ---------- 2-MINUTE LOCATION COOLDOWN ---------- */
-const COOLDOWN_PERIOD_MS = 2 * 60 * 1000; // 2 minutes
+const COOLDOWN_PERIOD_MS = 2 * 60 * 1000;
 const STORAGE_KEY = 'locationCooldowns';
 const DEBOUNCE_TIME_MS = ('ontouchstart' in window || navigator.maxTouchPoints > 0) ? 500 : 300;
-const CLEANUP_INTERVAL_MS = 60 * 1000; // Cleanup expired cooldowns every minute
-const TOAST_UPDATE_INTERVAL_MS = 500; // Update countdown toast every 500ms (more responsive)
-const MAP_RESET_CHECK_INTERVAL_MS = 1000; // Check for reset conditions every second
+const CLEANUP_INTERVAL_MS = 60 * 1000;
+const MAP_RESET_CHECK_INTERVAL_MS = 1000;
+const CENTERED_POPUP_DURATION_MS = 3000;
+const EXIT_DELAY_MS = 500;
 
 class LocationCooldownManager {
   constructor() {
-    // State
-    this.cooldowns = this.loadFromStorage(); // { id: startTime_ms }
-    this.hiddenMsPerLoc = {}; // { id: accumulated_hidden_time_ms }
-    this.currentLocationId = null; // ID of the location the user is currently in
-    this.lastActionTime = 0; // Timestamp of the last enter/leave action (for debouncing)
-    this.hiddenAt = null; // Timestamp when the app was hidden
-    this.resetCooldownIds = new Set(); // Track IDs that triggered a map reset due to expiry
-    this.wasOverSpeedThreshold = false; // Track speed threshold state
+    this.cooldowns = this.loadFromStorage();
+    this.currentLocationId = null;
+    this.lastActionTime = 0;
+    this.resetCooldownIds = new Set();
+    this.wasOverSpeedThreshold = false;
+    this._monitoringLocationId = null;
+    this._announcedLocations = new Set();
+    this._centeredPopupTimeout = null;
+    this._exitTimeout = null;
+    this._badgeDismissed = false;
+    this._currentDisplayMode = null; // 'center' | 'corner' | null
+    
+    // === SESSION PREFERENCES ===
+    this._sessionPrefs = this._loadSessionPrefs(); // { hideCooldownUI: boolean }
+    this._prefsChecked = new Set(); // Track locations we've applied prefs to
 
-    // Intervals/Timers
     this.cleanupInterval = null;
     this.mapResetInterval = null;
     this.toastInterval = null;
-
-    // UI Elements/Handlers
-    this.visibilityHandler = null;
     this.activeToast = null;
 
-    // Initialize
-    this.initVisibilityTracking();
-    this.cleanupExpiredCooldowns(); // Clean up any old data on start
+    this.cleanupExpiredCooldowns();
     this.startPeriodicCleanup();
     this.startMapResetMonitoring();
     this.patchGameFunctions();
   }
 
-  /* Checks if a location is currently on cooldown. */
+  // === SESSION PREFERENCE HELPERS ===
+  _loadSessionPrefs() {
+    try {
+      const raw = sessionStorage.getItem('cooldownSessionPrefs');
+      if (!raw) return { hideCooldownUI: false };
+      const parsed = JSON.parse(raw);
+      return { hideCooldownUI: !!parsed.hideCooldownUI };
+    } catch (e) {
+      console.warn('Failed to load session prefs:', e);
+      return { hideCooldownUI: false };
+    }
+  }
+
+  _saveSessionPrefs() {
+    try {
+      sessionStorage.setItem('cooldownSessionPrefs', JSON.stringify(this._sessionPrefs));
+    } catch (e) {
+      console.error('Failed to save session prefs:', e);
+    }
+  }
+
+  // Call this when user logs out or session ends
+  clearSessionPrefs() {
+    sessionStorage.removeItem('cooldownSessionPrefs');
+    this._sessionPrefs = { hideCooldownUI: false };
+    this._prefsChecked.clear();
+  }
+
   checkCooldown(locationId) {
     if (!locationId) {
       return { isOnCooldown: false, remainingMs: 0, remainingSeconds: 0 };
@@ -7370,23 +7399,18 @@ class LocationCooldownManager {
       return { isOnCooldown: false, remainingMs: 0, remainingSeconds: 0 };
     }
 
-    const hiddenTime = this.hiddenMsPerLoc[id] || 0;
-    const elapsed = Date.now() - startTime - hiddenTime;
+    const elapsed = Date.now() - startTime;
 
-    // Corrupted state or inflated hidden time (clock change, race condition) — 
-    // treat as expired so the user is never permanently locked out.
     if (!isFinite(elapsed) || elapsed < 0) {
       this._clearCooldownState(id);
       return { isOnCooldown: false, remainingMs: 0, remainingSeconds: 0 };
     }
 
-    // Cooldown has fully elapsed — clean up state
     if (elapsed >= COOLDOWN_PERIOD_MS) {
       this._clearCooldownState(id);
       return { isOnCooldown: false, remainingMs: 0, remainingSeconds: 0 };
     }
 
-    // Cooldown is actively counting down
     const remainingMs = COOLDOWN_PERIOD_MS - elapsed;
     return {
       isOnCooldown: true,
@@ -7395,11 +7419,11 @@ class LocationCooldownManager {
     };
   }
 
-  /* Cleans up all state for an expired or corrupted cooldown entry. */
   _clearCooldownState(id) {
     delete this.cooldowns[id];
-    delete this.hiddenMsPerLoc[id];
     this.resetCooldownIds.delete(id);
+    this._announcedLocations.delete(id);
+    this._prefsChecked.delete(id);
     this.saveToStorage();
 
     if (window._lastProximityTriggerByLocation) {
@@ -7410,65 +7434,54 @@ class LocationCooldownManager {
     }
   }
 
- /* Attempts to enter a location. Checks cooldown and current state. */
-enterLocation(locationId) {
-  if (!locationId) {
-    return { success: false, reason: 'invalid_id', message: 'Invalid location ID' };
-  }
-  const id = String(locationId);
-  const now = Date.now();
-  if (now - this.lastActionTime < DEBOUNCE_TIME_MS) {
-    return { success: false, reason: 'debounced', message: 'Action too rapid' };
-  }
-  this.lastActionTime = now;
-  if (this.currentLocationId === id) {
-    return { success: false, reason: 'already_inside', message: 'Already in this location' };
-  }
-  const status = this.checkCooldown(id);
-  if (status.isOnCooldown) {
-    return {
-      success: false,
-      reason: 'on_cooldown',
-      message: 'This location cannot be revisited for two minutes',
-      remainingMs: status.remainingMs,
-      remainingSeconds: status.remainingSeconds,
-      locationId: id,
-    };
-  }
-  // Successfully entering a new location
-  this.currentLocationId = id;
-  this.resetCooldownIds.delete(id); // Clear reset tracking - allows proximity zoom to work again
-  return { success: true, reason: 'allowed', message: 'Location entry allowed' };
-}
-
-/* Leaves the current location, starting its cooldown period. */
-leaveLocation(locationId = null) {
-  const id = locationId ? String(locationId) : this.currentLocationId;
-  if (!id || id === 'null' || id === 'undefined') return;
-
-  // Clear currentLocationId first so re-entry checks work correctly
-  if (this.currentLocationId === id) this.currentLocationId = null;
-
-  // Check if there is an *active* (non-expired) cooldown already running.
-  // We must call checkCooldown() here rather than checking this.cooldowns[id]
-  // directly, because checkCooldown() handles expiry cleanup. A raw key check
-  // would block re-entry after an expired cooldown whose key was never pruned.
-  if (this.cooldowns[id]) {
+  enterLocation(locationId) {
+    if (!locationId) {
+      return { success: false, reason: 'invalid_id', message: 'Invalid location ID' };
+    }
+    const id = String(locationId);
+    const now = Date.now();
+    if (now - this.lastActionTime < DEBOUNCE_TIME_MS) {
+      return { success: false, reason: 'debounced', message: 'Action too rapid' };
+    }
+    this.lastActionTime = now;
+    if (this.currentLocationId === id) {
+      return { success: false, reason: 'already_inside', message: 'Already in this location' };
+    }
     const status = this.checkCooldown(id);
     if (status.isOnCooldown) {
-      // A genuine active cooldown exists — do not overwrite its start time.
-      return;
+      return {
+        success: false,
+        reason: 'on_cooldown',
+        message: 'This location cannot be revisited for two minutes',
+        remainingMs: status.remainingMs,
+        remainingSeconds: status.remainingSeconds,
+        locationId: id,
+      };
     }
-    // Expired entry was just cleaned up by checkCooldown(); fall through
-    // to start a fresh cooldown below.
+    this.currentLocationId = id;
+    this.resetCooldownIds.delete(id);
+    return { success: true, reason: 'allowed', message: 'Location entry allowed' };
   }
 
-  this.cooldowns[id] = Date.now();
-  this.hiddenMsPerLoc[id] = 0;
-  this.saveToStorage();
-}
+  leaveLocation(locationId = null) {
+    const id = locationId ? String(locationId) : this.currentLocationId;
+    if (!id || id === 'null' || id === 'undefined') return;
 
-  // --- Map Reset Logic ---
+    if (this.currentLocationId === id) this.currentLocationId = null;
+
+    if (this.cooldowns[id]) {
+      const status = this.checkCooldown(id);
+      if (status.isOnCooldown) {
+        return;
+      }
+    }
+
+    this.cooldowns[id] = Date.now();
+    this._announcedLocations.delete(id);
+    this._prefsChecked.delete(id);
+    this.saveToStorage();
+  }
+
   startMapResetMonitoring() {
     this.mapResetInterval = setInterval(() => {
       this.checkAndResetMap();
@@ -7480,7 +7493,6 @@ leaveLocation(locationId = null) {
     let shouldReset = false;
     let resetReason = null;
 
-    // Reset if moving fast (>6 mph -> likely driving away)
     if (typeof window.currentSpeed === 'number' && window.currentSpeed > 6) {
       if (!this.wasOverSpeedThreshold) {
         shouldReset = true;
@@ -7488,20 +7500,18 @@ leaveLocation(locationId = null) {
         this.wasOverSpeedThreshold = true;
       }
     } else {
-      this.wasOverSpeedThreshold = false; // Reset flag if speed is low
+      this.wasOverSpeedThreshold = false;
     }
 
-    // Reset if any NEARBY active cooldown has just expired (one-time trigger per expiry)
     if (!shouldReset && Object.keys(this.cooldowns).length > 0) {
       for (const id of Object.keys(this.cooldowns)) {
-        if (this.resetCooldownIds.has(id)) continue; // Already triggered a reset
+        if (this.resetCooldownIds.has(id)) continue;
 
         const status = this.checkCooldown(id);
-        // Only reset if cooldown expired AND user is near that location
         if (!status.isOnCooldown && this.isWithinThreshold(id)) {
           shouldReset = true;
           resetReason = 'cooldown_expired';
-          this.resetCooldownIds.add(id); // Mark this ID as having triggered a reset
+          this.resetCooldownIds.add(id);
           break;
         }
       }
@@ -7514,27 +7524,23 @@ leaveLocation(locationId = null) {
   }
 
   resetMapToUser() {
-    // Delegate to the existing motion system for intelligent, smooth reset
     if (typeof window.updateUserLocation === 'function' && window.lastPosition) {
-      // Reconstruct a GeolocationPosition-like object
       const fakePosition = {
         coords: {
           latitude: window.lastPosition.lat,
           longitude: window.lastPosition.lng,
           accuracy: window.lastPosition.accuracy || 20,
-          speed: (window.currentSpeed || 0) / 2.23694, // convert mph -> m/s
+          speed: (window.currentSpeed || 0) / 2.23694,
           heading: window.lastPosition.heading || null
         },
         timestamp: Date.now()
       };
 
-      updateUserLocation(fakePosition, false); // Use normal smoothing
+      updateUserLocation(fakePosition, false);
 
-      // Ensure auto-follow is re-enabled after reset
       window.followUser = true;
       window.isMapInteracting = false;
 
-      // Prevent both speed and proximity zoom from immediately fighting the reset
       window.blockSpeedZoom = true;
       if (typeof window.blockProximityZoom !== 'undefined') {
         window.blockProximityZoom = true;
@@ -7548,14 +7554,12 @@ leaveLocation(locationId = null) {
       }, 2000);
 
     } else {
-      // Fallback: only used if motion system isn't ready
       try {
         if (typeof window.recenterMap === 'function') {
           window.recenterMap();
         } else if (window.map && window.userMarker) {
           const userPos = window.userMarker.getLatLng();
           if (userPos && window.map.setView) {
-            // Use flyTo for smooth centering instead of setView
             window.map.flyTo(userPos, window.map.getZoom?.() || 16, {
               animate: true,
               duration: 1.0,
@@ -7572,7 +7576,6 @@ leaveLocation(locationId = null) {
     }
   }
 
-  // --- UI & Notifications ---
   formatTime(seconds) {
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
@@ -7581,7 +7584,6 @@ leaveLocation(locationId = null) {
 
   isWithinThreshold(locationId) {
     try {
-      // Directly access potential location sources
       let location = null;
       const sources = [window.gameLocations, window.locations];
       for (const source of sources) {
@@ -7590,7 +7592,6 @@ leaveLocation(locationId = null) {
           if (location) break;
         }
       }
-      // Check locationsMap if not found in arrays
       if (!location && window.locationsMap && typeof window.locationsMap === 'object') {
         location = Object.values(window.locationsMap).find(loc => loc?.id === locationId);
       }
@@ -7619,91 +7620,373 @@ leaveLocation(locationId = null) {
     }
   }
 
+  // === POLISHED COUNTDOWN NOTIFICATION (WITH SESSION PREFS) ===
   notifyUserWithCountdown(locationId, remainingSeconds) {
-    if (!this.isWithinThreshold(locationId)) return; // Only show if user is near the location
-
-    this.clearToast(); // Clear any existing toast
-
-    // Try external notification functions first
-    if (window.showToast) {
-      window.showToast(`This location can't be revisited for ${this.formatTime(remainingSeconds)}`, 'warning');
-      return;
-    }
-    if (window.showNotification) {
-      window.showNotification(`This location can't be revisited for ${this.formatTime(remainingSeconds)}`);
-      return;
+    // === SESSION PREFERENCE CHECK: Exit early if user opted out ===
+    if (this._sessionPrefs.hideCooldownUI) {
+      this._monitoringLocationId = locationId;
+      this._prefsChecked.add(locationId);
+      return; // No UI, no timers
     }
 
-    // Fallback: Create a simple toast element
-    const toast = document.createElement('div');
-    toast.style.cssText = `
-      position: fixed;
-      bottom: 20px;
-      left: 50%;
-      transform: translateX(-50%);
-      background: #333;
-      color: white;
-      padding: 12px 20px;
-      border-radius: 6px;
-      font-size: 15px;
-      z-index: 10000;
-      opacity: 0.95;
-      max-width: 80%;
-      text-align: center;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.3);
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
-    `;
-    document.body.appendChild(toast);
-    this.activeToast = toast;
+    if (this._monitoringLocationId === locationId) return;
+    
+    this.clearToast();
+    this._monitoringLocationId = locationId;
+    this._badgeDismissed = false;
+    this._currentDisplayMode = null;
 
-    // Function to update the toast text and handle its lifecycle
-    const updateToast = () => {
-      if (!this.activeToast?.parentNode) { // Check if toast was removed
+    const updatePopup = () => {
+      if (this._monitoringLocationId !== locationId) {
         this.clearToastInterval();
         return;
       }
 
-      if (!this.isWithinThreshold(locationId)) { // User moved away
+      // Re-check preference in case it changed mid-session
+      if (this._sessionPrefs.hideCooldownUI) {
         this.clearToast();
         return;
       }
 
-      const status = this.checkCooldown(locationId); // Get current status
-      if (!status.isOnCooldown) { // Cooldown expired
-        this.clearToast();
-        // Optionally trigger the original location hunt if it's available
-        const location = window.gameLocations?.find(loc => loc?.id === locationId) ||
-                         window.locations?.find(loc => loc?.id === locationId) ||
-                         Object.values(window.locationsMap || {}).find(loc => loc?.id === locationId);
-        if (location && window.showLocationHunt) {
-          const originalFunc = window.showLocationHunt.__original || window.showLocationHunt;
-          originalFunc.call(window, location);
+      if (this._badgeDismissed) return;
+
+      const isNearby = this.isWithinThreshold(locationId);
+      const status = this.checkCooldown(locationId);
+
+      // Cooldown expired
+      if (!status.isOnCooldown) {
+        this.clearToastInterval();
+        this._monitoringLocationId = null;
+        this._currentDisplayMode = null;
+        this._prefsChecked.delete(locationId);
+        
+        if (isNearby) {
+          const location = window.gameLocations?.find(loc => loc?.id === locationId) ||
+                           window.locations?.find(loc => loc?.id === locationId) ||
+                           Object.values(window.locationsMap || {}).find(loc => loc?.id === locationId);
+          if (location && window.showLocationHunt) {
+            const originalFunc = window.showLocationHunt.__original || window.showLocationHunt;
+            originalFunc.call(window, location);
+          }
         }
         return;
       }
 
-      // Update the toast text with the new remaining time
-      this.activeToast.textContent = `This location can't be revisited for ${this.formatTime(status.remainingSeconds)}`;
+      // Handle proximity changes
+      if (isNearby) {
+        if (this._exitTimeout) {
+          clearTimeout(this._exitTimeout);
+          this._exitTimeout = null;
+        }
+
+        const targetMode = this._announcedLocations.has(locationId) ? 'corner' : 'center';
+
+        if (this._currentDisplayMode !== targetMode) {
+          if (targetMode === 'center') {
+            this._currentDisplayMode = 'center';
+            this._hideCornerBadge();
+            this._showCenteredPopup(status.remainingSeconds);
+            this._announcedLocations.add(locationId);
+            
+            if (this._centeredPopupTimeout) clearTimeout(this._centeredPopupTimeout);
+            this._centeredPopupTimeout = setTimeout(() => {
+              if (this._currentDisplayMode === 'center') {
+                this._currentDisplayMode = 'corner';
+                this._removeCenteredPopup();
+                this._showOrUpdateCornerBadge(status.remainingSeconds);
+              }
+              this._centeredPopupTimeout = null;
+            }, CENTERED_POPUP_DURATION_MS);
+          } else {
+            this._currentDisplayMode = 'corner';
+            this._removeCenteredPopup();
+            this._showOrUpdateCornerBadge(status.remainingSeconds);
+          }
+        } else {
+          // Same mode: just update text (no DOM reflow)
+          if (this._currentDisplayMode === 'center') {
+            const countdownEl = document.getElementById('cd-centered-countdown');
+            if (countdownEl) countdownEl.textContent = this.formatTime(status.remainingSeconds);
+          } else if (this._currentDisplayMode === 'corner') {
+            const textEl = document.getElementById('cd-corner-text');
+            if (textEl) textEl.textContent = this.formatTime(status.remainingSeconds);
+          }
+        }
+      } else {
+        // User left threshold - use exit delay
+        if (!this._exitTimeout) {
+          this._exitTimeout = setTimeout(() => {
+            this._hideAll();
+            this._currentDisplayMode = null;
+            this._badgeDismissed = false;
+            this._exitTimeout = null;
+          }, EXIT_DELAY_MS);
+        }
+      }
     };
 
-    updateToast(); // Initial update
-    this.toastInterval = setInterval(updateToast, TOAST_UPDATE_INTERVAL_MS); // Start periodic updates
+    updatePopup();
+    this.toastInterval = setInterval(updatePopup, 1000);
+  }
+
+  // === CENTERED POPUP (with "Don't show again" checkbox) ===
+  _showCenteredPopup(remainingSeconds) {
+    let popup = document.getElementById('cd-centered-popup');
+    
+    if (!popup) {
+      popup = document.createElement('div');
+      popup.id = 'cd-centered-popup';
+      popup.style.cssText = `
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        z-index: 10001;
+        background: rgba(0, 0, 0, 0.88);
+        color: #fff;
+        border-radius: 16px;
+        padding: 24px 32px;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        text-align: center;
+        box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        max-width: 320px;
+        width: 90%;
+        user-select: none;
+        opacity: 0;
+        transition: opacity 0.3s ease;
+      `;
+
+      popup.innerHTML = `
+        <div style="margin-bottom: 14px;">
+          <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#FFB74D" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin: 0 auto;">
+            <circle cx="12" cy="12" r="10"/>
+            <polyline points="12 6 12 12 16 14"/>
+          </svg>
+        </div>
+        <div style="font-size: 17px; font-weight: 600; margin-bottom: 8px; line-height: 1.4;">
+          This location is in a cooldown period
+        </div>
+        <div style="font-size: 14px; color: #B0B0B0; margin-bottom: 14px; line-height: 1.4;">
+          You are unable to revisit for
+        </div>
+        <div id="cd-centered-countdown" style="font-size: 40px; font-weight: 700; color: #FFB74D; letter-spacing: 3px; margin-bottom: 6px;">
+          ${this.formatTime(remainingSeconds)}
+        </div>
+        <div style="font-size: 14px; color: #B0B0B0; line-height: 1.4;">
+          longer
+        </div>
+        <div style="margin-top: 18px; padding-top: 14px; border-top: 1px solid rgba(255,255,255,0.1);">
+          <label style="display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 13px; color: #B0B0B0; user-select: none; justify-content: center;">
+            <input type="checkbox" id="cd-dont-show-again" style="width: 16px; height: 16px; accent-color: #FFB74D; cursor: pointer;">
+            <span>Don't show this again today</span>
+          </label>
+        </div>
+      `;
+
+      popup.style.pointerEvents = 'auto';
+      popup.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this._dismissBadge();
+      });
+
+      // Handle checkbox preference
+      const checkbox = popup.querySelector('#cd-dont-show-again');
+      if (checkbox) {
+        checkbox.addEventListener('change', (e) => {
+          if (e.target.checked) {
+            this._sessionPrefs.hideCooldownUI = true;
+            this._saveSessionPrefs();
+            // Provide subtle feedback
+            checkbox.parentElement.style.color = '#FFB74D';
+            setTimeout(() => {
+              if (checkbox.parentElement) {
+                checkbox.parentElement.style.color = '#B0B0B0';
+              }
+            }, 300);
+          }
+        });
+      }
+
+      document.body.appendChild(popup);
+    } else {
+      const countdownEl = popup.querySelector('#cd-centered-countdown');
+      if (countdownEl) {
+        countdownEl.textContent = this.formatTime(remainingSeconds);
+      }
+    }
+
+    requestAnimationFrame(() => {
+      popup.style.opacity = '1';
+    });
+  }
+
+  _removeCenteredPopup() {
+    const popup = document.getElementById('cd-centered-popup');
+    if (popup) {
+      popup.style.opacity = '0';
+      setTimeout(() => {
+        if (popup.parentNode && popup.style.opacity === '0') {
+          popup.remove();
+        }
+      }, 300);
+    }
+  }
+
+  // === CORNER BADGE (GPS-OVERLAY OPTIMIZED) ===
+  _showOrUpdateCornerBadge(remainingSeconds) {
+    let badge = document.getElementById('cd-corner-badge');
+    
+    if (!badge) {
+      badge = document.createElement('div');
+      badge.id = 'cd-corner-badge';
+      // === KEY CHANGES FOR GPS OVERLAY ===
+      badge.style.cssText = `
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        z-index: 99999; /* Higher than typical GPS indicators (~1000-10000) */
+        background: rgba(26, 58, 138, 0.98); /* Slightly more opaque for readability */
+        color: #fff;
+        border-radius: 8px; /* Slightly tighter */
+        padding: 8px 12px; /* Compact padding */
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        font-size: 12px; /* Smaller but still readable */
+        font-weight: 600;
+        line-height: 1.2;
+        box-shadow: 0 3px 10px rgba(0,0,0,0.35);
+        backdrop-filter: blur(6px);
+        -webkit-backdrop-filter: blur(6px);
+        max-width: 180px;
+        user-select: none;
+        opacity: 0;
+        transform: translateX(-10px);
+        transition: opacity 0.2s ease, transform 0.2s ease;
+        pointer-events: auto; /* Ensure clickable */
+        border: 1px solid rgba(255,255,255,0.15); /* Subtle border for contrast */
+      `;
+
+      badge.innerHTML = `
+        <div style="display:flex;align-items:center;gap:6px;">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;opacity:0.95;">
+            <circle cx="12" cy="12" r="10"/>
+            <polyline points="12 6 12 12 16 14"/>
+          </svg>
+          <span id="cd-corner-text" style="white-space:nowrap;font-variant-numeric:tabular-nums;">${this.formatTime(remainingSeconds)}</span>
+        </div>
+        <div style="font-size:9px;font-weight:500;opacity:0.75;margin-top:2px;padding-left:18px;line-height:1.1;">
+          until revisit
+        </div>
+      `;
+
+      badge.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this._dismissBadge();
+      });
+
+      document.body.appendChild(badge);
+    } else {
+      const textEl = badge.querySelector('#cd-corner-text');
+      if (textEl) textEl.textContent = this.formatTime(remainingSeconds);
+    }
+
+    requestAnimationFrame(() => {
+      badge.style.opacity = '1';
+      badge.style.transform = 'translateX(0)';
+    });
+  }
+
+  _hideCornerBadge() {
+    const badge = document.getElementById('cd-corner-badge');
+    if (badge) {
+      badge.style.opacity = '0';
+      badge.style.transform = 'translateX(-10px)';
+    }
+  }
+
+  _hideAll() {
+    const popup = document.getElementById('cd-centered-popup');
+    if (popup && popup.style.display !== 'none') {
+      popup.style.opacity = '0';
+      setTimeout(() => {
+        if (popup.style.opacity === '0') popup.style.display = 'none';
+      }, 300);
+    }
+
+    const badge = document.getElementById('cd-corner-badge');
+    if (badge) {
+      badge.style.opacity = '0';
+      badge.style.transform = 'translateX(-10px)';
+    }
+  }
+
+  _dismissBadge() {
+    this._badgeDismissed = true;
+    this._currentDisplayMode = null;
+    
+    if (this._centeredPopupTimeout) {
+      clearTimeout(this._centeredPopupTimeout);
+      this._centeredPopupTimeout = null;
+    }
+    if (this._exitTimeout) {
+      clearTimeout(this._exitTimeout);
+      this._exitTimeout = null;
+    }
+
+    this._removeCenteredPopup();
+    const badge = document.getElementById('cd-corner-badge');
+    if (badge) {
+      badge.style.opacity = '0';
+      badge.style.transform = 'translateX(-10px)';
+      setTimeout(() => {
+        if (badge.parentNode) badge.remove();
+      }, 200);
+    }
   }
 
   clearToast() {
     this.clearToastInterval();
-    if (this.activeToast?.parentNode) {
-      this.activeToast.parentNode.removeChild(this.activeToast);
+    this._monitoringLocationId = null;
+    this._badgeDismissed = false;
+    this._currentDisplayMode = null;
+
+    if (this._centeredPopupTimeout) {
+      clearTimeout(this._centeredPopupTimeout);
+      this._centeredPopupTimeout = null;
     }
+    if (this._exitTimeout) {
+      clearTimeout(this._exitTimeout);
+      this._exitTimeout = null;
+    }
+    
+    const centered = document.getElementById('cd-centered-popup');
+    if (centered) {
+      centered.style.opacity = '0';
+      setTimeout(() => {
+        if (centered.parentNode) centered.remove();
+      }, 300);
+    }
+    
+    const corner = document.getElementById('cd-corner-badge');
+    if (corner) {
+      corner.style.opacity = '0';
+      corner.style.transform = 'translateX(-10px)';
+      setTimeout(() => {
+        if (corner.parentNode) corner.remove();
+      }, 200);
+    }
+    
     this.activeToast = null;
   }
 
   clearToastInterval() {
-    if (this.toastInterval) clearInterval(this.toastInterval);
-    this.toastInterval = null;
+    if (this.toastInterval) {
+      clearInterval(this.toastInterval);
+      this.toastInterval = null;
+    }
   }
 
-  // --- Storage & Cleanup ---
   loadFromStorage() {
     try {
       const data = localStorage.getItem(STORAGE_KEY);
@@ -7727,28 +8010,16 @@ leaveLocation(locationId = null) {
   cleanupExpiredCooldowns() {
     const now = Date.now();
     let modified = false;
-    const activeIds = new Set(); // Track IDs that are still active
 
     for (const [id, startTime] of Object.entries(this.cooldowns)) {
-      const hiddenTime = this.hiddenMsPerLoc[id] || 0;
-      const elapsed = now - startTime - hiddenTime;
+      const elapsed = now - startTime;
 
-      if (elapsed >= COOLDOWN_PERIOD_MS || elapsed < 0 || !isFinite(elapsed)) {
-        // Cooldown expired, remove it
+      if (!isFinite(elapsed) || elapsed < 0 || elapsed >= COOLDOWN_PERIOD_MS) {
         delete this.cooldowns[id];
-        delete this.hiddenMsPerLoc[id];
-        this.resetCooldownIds.delete(id); // Clean up reset tracking
+        this.resetCooldownIds.delete(id);
+        this._announcedLocations.delete(id);
+        this._prefsChecked.delete(id);
         modified = true;
-      } else {
-        // Cooldown still active
-        activeIds.add(id);
-      }
-    }
-
-    // Clean up hiddenMsPerLoc entries for IDs that no longer have an active cooldown
-    for (const id of Object.keys(this.hiddenMsPerLoc)) {
-      if (!activeIds.has(id)) {
-        delete this.hiddenMsPerLoc[id];
       }
     }
 
@@ -7760,88 +8031,7 @@ leaveLocation(locationId = null) {
       this.cleanupExpiredCooldowns();
     }, CLEANUP_INTERVAL_MS);
   }
-/*
-  initVisibilityTracking() {
-    this.visibilityHandler = () => {
-      if (document.hidden) {
-        this.hiddenAt = Date.now(); // Mark when app was hidden
-      } else if (this.hiddenAt !== null) {
-        const hiddenDuration = Date.now() - this.hiddenAt;
-        // Add the hidden duration to the accumulated time for all *currently active* cooldowns
-        for (const id of Object.keys(this.cooldowns)) {
-          if (!this.hiddenMsPerLoc[id]) this.hiddenMsPerLoc[id] = 0;
-          this.hiddenMsPerLoc[id] += hiddenDuration;
-        }
-        this.hiddenAt = null; // Reset hidden timestamp
-      }
-    };
-    document.addEventListener('visibilitychange', this.visibilityHandler);
-  }
-*/
 
-initVisibilityTracking() {
-  // Wall-clock time never stops. Nothing to track.
-  // This method is intentionally a no-op — cooldowns run in real time
-  // regardless of whether the app is in the background.
-  this.visibilityHandler = null;
-}
-
-checkCooldown(locationId) {
-  if (!locationId) {
-    return { isOnCooldown: false, remainingMs: 0, remainingSeconds: 0 };
-  }
-
-  const id = String(locationId);
-  const startTime = this.cooldowns[id];
-
-  if (!startTime) {
-    return { isOnCooldown: false, remainingMs: 0, remainingSeconds: 0 };
-  }
-
-  const elapsed = Date.now() - startTime;
-
-  // Corrupted state — treat as expired so user is never permanently locked out
-  if (!isFinite(elapsed) || elapsed < 0) {
-    this._clearCooldownState(id);
-    return { isOnCooldown: false, remainingMs: 0, remainingSeconds: 0 };
-  }
-
-  // Cooldown has fully elapsed — clean up
-  if (elapsed >= COOLDOWN_PERIOD_MS) {
-    this._clearCooldownState(id);
-    return { isOnCooldown: false, remainingMs: 0, remainingSeconds: 0 };
-  }
-
-  // Actively counting down
-  const remainingMs = COOLDOWN_PERIOD_MS - elapsed;
-  return {
-    isOnCooldown: true,
-    remainingMs: Math.max(0, remainingMs),
-    remainingSeconds: Math.max(0, Math.ceil(remainingMs / 1000)),
-  };
-}
-
-cleanupExpiredCooldowns() {
-  const now = Date.now();
-  let modified = false;
-
-  for (const [id, startTime] of Object.entries(this.cooldowns)) {
-    const elapsed = now - startTime;
-
-    if (!isFinite(elapsed) || elapsed < 0 || elapsed >= COOLDOWN_PERIOD_MS) {
-      delete this.cooldowns[id];
-      this.resetCooldownIds.delete(id);
-      modified = true;
-    }
-  }
-
-  // hiddenMsPerLoc is no longer used, but clean it up defensively
-  this.hiddenMsPerLoc = {};
-
-  if (modified) this.saveToStorage();
-}
-    
-  // Game Function Patching 
   patchGameFunctions() {
     this.patchShowLocationHunt();
     this.patchCheckProximityAutoOpen();
@@ -7849,115 +8039,105 @@ cleanupExpiredCooldowns() {
     this.patchCreateBottomActionBar();
   }
 
-patchShowLocationHunt() {
-  const manager = this;
+  patchShowLocationHunt() {
+    const manager = this;
 
-  const applyPatch = () => {
-    if (!window.showLocationHunt || window.showLocationHunt.__patched) return;
+    const applyPatch = () => {
+      if (!window.showLocationHunt || window.showLocationHunt.__patched) return;
 
-    const original = window.showLocationHunt;
+      const original = window.showLocationHunt;
 
-    window.showLocationHunt = function(loc) {
-      if (!loc?.id) return original.call(this, loc);
+      window.showLocationHunt = function(loc) {
+        if (!loc?.id) return original.call(this, loc);
 
-      const result = manager.enterLocation(loc.id);
+        const result = manager.enterLocation(loc.id);
 
-      if (result.success) {
-        return original.call(this, loc);
-      }
+        if (result.success) {
+          return original.call(this, loc);
+        }
 
-      if (result.reason === 'already_inside') {
-        // Already open — do nothing
-        return;
-      }
+        if (result.reason === 'already_inside') {
+          return;
+        }
 
-      if (result.reason === 'on_cooldown') {
-        manager.notifyUserWithCountdown(result.locationId, result.remainingSeconds);
-        console.log(`[Cooldown] Location ${loc.id} blocked — ${result.remainingSeconds}s remaining`);
-        return;
-      }
+        if (result.reason === 'on_cooldown') {
+          manager.notifyUserWithCountdown(result.locationId, result.remainingSeconds);
+          console.log(`[Cooldown] Location ${loc.id} blocked — ${result.remainingSeconds}s remaining`);
+          return;
+        }
 
-      if (result.reason === 'debounced') {
-        return;
-      }
+        if (result.reason === 'debounced') {
+          return;
+        }
 
-      console.warn('[Cooldown] Location entry failed:', result);
+        console.warn('[Cooldown] Location entry failed:', result);
+      };
+
+      window.showLocationHunt.__patched = true;
+      window.showLocationHunt.__original = original;
+      console.log('[Cooldown] showLocationHunt patched successfully');
     };
 
-    window.showLocationHunt.__patched = true;
-    window.showLocationHunt.__original = original;
-    console.log('[Cooldown] showLocationHunt patched successfully');
-  };
+    applyPatch();
 
-  applyPatch();
-
-  if (!window.showLocationHunt?.__patched) {
-    window.addEventListener('load', applyPatch, { once: true });
+    if (!window.showLocationHunt?.__patched) {
+      window.addEventListener('load', applyPatch, { once: true });
+    }
   }
-}
 
   patchCheckProximityAutoOpen() {
     if (!window.checkProximityAutoOpen || window.checkProximityAutoOpen.__patched) return;
     const original = window.checkProximityAutoOpen;
     const manager = this;
     window.checkProximityAutoOpen = function(loc, ft) {
-      if (!loc?.id) return original.call(this, loc, ft); // Allow if no ID
+      if (!loc?.id) return original.call(this, loc, ft);
       const result = manager.enterLocation(loc.id);
-      if (result.success) return original.call(this, loc, ft); // Allow if no cooldown
+      if (result.success) return original.call(this, loc, ft);
       if (result.reason === 'on_cooldown') {
-        // Show countdown if on cooldown
         manager.notifyUserWithCountdown(result.locationId, result.remainingSeconds);
       }
-      return false; // Block auto-open
+      return false;
     };
     window.checkProximityAutoOpen.__patched = true;
     window.checkProximityAutoOpen.__original = original;
   }
 
-patchCloseFunctions() {
-  const names = ['closeLocationHunt', 'closeLocation', 'hideLocationHunt', 'exitLocation'];
+  patchCloseFunctions() {
+    const names = ['closeLocationHunt', 'closeLocation', 'hideLocationHunt', 'exitLocation'];
 
-  for (const name of names) {
-    if (window[name] && !window[name].__patched) {
-      this.patchCloseFunction(name);
+    for (const name of names) {
+      if (window[name] && !window[name].__patched) {
+        this.patchCloseFunction(name);
+      }
     }
+
+    const manager = this;
+    const observer = new MutationObserver(() => {
+      for (const name of names) {
+        if (window[name] && !window[name].__patched) {
+          manager.patchCloseFunction(name);
+        }
+      }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    let attempts = 0;
+    const poll = setInterval(() => {
+      for (const name of names) {
+        if (window[name] && !window[name].__patched) {
+          manager.patchCloseFunction(name);
+        }
+      }
+      if (++attempts >= 20) clearInterval(poll);
+    }, 500);
   }
-
-  // Guard: watch for any of the target functions being defined *after*
-  // this constructor runs (e.g. from a deferred script). Without this,
-  // functions that don't exist yet simply never get patched.
-  const manager = this;
-  const observer = new MutationObserver(() => {
-    for (const name of names) {
-      if (window[name] && !window[name].__patched) {
-        manager.patchCloseFunction(name);
-      }
-    }
-  });
-  observer.observe(document.body, { childList: true, subtree: true });
-
-  // Also poll briefly at startup as a belt-and-suspenders fallback,
-  // since deferred scripts fire after DOMContentLoaded but the
-  // MutationObserver may miss purely programmatic window assignments.
-  let attempts = 0;
-  const poll = setInterval(() => {
-    for (const name of names) {
-      if (window[name] && !window[name].__patched) {
-        manager.patchCloseFunction(name);
-      }
-    }
-    if (++attempts >= 20) clearInterval(poll); // stop after ~10 seconds
-  }, 500);
-}
 
   patchCloseFunction(funcName) {
     const original = window[funcName];
     const manager = this;
     window[funcName] = function(locationId) {
-      // Always call leaveLocation when a close function is triggered
       if (manager.currentLocationId) manager.leaveLocation(manager.currentLocationId);
       else if (locationId) manager.leaveLocation(locationId);
-      // Then call the original function
       return original.call(this, locationId);
     };
     window[funcName].__patched = true;
@@ -7973,9 +8153,8 @@ patchCloseFunctions() {
       if (bar && location?.id) {
         const originalOnClick = bar.onclick;
         bar.onclick = function(e) {
-          // Call leaveLocation when the action bar button is clicked
           manager.leaveLocation(location.id);
-          return originalOnClick?.call(this, e); // Then call the original click handler
+          return originalOnClick?.call(this, e);
         };
       }
       return bar;
@@ -7984,15 +8163,11 @@ patchCloseFunctions() {
     window.createBottomActionBar.__original = original;
   }
 
-  // Destruction 
   destroy() {
     if (this.cleanupInterval) clearInterval(this.cleanupInterval);
     if (this.mapResetInterval) clearInterval(this.mapResetInterval);
     this.clearToast();
-    if (this.visibilityHandler) {
-      document.removeEventListener('visibilitychange', this.visibilityHandler);
-    }
-    // Restore original functions
+
     const patchedNames = ['showLocationHunt', 'checkProximityAutoOpen', 'closeLocationHunt', 'closeLocation', 'hideLocationHunt', 'exitLocation', 'createBottomActionBar'];
     for (const name of patchedNames) {
       if (window[name] && window[name].__original) {
@@ -8000,13 +8175,31 @@ patchCloseFunctions() {
       }
     }
 
-    // Clear state
     this.currentLocationId = null;
     this.resetCooldownIds.clear();
+    this._monitoringLocationId = null;
+    this._announcedLocations.clear();
+    this._currentDisplayMode = null;
+    this._prefsChecked.clear();
   }
 
-  // Utility Methods (for external API if needed) 
+  // === PUBLIC API FOR SESSION MANAGEMENT ===
+  /**
+   * Call this when user logs out or ends their session
+   */
+  resetSessionPreferences() {
+    this.clearSessionPrefs();
+  }
+  
+  /**
+   * Check if cooldown UI is currently suppressed by user preference
+   */
+  isUHiddenByPreference() {
+    return this._sessionPrefs.hideCooldownUI;
+  }
+
   getRemainingTime(locationId) { return this.checkCooldown(locationId).remainingSeconds; }
+  
   getAllCooldowns() {
     const out = {};
     for (const id of Object.keys(this.cooldowns)) {
@@ -8015,41 +8208,39 @@ patchCloseFunctions() {
     }
     return out;
   }
+  
   clearCooldown(locationId) {
     if (!locationId) return;
     const id = String(locationId);
     delete this.cooldowns[id];
-    delete this.hiddenMsPerLoc[id];
     this.resetCooldownIds.delete(id);
+    this._announcedLocations.delete(id);
+    this._prefsChecked.delete(id);
     this.saveToStorage();
   }
+  
   clearAllCooldowns() {
     this.cooldowns = {};
-    this.hiddenMsPerLoc = {};
     this.resetCooldownIds.clear();
+    this._announcedLocations.clear();
+    this._prefsChecked.clear();
     this.saveToStorage();
   }
+  
   getCurrentLocation() { return this.currentLocationId; }
 }
 
-// Initialize the manager
 if (typeof window !== 'undefined') {
   if (window.cooldownManager) window.cooldownManager.destroy();
   window.cooldownManager = new LocationCooldownManager();
 }
 
-// Export for module systems if needed
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = LocationCooldownManager;
 }
 
-// GLOBAL BRIDGE — called by updateUserLocation's POI threshold system.
-// Ensures ALL location opens go through the cooldown manager regardless
-// of which internal code path triggers them.
 window._openLocationPage = function(location) {
   if (!location?.id) return;
-
-  // Route through the patched showLocationHunt so cooldown is always enforced
   if (typeof window.showLocationHunt === 'function') {
     window.showLocationHunt(location);
   }
