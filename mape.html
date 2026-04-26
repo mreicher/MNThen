@@ -3951,35 +3951,35 @@ function handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, c
         window._needsPreload = true;
     }
 
-    // ── Cooldown Cache (Map-based, bounded) ──
+    // ── Cooldown Cache (Map-based, bounded) - For UI display only, not blocking ──
     if (!window._cooldownCache) {
         window._cooldownCache = new Map();
     }
 
-    let isOnCooldown = false;
+    let isOnCooldownForUI = false;
     const cooldownCacheTTL = 2000; // 2s
     const locationId = closestLocation.id;
 
     const cachedCooldown = window._cooldownCache.get(locationId);
     if (cachedCooldown && (now - cachedCooldown.time) < cooldownCacheTTL) {
-        isOnCooldown = cachedCooldown.status;
+        isOnCooldownForUI = cachedCooldown.status;
     } else {
         if (typeof window.cooldownManager !== 'undefined' && window.cooldownManager.checkCooldown) {
             try {
                 const cooldownStatus = window.cooldownManager.checkCooldown(locationId);
-                isOnCooldown = cooldownStatus.isOnCooldown || false;
-                window._cooldownCache.set(locationId, { status: isOnCooldown, time: now });
+                isOnCooldownForUI = cooldownStatus.isOnCooldown || false;
+                window._cooldownCache.set(locationId, { status: isOnCooldownForUI, time: now });
             } catch (err) {
                 console.warn('[Proximity] Cooldown check failed:', err);
             }
         }
     }
 
-    // ── Update Proximity State ──
+    // ── Update Proximity State (cooldown status for UI only) ──
     window.proximityState = {
         closestLocation,
         distanceMeters: closestDistance,
-        isOnCooldown,
+        isOnCooldown: isOnCooldownForUI,
         lastUpdateTime: now
     };
 
@@ -3994,8 +3994,9 @@ function handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, c
     }
 
     // ── STAGE 2: Trigger Zone (≤ 20ft) ──
+    // Pass false for isOnCooldown - we'll do the real check inside _handleTriggerZone
     if (distanceFeet <= TRIGGER_DISTANCE && closestLocation && closestLocation.id) {
-        _handleTriggerZone(closestLocation, distanceFeet, now, isOnCooldown);
+        _handleTriggerZone(closestLocation, distanceFeet, now, false);
     } else {
         if (distanceFeet > PREFETCH_DISTANCE) {
             window._prefetchState = null;
@@ -4086,7 +4087,6 @@ function _handlePrefetchZone(location, distanceFeet, now) {
     }
 }
 
-// STAGE 2: TRIGGER ZONE HANDLER (≤ 20ft)
 function _handleTriggerZone(location, distanceFeet, now, isOnCooldown) {
     const locationId = location.id;
 
@@ -4111,11 +4111,11 @@ function _handleTriggerZone(location, distanceFeet, now, isOnCooldown) {
     let debounceTime = MIN_DEBOUNCE;
     if (window._prefetchState && window._prefetchState[locationId]) {
         const approach = window._prefetchState[locationId];
-        const approachTime = now - approach.startTime;      // both performance.now()
+        const approachTime = now - approach.startTime;
         const distanceTraveled = approach.startDistance - distanceFeet;
 
         if (approachTime > 0 && distanceTraveled > 0) {
-            const approachSpeed = distanceTraveled / (approachTime / 1000); // ft/s
+            const approachSpeed = distanceTraveled / (approachTime / 1000);
 
             if (approachSpeed > 5) {
                 debounceTime = MIN_DEBOUNCE;
@@ -4129,8 +4129,8 @@ function _handleTriggerZone(location, distanceFeet, now, isOnCooldown) {
         }
     }
 
-    // ── Gate Checks ──
-    let shouldAutoOpen = !isOnCooldown && !locationPageOpen;
+    // ── Gate Checks (removed cooldown check - we'll do it at the end) ──
+    let shouldAutoOpen = !locationPageOpen;
 
     if (timeSinceLastTrigger < debounceTime) {
         console.log(`[Proximity] Debounced - opened ${locationId} ${(timeSinceLastTrigger / 1000).toFixed(1)}s ago (need ${(debounceTime / 1000).toFixed(1)}s)`);
@@ -4138,7 +4138,6 @@ function _handleTriggerZone(location, distanceFeet, now, isOnCooldown) {
     }
 
     if (!shouldAutoOpen) {
-        if (isOnCooldown) console.log('[Proximity] Skipped - location on cooldown');
         if (locationPageOpen) console.log('[Proximity] Skipped - page already open');
         return;
     }
@@ -4171,8 +4170,25 @@ function _handleTriggerZone(location, distanceFeet, now, isOnCooldown) {
     // ── Update Trigger Timestamp ──
     window._lastProximityTriggerByLocation[locationId] = now;
 
-    // ── Open Location Page ──
+    // ── Open Location Page with Final Cooldown Check ──
     const locationToOpen = window.preloadedLocation || location;
+
+    // FINAL COOLDOWN CHECK - right before opening
+    if (window.cooldownManager && locationToOpen?.id) {
+        const finalCheck = window.cooldownManager.enterLocation(locationToOpen.id);
+        
+        if (!finalCheck.success && finalCheck.reason === 'on_cooldown') {
+            // Show your beautiful UI
+            if (window.cooldownManager.notifyUserWithCountdown) {
+                window.cooldownManager.notifyUserWithCountdown(
+                    finalCheck.locationId, 
+                    finalCheck.remainingSeconds
+                );
+            }
+            console.log(`[Proximity] Location on cooldown - not opening: ${locationToOpen.id}`);
+            return; // Don't open - keep all the other functionality
+        }
+    }
 
     if (typeof showLocationHunt === 'function') {
         try {
@@ -4577,8 +4593,7 @@ async function updateUserLocation(position, forceUpdate = false) {
     if (
         closestLocation &&
         closestDistance !== Infinity &&
-        typeof window.poiDistanceThreshold === 'number' &&
-        typeof _openLocationPage === 'function'
+        typeof window.poiDistanceThreshold === 'number'
     ) {
         window._poiInRange = window._poiInRange || {};
 
@@ -4596,10 +4611,41 @@ async function updateUserLocation(position, forceUpdate = false) {
         const inRange = closestDistance <= window.poiDistanceThreshold;
         const wasIn   = window._poiInRange[locId] ?? false;
 
-        if (inRange && !wasIn) {
-            window._poiInRange[locId] = true;
-            _openLocationPage(closestLocation);
-        } else if (!inRange && wasIn) {
+        // COOLDOWN CHECK
+        if (inRange) {
+            // Always check cooldown when in range
+            if (window.cooldownManager && closestLocation?.id) {
+                const cooldownResult = window.cooldownManager.enterLocation(closestLocation.id);
+                
+                if (cooldownResult.success) {
+                    // Not on cooldown - proceed with opening
+                    if (!wasIn) {
+                        window._poiInRange[locId] = true;
+                        if (typeof _openLocationPage === 'function') {
+                            _openLocationPage(closestLocation);
+                        }
+                    }
+                } else if (cooldownResult.reason === 'on_cooldown') {
+                    // On cooldown - show your beautiful UI
+                    if (window.cooldownManager.notifyUserWithCountdown) {
+                        window.cooldownManager.notifyUserWithCountdown(
+                            cooldownResult.locationId, 
+                            cooldownResult.remainingSeconds
+                        );
+                    }
+                    console.log(`[Cooldown] Location ${closestLocation.id} blocked — ${cooldownResult.remainingSeconds}s remaining`);
+                }
+            } else {
+                // Fallback if no cooldown manager
+                if (!wasIn) {
+                    window._poiInRange[locId] = true;
+                    if (typeof _openLocationPage === 'function') {
+                        _openLocationPage(closestLocation);
+                    }
+                }
+            }
+        } else if (wasIn) {
+            // Left proximity zone - reset flag
             window._poiInRange[locId] = false;
         }
     }
