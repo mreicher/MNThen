@@ -3916,9 +3916,7 @@ function _handleInactivityReset() {
     window.inactivityTimer = null;
 }
 
-// PROXIMITY & PREFETCH LOGIC
 function handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, closestDistance) {
-    // Use performance.now() consistently for all internal timing
     const now = performance.now();
 
     // ── Early Exit: Invalid Data ──
@@ -3943,9 +3941,9 @@ function handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, c
         ? CONFIG.DISTANCE_THRESHOLD
         : 20;
 
-    // Progressive cache clearing with hysteresis
-    const CACHE_CLEAR_DISTANCE = 120; // feet
-    const CACHE_RESTORE_DISTANCE = 100; // feet - prevents thrashing
+    // ── Progressive Cache Clearing (hysteresis prevents thrashing) ──
+    const CACHE_CLEAR_DISTANCE   = 120; // feet
+    const CACHE_RESTORE_DISTANCE = 100; // feet
 
     if (distanceFeet > CACHE_CLEAR_DISTANCE) {
         if (window.preloadedLocation) {
@@ -3956,14 +3954,14 @@ function handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, c
         window._needsPreload = true;
     }
 
-    // ── Cooldown Cache (Map-based, bounded) - For UI display only, not blocking ──
+    // ── Cooldown Cache (Map-based, bounded) — UI display only, never blocks entry ──
     if (!window._cooldownCache) {
         window._cooldownCache = new Map();
     }
 
-    let isOnCooldownForUI = false;
     const cooldownCacheTTL = 2000; // 2s
     const locationId = closestLocation.id;
+    let isOnCooldownForUI = false;
 
     const cachedCooldown = window._cooldownCache.get(locationId);
     if (cachedCooldown && (now - cachedCooldown.time) < cooldownCacheTTL) {
@@ -3974,13 +3972,22 @@ function handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, c
                 const cooldownStatus = window.cooldownManager.checkCooldown(locationId);
                 isOnCooldownForUI = cooldownStatus.isOnCooldown || false;
                 window._cooldownCache.set(locationId, { status: isOnCooldownForUI, time: now });
+
+                // ── Prune stale cache entries ──
+                if (window._cooldownCache.size > 50) {
+                    for (const [key, val] of window._cooldownCache) {
+                        if ((now - val.time) >= cooldownCacheTTL) {
+                            window._cooldownCache.delete(key);
+                        }
+                    }
+                }
             } catch (err) {
                 console.warn('[Proximity] Cooldown check failed:', err);
             }
         }
     }
 
-    // ── Update Proximity State (cooldown status for UI only) ──
+    // ── Update Proximity State ──
     window.proximityState = {
         closestLocation,
         distanceMeters: closestDistance,
@@ -3988,24 +3995,19 @@ function handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, c
         lastUpdateTime: now
     };
 
-    // Multi-stage proximity with intelligent prefetching
-    const PREFETCH_DISTANCE = 80;  // Start prefetching at 80ft
-    const TRIGGER_DISTANCE = PROXIMITY_THRESHOLD; // Open at configured threshold (default 20ft)
+    // ── Zone Routing ──
+    const PREFETCH_DISTANCE = 80; // feet — begin prefetching
+    const TRIGGER_DISTANCE  = PROXIMITY_THRESHOLD; // feet — open location (default 20ft)
 
-    // ── STAGE 1: Prefetch Zone (80ft - 20ft) ──
-    if (distanceFeet <= PREFETCH_DISTANCE && distanceFeet > TRIGGER_DISTANCE) {
-        _handlePrefetchZone(closestLocation, distanceFeet, now);
-        return;
-    }
-
-    // ── STAGE 2: Trigger Zone (≤ 20ft) ──
-    // Pass false for isOnCooldown - we'll do the real check inside _handleTriggerZone
-    if (distanceFeet <= TRIGGER_DISTANCE && closestLocation && closestLocation.id) {
+    if (distanceFeet <= TRIGGER_DISTANCE) {
+        // Stage 2: Trigger zone — _handleTriggerZone does its own authoritative cooldown check
         _handleTriggerZone(closestLocation, distanceFeet, now, false);
+    } else if (distanceFeet <= PREFETCH_DISTANCE) {
+        // Stage 1: Prefetch zone
+        _handlePrefetchZone(closestLocation, distanceFeet, now);
     } else {
-        if (distanceFeet > PREFETCH_DISTANCE) {
-            window._prefetchState = null;
-        }
+        // Outside all zones
+        window._prefetchState = null;
         console.debug(`[Proximity] Outside all zones: ${distanceFeet.toFixed(1)}ft`);
     }
 }
@@ -7499,20 +7501,22 @@ class LocationCooldownManager {
     const id = locationId ? String(locationId) : this.currentLocationId;
     if (!id || id === 'null' || id === 'undefined') return;
 
+    // Only stamp a cooldown if this location was actually entered this session
+    const wasCurrentLocation = this.currentLocationId === id;
     if (this.currentLocationId === id) this.currentLocationId = null;
 
+    if (!wasCurrentLocation) return; // Never entered — don't punish the player
+
     if (this.cooldowns[id]) {
-      const status = this.checkCooldown(id);
-      if (status.isOnCooldown) {
-        return;
-      }
+        const status = this.checkCooldown(id);
+        if (status.isOnCooldown) return;
     }
 
     this.cooldowns[id] = Date.now();
     this._announcedLocations.delete(id);
     this._prefsChecked.delete(id);
     this.saveToStorage();
-  }
+}
 
   startMapResetMonitoring() {
     this.mapResetInterval = setInterval(() => {
@@ -7652,60 +7656,77 @@ class LocationCooldownManager {
     }
   }
 
-  notifyUserWithCountdown(locationId, remainingSeconds) {
+notifyUserWithCountdown(locationId, remainingSeconds) {
     // ── Early exits ──
     if (this._sessionPrefs.hideCooldownUI) {
-      this._monitoringLocationId = locationId;
-      this._prefsChecked.add(locationId);
-      return;
+        this._monitoringLocationId = locationId;
+        this._prefsChecked.add(locationId);
+        return;
     }
 
     // Prevent duplicate monitoring for same location
     if (this._monitoringLocationId === locationId) {
-      console.debug('[Cooldown] Already monitoring location:', locationId);
-      return;
+        console.debug('[Cooldown] Already monitoring location:', locationId);
+        return;
     }
-    
+
     // ── Setup monitoring ──
-    this.clearToast(); // Clean up any previous toast
-    this._monitoringLocationId = locationId;
+    // Clear previous interval and timeouts WITHOUT nuking _monitoringLocationId prematurely
+    this.clearToastInterval();
     this._badgeDismissed = false;
     this._currentDisplayMode = null;
-    
+
+    if (this._centeredPopupTimeout) {
+        clearTimeout(this._centeredPopupTimeout);
+        this._centeredPopupTimeout = null;
+    }
+    if (this._exitTimeout) {
+        clearTimeout(this._exitTimeout);
+        this._exitTimeout = null;
+    }
+
+    // Now safe to assign the new location
+    this._monitoringLocationId = locationId;
+
     // ── Core update logic (runs every second) ──
     const updatePopup = () => {
-      // Safety check: are we still monitoring this location?
-      if (this._monitoringLocationId !== locationId) {
-        this.clearToastInterval();
-        return;
-      }
+        // Safety check: are we still monitoring this location?
+        if (this._monitoringLocationId !== locationId) {
+            this.clearToastInterval();
+            return;
+        }
 
-      // User preference changed mid-monitoring
-      if (this._sessionPrefs.hideCooldownUI) {
-        this.clearToast();
-        return;
-      }
+        // User preference changed mid-monitoring
+        if (this._sessionPrefs.hideCooldownUI) {
+            this.clearToast();
+            return;
+        }
 
-      // User dismissed the badge
-      if (this._badgeDismissed) return;
+        // User dismissed the badge
+        if (this._badgeDismissed) return;
 
-      // Get fresh data
-      const isNearby = this.isWithinThreshold(locationId);
-      const status = this.checkCooldown(locationId);
+        // Get fresh data
+        const isNearby = this.isWithinThreshold(locationId);
+        const status = this.checkCooldown(locationId);
 
-      // ── Case 1: Cooldown expired ──
-      if (!status.isOnCooldown) {
-        this._handleCooldownExpired(locationId, isNearby);
-        return;
-      }
+        // ── Case 1: Cooldown expired ──
+        if (!status.isOnCooldown) {
+            this._handleCooldownExpired(locationId, isNearby);
+            return;
+        }
 
-      // ── Case 2: Still on cooldown ──
-      if (isNearby) {
-        this._handleNearbyWithCooldown(locationId, status.remainingSeconds);
-      } else {
-        this._handleLeftProximity();
-      }
+        // ── Case 2: Still on cooldown ──
+        if (isNearby) {
+            this._handleNearbyWithCooldown(locationId, status.remainingSeconds);
+        } else {
+            this._handleLeftProximity();
+        }
     };
+
+    // Start the update loop
+    updatePopup(); // Run immediately
+    this.toastInterval = setInterval(updatePopup, 1000);
+}
 
     // Start the update loop
     updatePopup(); // Run immediately
