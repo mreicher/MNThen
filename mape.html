@@ -2079,14 +2079,6 @@ function initMap() {
         zIndexOffset: 1000
     }).addTo(map);
     
-    const keepMarkerSynced = () => {
-        if (lastPosition) {
-            userMarker.setLatLng([lastPosition.lat, lastPosition.lng], { animate: false });
-        }
-        requestAnimationFrame(keepMarkerSynced);
-    };
-    requestAnimationFrame(keepMarkerSynced);
-    
     showLoadingMessage();
     if ('geolocation' in navigator) {
         const opts = { enableHighAccuracy: true, timeout: 45000, maximumAge: 0 };
@@ -3020,41 +3012,135 @@ function initializeUserLocation(position) {
 let onlineListenerAdded = false;
 let onlineRestartTimeout = null;
 
+/* Starts or restarts the geolocation watch with power-appropriate settings. */
 function startPositionUpdates() {
     try {
-        const startWatch = () => navigator.geolocation.watchPosition(
-            handlePositionUpdate,
-            handleLocationError,
-            { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 }
-        );
-        
-        // Clear any existing watch
-        if (window.positionWatchId !== undefined && window.positionWatchId !== null) {
-            navigator.geolocation.clearWatch(window.positionWatchId);
+        // ── GPS Power Mode Selection ──
+        // Determines watchPosition options based on current movement state.
+        function getWatchOptions() {
+            const speedMPS = window.lastPosition?.speedMPS ?? 0;
+            const speedMPH = speedMPS * 2.23694;
+
+            if (window.isStationary || speedMPH < 0.5) {
+                // STATIONARY: Warm Standby.
+                // GPS radio stays warm (enableHighAccuracy: true) so there is 
+                // zero cold-start delay when the user takes their first step.
+                // maximumAge: 15000 saves battery by allowing the OS to throttle
+                // CPU interrupts, delivering fixes every ~15s instead of ~1s.
+                return {
+                    enableHighAccuracy: true,
+                    maximumAge: 15000,
+                    timeout: 30000
+                };
+            } else if (speedMPH < 5) {
+                // WALKING: Medium power.
+                // High accuracy for smooth map tracking, but the 5s maximumAge
+                // prevents unnecessary CPU wakeups on devices with 10Hz GPS chips.
+                return {
+                    enableHighAccuracy: true,
+                    maximumAge: 5000,
+                    timeout: 15000
+                };
+            } else {
+                // DRIVING (original behavior): Full burn.
+                // Fresh fixes every second for smooth panning at high speeds.
+                return {
+                    enableHighAccuracy: true,
+                    maximumAge: 1000,
+                    timeout: 10000
+                };
+            }
         }
-        
-        window.positionWatchId = startWatch();
-        
-        // Register listeners only once per page load
+
+        // Re-registers the watch with current-appropriate options.
+        // This is the core mechanism: same watchPosition API, different
+        // CPU throttling depending on what the user is doing.
+        function restartWatchWithCurrentOptions() {
+            if (window.positionWatchId !== undefined && window.positionWatchId !== null) {
+                navigator.geolocation.clearWatch(window.positionWatchId);
+            }
+            const opts = getWatchOptions();
+            window.positionWatchId = navigator.geolocation.watchPosition(
+                handlePositionUpdate,
+                handleLocationError,
+                opts
+            );
+            return window.positionWatchId;
+        }
+
+        // Start the watch with power-appropriate settings
+        window.positionWatchId = restartWatchWithCurrentOptions();
+
+        // ── Dynamic GPS Power Manager ──
+        // Periodically checks if the power mode should change and re-registers
+        // the watch if so. Runs every 5 seconds — cheap (just reads state).
+        if (!window._gpsPowerManagerSetup) {
+            window._gpsPowerManagerSetup = true;
+
+            let lastPowerMode = null; // 'low' | 'medium' | 'high'
+
+            function getCurrentPowerMode() {
+                const speedMPS = window.lastPosition?.speedMPS ?? 0;
+                const speedMPH = speedMPS * 2.23694;
+                if (window.isStationary || speedMPH < 0.5) return 'low';
+                if (speedMPH < 5) return 'medium';
+                return 'high';
+            }
+
+            function adjustGPSPower() {
+                const newMode = getCurrentPowerMode();
+
+                // Skip if mode hasn't changed — avoids redundant re-registrations
+                if (newMode === lastPowerMode) return;
+
+                console.log(
+                    `[GPS Power] ${lastPowerMode ?? '(init)'} → ${newMode} ` +
+                    `(speed: ${((window.lastPosition?.speedMPS ?? 0) * 2.23694).toFixed(1)} mph)`
+                );
+                lastPowerMode = newMode;
+
+                // Re-register the watch with new power settings.
+                restartWatchWithCurrentOptions();
+            }
+
+            // Fallback interval: check power mode every 5 seconds
+            window._gpsPowerInterval = setInterval(adjustGPSPower, 5000);
+
+            // Instant-response hooks: Adjust GPS *immediately* when stationary 
+            // state changes, instead of waiting up to 5 seconds for the interval.
+            const hookPowerAdjustment = (funcName) => {
+                if (typeof window[funcName] === 'function' && !window[funcName]._powerManagerPatched) {
+                    const original = window[funcName];
+                    window[funcName] = function (...args) {
+                        const result = original.apply(this, args);
+                        adjustGPSPower();
+                        return result;
+                    };
+                    window[funcName]._powerManagerPatched = true;
+                }
+            };
+
+            hookPowerAdjustment('_confirmStationary');
+            hookPowerAdjustment('_clearStationaryState');
+        }
+
+        // ── Network & Lifecycle Listeners (preserved from original) ──
         if (!onlineListenerAdded) {
             // Restart geolocation when network returns
             window.addEventListener('online', () => {
                 console.debug('Online event detected - scheduling position watch restart');
-                
+
                 if (onlineRestartTimeout) {
                     clearTimeout(onlineRestartTimeout);
                 }
-                
+
                 onlineRestartTimeout = setTimeout(() => {
-                    if (window.positionWatchId !== null) {
-                        navigator.geolocation.clearWatch(window.positionWatchId);
-                    }
-                    window.positionWatchId = startWatch();
+                    restartWatchWithCurrentOptions();
                     console.debug('Position watch restarted after online event');
                     onlineRestartTimeout = null;
-                }, 500); // Allow network to stabilize
+                }, 500);
             });
-            
+
             // Clean up on offline: clear watch + cancel pending restart
             window.addEventListener('offline', () => {
                 if (onlineRestartTimeout) {
@@ -3062,15 +3148,15 @@ function startPositionUpdates() {
                     onlineRestartTimeout = null;
                     console.debug('Cancelled pending position watch restart (offline)');
                 }
-                
+
                 if (window.positionWatchId !== null) {
                     navigator.geolocation.clearWatch(window.positionWatchId);
                     window.positionWatchId = null;
                     console.debug('Cleared position watch on offline event');
                 }
             });
-            
-            // Prevent background battery drain
+
+            // Prevent background battery drain on page unload
             window.addEventListener('beforeunload', () => {
                 if (window.positionWatchId !== null) {
                     navigator.geolocation.clearWatch(window.positionWatchId);
@@ -3078,13 +3164,16 @@ function startPositionUpdates() {
                 if (onlineRestartTimeout) {
                     clearTimeout(onlineRestartTimeout);
                 }
+                if (window._gpsPowerInterval) {
+                    clearInterval(window._gpsPowerInterval);
+                }
                 console.debug('Geolocation cleanup on page unload');
             });
-            
+
             onlineListenerAdded = true;
             console.debug('Online/offline/beforeunload listeners registered');
         }
-        
+
         return window.positionWatchId;
     } catch (err) {
         console.error('Geolocation unavailable:', err);
@@ -3092,7 +3181,7 @@ function startPositionUpdates() {
         return null;
     }
 }
-
+        
 function handlePositionUpdate(position) {
     if (!position || !position.coords || 
         isNaN(position.coords.latitude) || 
