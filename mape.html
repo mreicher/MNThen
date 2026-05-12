@@ -2722,15 +2722,18 @@ function startPositionUpdates() {
         }
 
         // ── GPS Power Mode Selection ──
-        function getWatchOptions() {
+                function getWatchOptions() {
             const speedMPS = window.lastPosition?.speedMPS ?? 0;
             const speedMPH = speedMPS * 2.23694;
 
             if (window.isStationary || speedMPH < 0.5) {
+                // Parked: allow stale data, save battery
                 return { enableHighAccuracy: true, maximumAge: 15000, timeout: 30000 };
             } else if (speedMPH < 5) {
-                return { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 };
+                // Walking: tighten from 5000ms → 2000ms to catch acceleration sooner
+                return { enableHighAccuracy: true, maximumAge: 2000, timeout: 15000 };
             } else {
+                // Driving: always use fresh data (<1s old)
                 return { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 };
             }
         }
@@ -3452,8 +3455,8 @@ const SPEED_THRESHOLDS = {
     WALKING: 3,
     JOGGING: 5, 
     TRANSITION_START: 10,
-    HIGH_SPEED: 16,        // enter centered mode at or above this
-    HYSTERESIS_RETURN: 13.5 // exit centered mode at or below this
+    HIGH_SPEED: 13,       
+    HYSTERESIS_RETURN: 10  
 };
 
 // Single Source Mode Manager 
@@ -3500,20 +3503,13 @@ function highSpeedAggressiveness(speedMPH) {
     return speedAggressiveness(speedMPH, 15, 65, 0.7);
 }
 
+/* DISABLED: Speed-based zoom changes removed. */
 function getSpeedBasedZoom(speedMPS, closestDistance = Infinity) {
     return 17;
 }
 
-function easeInOutQuad(t) {
-    return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
-}
-
-getSpeedBasedZoom.reset = function() {
-    delete getSpeedBasedZoom.currentZoom;
-    delete getSpeedBasedZoom.targetZoom;
-    delete getSpeedBasedZoom.transitionStartTime;
-    delete getSpeedBasedZoom.transitionStartZoom;
-};
+/** No-op: speed-based zoom is permanently disabled. */
+getSpeedBasedZoom.reset = function() {};
 
 // INTERACTION & INACTIVITY HANDLERS
 function setupMapInteractionHandlers() {
@@ -3988,66 +3984,155 @@ function _prefetchMapTiles(location, now) {
     }
 }
 
-function _cleanupMarkerStyles() {
-    try {
-        const markerEl = userMarker?.getElement?.();
-        if (markerEl && markerEl.style) {
-            markerEl.style.willChange = 'auto';
+// ─── Marker Update
+;(function () {
+
+    // ── Configuration ────────────────────────────────────────────────────────
+
+    /**
+     * How long (ms) after the last position update before the compositor layer
+     * is released.  Keeps the layer promoted while the user is moving and frees
+     * it shortly after they stop — balancing smoothness against battery/memory.
+     */
+    var WILL_CHANGE_IDLE_MS = 2000;
+
+    // ── Module state — never written to window ────────────────────────────────
+
+    var _pendingLat    = null;
+    var _pendingLng    = null;
+    var _rafId         = null;
+    var _resetTimer    = null;
+    var _willChangeOn  = false;
+    var _updateCount   = 0;     // gates compositor promotion (see _ensureWillChange)
+
+    // ── Private helpers ───────────────────────────────────────────────────────
+
+    /**
+     * Safely retrieve the DOM element backing userMarker.
+     * Returns null on any failure so callers never have to try/catch.
+     */
+    function _getMarkerEl() {
+        try {
+            return (userMarker && typeof userMarker.getElement === 'function')
+                ? userMarker.getElement()
+                : null;
+        } catch (_) {
+            return null;
         }
-    } catch (e) {}
-}
-
-// Proper Marker Update RAF
-function scheduleMarkerUpdate(lat, lng, options = {}) {
-    const animOpts = {
-        animate: true,
-        duration: 0.12,
-        easeLinearity: 0.08,
-        ...options
-    };
-
-    window._pendingMarkerUpdate = { lat, lng, animOpts };
-
-    if (!window._markerRAFPending) {
-        // Shared flag prevents both rAF and fallback from firing
-        let updateExecuted = false;
-
-        if (window._markerFallbackTimer) {
-            clearTimeout(window._markerFallbackTimer);
-            window._markerFallbackTimer = null;
-        }
-
-        window._markerRAFPending = requestAnimationFrame(() => {
-            if (updateExecuted) return;
-            updateExecuted = true;
-
-            if (window._pendingMarkerUpdate && userMarker) {
-                const { lat, lng, animOpts } = window._pendingMarkerUpdate;
-                userMarker.setLatLng([lat, lng], animOpts);
-            }
-            window._markerRAFPending = null;
-            window._pendingMarkerUpdate = null;
-
-            if (window._markerFallbackTimer) {
-                clearTimeout(window._markerFallbackTimer);
-                window._markerFallbackTimer = null;
-            }
-        });
-
-        window._markerFallbackTimer = setTimeout(() => {
-            if (updateExecuted) return;
-            updateExecuted = true;
-
-            if (window._pendingMarkerUpdate && userMarker) {
-                const { lat, lng, animOpts } = window._pendingMarkerUpdate;
-                userMarker.setLatLng([lat, lng], animOpts);
-            }
-            window._markerRAFPending = null;
-            window._pendingMarkerUpdate = null;
-            window._markerFallbackTimer = null;
-        }, 100);
     }
-}
+
+    /**
+     * Promote the marker element to its own compositor layer — but only after
+     * two consecutive updates.  
+     */
+    function _ensureWillChange() {
+        if (_willChangeOn) return;
+        if (++_updateCount < 2) return;
+        var el = _getMarkerEl();
+        if (!el) return;
+        el.style.willChange = 'transform';
+        _willChangeOn = true;
+    }
+
+    /**
+     * (Re)schedule releasing the compositor layer after WILL_CHANGE_IDLE_MS of
+     * inactivity. */
+    function _scheduleWillChangeReset() {
+        if (_resetTimer !== null) {
+            clearTimeout(_resetTimer);
+        }
+        _resetTimer = setTimeout(function () {
+            _resetTimer   = null;
+            _willChangeOn = false;
+            _updateCount  = 0;
+            var el = _getMarkerEl();
+            if (el) el.style.willChange = 'auto';
+        }, WILL_CHANGE_IDLE_MS);
+    }
+
+    /* RAF callback. */
+    function _commitMarkerUpdate() {
+        _rafId = null;
+
+        if (_pendingLat === null || !userMarker) {
+            _pendingLat = _pendingLng = null;
+            return;
+        }
+
+        var lat = _pendingLat;
+        var lng = _pendingLng;
+        _pendingLat = _pendingLng = null;
+
+        try {
+            userMarker.setLatLng([lat, lng]);
+        } catch (err) {
+            // Surface in development; fail silently in production
+            if (typeof process === 'undefined' ||
+                !process.env ||
+                process.env.NODE_ENV !== 'production') {
+                console.warn('[scheduleMarkerUpdate] setLatLng failed:', err);
+            }
+        }
+
+        _scheduleWillChangeReset();
+    }
+
+    /**
+     * Schedule a marker position update coalesced to the next animation frame.
+     */
+    function scheduleMarkerUpdate(lat, lng, options) { // eslint-disable-line no-unused-vars
+        // Always overwrite pending coords.  The RAF callback reads the latest
+        // value at paint time — intermediate positions are intentionally dropped.
+        _pendingLat = lat;
+        _pendingLng = lng;
+
+        // Arm willChange *before* the paint so the browser can promote the
+        // compositor layer ahead of the transform change, not after.
+        _ensureWillChange();
+
+        // Guard: if a RAF is already queued it will pick up the new coords above.
+        if (_rafId !== null) return;
+
+        _rafId = requestAnimationFrame(_commitMarkerUpdate);
+    }
+
+    /**
+     * Release all resources and cancel any pending update.
+     */
+    function cancelMarkerUpdate() {
+        if (_rafId !== null) {
+            cancelAnimationFrame(_rafId);
+            _rafId = null;
+        }
+
+        if (_resetTimer !== null) {
+            clearTimeout(_resetTimer);
+            _resetTimer = null;
+        }
+
+        _pendingLat   = null;
+        _pendingLng   = null;
+        _willChangeOn = false;
+        _updateCount  = 0;
+
+        var el = _getMarkerEl();
+        if (el) el.style.willChange = 'auto';
+    }
+
+    /**
+     * _cleanupMarkerStyles — backwards-compatible alias.
+     */
+    function _cleanupMarkerStyles() {
+        cancelMarkerUpdate();
+    }
+
+    // Expose on window so existing call-sites require zero changes.
+
+    window.scheduleMarkerUpdate  = scheduleMarkerUpdate;
+    window.cancelMarkerUpdate    = cancelMarkerUpdate;
+    window._cleanupMarkerStyles  = _cleanupMarkerStyles;
+
+})();
         
 /* updateUserLocation — Core position processing pipeline */
 function updateUserLocation(position, forceUpdate = false) {
@@ -4151,28 +4236,56 @@ function updateUserLocation(position, forceUpdate = false) {
         speedMPS: rawSpeedMPS
     };
 
-    // SECTION 5: SPEED CALCULATION (Dual EMA)
-    window._emaSpeedFast = window._emaSpeedFast ?? rawSpeedMPS;
-    window._emaSpeedSlow = window._emaSpeedSlow ?? rawSpeedMPS;
+  // SECTION 5: SPEED CALCULATION (Optimized for Instant Mode Switching).
 
-    // Fast EMA for mode decisions (α=0.90, responds in ~1 sample)
-    window._emaSpeedFast = 0.90 * rawSpeedMPS + 0.10 * window._emaSpeedFast;
-    // Slow EMA for visuals (α=0.35, smooth ~3-sample rolling average)
-    window._emaSpeedSlow = 0.35 * rawSpeedMPS + 0.65 * window._emaSpeedSlow;
+// 1. Build a reliable speed estimate: prefer displacement over GPS when GPS is stale/low
+let reliableSpeedMPS = rawSpeedMPS;
 
-    let modeSpeedMPH = Math.min(window._emaSpeedFast * 2.23694, 120);
-    const speedMPH = Math.min(window._emaSpeedSlow * 2.23694, 120);
-    const speedMPS = window._emaSpeedSlow;
+if (lastPos && timeDelta > 0.15 && timeDelta < 5.0) {
+    const dist = calculateDistance(lastPos, newPosition);
 
-    // Instant speed bypass for accurate mode switching
-    if (lastPos && timeDelta > 0.25) {
-        const rawDist = calculateDistance(lastPos, newPosition);
-        const rawCalcMPH = (rawDist / timeDelta) * 2.23694;
-        const maxDelta = 10 * timeDelta;
-        if (rawCalcMPH > modeSpeedMPH && (rawCalcMPH - modeSpeedMPH) < maxDelta) {
-            modeSpeedMPH = rawCalcMPH;
+    // iOS/Android safety: ignore GPS jumps > 20m in < 1s (teleport artifact)
+    if (dist > 20 && timeDelta < 1.0) {
+        console.debug('GPS jump filtered:', dist.toFixed(1) + 'm in', timeDelta.toFixed(2) + 's');
+    } else {
+        // Cap at 15 m/s (~33mph) — prevents jitter from reporting impossible speeds
+        const calcSpeed = Math.min(dist / timeDelta, 15);
+
+        // Use displacement speed if:
+        //   a) GPS reports < 0.5 m/s (likely under-reporting on Android), OR
+        //   b) Displacement speed is significantly higher than GPS (GPS is stale)
+        if (reliableSpeedMPS < 0.5 && calcSpeed > 1.0) {
+            reliableSpeedMPS = calcSpeed;
+        } else if (calcSpeed > reliableSpeedMPS * 1.5 && calcSpeed > 2.0) {
+            reliableSpeedMPS = calcSpeed;
         }
     }
+}
+
+// Fast EMA for mode decisions (α=0.95 → reacts in ~1 GPS tick)
+window._emaSpeedFast = window._emaSpeedFast ?? reliableSpeedMPS;
+window._emaSpeedFast = 0.95 * reliableSpeedMPS + 0.05 * window._emaSpeedFast;
+
+// Slow EMA for UI/panning visuals (unchanged smoothing)
+window._emaSpeedSlow = window._emaSpeedSlow ?? reliableSpeedMPS;
+window._emaSpeedSlow = 0.35 * reliableSpeedMPS + 0.65 * window._emaSpeedSlow;
+
+let modeSpeedMPH = Math.min(window._emaSpeedFast * 2.23694, 120);
+const speedMPH = Math.min(window._emaSpeedSlow * 2.23694, 120);
+const speedMPS = window._emaSpeedSlow;
+
+// EMERGENCY BURST OVERRIDE: If raw GPS or displacement spikes hard,
+// snap modeSpeed immediately. This guarantees 1-sample transition.
+const rawGPSMPH = rawSpeedMPS * 2.23694;
+const rawCalcMPH = (lastPos && timeDelta > 0.15) 
+    ? Math.min((calculateDistance(lastPos, newPosition) / timeDelta) * 2.23694, 33) // capped at 33mph
+    : 0;
+
+if (rawGPSMPH >= SPEED_THRESHOLDS.HIGH_SPEED) {
+    modeSpeedMPH = rawGPSMPH; // Native GPS says we're fast — trust it
+} else if (rawCalcMPH >= SPEED_THRESHOLDS.HIGH_SPEED) {
+    modeSpeedMPH = rawCalcMPH; // Displacement says we're fast — GPS is lying
+}
 
     // SECTION 6: MODE & INACTIVITY
     const modeChanged = ModeManager.update(modeSpeedMPH);
@@ -4697,10 +4810,8 @@ function updateUserLocation(position, forceUpdate = false) {
     }
 }
 
-/**
- * Proximity zoom logic extracted for clarity.
- * Handles zoom-in when approaching a POI and zoom-out when leaving.
- */
+/* Proximity zoom logic extracted for clarity.
+ * Handles zoom-in when approaching a POI and zoom-out when leaving. */
 function _handleProximityZoomLogic(speedMPH, eastWestMove) {
     const PROX_NEAR_M = 13.716;
     const PROX_FAR_M = 21.336;
