@@ -8402,45 +8402,50 @@ function initAudioPlayer() {
         console.error("Audio player elements not found");
         return;
     }
-    
+
     if (audio.src && !audio.dataset.originalSrc) {
         audio.dataset.originalSrc = audio.src;
     }
-    
+
     let wakeLock = null;
     let isPlayerActive = true;
-    
+
     let retryCount = 0;
     const maxRetries = 3;
     let lastPlaybackPosition = 0;
     let recoveryInProgress = false;
-    
+
     let wasPlayingWhenHidden = false;
     let screenWentAway = false;
     let wasPlaying = false;
 
-     // Shared AudioContext — reuse across all player instances to avoid iOS 6-context limit
+    // ─── AudioContext ─────────────────────────────────────────────────────────
+    // Shared across all player instances to avoid iOS 6-context hard limit.
+    // IMPORTANT: On iOS, createMediaElementSource() must only ever be called
+    // once per HTMLMediaElement. Calling it again (e.g. after src reset) throws
+    // InvalidStateError and permanently silences the element. We therefore guard
+    // with a WeakMap keyed on the audio element itself.
+    const _elementSourceMap = window._audioElementSourceMap || (window._audioElementSourceMap = new WeakMap());
+
     function getOrCreateAudioContext() {
         if (window._sharedAudioContext) {
-            // iOS suspends AudioContext when the app is backgrounded.
-            // Resume it so playback works immediately on return.
-            if (window._sharedAudioContext.state === 'suspended') {
-                window._sharedAudioContext.resume().catch((e) => {
-                    console.warn('AudioContext resume failed:', e);
-                });
-            }
-            // If somehow closed, fall through to create a new one
-            if (window._sharedAudioContext.state !== 'closed') {
-                return window._sharedAudioContext;
+            const ctx = window._sharedAudioContext;
+            // Closed contexts cannot be resumed — create a fresh one.
+            if (ctx.state === 'closed') {
+                window._sharedAudioContext = null;
+            } else {
+                if (ctx.state === 'suspended') {
+                    // Best-effort resume; callers must not await this.
+                    ctx.resume().catch((e) => console.warn('AudioContext resume failed:', e));
+                }
+                return ctx;
             }
         }
         try {
             window._sharedAudioContext = new (window.AudioContext || window.webkitAudioContext)();
-            window._audioSourceNode = null;
-            window._audioSourceNodeElement = null; // Track which <audio> element is connected
             return window._sharedAudioContext;
         } catch (e) {
-            console.warn('AudioContext creation failed:', e);
+            console.log('AudioContext creation failed:', e);
             return null;
         }
     }
@@ -8449,186 +8454,144 @@ function initAudioPlayer() {
         const ctx = getOrCreateAudioContext();
         if (!ctx) return null;
 
-        // Reconnect if: no source node exists, the context changed, 
-        // OR the audio element changed (happens when opening a new location)
-        const needsReconnect =
-            !window._audioSourceNode ||
-            window._audioSourceNode.context !== ctx ||
-            window._audioSourceNodeElement !== audio;
-
-        if (needsReconnect) {
+        // Guard: only connect this audio element to the context once, ever.
+        // On iOS, a second createMediaElementSource() on the same element is
+        // a hard error that kills future playback with no visible exception.
+        if (!_elementSourceMap.has(audio)) {
             try {
-                // Disconnect old node if it's still active from a previous location
-                if (window._audioSourceNode) {
-                    try { window._audioSourceNode.disconnect(); } catch (_) {}
-                }
-                
-                // Connect the new audio element
-                window._audioSourceNode = ctx.createMediaElementSource(audio);
-                window._audioSourceNode.connect(ctx.destination);
-                window._audioSourceNodeElement = audio; // Remember this element
+                const sourceNode = ctx.createMediaElementSource(audio);
+                sourceNode.connect(ctx.destination);
+                _elementSourceMap.set(audio, sourceNode);
             } catch (e) {
-                // InvalidStateError means the element is already connected to this context
-                if (e.name === 'InvalidStateError') {
-                    try {
-                        // Ensure the existing node is wired to the destination
-                        window._audioSourceNode.connect(ctx.destination);
-                        window._audioSourceNodeElement = audio;
-                    } catch (connectErr) {
-                        console.warn('AudioContext destination reconnection failed:', connectErr);
-                    }
-                } else {
+                if (e.name !== 'InvalidStateError') {
                     console.warn('AudioContext source connection failed:', e);
                 }
+                // InvalidStateError: element already connected elsewhere; safe to continue.
+            }
+        } else {
+            // Element already has a source node; ensure it's still on the current context.
+            const existingNode = _elementSourceMap.get(audio);
+            if (existingNode.context !== ctx) {
+                // Context was recreated. Remove stale entry and reconnect.
+                _elementSourceMap.delete(audio);
+                return initAudioContext(); // recurse once
             }
         }
 
         return ctx;
     }
-    
+
+    // ─── Wake lock ────────────────────────────────────────────────────────────
+    // iOS Safari does not support the Screen Wake Lock API.
+    const supportsWakeLock = 'wakeLock' in navigator;
+
     async function requestWakeLock() {
+        if (!supportsWakeLock || !isPlayerActive) return;
         try {
-            if ('wakeLock' in navigator && !wakeLock && isPlayerActive) {
+            if (!wakeLock) {
                 wakeLock = await navigator.wakeLock.request('screen');
-                console.log('Wake lock acquired');
-                
                 wakeLock.addEventListener('release', () => {
-                    console.log('Wake lock released');
                     wakeLock = null;
-                    if (!audio.paused) {
-                        screenWentAway = true;
-                        wasPlayingWhenHidden = true;
-                    }
                 });
             }
         } catch (err) {
             console.warn('Wake lock failed:', err);
         }
     }
-    
+
     async function releaseWakeLock() {
         if (wakeLock) {
             try {
                 await wakeLock.release();
-                wakeLock = null;
-                console.log('Wake lock manually released');
             } catch (err) {
                 console.warn('Wake lock release failed:', err);
+            } finally {
+                wakeLock = null;
             }
         }
     }
 
-      // Pause audio when tab is hidden — prevents background battery drain and iOS interruptions
+    // ─── Visibility / interruption handling ──────────────────────────────────
+    // iOS fires visibilitychange *after* the system has already paused the audio
+    // element, so audio.paused is already true by the time our handler runs.
+    // We track intent via `wasPlaying` (set in play/pause event listeners)
+    // rather than checking audio.paused at the moment the event fires.
+
     const visibilityHandler = () => {
         if (document.hidden) {
-            // ── Going to background ──
-            if (audio && !audio.paused) {
-                if (!isNaN(audio.currentTime)) {
-                    lastPlaybackPosition = audio.currentTime;
-                    try {
-                        localStorage.setItem('audioPosition', audio.currentTime.toString());
-                    } catch (e) {}
-                }
+            if (!isNaN(audio.currentTime) && audio.currentTime > 0) {
+                lastPlaybackPosition = audio.currentTime;
+                _throttledSavePosition(audio.currentTime);
+            }
+
+            if (wasPlaying) {
                 wasPlayingWhenHidden = true;
                 screenWentAway = true;
-                audio.pause();
-                playPauseBtn.innerHTML = '<i class="bi bi-play"></i>';
-                playPauseBtn.setAttribute('aria-label', 'Play');
+                // Explicitly pause so Android doesn't drain battery in background.
+                if (!audio.paused) {
+                    audio.pause();
+                    playPauseBtn.innerHTML = '<i class="bi bi-play"></i>';
+                    playPauseBtn.setAttribute('aria-label', 'Play');
+                }
             }
         } else {
-            // ── Returning to foreground ──
-
-            // 1. Defensively ensure the audio source is intact (in case memory manager wiped it)
-            ensureAudioSource();
-
-            // 2. If audio was playing when we left, try to resume or prep for manual resume
-            if (wasPlayingWhenHidden && audio.paused) {
-                
-                // Store the position for togglePlay to pick up
-                if (lastPlaybackPosition > 0) {
-                    audio.dataset.resumePosition = lastPlaybackPosition.toString();
-                }
-
-                // Attempt auto-resume (works on Desktop/Android, fails silently on iOS requiring gesture)
-                const tryAutoResume = async () => {
-                    try {
-                        const ctx = getOrCreateAudioContext();
-                        if (ctx && ctx.state === 'suspended') {
-                            await ctx.resume();
-                        }
-                        await audio.play();
-                        
-                        // Auto-resume succeeded
-                        playPauseBtn.innerHTML = '<i class="bi bi-pause"></i>';
-                        playPauseBtn.setAttribute('aria-label', 'Pause');
-                        await requestWakeLock();
+            if (wasPlayingWhenHidden) {
+                setTimeout(() => {
+                    if (screenWentAway) {
+                        showSourcePopup(
+                            "Audio Paused",
+                            "Audio was paused when this tab became inactive. Press play to resume."
+                        );
                         screenWentAway = false;
                         wasPlayingWhenHidden = false;
-                        
-                    } catch (e) {
-                        // Expected on iOS — user must tap Play manually.
-                        // Do not clear flags here so togglePlay knows the context is suspended.
-                        console.debug('Auto-resume failed (user gesture required):', e.message);
-                        
-                        // Show accurate message with the time they will resume from
-                        if (screenWentAway) {
-                            const mins = Math.floor(lastPlaybackPosition / 60);
-                            const secs = Math.floor(lastPlaybackPosition % 60);
-                            showSourcePopup(
-                                "Audio Paused", 
-                                `Audio was interrupted when this tab became inactive. Tap play to resume from ${mins}:${String(secs).padStart(2, '0')}.`
-                            );
-                            screenWentAway = false;
-                            wasPlayingWhenHidden = false;
-                        }
                     }
-                };
-                
-                tryAutoResume();
+                }, 100);
             }
         }
     };
     document.addEventListener('visibilitychange', visibilityHandler);
 
+    // Android Chrome fires blur spuriously (soft keyboard, permission dialogs).
+    // Use blur only as a position-save hint — never to set screenWentAway.
     const blurHandler = () => {
-        if (audio && !audio.paused) {
+        if (!isNaN(audio.currentTime) && audio.currentTime > 0) {
             lastPlaybackPosition = audio.currentTime;
-            wasPlayingWhenHidden = true;
-            screenWentAway = true;
-            console.log('Window blur, storing position:', lastPlaybackPosition);
         }
     };
     window.addEventListener('blur', blurHandler);
-    
+
+    // ─── Play / pause state tracking ─────────────────────────────────────────
     audio.addEventListener('play', () => {
         wasPlaying = true;
         announceToScreenReader('Audio playback started');
     });
-    
+
     audio.addEventListener('pause', () => {
         wasPlaying = false;
         announceToScreenReader('Audio playback paused');
     });
-    
+
+    // ─── Recovery ────────────────────────────────────────────────────────────
     function recoverAudioSource() {
         if (recoveryInProgress || !isPlayerActive) return;
-        
         recoveryInProgress = true;
         console.log('Attempting audio recovery...');
-        
-        if (!isNaN(audio.currentTime)) {
+
+        if (!isNaN(audio.currentTime) && audio.currentTime > 0) {
             lastPlaybackPosition = audio.currentTime;
         }
-        
-        if (audio.dataset.originalSrc) {
-            audio.src = audio.dataset.originalSrc;
-        } else if (audio.getAttribute('data-src')) {
-            audio.src = audio.getAttribute('data-src');
+
+        // Only reassign src when it is actually missing or broken.
+        // On iOS, setting audio.src = '' detaches the element from the Web Audio
+        // graph in a way that cannot be repaired without a full page reload.
+        const targetSrc = audio.dataset.originalSrc || audio.getAttribute('data-src');
+        if (targetSrc && (!audio.src || audio.src === window.location.href)) {
+            audio.src = targetSrc;
         }
-        
+
         audio.load();
-        
-        const setPositionAfterNetworkRecovery = () => {
+
+        const onReady = () => {
             if (lastPlaybackPosition > 0 && !screenWentAway) {
                 audio.currentTime = lastPlaybackPosition;
             } else if (screenWentAway) {
@@ -8636,77 +8599,61 @@ function initAudioPlayer() {
             }
             recoveryInProgress = false;
             retryCount = 0;
-            audio.removeEventListener('loadedmetadata', setPositionAfterNetworkRecovery);
-            audio.removeEventListener('canplay', setPositionAfterNetworkRecovery);
+            audio.removeEventListener('loadedmetadata', onReady);
+            audio.removeEventListener('canplay', onReady);
         };
-        
-        audio.addEventListener('loadedmetadata', setPositionAfterNetworkRecovery);
-        audio.addEventListener('canplay', setPositionAfterNetworkRecovery);
+
+        audio.addEventListener('loadedmetadata', onReady);
+        audio.addEventListener('canplay', onReady);
     }
-    
+
     function handleAudioError(error) {
-        console.log('handleAudioError called, isPlayerActive:', isPlayerActive, 'audio exists:', !!audio);
-        
         const actualError = audio ? audio.error : null;
         if (actualError) {
-            console.error("Actual audio error details:", {
+            console.error("Audio error details:", {
                 code: actualError.code,
                 message: actualError.message,
-                MEDIA_ERR_ABORTED: actualError.code === 1,
-                MEDIA_ERR_NETWORK: actualError.code === 2,
-                MEDIA_ERR_DECODE: actualError.code === 3,
-                MEDIA_ERR_SRC_NOT_SUPPORTED: actualError.code === 4
             });
         }
-        
+
         if (!isPlayerActive && (!audio || audio.readyState === 0)) {
-            console.log('Audio error ignored - player cleaned up');
+            console.log('Audio error ignored — player cleaned up');
             return;
         }
-        
-        console.error("Audio play error event:", error);
+
+        console.error("Audio error event:", error);
         releaseWakeLock();
-        
+
         if (screenWentAway || wasPlayingWhenHidden) {
             const resumePosition = lastPlaybackPosition || 0;
-            console.log('Screen interruption detected, stored position:', resumePosition);
-            
-            showSourcePopup("Audio Interrupted", `Audio was paused when you left the screen. Click play to resume from ${Math.floor(resumePosition / 60)}:${String(Math.floor(resumePosition % 60)).padStart(2, '0')}.`);
-            
+            const mm = Math.floor(resumePosition / 60);
+            const ss = String(Math.floor(resumePosition % 60)).padStart(2, '0');
+
+            showSourcePopup(
+                "Audio Interrupted",
+                `Audio was paused when you left the screen. Click play to resume from ${mm}:${ss}.`
+            );
+
             if (audio) {
                 audio.dataset.resumePosition = resumePosition.toString();
-                
-                const prepareForResume = () => {
-                    console.log('Audio prepared for manual resume');
-                    audio.removeEventListener('loadedmetadata', prepareForResume);
-                    audio.removeEventListener('canplay', prepareForResume);
-                };
-                
-                audio.addEventListener('loadedmetadata', prepareForResume);
-                audio.addEventListener('canplay', prepareForResume);
-                
                 recoverAudioSource();
             }
-            
+
             screenWentAway = false;
             wasPlayingWhenHidden = false;
         } else if (retryCount < maxRetries && isPlayerActive) {
             retryCount++;
             console.log(`Recovery attempt ${retryCount}/${maxRetries}`);
-            
+
             setTimeout(() => {
                 const currentPos = lastPlaybackPosition || 0;
-                const setPositionAfterNetworkRecovery = () => {
-                    if (currentPos > 0) {
-                        audio.currentTime = currentPos;
-                    }
-                    audio.removeEventListener('loadedmetadata', setPositionAfterNetworkRecovery);
-                    audio.removeEventListener('canplay', setPositionAfterNetworkRecovery);
+                const onReady = () => {
+                    if (currentPos > 0) audio.currentTime = currentPos;
+                    audio.removeEventListener('loadedmetadata', onReady);
+                    audio.removeEventListener('canplay', onReady);
                 };
-                
-                audio.addEventListener('loadedmetadata', setPositionAfterNetworkRecovery);
-                audio.addEventListener('canplay', setPositionAfterNetworkRecovery);
-                
+                audio.addEventListener('loadedmetadata', onReady);
+                audio.addEventListener('canplay', onReady);
                 recoverAudioSource();
             }, 1000 * retryCount);
         } else if (retryCount >= maxRetries) {
@@ -8717,106 +8664,63 @@ function initAudioPlayer() {
         } else {
             if (audio) {
                 const currentPos = lastPlaybackPosition || 0;
-                const setPositionAfterGenericRecovery = () => {
-                    if (currentPos > 0) {
-                        audio.currentTime = currentPos;
-                    }
-                    audio.removeEventListener('loadedmetadata', setPositionAfterGenericRecovery);
-                    audio.removeEventListener('canplay', setPositionAfterGenericRecovery);
+                const onReady = () => {
+                    if (currentPos > 0) audio.currentTime = currentPos;
+                    audio.removeEventListener('loadedmetadata', onReady);
+                    audio.removeEventListener('canplay', onReady);
                 };
-                
-                audio.addEventListener('loadedmetadata', setPositionAfterGenericRecovery);
-                audio.addEventListener('canplay', setPositionAfterGenericRecovery);
-                
+                audio.addEventListener('loadedmetadata', onReady);
+                audio.addEventListener('canplay', onReady);
                 recoverAudioSource();
             }
             showSourcePopup("Audio Error", "An audio error occurred. Attempting to resume from last position.");
         }
-        
+
         playPauseBtn.innerHTML = '<i class="bi bi-play"></i>';
         playPauseBtn.setAttribute('aria-label', 'Play');
     }
 
-     /** Ensure the audio element has a valid source, restoring from the saved original if needed. */
-    function ensureAudioSource() {
-        const hasValidSrc = audio.src &&
-                            audio.src.trim() !== '' &&
-                            audio.src !== window.location.href &&
-                            audio.src !== 'about:blank';
-        if (!hasValidSrc && audio.dataset.originalSrc) {
-            console.log('[Audio] Restoring source from originalSrc');
-            audio.src = audio.dataset.originalSrc;
-            audio.load();
-            return false; // Source was restored but needs a moment to buffer
-        }
-        return hasValidSrc;
-    }
-
+    // ─── Play / pause toggle ──────────────────────────────────────────────────
+    // CRITICAL for iOS: audio.play() MUST be called synchronously within the
+    // user-gesture handler. Any await before play() breaks iOS autoplay policy
+    // and the promise is rejected with NotAllowedError.
+    // Strategy: initAudioContext() is synchronous; ctx.resume() is fire-and-
+    // forget — we do NOT await it before calling play().
     async function togglePlay() {
         if (!isPlayerActive) return;
 
-        // Guard: no valid source — try restoring it before giving up
-        ensureAudioSource();
         if (!audio.src || audio.src.trim() === '' || audio.src === window.location.href) {
             return;
         }
 
-        const ctx = initAudioContext();
-        // Check if context is suspended. If so, we need to resume it.
-        // On iOS, a suspended context causes silent playback even if audio.paused is false.
-        const isSuspended = ctx && ctx.state === 'suspended';
-
         try {
-            // We want to play if the audio is paused OR if context is suspended (silent state)
-            if (audio.paused || isSuspended) {
-                // If context is suspended, try to resume it first
-                if (isSuspended) {
-                    try {
-                        await ctx.resume();
-                        if (ctx.state === 'suspended') {
-                            throw new Error('AudioContext could not be resumed');
-                        }
-                    } catch (e) {
-                        console.error('Failed to resume AudioContext:', e);
-                        // Fall through to attempt audio.play() anyway, which might trigger the gesture requirement
-                    }
-                }
-
-                // Resume position if available
+            if (audio.paused) {
                 const resumePosition = audio.dataset.resumePosition;
                 if (resumePosition && parseFloat(resumePosition) > 0) {
-                    console.log('Resuming from stored position:', resumePosition);
                     audio.currentTime = parseFloat(resumePosition);
                     delete audio.dataset.resumePosition;
                 }
 
-                // Play audio if it's actually paused
-                if (audio.paused) {
-                    const playPromise = audio.play();
-                    if (playPromise !== undefined) {
-                        playPromise.then(async () => {
+                // Synchronous — no await — to stay within the user gesture.
+                const ctx = initAudioContext();
+                if (ctx && ctx.state === 'suspended') {
+                    ctx.resume().catch(() => {}); // fire-and-forget
+                }
+
+                const playPromise = audio.play();
+                if (playPromise !== undefined) {
+                    playPromise
+                        .then(async () => {
                             playPauseBtn.innerHTML = '<i class="bi bi-pause"></i>';
                             playPauseBtn.setAttribute('aria-label', 'Pause');
                             await requestWakeLock();
                             retryCount = 0;
-                            // Clear interruption flags on successful play
-                            screenWentAway = false;
-                            wasPlayingWhenHidden = false;
-                        }).catch(error => {
+                        })
+                        .catch((error) => {
                             handleAudioError(error);
                         });
-                    }
-                } else {
-                    // Audio was "playing" but context was suspended. Resuming context should restore sound.
-                    // Ensure UI is correct.
-                    playPauseBtn.innerHTML = '<i class="bi bi-pause"></i>';
-                    playPauseBtn.setAttribute('aria-label', 'Pause');
-                    await requestWakeLock();
-                    screenWentAway = false;
-                    wasPlayingWhenHidden = false;
                 }
             } else {
-                // Pause
                 audio.pause();
                 playPauseBtn.innerHTML = '<i class="bi bi-play"></i>';
                 playPauseBtn.setAttribute('aria-label', 'Play');
@@ -8826,96 +8730,105 @@ function initAudioPlayer() {
             handleAudioError(error);
         }
     }
-    
+
+    // ─── Progress persistence (throttled) ────────────────────────────────────
+    // Writing to localStorage on every timeupdate (~4 Hz) causes layout jank
+    // on low-end Android devices. Throttle to at most once per second.
+    let _lastSaveTime = 0;
+    function _throttledSavePosition(time) {
+        const now = Date.now();
+        if (now - _lastSaveTime >= 1000) {
+            _lastSaveTime = now;
+            try {
+                localStorage.setItem('audioPosition', time.toString());
+            } catch (e) {}
+        }
+    }
+
     audio.addEventListener('timeupdate', () => {
         if (!isNaN(audio.currentTime) && isPlayerActive && audio.currentTime > 0) {
             lastPlaybackPosition = audio.currentTime;
-            try {
-                localStorage.setItem('audioPosition', audio.currentTime.toString());
-            } catch (e) {}
+            _throttledSavePosition(audio.currentTime);
         }
     });
 
+    // ─── Network recovery ────────────────────────────────────────────────────
     const onlineHandler = () => {
         if (audio.error && isPlayerActive) {
             console.log('Network recovered, attempting to reload audio');
             const savedPos = lastPlaybackPosition || 0;
-            const setPositionAfterOnline = () => {
-                if (savedPos > 0) {
-                    audio.currentTime = savedPos;
-                }
-                audio.removeEventListener('loadedmetadata', setPositionAfterOnline);
-                audio.removeEventListener('canplay', setPositionAfterOnline);
+            const onReady = () => {
+                if (savedPos > 0) audio.currentTime = savedPos;
+                audio.removeEventListener('loadedmetadata', onReady);
+                audio.removeEventListener('canplay', onReady);
             };
-            
-            audio.addEventListener('loadedmetadata', setPositionAfterOnline);
-            audio.addEventListener('canplay', setPositionAfterOnline);
-            
+            audio.addEventListener('loadedmetadata', onReady);
+            audio.addEventListener('canplay', onReady);
             recoverAudioSource();
         }
     };
     window.addEventListener('online', onlineHandler);
-    
+
+    // ─── Control bindings ────────────────────────────────────────────────────
     playPauseBtn.addEventListener('click', togglePlay);
     rewindBtn.addEventListener('click', () => seek(-10));
     forwardBtn.addEventListener('click', () => seek(10));
     audio.addEventListener('timeupdate', updateProgress);
     audio.addEventListener('loadedmetadata', setDuration);
+
     audio.addEventListener('ended', async () => {
         playPauseBtn.innerHTML = '<i class="bi bi-play"></i>';
         playPauseBtn.setAttribute('aria-label', 'Play');
         await releaseWakeLock();
-        
-        try {
-            localStorage.removeItem('audioPosition');
-        } catch (e) {}
-        
+
+        try { localStorage.removeItem('audioPosition'); } catch (e) {}
+
         audio.currentTime = 0;
-        if (progressBar) {
-            progressBar.style.width = '0%';
-        }
-        
-        // Reset backgrounding flags when audio finishes naturally
-        screenWentAway = false;
-        wasPlayingWhenHidden = false;
-        
+        if (progressBar) progressBar.style.width = '0%';
+
         announceToScreenReader('Audio playback completed');
         showAdditionalInfo();
     });
+
     audio.addEventListener('pause', releaseWakeLock);
-    audio.addEventListener('error', (e) => {
-        handleAudioError(e);
-    });
-    
+    audio.addEventListener('error', (e) => handleAudioError(e));
+
     if (progressContainer) {
         progressContainer.addEventListener('click', setProgress);
     }
-    
+
     audio.addEventListener('loadedmetadata', () => {
         try {
             const savedPosition = localStorage.getItem('audioPosition');
-            if (savedPosition && !isNaN(savedPosition) && parseFloat(savedPosition) > 0 && !screenWentAway && !wasPlayingWhenHidden) {
+            if (
+                savedPosition &&
+                !isNaN(savedPosition) &&
+                parseFloat(savedPosition) > 0 &&
+                !screenWentAway &&
+                !wasPlayingWhenHidden
+            ) {
                 audio.currentTime = parseFloat(savedPosition);
             }
         } catch (e) {}
     });
-    
+
     audio.load();
-    
+
+    // ─── Helpers ─────────────────────────────────────────────────────────────
     function seek(seconds) {
         if (!isPlayerActive) return;
         audio.currentTime = Math.max(0, Math.min(audio.currentTime + seconds, audio.duration));
         const direction = seconds > 0 ? 'forward' : 'backward';
         announceToScreenReader(`Skipped ${Math.abs(seconds)} seconds ${direction}`);
     }
-    
+
     function updateProgress() {
         if (!isPlayerActive || !isFinite(audio.duration)) return;
         const percent = (audio.currentTime / audio.duration) * 100;
         progressBar.style.width = `${percent}%`;
         currentTimeSpan.textContent = formatTime(audio.currentTime);
     }
-    
+
     function setProgress(e) {
         if (!isPlayerActive) return;
         const width = this.clientWidth;
@@ -8923,16 +8836,15 @@ function initAudioPlayer() {
         const duration = audio.duration;
         if (isFinite(duration) && width > 0) {
             audio.currentTime = (clickX / width) * duration;
-            const newTime = formatTime(audio.currentTime);
-            announceToScreenReader(`Jumped to ${newTime}`);
+            announceToScreenReader(`Jumped to ${formatTime(audio.currentTime)}`);
         }
     }
-    
+
     function setDuration() {
         if (!isPlayerActive || !isFinite(audio.duration)) return;
         durationSpan.textContent = formatTime(audio.duration);
     }
-    
+
     function formatTime(time) {
         if (!isFinite(time)) return "0:00";
         const minutes = Math.floor(time / 60);
@@ -8940,8 +8852,11 @@ function initAudioPlayer() {
         return `${minutes}:${seconds.toString().padStart(2, '0')}`;
     }
 
-    // Cleanup — removes all event listeners and releases resources
-    // Does NOT close the shared AudioContext since other players may use it
+    // ─── Cleanup ─────────────────────────────────────────────────────────────
+    // Removes all event listeners and releases resources.
+    // Does NOT close the shared AudioContext (other players may use it).
+    // Does NOT remove the WeakMap entry — the source node must stay connected
+    // so the element can be reused without triggering InvalidStateError on iOS.
     return function cleanup() {
         console.log('Audio player cleanup starting');
         releaseWakeLock();
@@ -8953,7 +8868,9 @@ function initAudioPlayer() {
 
         if (audio) {
             audio.pause();
-            audio.src = '';
+            // Use removeAttribute instead of audio.src = '' to avoid detaching
+            // the MediaElementSource node that Web Audio holds on the element.
+            audio.removeAttribute('src');
             audio.load();
         }
 
