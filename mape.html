@@ -4059,58 +4059,176 @@ function _prefetchMapTiles(location, now) {
     /**
      * Schedule a marker position update coalesced to the next animation frame.
      */
-    function scheduleMarkerUpdate(lat, lng, options) { // eslint-disable-line no-unused-vars
-        // Always overwrite pending coords.  The RAF callback reads the latest
-        // value at paint time — intermediate positions are intentionally dropped.
-        _pendingLat = lat;
-        _pendingLng = lng;
+;(function () {
+    'use strict';
 
-        // Arm willChange *before* the paint so the browser can promote the
-        // compositor layer ahead of the transform change, not after.
-        _ensureWillChange();
+    // ── Configuration ────────────────────────────────────────────────────────
+    var WILL_CHANGE_IDLE_MS = 2000;
 
-        // Guard: if a RAF is already queued it will pick up the new coords above.
-        if (_rafId !== null) return;
+    // ── Module state — NEVER written to window ────────────────────────────────
+    var _state = {
+        rafId:          null,
+        pendingLat:     null,
+        pendingLng:     null,
+        pendingOptions: null,
+        resetTimer:     null,
+        willChangeOn:   false,
+        updateCount:    0,
+        isDestroyed:    false
+    };
 
-        _rafId = requestAnimationFrame(_commitMarkerUpdate);
+    // ── Private helpers ───────────────────────────────────────────────────────
+    function _getMarkerEl() {
+        try {
+            return (userMarker && typeof userMarker.getElement === 'function')
+                ? userMarker.getElement()
+                : null;
+        } catch (_) {
+            return null;
+        }
     }
 
-    /**
-     * Release all resources and cancel any pending update.
-     */
-    function cancelMarkerUpdate() {
-        if (_rafId !== null) {
-            cancelAnimationFrame(_rafId);
-            _rafId = null;
-        }
-
-        if (_resetTimer !== null) {
-            clearTimeout(_resetTimer);
-            _resetTimer = null;
-        }
-
-        _pendingLat   = null;
-        _pendingLng   = null;
-        _willChangeOn = false;
-        _updateCount  = 0;
-
+    /** Centralized will-change toggle with null-guard. */
+    function _setWillChange(active) {
         var el = _getMarkerEl();
-        if (el) el.style.willChange = 'auto';
+        if (!el) return;
+        el.style.willChange = active ? 'transform' : 'auto';
+        _state.willChangeOn = active;
+        if (!active) _state.updateCount = 0;
     }
 
-    /**
-     * _cleanupMarkerStyles — backwards-compatible alias.
-     */
+    /** (Re)schedule compositor-layer release after inactivity. */
+    function _scheduleWillChangeReset() {
+        if (_state.resetTimer !== null) clearTimeout(_state.resetTimer);
+        _state.resetTimer = setTimeout(function () {
+            _state.resetTimer = null;
+            _setWillChange(false);
+        }, WILL_CHANGE_IDLE_MS);
+    }
+
+    // ── RAF Lifecycle ───────────────────────────────────────────────────────
+    function _cancelPendingRAF() {
+        if (_state.rafId !== null) {
+            cancelAnimationFrame(_state.rafId);
+            _state.rafId = null;
+        }
+    }
+
+    /** RAF callback — executes the actual DOM update. */
+    function _commitMarkerUpdate() {
+        if (_state.isDestroyed) {
+            _state.rafId = null;
+            return;
+        }
+
+        _state.rafId = null; // Clear slot immediately
+
+        // Read pending state BEFORE nullifying
+        var lat = _state.pendingLat;
+        var lng = _state.pendingLng;
+        var options = _state.pendingOptions;
+
+        // Clear pending so a fresh schedule can start clean
+        _state.pendingLat = _state.pendingLng = _state.pendingOptions = null;
+
+        if (lat === null || lng === null || !userMarker) return;
+
+        try {
+            // Thread options through to setLatLng (preserves existing behavior)
+            userMarker.setLatLng([lat, lng], {
+                animate: !!(options && options.animate),
+                duration: (options && options.duration) || 0,
+                easeLinearity: (options && options.easeLinearity) || 0
+            });
+
+            // Apply rotation safely without destroying map positioning.
+            // Target a child element (like '.marker-icon') so we don't overwrite
+            // the library's translate3d positioning on the root element.
+            var el = _getMarkerEl();
+            if (el && options && options.heading != null) {
+                var innerEl = el.querySelector('.marker-icon') || el;
+                innerEl.style.transform = 'rotate(' + options.heading + 'deg)';
+            }
+        } catch (err) {
+            // Production-safe error swallowing
+            if (typeof console !== 'undefined' && console.warn) {
+                console.warn('[MarkerUpdate] setLatLng failed:', err.message || err);
+            }
+        }
+
+        _scheduleWillChangeReset();
+    }
+
+    // ── Public API ────────────────────────────────────────────────────────────
+    function scheduleMarkerUpdate(lat, lng, options) {
+        if (_state.isDestroyed) {
+            console.warn('[MarkerUpdate] Called after destroy');
+            return;
+        }
+
+        // Validate inputs
+        if (typeof lat !== 'number' || typeof lng !== 'number' ||
+            isNaN(lat) || isNaN(lng)) {
+            console.warn('[MarkerUpdate] Invalid coordinates:', lat, lng);
+            return;
+        }
+
+        _state.pendingLat = lat;
+        _state.pendingLng = lng;
+        _state.pendingOptions = options || null;
+
+        // Promote to compositor layer, but only after 2nd confirmed update
+        if (!_state.willChangeOn) {
+            _state.updateCount++;
+            if (_state.updateCount >= 2) _setWillChange(true);
+        }
+
+        // Reverted to the original coalescing pattern.
+        // If a RAF is already queued, it will naturally pick up the latest
+        // pending variables when it fires. Canceling and rescheduling is 
+        // harmless but unnecessary overhead.
+        if (_state.rafId !== null) return;
+
+        _state.rafId = requestAnimationFrame(_commitMarkerUpdate);
+    }
+
+    function cancelMarkerUpdate() {
+        _cancelPendingRAF();
+        _state.pendingLat = _state.pendingLng = _state.pendingOptions = null;
+
+        if (_state.resetTimer !== null) {
+            clearTimeout(_state.resetTimer);
+            _state.resetTimer = null;
+        }
+
+        _setWillChange(false);
+    }
+
+    function destroyMarkerUpdateSystem() {
+        _state.isDestroyed = true;
+        cancelMarkerUpdate();
+
+        // Null out window references to allow full GC
+        if (typeof window !== 'undefined') {
+            delete window.scheduleMarkerUpdate;
+            delete window.cancelMarkerUpdate;
+            delete window._cleanupMarkerStyles;
+            delete window.destroyMarkerUpdateSystem;
+        }
+    }
+
+    /** Backwards-compatible alias. */
     function _cleanupMarkerStyles() {
         cancelMarkerUpdate();
     }
 
-    // Expose on window so existing call-sites require zero changes.
-
-    window.scheduleMarkerUpdate  = scheduleMarkerUpdate;
-    window.cancelMarkerUpdate    = cancelMarkerUpdate;
-    window._cleanupMarkerStyles  = _cleanupMarkerStyles;
-
+    // ── Expose ────────────────────────────────────────────────────────────
+    if (typeof window !== 'undefined') {
+        window.scheduleMarkerUpdate  = scheduleMarkerUpdate;
+        window.cancelMarkerUpdate    = cancelMarkerUpdate;
+        window._cleanupMarkerStyles  = _cleanupMarkerStyles;
+        window.destroyMarkerUpdateSystem = destroyMarkerUpdateSystem;
+    }
 })();
         
 /* updateUserLocation — Core position processing pipeline */
