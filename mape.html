@@ -1655,9 +1655,14 @@ function setupMemoryManagement({
         }
     });
 
-    const onVisibility = () => { 
-        if (document.hidden) cleanupAudioResources(); 
+       const onVisibility = () => {
+        // Do NOT call cleanupAudioResources() when the app goes to background.
+        // iOS and Android automatically pause audio when the app is backgrounded.
+        // Destroying the <audio> element here wipes audio.src and removes it from 
+        // the DOM, making it impossible to resume playback when the user returns.
+        // Audio resources will be safely cleaned up on 'beforeunload' instead.
     };
+    
     const onBeforeUnload = () => executeCleanup();
 
     trackEventListener(document, 'visibilitychange', onVisibility);
@@ -8414,8 +8419,8 @@ function initAudioPlayer() {
     let screenWentAway = false;
     let wasPlaying = false;
 
-    // Shared AudioContext — reuse across all player instances to avoid iOS 6-context limit
-   function getOrCreateAudioContext() {
+     // Shared AudioContext — reuse across all player instances to avoid iOS 6-context limit
+    function getOrCreateAudioContext() {
         if (window._sharedAudioContext) {
             // iOS suspends AudioContext when the app is backgrounded.
             // Resume it so playback works immediately on return.
@@ -8432,9 +8437,10 @@ function initAudioPlayer() {
         try {
             window._sharedAudioContext = new (window.AudioContext || window.webkitAudioContext)();
             window._audioSourceNode = null;
+            window._audioSourceNodeElement = null; // Track which <audio> element is connected
             return window._sharedAudioContext;
         } catch (e) {
-            console.log('AudioContext creation failed:', e);
+            console.warn('AudioContext creation failed:', e);
             return null;
         }
     }
@@ -8443,14 +8449,35 @@ function initAudioPlayer() {
         const ctx = getOrCreateAudioContext();
         if (!ctx) return null;
 
-        // Only connect source once per audio element per context
-        if (!window._audioSourceNode || window._audioSourceNode.context !== ctx) {
+        // Reconnect if: no source node exists, the context changed, 
+        // OR the audio element changed (happens when opening a new location)
+        const needsReconnect =
+            !window._audioSourceNode ||
+            window._audioSourceNode.context !== ctx ||
+            window._audioSourceNodeElement !== audio;
+
+        if (needsReconnect) {
             try {
+                // Disconnect old node if it's still active from a previous location
+                if (window._audioSourceNode) {
+                    try { window._audioSourceNode.disconnect(); } catch (_) {}
+                }
+                
+                // Connect the new audio element
                 window._audioSourceNode = ctx.createMediaElementSource(audio);
                 window._audioSourceNode.connect(ctx.destination);
+                window._audioSourceNodeElement = audio; // Remember this element
             } catch (e) {
-                // InvalidStateError means the element is already connected — safe to ignore
-                if (e.name !== 'InvalidStateError') {
+                // InvalidStateError means the element is already connected to this context
+                if (e.name === 'InvalidStateError') {
+                    try {
+                        // Ensure the existing node is wired to the destination
+                        window._audioSourceNode.connect(ctx.destination);
+                        window._audioSourceNodeElement = audio;
+                    } catch (connectErr) {
+                        console.warn('AudioContext destination reconnection failed:', connectErr);
+                    }
+                } else {
                     console.warn('AudioContext source connection failed:', e);
                 }
             }
@@ -8491,9 +8518,10 @@ function initAudioPlayer() {
         }
     }
 
-    // Pause audio when tab is hidden — prevents background battery drain and iOS interruptions
+      // Pause audio when tab is hidden — prevents background battery drain and iOS interruptions
     const visibilityHandler = () => {
         if (document.hidden) {
+            // ── Going to background ──
             if (audio && !audio.paused) {
                 if (!isNaN(audio.currentTime)) {
                     lastPlaybackPosition = audio.currentTime;
@@ -8508,14 +8536,55 @@ function initAudioPlayer() {
                 playPauseBtn.setAttribute('aria-label', 'Play');
             }
         } else {
+            // ── Returning to foreground ──
+
+            // 1. Defensively ensure the audio source is intact (in case memory manager wiped it)
+            ensureAudioSource();
+
+            // 2. If audio was playing when we left, try to resume or prep for manual resume
             if (wasPlayingWhenHidden && audio.paused) {
-                setTimeout(() => {
-                    if (screenWentAway) {
-                        showSourcePopup("Audio Restarted", "Audio was interrupted when this tab became inactive and has restarted from the beginning. Keep this tab active to prevent interruptions.");
+                
+                // Store the position for togglePlay to pick up
+                if (lastPlaybackPosition > 0) {
+                    audio.dataset.resumePosition = lastPlaybackPosition.toString();
+                }
+
+                // Attempt auto-resume (works on Desktop/Android, fails silently on iOS requiring gesture)
+                const tryAutoResume = async () => {
+                    try {
+                        const ctx = getOrCreateAudioContext();
+                        if (ctx && ctx.state === 'suspended') {
+                            await ctx.resume();
+                        }
+                        await audio.play();
+                        
+                        // Auto-resume succeeded
+                        playPauseBtn.innerHTML = '<i class="bi bi-pause"></i>';
+                        playPauseBtn.setAttribute('aria-label', 'Pause');
+                        await requestWakeLock();
                         screenWentAway = false;
                         wasPlayingWhenHidden = false;
+                        
+                    } catch (e) {
+                        // Expected on iOS — user must tap Play manually.
+                        // Do not clear flags here so togglePlay knows the context is suspended.
+                        console.debug('Auto-resume failed (user gesture required):', e.message);
+                        
+                        // Show accurate message with the time they will resume from
+                        if (screenWentAway) {
+                            const mins = Math.floor(lastPlaybackPosition / 60);
+                            const secs = Math.floor(lastPlaybackPosition % 60);
+                            showSourcePopup(
+                                "Audio Paused", 
+                                `Audio was interrupted when this tab became inactive. Tap play to resume from ${mins}:${String(secs).padStart(2, '0')}.`
+                            );
+                            screenWentAway = false;
+                            wasPlayingWhenHidden = false;
+                        }
                     }
-                }, 100);
+                };
+                
+                tryAutoResume();
             }
         }
     };
@@ -8668,15 +8737,52 @@ function initAudioPlayer() {
         playPauseBtn.setAttribute('aria-label', 'Play');
     }
 
+     /** Ensure the audio element has a valid source, restoring from the saved original if needed. */
+    function ensureAudioSource() {
+        const hasValidSrc = audio.src &&
+                            audio.src.trim() !== '' &&
+                            audio.src !== window.location.href &&
+                            audio.src !== 'about:blank';
+        if (!hasValidSrc && audio.dataset.originalSrc) {
+            console.log('[Audio] Restoring source from originalSrc');
+            audio.src = audio.dataset.originalSrc;
+            audio.load();
+            return false; // Source was restored but needs a moment to buffer
+        }
+        return hasValidSrc;
+    }
+
     async function togglePlay() {
         if (!isPlayerActive) return;
-        
+
+        // Guard: no valid source — try restoring it before giving up
+        ensureAudioSource();
         if (!audio.src || audio.src.trim() === '' || audio.src === window.location.href) {
             return;
         }
-        
+
+        const ctx = initAudioContext();
+        // Check if context is suspended. If so, we need to resume it.
+        // On iOS, a suspended context causes silent playback even if audio.paused is false.
+        const isSuspended = ctx && ctx.state === 'suspended';
+
         try {
-            if (audio.paused) {
+            // We want to play if the audio is paused OR if context is suspended (silent state)
+            if (audio.paused || isSuspended) {
+                // If context is suspended, try to resume it first
+                if (isSuspended) {
+                    try {
+                        await ctx.resume();
+                        if (ctx.state === 'suspended') {
+                            throw new Error('AudioContext could not be resumed');
+                        }
+                    } catch (e) {
+                        console.error('Failed to resume AudioContext:', e);
+                        // Fall through to attempt audio.play() anyway, which might trigger the gesture requirement
+                    }
+                }
+
+                // Resume position if available
                 const resumePosition = audio.dataset.resumePosition;
                 if (resumePosition && parseFloat(resumePosition) > 0) {
                     console.log('Resuming from stored position:', resumePosition);
@@ -8684,23 +8790,33 @@ function initAudioPlayer() {
                     delete audio.dataset.resumePosition;
                 }
 
-                const ctx = initAudioContext();
-                if (ctx && ctx.state === 'suspended') {
-                    await ctx.resume();
-                }
-                
-                const playPromise = audio.play();
-                if (playPromise !== undefined) {
-                    playPromise.then(async () => {
-                        playPauseBtn.innerHTML = '<i class="bi bi-pause"></i>';
-                        playPauseBtn.setAttribute('aria-label', 'Pause');
-                        await requestWakeLock();
-                        retryCount = 0;
-                    }).catch(error => {
-                        handleAudioError(error);
-                    });
+                // Play audio if it's actually paused
+                if (audio.paused) {
+                    const playPromise = audio.play();
+                    if (playPromise !== undefined) {
+                        playPromise.then(async () => {
+                            playPauseBtn.innerHTML = '<i class="bi bi-pause"></i>';
+                            playPauseBtn.setAttribute('aria-label', 'Pause');
+                            await requestWakeLock();
+                            retryCount = 0;
+                            // Clear interruption flags on successful play
+                            screenWentAway = false;
+                            wasPlayingWhenHidden = false;
+                        }).catch(error => {
+                            handleAudioError(error);
+                        });
+                    }
+                } else {
+                    // Audio was "playing" but context was suspended. Resuming context should restore sound.
+                    // Ensure UI is correct.
+                    playPauseBtn.innerHTML = '<i class="bi bi-pause"></i>';
+                    playPauseBtn.setAttribute('aria-label', 'Pause');
+                    await requestWakeLock();
+                    screenWentAway = false;
+                    wasPlayingWhenHidden = false;
                 }
             } else {
+                // Pause
                 audio.pause();
                 playPauseBtn.innerHTML = '<i class="bi bi-play"></i>';
                 playPauseBtn.setAttribute('aria-label', 'Play');
@@ -8758,6 +8874,10 @@ function initAudioPlayer() {
         if (progressBar) {
             progressBar.style.width = '0%';
         }
+        
+        // Reset backgrounding flags when audio finishes naturally
+        screenWentAway = false;
+        wasPlayingWhenHidden = false;
         
         announceToScreenReader('Audio playback completed');
         showAdditionalInfo();
