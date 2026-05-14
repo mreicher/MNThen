@@ -1532,17 +1532,72 @@ function setupMemoryManagement({
 
     /* core cleanup routines */
     const cleanupAudioResources = () => {
-        try {
-            document.querySelectorAll('audio').forEach(audio => {
-                audio.pause();
-                audio.src = '';
-                audio.load();
-                audio.remove();
-            });
-        } catch (e) {
-            console.warn('Audio cleanup failed:', e);
-        }
-    };
+    try {
+        document.querySelectorAll('audio').forEach(audio => {
+
+            // 1. Pause playback immediately
+            audio.pause();
+
+            // 2. Fire-and-forget: release wake lock if the player
+            //    registered one. The player's own cleanup will also
+            //    try this — calling it twice is safe.
+            if (typeof releaseWakeLock === 'function') {
+                releaseWakeLock().catch(() => {});
+            }
+
+            // 3. Save position before we touch src, in case the
+            //    player's own visibilityHandler hasn't run yet.
+            if (!isNaN(audio.currentTime) && audio.currentTime > 0) {
+                try {
+                    localStorage.setItem('audioPosition', audio.currentTime.toString());
+                } catch (_) {}
+            }
+
+            //  Clear the src WITHOUT using audio.src = ''
+            //    and WITHOUT calling audio.load().
+            //
+            //    WHY: On iOS, setting .src = '' detaches the element
+            //    from its MediaElementSource node in the Web Audio
+            //    graph permanently — subsequent play() calls produce
+            //    silence even after src is restored, with no error
+            //    thrown. Calling .load() after clearing src compounds
+            //    this by resetting the element's entire network state.
+            //
+            //    removeAttribute('src') avoids detaching the Web Audio
+            //    binding. The browser unloads the media resource but
+            //    the AudioContext source node remains intact so the
+            //    player can reconnect cleanly on next open.
+            //
+            //    We deliberately skip audio.load() here for the same
+            //    reason: calling load() with no src on iOS suspends
+            //    the AudioContext, requiring another user gesture to
+            //    resume it.
+            audio.removeAttribute('src');
+
+            //  DO NOT call audio.remove().
+            //
+            //    WHY: The audio element is created fresh by
+            //    createAudioPlayer() every time a location opens, so
+            //    removing it here destroys the element that
+            //    initAudioPlayer() has already bound its WeakMap
+            //    entry and event listeners to. On the next location
+            //    open, createAudioPlayer() makes a new element,
+            //    initAudioPlayer() finds it via getElementById, and
+            //    tries createMediaElementSource() on it — which works
+            //    once, but the orphaned WeakMap entry from the
+            //    removed element persists as a memory leak and the
+            //    cycle repeats on every location visit.
+            //
+            //    Leaving the element in the DOM is safe: showLocationHunt
+            //    calls lochuntContainer.innerHTML = '' before rebuilding,
+            //    which detaches and garbage-collects the old element
+            //    naturally, and the WeakMap releases the entry when the
+            //    element is GC'd.
+        });
+    } catch (e) {
+        console.warn('Audio cleanup failed:', e);
+    }
+};
 
     const cleanupMapResources = () => {
         try {
@@ -1655,9 +1710,64 @@ function setupMemoryManagement({
         }
     });
 
-    const onVisibility = () => { 
-        if (document.hidden) cleanupAudioResources(); 
-    };
+const onVisibility = () => {
+    if (document.hidden) {
+        // When the tab hides, we only want to PAUSE playback and
+        // save position — not destroy the audio element or src.
+        //
+        // The full cleanupAudioResources() call here was wrong for
+        // three reasons:
+        //
+        // 1. iOS fires visibilitychange AFTER it has already paused
+        //    the audio element. So cleanupAudioResources() was running
+        //    removeAttribute('src') on an element the system had just
+        //    paused — nuking the src so that when the user returns and
+        //    taps play, there is nothing to play back.
+        //
+        // 2. Android Chrome fires visibilitychange while audio is
+        //    still technically playing (before the system pauses it).
+        //    So cleanupAudioResources() was racing the audio player's
+        //    own visibilityHandler — both trying to read currentTime
+        //    and modify the element simultaneously, corrupting the
+        //    saved position.
+        //
+        // 3. cleanupAudioResources() was registered inside
+        //    setupMemoryManagement() which has no reference to the
+        //    audio player's internal state (wasPlaying, screenWentAway,
+        //    lastPlaybackPosition). Calling it from here bypassed all
+        //    of that carefully maintained state, so the player's own
+        //    recovery logic had nothing reliable to work with on return.
+        //
+        // The audio player's own visibilityHandler (registered inside
+        // initAudioPlayer) already handles everything correctly:
+        //   - saves currentTime via _throttledSavePosition
+        //   - sets wasPlaying and screenWentAway flags
+        //   - pauses and updates the play button
+        //
+        // All we need to do here is nothing — or at most a soft
+        // position save as a belt-and-suspenders backup, in case
+        // initAudioPlayer hasn't been initialized yet (e.g. the user
+        // backgrounds the app before opening any location).
+
+        const audio = document.getElementById('locationAudio');
+        if (audio && !isNaN(audio.currentTime) && audio.currentTime > 0) {
+            try {
+                localStorage.setItem('audioPosition', audio.currentTime.toString());
+            } catch (_) {}
+        }
+
+        // DO NOT call cleanupAudioResources() here.
+        // DO NOT call audio.pause() here — the audio player's own
+        // visibilityHandler owns that responsibility. Calling it from
+        // two places creates a race where wasPlaying gets set to false
+        // by the pause event before the player's handler can read it.
+    }
+    // No else branch needed. The audio player's own visibilityHandler
+    // handles the return-to-foreground case (showing the resume popup,
+    // clearing screenWentAway, etc.). Duplicating that logic here would
+    // create a second race in the opposite direction.
+};
+    
     const onBeforeUnload = () => executeCleanup();
 
     trackEventListener(document, 'visibilitychange', onVisibility);
@@ -2761,15 +2871,38 @@ function startPositionUpdates() {
             }
 
             function adjustGPSPower() {
-                if (!navigator.onLine) return; // FIX: Prevent errors when offline
-                
+                // ── Guard 1: Don't cycle the watch while backgrounded ──────────────────
+                // The whole point of this function is to save battery by adjusting GPS
+                // accuracy. Running it while the tab is hidden defeats that — we'd be
+                // spinning up a new watchPosition every 5 seconds with no user benefit.
+                // The interval fires regardless of visibility; this guard stops it cold.
+                if (document.hidden) return;
+            
+                // ── Guard 2: Don't adjust during an active location page ───────────────
+                // If the user is reading a location exhibit, the position watch is
+                // effectively idle (no proximity triggers fire while lochunt is open).
+                // Cycling the watch here interrupts any in-flight GPS fix unnecessarily.
+                if (window.isLocationHuntVisible) return;
+            
+                // ── REMOVED: !navigator.onLine guard ───────────────────────────────────
+                // GPS hardware is independent of the network. navigator.onLine reflects
+                // whether the device has a data connection — it says nothing about whether
+                // geolocation is available. Blocking on offline status meant the watch
+                // was never adjusted after a network drop, leaving it on whatever mode
+                // happened to be active when connectivity was lost.
+            
                 const newMode = getCurrentPowerMode();
                 if (newMode === lastPowerMode) return;
                 lastPowerMode = newMode;
-                
+            
+                // Clear the old watch before starting a new one.
+                // We null positionWatchId immediately so that if watchPosition throws
+                // synchronously, we're not left with a stale ID that looks valid.
                 if (window.positionWatchId !== null) {
                     navigator.geolocation.clearWatch(window.positionWatchId);
+                    window.positionWatchId = null;
                 }
+            
                 const newOpts = getWatchOptions();
                 window.positionWatchId = navigator.geolocation.watchPosition(
                     handlePositionUpdate,
@@ -2777,79 +2910,139 @@ function startPositionUpdates() {
                     newOpts
                 );
             }
-
-            window._gpsPowerInterval = setInterval(adjustGPSPower, 5000);
-
-            // ── Instant-response hooks for stationary state changes ──
+            
+            // Run the power adjustment at most every 10s (was 5s), and only when visible.
+            // 10s is fast enough to catch a walking→driving transition without hammering
+            // the GPS radio with unnecessary clearWatch/watchPosition cycles.
+            window._gpsPowerInterval = setInterval(adjustGPSPower, 10000);
+            
+            // ── Instant-response hooks for stationary state changes ────────────────────
+            // These patch _confirmStationary and _clearStationaryState so a mode change
+            // triggers immediately rather than waiting up to 10s for the next interval.
+            //
+            // The original code called adjustGPSPower() synchronously inside the patched
+            // function, which meant clearWatch + watchPosition ran mid-execution of the
+            // stationary change — a race where positionWatchId could point at a dead
+            // watch for the remainder of that call's stack.
+            //
+            // Fix: defer adjustGPSPower via setTimeout(0) so the stationary state change
+            // completes fully before the watch is cycled. The 0ms delay is enough to
+            // exit the current call stack; GPS mode changes at this timescale are not
+            // time-critical to the millisecond.
             const hookPowerAdjustment = (funcName) => {
-                if (typeof window[funcName] === 'function' && !window[funcName]._powerManagerPatched) {
+                if (
+                    typeof window[funcName] === 'function' &&
+                    !window[funcName]._powerManagerPatched
+                ) {
                     const original = window[funcName];
-                    window[funcName] = function(...args) {
+                    window[funcName] = function (...args) {
                         const result = original.apply(this, args);
-                        adjustGPSPower();
+                        // Deferred — lets the stationary state change finish before
+                        // we cycle the watch. Safe because adjustGPSPower is idempotent:
+                        // if the mode hasn't changed by the time this runs, it exits
+                        // immediately via the lastPowerMode guard.
+                        setTimeout(adjustGPSPower, 0);
                         return result;
                     };
                     window[funcName]._powerManagerPatched = true;
                 }
             };
-
+            
             hookPowerAdjustment('_confirmStationary');
             hookPowerAdjustment('_clearStationaryState');
+
+  // ── Network & Lifecycle Listeners ──────────────────────────────────────────
+if (!window._positionUpdatesListenersSetup) {
+    window._positionUpdatesListenersSetup = true;
+
+    window.addEventListener('online', () => {
+        // Network restored. The GPS watch may have been left running through
+        // the outage (see offline handler below), so check before restarting.
+        // Debounce: rapid online/offline flapping on Android can fire this
+        // multiple times in quick succession.
+        if (window.onlineRestartTimeout) clearTimeout(window.onlineRestartTimeout);
+
+        window.onlineRestartTimeout = setTimeout(() => {
+            // Only restart if the watch was actually stopped during the outage.
+            // If it's still running (positionWatchId !== null), leave it alone —
+            // there's no benefit to cycling a healthy watch just because the
+            // network came back.
+            if (window.positionWatchId === null) {
+                const restartOpts = getWatchOptions();
+                window.positionWatchId = navigator.geolocation.watchPosition(
+                    handlePositionUpdate,
+                    handleLocationError,
+                    restartOpts
+                );
+            }
+            window.onlineRestartTimeout = null;
+        }, 500);
+    });
+
+    window.addEventListener('offline', () => {
+        // Cancel any pending online-restart debounce.
+        if (window.onlineRestartTimeout) {
+            clearTimeout(window.onlineRestartTimeout);
+            window.onlineRestartTimeout = null;
         }
 
-        // ── Network & Lifecycle Listeners ──
-        if (!window._positionUpdatesListenersSetup) {
-            window._positionUpdatesListenersSetup = true;
-            
-            window.addEventListener('online', () => {
-                if (window.onlineRestartTimeout) clearTimeout(window.onlineRestartTimeout);
-                window.onlineRestartTimeout = setTimeout(() => {
-                    // FIX: Always restart the watch when coming online
-                    if (window.positionWatchId !== null) {
-                        navigator.geolocation.clearWatch(window.positionWatchId);
-                    }
-                    const restartOpts = getWatchOptions();
-                    window.positionWatchId = navigator.geolocation.watchPosition(
-                        handlePositionUpdate,
-                        handleLocationError,
-                        restartOpts
-                    );
-                    window.onlineRestartTimeout = null;
-                }, 500);
-            });
+        // ── CHANGED: Do NOT kill the watch on offline ───────────────────────
+        // GPS hardware is independent of the network stack. The original code
+        // killed the watch entirely on any offline event, which meant:
+        //   - No position updates while the user walked through a dead zone
+        //   - No proximity detection, so locations never triggered
+        //   - On Android, network-assisted GPS (A-GPS) degraded to cold-start
+        //     accuracy when the watch was restarted, adding 30-60s to first fix
+        //
+        // We keep the watch running. The only thing that stops working offline
+        // is tile loading (map tiles) and any server-side features — neither
+        // of which depends on geolocation.
+        //
+        // If the device genuinely has no GPS signal (not just no network), the
+        // existing handleLocationError + retry logic handles that case already.
 
-            window.addEventListener('offline', () => {
-                if (window.onlineRestartTimeout) {
-                    clearTimeout(window.onlineRestartTimeout);
-                    window.onlineRestartTimeout = null;
-                }
-                if (window.positionWatchId !== null) {
-                    navigator.geolocation.clearWatch(window.positionWatchId);
-                    window.positionWatchId = null;
-                }
-            });
-
-            window._positionUpdatesBeforeUnload = () => {
-                if (window.positionWatchId !== null) {
-                    navigator.geolocation.clearWatch(window.positionWatchId);
-                }
-                if (window.onlineRestartTimeout) {
-                    clearTimeout(window.onlineRestartTimeout);
-                }
-                if (window._gpsPowerInterval) {
-                    clearInterval(window._gpsPowerInterval);
-                }
-            };
-            window.addEventListener('beforeunload', window._positionUpdatesBeforeUnload);
+        // Slow the power-adjustment interval while offline to reduce churn
+        // (adjustGPSPower is mostly a no-op offline since mode won't change,
+        // but this makes the intent explicit).
+        if (window._gpsPowerInterval) {
+            clearInterval(window._gpsPowerInterval);
+            window._gpsPowerInterval = setInterval(adjustGPSPower, 30000);
         }
+    });
 
-        return window.positionWatchId;
-        
-    } catch (err) {
-        console.error('Geolocation unavailable:', err);
-        handleLocationError({ code: 0, message: 'Geolocation unavailable' });
-        return null;
-    }
+    // Restore normal interval cadence when network comes back.
+    // We add this as a separate online listener so it doesn't conflict
+    // with the watch-restart logic above.
+    window.addEventListener('online', () => {
+        if (window._gpsPowerInterval) {
+            clearInterval(window._gpsPowerInterval);
+            window._gpsPowerInterval = setInterval(adjustGPSPower, 10000);
+        }
+    });
+
+    window._positionUpdatesBeforeUnload = () => {
+        if (window.positionWatchId !== null) {
+            navigator.geolocation.clearWatch(window.positionWatchId);
+            window.positionWatchId = null;
+        }
+        if (window.onlineRestartTimeout) {
+            clearTimeout(window.onlineRestartTimeout);
+            window.onlineRestartTimeout = null;
+        }
+        if (window._gpsPowerInterval) {
+            clearInterval(window._gpsPowerInterval);
+            window._gpsPowerInterval = null;
+        }
+    };
+    window.addEventListener('beforeunload', window._positionUpdatesBeforeUnload);
+}
+
+return window.positionWatchId;
+
+} catch (err) {
+    console.error('Geolocation unavailable:', err);
+    handleLocationError({ code: 0, message: 'Geolocation unavailable' });
+    return null;
 }
         
 function handlePositionUpdate(position) {
@@ -8312,63 +8505,86 @@ function showSourcePopup(title, content) {
 }
 
 function initAudioPlayer() {
-    const audio = document.getElementById('locationAudio');
-    const playPauseBtn = document.getElementById('playPauseBtn');
-    const rewindBtn = document.getElementById('rewindBtn');
-    const forwardBtn = document.getElementById('forwardBtn');
-    const progressBar = document.getElementById('progressBar');
+    const audio           = document.getElementById('locationAudio');
+    const playPauseBtn    = document.getElementById('playPauseBtn');
+    const rewindBtn       = document.getElementById('rewindBtn');
+    const forwardBtn      = document.getElementById('forwardBtn');
+    const progressBar     = document.getElementById('progressBar');
     const progressContainer = document.querySelector('.progress');
     const currentTimeSpan = document.getElementById('currentTime');
-    const durationSpan = document.getElementById('duration');
+    const durationSpan    = document.getElementById('duration');
 
     if (!audio || !playPauseBtn || !progressBar) {
-        console.error("Audio player elements not found");
+        console.error('initAudioPlayer: required elements not found');
         return;
     }
 
-    if (audio.src && !audio.dataset.originalSrc) {
+    // Save src before anything else touches the element.
+    // Guard against audio.src resolving to window.location.href when
+    // the attribute is absent — that's the browser's fallback value,
+    // not a real source.
+    if (
+        audio.src &&
+        audio.src !== window.location.href &&
+        !audio.dataset.originalSrc
+    ) {
         audio.dataset.originalSrc = audio.src;
     }
 
-    let wakeLock = null;
-    let isPlayerActive = true;
-
-    let retryCount = 0;
-    const maxRetries = 3;
+    let wakeLock             = null;
+    let isPlayerActive       = true;
+    let retryCount           = 0;
+    const maxRetries         = 3;
     let lastPlaybackPosition = 0;
-    let recoveryInProgress = false;
-
+    let recoveryInProgress   = false;
     let wasPlayingWhenHidden = false;
-    let screenWentAway = false;
-    let wasPlaying = false;
+    let screenWentAway       = false;
+    let wasPlaying           = false;
 
     // ─── AudioContext ─────────────────────────────────────────────────────────
-    // Shared across all player instances to avoid iOS 6-context hard limit.
-    // IMPORTANT: On iOS, createMediaElementSource() must only ever be called
-    // once per HTMLMediaElement. Calling it again (e.g. after src reset) throws
-    // InvalidStateError and permanently silences the element. We therefore guard
-    // with a WeakMap keyed on the audio element itself.
-    const _elementSourceMap = window._audioElementSourceMap || (window._audioElementSourceMap = new WeakMap());
+    // One shared AudioContext for the page lifetime (iOS hard-limits to 6).
+    //
+    // One MediaElementSource per HTMLMediaElement, ever. The WeakMap entry
+    // stores { node, contextId } — NOT the raw node — so the context-changed
+    // check below has something reliable to compare against.
+    //
+    // contextId is a simple incrementing integer stamped onto each new
+    // AudioContext. Comparing object references (ctx === entry.ctx) would also
+    // work, but storing the whole context object in the WeakMap value would
+    // prevent GC of a closed context. The integer is GC-neutral.
+    if (!window._audioContextId) window._audioContextId = 0;
+
+    const _elementSourceMap = window._audioElementSourceMap
+        ?? (window._audioElementSourceMap = new WeakMap());
 
     function getOrCreateAudioContext() {
-        if (window._sharedAudioContext) {
-            const ctx = window._sharedAudioContext;
-            // Closed contexts cannot be resumed — create a fresh one.
-            if (ctx.state === 'closed') {
-                window._sharedAudioContext = null;
+        const existing = window._sharedAudioContext;
+
+        if (existing) {
+            if (existing.state === 'closed') {
+                // Closed contexts cannot be resumed — discard and fall through.
+                window._sharedAudioContext   = null;
+                window._sharedAudioContextId = null;
             } else {
-                if (ctx.state === 'suspended') {
-                    // Best-effort resume; callers must not await this.
-                    ctx.resume().catch((e) => console.warn('AudioContext resume failed:', e));
+                if (existing.state === 'suspended') {
+                    // Best-effort resume. NOT awaited — callers must never
+                    // yield before play() or iOS rejects with NotAllowedError.
+                    existing.resume().catch(e =>
+                        console.warn('AudioContext resume failed:', e)
+                    );
                 }
-                return ctx;
+                return existing;
             }
         }
+
         try {
-            window._sharedAudioContext = new (window.AudioContext || window.webkitAudioContext)();
-            return window._sharedAudioContext;
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            window._audioContextId++;
+            window._sharedAudioContext   = ctx;
+            window._sharedAudioContextId = window._audioContextId;
+            return ctx;
         } catch (e) {
-            console.log('AudioContext creation failed:', e);
+            console.warn('AudioContext creation failed:', e);
             return null;
         }
     }
@@ -8377,30 +8593,52 @@ function initAudioPlayer() {
         const ctx = getOrCreateAudioContext();
         if (!ctx) return null;
 
-        // Guard: only connect this audio element to the context once, ever.
-        // On iOS, a second createMediaElementSource() on the same element is
-        // a hard error that kills future playback with no visible exception.
+        const currentCtxId = window._sharedAudioContextId;
+
         if (!_elementSourceMap.has(audio)) {
+            // First time connecting this element. Create the source node and
+            // store { node, contextId } so future calls can detect a replaced
+            // context without touching node.context (which doesn't exist on
+            // MediaElementSourceNode and would always be undefined).
             try {
                 const sourceNode = ctx.createMediaElementSource(audio);
                 sourceNode.connect(ctx.destination);
-                _elementSourceMap.set(audio, sourceNode);
+                _elementSourceMap.set(audio, { node: sourceNode, contextId: currentCtxId });
             } catch (e) {
-                if (e.name !== 'InvalidStateError') {
+                if (e.name === 'InvalidStateError') {
+                    // Element was already connected by a path outside this
+                    // module (e.g. a previous page-level script). Store a
+                    // sentinel so we don't retry on every call.
+                    _elementSourceMap.set(audio, { node: null, contextId: currentCtxId });
+                } else {
                     console.warn('AudioContext source connection failed:', e);
+                    // Don't store anything — allow a retry on the next gesture.
                 }
-                // InvalidStateError: element already connected elsewhere; safe to continue.
             }
-        } else {
-            // Element already has a source node; ensure it's still on the current context.
-            const existingNode = _elementSourceMap.get(audio);
-            if (existingNode.context !== ctx) {
-                // Context was recreated. Remove stale entry and reconnect.
-                _elementSourceMap.delete(audio);
-                return initAudioContext(); // recurse once
-            }
+            return ctx;
         }
 
+        const entry = _elementSourceMap.get(audio);
+
+        if (entry.contextId !== currentCtxId) {
+            // The shared context was closed and recreated since this element
+            // was last connected. The old source node is dead.
+            //
+            // We cannot call createMediaElementSource() again on the same
+            // element — on iOS that permanently silences it. The only safe
+            // recovery is to clear the stale entry and return null, letting
+            // the next user gesture trigger a clean reconnect on the now-
+            // current context. We do NOT recurse here: if context creation
+            // is repeatedly failing we'd loop forever.
+            console.warn(
+                'AudioContext was replaced; stale source node cleared. ' +
+                'Audio will reconnect on next user gesture.'
+            );
+            _elementSourceMap.delete(audio);
+            return null;
+        }
+
+        // Entry is current — context hasn't changed, node is still live.
         return ctx;
     }
 
