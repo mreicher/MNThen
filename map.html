@@ -1532,17 +1532,72 @@ function setupMemoryManagement({
 
     /* core cleanup routines */
     const cleanupAudioResources = () => {
-        try {
-            document.querySelectorAll('audio').forEach(audio => {
-                audio.pause();
-                audio.src = '';
-                audio.load();
-                audio.remove();
-            });
-        } catch (e) {
-            console.warn('Audio cleanup failed:', e);
-        }
-    };
+    try {
+        document.querySelectorAll('audio').forEach(audio => {
+
+            // 1. Pause playback immediately
+            audio.pause();
+
+            // 2. Fire-and-forget: release wake lock if the player
+            //    registered one. The player's own cleanup will also
+            //    try this — calling it twice is safe.
+            if (typeof releaseWakeLock === 'function') {
+                releaseWakeLock().catch(() => {});
+            }
+
+            // 3. Save position before we touch src, in case the
+            //    player's own visibilityHandler hasn't run yet.
+            if (!isNaN(audio.currentTime) && audio.currentTime > 0) {
+                try {
+                    localStorage.setItem('audioPosition', audio.currentTime.toString());
+                } catch (_) {}
+            }
+
+            //  Clear the src WITHOUT using audio.src = ''
+            //    and WITHOUT calling audio.load().
+            //
+            //    WHY: On iOS, setting .src = '' detaches the element
+            //    from its MediaElementSource node in the Web Audio
+            //    graph permanently — subsequent play() calls produce
+            //    silence even after src is restored, with no error
+            //    thrown. Calling .load() after clearing src compounds
+            //    this by resetting the element's entire network state.
+            //
+            //    removeAttribute('src') avoids detaching the Web Audio
+            //    binding. The browser unloads the media resource but
+            //    the AudioContext source node remains intact so the
+            //    player can reconnect cleanly on next open.
+            //
+            //    We deliberately skip audio.load() here for the same
+            //    reason: calling load() with no src on iOS suspends
+            //    the AudioContext, requiring another user gesture to
+            //    resume it.
+            audio.removeAttribute('src');
+
+            //  DO NOT call audio.remove().
+            //
+            //    WHY: The audio element is created fresh by
+            //    createAudioPlayer() every time a location opens, so
+            //    removing it here destroys the element that
+            //    initAudioPlayer() has already bound its WeakMap
+            //    entry and event listeners to. On the next location
+            //    open, createAudioPlayer() makes a new element,
+            //    initAudioPlayer() finds it via getElementById, and
+            //    tries createMediaElementSource() on it — which works
+            //    once, but the orphaned WeakMap entry from the
+            //    removed element persists as a memory leak and the
+            //    cycle repeats on every location visit.
+            //
+            //    Leaving the element in the DOM is safe: showLocationHunt
+            //    calls lochuntContainer.innerHTML = '' before rebuilding,
+            //    which detaches and garbage-collects the old element
+            //    naturally, and the WeakMap releases the entry when the
+            //    element is GC'd.
+        });
+    } catch (e) {
+        console.warn('Audio cleanup failed:', e);
+    }
+};
 
     const cleanupMapResources = () => {
         try {
@@ -1655,9 +1710,64 @@ function setupMemoryManagement({
         }
     });
 
-    const onVisibility = () => { 
-        if (document.hidden) cleanupAudioResources(); 
-    };
+const onVisibility = () => {
+    if (document.hidden) {
+        // When the tab hides, we only want to PAUSE playback and
+        // save position — not destroy the audio element or src.
+        //
+        // The full cleanupAudioResources() call here was wrong for
+        // three reasons:
+        //
+        // 1. iOS fires visibilitychange AFTER it has already paused
+        //    the audio element. So cleanupAudioResources() was running
+        //    removeAttribute('src') on an element the system had just
+        //    paused — nuking the src so that when the user returns and
+        //    taps play, there is nothing to play back.
+        //
+        // 2. Android Chrome fires visibilitychange while audio is
+        //    still technically playing (before the system pauses it).
+        //    So cleanupAudioResources() was racing the audio player's
+        //    own visibilityHandler — both trying to read currentTime
+        //    and modify the element simultaneously, corrupting the
+        //    saved position.
+        //
+        // 3. cleanupAudioResources() was registered inside
+        //    setupMemoryManagement() which has no reference to the
+        //    audio player's internal state (wasPlaying, screenWentAway,
+        //    lastPlaybackPosition). Calling it from here bypassed all
+        //    of that carefully maintained state, so the player's own
+        //    recovery logic had nothing reliable to work with on return.
+        //
+        // The audio player's own visibilityHandler (registered inside
+        // initAudioPlayer) already handles everything correctly:
+        //   - saves currentTime via _throttledSavePosition
+        //   - sets wasPlaying and screenWentAway flags
+        //   - pauses and updates the play button
+        //
+        // All we need to do here is nothing — or at most a soft
+        // position save as a belt-and-suspenders backup, in case
+        // initAudioPlayer hasn't been initialized yet (e.g. the user
+        // backgrounds the app before opening any location).
+
+        const audio = document.getElementById('locationAudio');
+        if (audio && !isNaN(audio.currentTime) && audio.currentTime > 0) {
+            try {
+                localStorage.setItem('audioPosition', audio.currentTime.toString());
+            } catch (_) {}
+        }
+
+        // DO NOT call cleanupAudioResources() here.
+        // DO NOT call audio.pause() here — the audio player's own
+        // visibilityHandler owns that responsibility. Calling it from
+        // two places creates a race where wasPlaying gets set to false
+        // by the pause event before the player's handler can read it.
+    }
+    // No else branch needed. The audio player's own visibilityHandler
+    // handles the return-to-foreground case (showing the resume popup,
+    // clearing screenWentAway, etc.). Duplicating that logic here would
+    // create a second race in the opposite direction.
+};
+    
     const onBeforeUnload = () => executeCleanup();
 
     trackEventListener(document, 'visibilitychange', onVisibility);
@@ -2760,7 +2870,7 @@ function startPositionUpdates() {
                 return 'high';
             }
 
-            function adjustGPSPower() {
+           function adjustGPSPower() {
                 if (!navigator.onLine) return; // FIX: Prevent errors when offline
                 
                 const newMode = getCurrentPowerMode();
@@ -8312,448 +8422,504 @@ function showSourcePopup(title, content) {
 }
 
 function initAudioPlayer() {
-    const audio = document.getElementById('locationAudio');
-    const playPauseBtn = document.getElementById('playPauseBtn');
-    const rewindBtn = document.getElementById('rewindBtn');
-    const forwardBtn = document.getElementById('forwardBtn');
-    const progressBar = document.getElementById('progressBar');
+    const audio           = document.getElementById('locationAudio');
+    const playPauseBtn    = document.getElementById('playPauseBtn');
+    const rewindBtn       = document.getElementById('rewindBtn');
+    const forwardBtn      = document.getElementById('forwardBtn');
+    const progressBar     = document.getElementById('progressBar');
     const progressContainer = document.querySelector('.progress');
     const currentTimeSpan = document.getElementById('currentTime');
-    const durationSpan = document.getElementById('duration');
+    const durationSpan    = document.getElementById('duration');
 
     if (!audio || !playPauseBtn || !progressBar) {
-        console.error("Audio player elements not found");
-        return;
+        console.error('[Audio] Required elements missing');
+        return function noop() {};
     }
-    
-    if (audio.src && !audio.dataset.originalSrc) {
+
+    // ─── Platform Detection ───────────────────────────────────────────────
+    const isIOS     = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+    const isAndroid = /android/i.test(navigator.userAgent);
+
+    // ─── Save original source before anything touches the element ─────────
+    if (audio.src && audio.src !== window.location.href && !audio.dataset.originalSrc) {
         audio.dataset.originalSrc = audio.src;
     }
-    
-    let wakeLock = null;
-    let isPlayerActive = true;
-    
-    let retryCount = 0;
-    const maxRetries = 3;
-    let lastPlaybackPosition = 0;
-    let recoveryInProgress = false;
-    
-    let wasPlayingWhenHidden = false;
-    let screenWentAway = false;
-    let wasPlaying = false;
 
-    // Shared AudioContext — reuse across all player instances to avoid iOS 6-context limit
-   function getOrCreateAudioContext() {
-        if (window._sharedAudioContext) {
-            // iOS suspends AudioContext when the app is backgrounded.
-            // Resume it so playback works immediately on return.
-            if (window._sharedAudioContext.state === 'suspended') {
-                window._sharedAudioContext.resume().catch((e) => {
-                    console.warn('AudioContext resume failed:', e);
-                });
+    // ─── State ────────────────────────────────────────────────────────────
+    let wakeLock             = null;
+    let isPlayerActive       = true;
+    let retryCount           = 0;
+    const maxRetries         = 3;
+    let lastPlaybackPosition = 0;
+    let userWantsPlayback    = false;   // User intent — NOT system state
+    let screenWentAway       = false;
+    let wasPlayingWhenHidden = false;
+    let mediaSessionReady    = false;
+
+    // ─── Shared AudioContext (lazy, gesture-unlocked) ─────────────────────
+    // NOT connected via createMediaElementSource — that creates fragile
+    // iOS bugs (one source per element, ever; closed context = silence).
+    // Exists solely to unlock the Web Audio pipeline for iOS HTML5 audio.
+    // Shared across player instances to stay under iOS's ~6 context limit.
+    function getSharedAudioContext() {
+        if (window._sharedAudioCtx && window._sharedAudioCtx.state !== 'closed') {
+            if (window._sharedAudioCtx.state === 'suspended' ||
+                window._sharedAudioCtx.state === 'interrupted') {
+                window._sharedAudioCtx.resume().catch(() => {});
             }
-            // If somehow closed, fall through to create a new one
-            if (window._sharedAudioContext.state !== 'closed') {
-                return window._sharedAudioContext;
-            }
+            return window._sharedAudioCtx;
         }
         try {
-            window._sharedAudioContext = new (window.AudioContext || window.webkitAudioContext)();
-            window._audioSourceNode = null;
-            return window._sharedAudioContext;
+            const AC = window.AudioContext || window.webkitAudioContext;
+            if (!AC) return null;
+            window._sharedAudioCtx = new AC();
+
+            // iOS: Handle interrupted state (phone call, alarm, Siri)
+            if (isIOS) {
+                window._sharedAudioCtx.onstatechange = () => {
+                    const ctx = window._sharedAudioCtx;
+                    if (ctx && ctx.state === 'interrupted') {
+                        setTimeout(() => {
+                            if (window._sharedAudioCtx &&
+                                window._sharedAudioCtx.state === 'interrupted') {
+                                window._sharedAudioCtx.resume().catch(() => {});
+                            }
+                        }, 100);
+                    }
+                };
+            }
+
+            return window._sharedAudioCtx;
         } catch (e) {
-            console.log('AudioContext creation failed:', e);
+            console.warn('[Audio] AudioContext creation failed:', e);
             return null;
         }
     }
 
-    function initAudioContext() {
-        const ctx = getOrCreateAudioContext();
-        if (!ctx) return null;
+    // ─── Media Session API (Android + iOS 15.4+) ────────────────────────
+    // Provides lock-screen controls and prevents the system from killing
+    // background audio on Android Chrome.
+    function setupMediaSession() {
+        if (mediaSessionReady || !('mediaSession' in navigator)) return;
+        mediaSessionReady = true;
 
-        // Only connect source once per audio element per context
-        if (!window._audioSourceNode || window._audioSourceNode.context !== ctx) {
-            try {
-                window._audioSourceNode = ctx.createMediaElementSource(audio);
-                window._audioSourceNode.connect(ctx.destination);
-            } catch (e) {
-                // InvalidStateError means the element is already connected — safe to ignore
-                if (e.name !== 'InvalidStateError') {
-                    console.warn('AudioContext source connection failed:', e);
-                }
-            }
-        }
-
-        return ctx;
-    }
-    
-    async function requestWakeLock() {
         try {
-            if ('wakeLock' in navigator && !wakeLock && isPlayerActive) {
-                wakeLock = await navigator.wakeLock.request('screen');
-                console.log('Wake lock acquired');
-                
-                wakeLock.addEventListener('release', () => {
-                    console.log('Wake lock released');
-                    wakeLock = null;
-                    if (!audio.paused) {
-                        screenWentAway = true;
-                        wasPlayingWhenHidden = true;
-                    }
-                });
-            }
-        } catch (err) {
-            console.warn('Wake lock failed:', err);
+            navigator.mediaSession.metadata = new MediaMetadata({
+                title: document.getElementById('locationTitle')?.textContent || 'Minnesota Then',
+                artist: document.getElementById('locationCreator')?.textContent || 'Historical Audio',
+                album: 'Minnesota Then Tour',
+                artwork: [
+                    { src: 'https://www.mnthen.com/images/icon-192.png', sizes: '192x192', type: 'image/png' },
+                    { src: 'https://www.mnthen.com/images/icon-512.png', sizes: '512x512', type: 'image/png' }
+                ]
+            });
+
+            navigator.mediaSession.setActionHandler('play', () => {
+                if (audio.paused) togglePlay();
+            });
+            navigator.mediaSession.setActionHandler('pause', () => {
+                if (!audio.paused) togglePlay();
+            });
+            navigator.mediaSession.setActionHandler('seekbackward', (details) => {
+                seek(-(details.seekOffset || 10));
+            });
+            navigator.mediaSession.setActionHandler('seekforward', (details) => {
+                seek(details.seekOffset || 10);
+            });
+
+            updateMediaSessionPosition();
+        } catch (e) {
+            console.warn('[Audio] Media Session setup failed:', e);
         }
     }
-    
+
+    function updateMediaSessionPosition() {
+        if (!('mediaSession' in navigator) || !navigator.mediaSession.setPositionState) return;
+        if (!isFinite(audio.duration)) return;
+        try {
+            navigator.mediaSession.setPositionState({
+                duration: audio.duration,
+                playbackRate: audio.playbackRate,
+                position: Math.min(audio.currentTime, audio.duration)
+            });
+        } catch (e) {}
+    }
+
+    // ─── Wake Lock ────────────────────────────────────────────────────────
+    const supportsWakeLock = 'wakeLock' in navigator;
+
+    async function requestWakeLock() {
+        if (!supportsWakeLock || !isPlayerActive || wakeLock) return;
+        try {
+            wakeLock = await navigator.wakeLock.request('screen');
+            wakeLock.addEventListener('release', () => { wakeLock = null; });
+        } catch (err) {}
+    }
+
     async function releaseWakeLock() {
         if (wakeLock) {
-            try {
-                await wakeLock.release();
-                wakeLock = null;
-                console.log('Wake lock manually released');
-            } catch (err) {
-                console.warn('Wake lock release failed:', err);
-            }
+            try { await wakeLock.release(); } catch (e) {}
+            wakeLock = null;
         }
     }
 
-    // Pause audio when tab is hidden — prevents background battery drain and iOS interruptions
+    // ─── Position Persistence ─────────────────────────────────────────────
+    let _lastSaveTime = 0;
+    function throttledSavePosition(time) {
+        const now = Date.now();
+        if (now - _lastSaveTime >= 1000) {
+            _lastSaveTime = now;
+            try { localStorage.setItem('audioPosition', time.toString()); } catch (e) {}
+        }
+    }
+
+    // ─── Visibility / Background Handling ─────────────────────────────────
+    // Uses userWantsPlayback instead of audio.paused because iOS pauses the
+    // audio element BEFORE firing visibilitychange — so audio.paused is
+    // already true and wasPlaying (if set by the pause event) is already
+    // false by the time this handler runs.
     const visibilityHandler = () => {
         if (document.hidden) {
-            if (audio && !audio.paused) {
-                if (!isNaN(audio.currentTime)) {
-                    lastPlaybackPosition = audio.currentTime;
-                    try {
-                        localStorage.setItem('audioPosition', audio.currentTime.toString());
-                    } catch (e) {}
-                }
+            // Save position before system pauses us
+            if (!isNaN(audio.currentTime) && audio.currentTime > 0) {
+                lastPlaybackPosition = audio.currentTime;
+                throttledSavePosition(audio.currentTime);
+            }
+
+            if (userWantsPlayback) {
                 wasPlayingWhenHidden = true;
                 screenWentAway = true;
-                audio.pause();
+
+                // Explicitly pause on Android to prevent battery drain
+                // in background. iOS will pause automatically, but pausing
+                // here too gives consistent state across platforms.
+                if (!audio.paused) {
+                    audio.pause();
+                }
+
                 playPauseBtn.innerHTML = '<i class="bi bi-play"></i>';
                 playPauseBtn.setAttribute('aria-label', 'Play');
+                releaseWakeLock();
             }
         } else {
-            if (wasPlayingWhenHidden && audio.paused) {
+            // Returning to foreground
+            if (screenWentAway && wasPlayingWhenHidden) {
+                // iOS: AudioContext may need resume after backgrounding
+                if (window._sharedAudioCtx &&
+                    (window._sharedAudioCtx.state === 'suspended' ||
+                     window._sharedAudioCtx.state === 'interrupted')) {
+                    window._sharedAudioCtx.resume().catch(() => {});
+                }
+
                 setTimeout(() => {
-                    if (screenWentAway) {
-                        showSourcePopup("Audio Restarted", "Audio was interrupted when this tab became inactive and has restarted from the beginning. Keep this tab active to prevent interruptions.");
+                    if (screenWentAway && audio.paused) {
+                        showSourcePopup(
+                            "Audio Paused",
+                            `Press play to resume from ${formatTime(lastPlaybackPosition)}`
+                        );
                         screenWentAway = false;
                         wasPlayingWhenHidden = false;
                     }
-                }, 100);
+                }, 300);
             }
         }
     };
     document.addEventListener('visibilitychange', visibilityHandler);
 
+    // Blur: save position only — Android fires blur spuriously for
+    // soft keyboard, permission dialogs, etc.
     const blurHandler = () => {
-        if (audio && !audio.paused) {
+        if (!isNaN(audio.currentTime) && audio.currentTime > 0) {
             lastPlaybackPosition = audio.currentTime;
-            wasPlayingWhenHidden = true;
-            screenWentAway = true;
-            console.log('Window blur, storing position:', lastPlaybackPosition);
         }
     };
     window.addEventListener('blur', blurHandler);
-    
+
+    // ─── Audio Element Events ─────────────────────────────────────────────
+    // These handle UI updates for ALL pause/play sources: user toggle,
+    // system interruption, Media Session controls, etc.
     audio.addEventListener('play', () => {
-        wasPlaying = true;
+        playPauseBtn.innerHTML = '<i class="bi bi-pause"></i>';
+        playPauseBtn.setAttribute('aria-label', 'Pause');
         announceToScreenReader('Audio playback started');
     });
-    
+
     audio.addEventListener('pause', () => {
-        wasPlaying = false;
+        playPauseBtn.innerHTML = '<i class="bi bi-play"></i>';
+        playPauseBtn.setAttribute('aria-label', 'Play');
+        releaseWakeLock();
         announceToScreenReader('Audio playback paused');
     });
-    
-    function recoverAudioSource() {
-        if (recoveryInProgress || !isPlayerActive) return;
-        
-        recoveryInProgress = true;
-        console.log('Attempting audio recovery...');
-        
-        if (!isNaN(audio.currentTime)) {
-            lastPlaybackPosition = audio.currentTime;
+
+    // ─── Core Playback Toggle ─────────────────────────────────────────────
+    // CRITICAL for iOS: audio.play() MUST be called synchronously within the
+    // user-gesture handler. No awaits before play() or iOS rejects with
+    // NotAllowedError. ctx.resume() is fire-and-forget — never awaited here.
+    function togglePlay() {
+        if (!isPlayerActive) return;
+
+        const hasValidSrc = audio.src &&
+                            audio.src !== window.location.href &&
+                            audio.src !== '' &&
+                            audio.src !== 'about:blank';
+        if (!hasValidSrc) return;
+
+        if (audio.paused) {
+            // Restore saved resume position if present
+            const resumePos = audio.dataset.resumePosition;
+            if (resumePos && parseFloat(resumePos) > 0) {
+                audio.currentTime = parseFloat(resumePos);
+                delete audio.dataset.resumePosition;
+            }
+
+            // Unlock AudioContext within the user gesture (iOS requirement)
+            getSharedAudioContext();
+
+            // Synchronous play() — the critical line for iOS autoplay policy
+            const playPromise = audio.play();
+
+            if (playPromise !== undefined) {
+                playPromise
+                    .then(() => {
+                        userWantsPlayback = true;
+                        requestWakeLock();
+                        setupMediaSession();
+                        retryCount = 0;
+                    })
+                    .catch((error) => {
+                        // AbortError = user cancelled by pausing before play
+                        // completed — not a real error, ignore it
+                        if (error.name === 'AbortError') return;
+                        handlePlayError(error);
+                    });
+            }
+        } else {
+            audio.pause();
+            userWantsPlayback = false;
+
+            if (!isNaN(audio.currentTime)) {
+                lastPlaybackPosition = audio.currentTime;
+            }
         }
-        
-        if (audio.dataset.originalSrc) {
-            audio.src = audio.dataset.originalSrc;
-        } else if (audio.getAttribute('data-src')) {
-            audio.src = audio.getAttribute('data-src');
+    }
+
+    // ─── Error Handling ───────────────────────────────────────────────────
+    function handlePlayError(error) {
+        console.error('[Audio] Play failed:', error?.name, error?.message);
+
+        releaseWakeLock();
+        playPauseBtn.innerHTML = '<i class="bi bi-play"></i>';
+        playPauseBtn.setAttribute('aria-label', 'Play');
+
+        if (error?.name === 'NotAllowedError') {
+            // iOS: User gesture not recognized or autoplay blocked
+            showSourcePopup(
+                "Tap to Play Audio",
+                "Please tap the play button again to start audio playback."
+            );
+        } else if (error?.name === 'NotSupportedError') {
+            showSourcePopup(
+                "Audio Error",
+                "This audio format is not supported on your device."
+            );
+        } else if (screenWentAway || wasPlayingWhenHidden) {
+            // Error after returning from background
+            const pos = lastPlaybackPosition || 0;
+            audio.dataset.resumePosition = pos.toString();
+            showSourcePopup(
+                "Audio Interrupted",
+                `Audio was paused when you left the screen. Press play to resume from ${formatTime(pos)}.`
+            );
+            screenWentAway = false;
+            wasPlayingWhenHidden = false;
+        } else if (retryCount < maxRetries) {
+            retryCount++;
+            setTimeout(() => attemptRecovery(), 1000 * retryCount);
+        } else {
+            playPauseBtn.innerHTML = '<i class="bi bi-exclamation-triangle"></i>';
+            playPauseBtn.setAttribute('aria-label', 'Audio Error');
+            showSourcePopup(
+                "Audio Error",
+                "Unable to play audio after multiple attempts. Please refresh and try again."
+            );
         }
-        
-        audio.load();
-        
-        const setPositionAfterNetworkRecovery = () => {
-            if (lastPlaybackPosition > 0 && !screenWentAway) {
-                audio.currentTime = lastPlaybackPosition;
+    }
+
+    // ─── Recovery ─────────────────────────────────────────────────────────
+    function attemptRecovery() {
+        if (!isPlayerActive) return;
+
+        console.log(`[Audio] Recovery attempt ${retryCount}/${maxRetries}`);
+
+        const savedPos = lastPlaybackPosition || 0;
+
+        // Only reassign src if it's actually broken.
+        // Never set audio.src = '' on iOS — it permanently breaks the
+        // element's Web Audio connection.
+        const targetSrc = audio.dataset.originalSrc || audio.getAttribute('data-src');
+        if (targetSrc && (!audio.src || audio.src === window.location.href)) {
+            audio.src = targetSrc;
+        }
+
+        // Only call load() if there's an actual error or missing source.
+        // Calling load() on a healthy element on iOS can suspend the
+        // AudioContext, requiring a new user gesture to resume.
+        if (audio.error || !audio.src || audio.src === window.location.href) {
+            audio.load();
+        }
+
+        const onReady = () => {
+            if (savedPos > 0 && !screenWentAway) {
+                audio.currentTime = savedPos;
             } else if (screenWentAway) {
                 audio.currentTime = 0;
             }
-            recoveryInProgress = false;
             retryCount = 0;
-            audio.removeEventListener('loadedmetadata', setPositionAfterNetworkRecovery);
-            audio.removeEventListener('canplay', setPositionAfterNetworkRecovery);
+            audio.removeEventListener('loadedmetadata', onReady);
+            audio.removeEventListener('canplay', onReady);
         };
-        
-        audio.addEventListener('loadedmetadata', setPositionAfterNetworkRecovery);
-        audio.addEventListener('canplay', setPositionAfterNetworkRecovery);
-    }
-    
-    function handleAudioError(error) {
-        console.log('handleAudioError called, isPlayerActive:', isPlayerActive, 'audio exists:', !!audio);
-        
-        const actualError = audio ? audio.error : null;
-        if (actualError) {
-            console.error("Actual audio error details:", {
-                code: actualError.code,
-                message: actualError.message,
-                MEDIA_ERR_ABORTED: actualError.code === 1,
-                MEDIA_ERR_NETWORK: actualError.code === 2,
-                MEDIA_ERR_DECODE: actualError.code === 3,
-                MEDIA_ERR_SRC_NOT_SUPPORTED: actualError.code === 4
-            });
-        }
-        
-        if (!isPlayerActive && (!audio || audio.readyState === 0)) {
-            console.log('Audio error ignored - player cleaned up');
-            return;
-        }
-        
-        console.error("Audio play error event:", error);
-        releaseWakeLock();
-        
-        if (screenWentAway || wasPlayingWhenHidden) {
-            const resumePosition = lastPlaybackPosition || 0;
-            console.log('Screen interruption detected, stored position:', resumePosition);
-            
-            showSourcePopup("Audio Interrupted", `Audio was paused when you left the screen. Click play to resume from ${Math.floor(resumePosition / 60)}:${String(Math.floor(resumePosition % 60)).padStart(2, '0')}.`);
-            
-            if (audio) {
-                audio.dataset.resumePosition = resumePosition.toString();
-                
-                const prepareForResume = () => {
-                    console.log('Audio prepared for manual resume');
-                    audio.removeEventListener('loadedmetadata', prepareForResume);
-                    audio.removeEventListener('canplay', prepareForResume);
-                };
-                
-                audio.addEventListener('loadedmetadata', prepareForResume);
-                audio.addEventListener('canplay', prepareForResume);
-                
-                recoverAudioSource();
-            }
-            
-            screenWentAway = false;
-            wasPlayingWhenHidden = false;
-        } else if (retryCount < maxRetries && isPlayerActive) {
-            retryCount++;
-            console.log(`Recovery attempt ${retryCount}/${maxRetries}`);
-            
-            setTimeout(() => {
-                const currentPos = lastPlaybackPosition || 0;
-                const setPositionAfterNetworkRecovery = () => {
-                    if (currentPos > 0) {
-                        audio.currentTime = currentPos;
-                    }
-                    audio.removeEventListener('loadedmetadata', setPositionAfterNetworkRecovery);
-                    audio.removeEventListener('canplay', setPositionAfterNetworkRecovery);
-                };
-                
-                audio.addEventListener('loadedmetadata', setPositionAfterNetworkRecovery);
-                audio.addEventListener('canplay', setPositionAfterNetworkRecovery);
-                
-                recoverAudioSource();
-            }, 1000 * retryCount);
-        } else if (retryCount >= maxRetries) {
-            console.error('Audio recovery failed after maximum retries');
-            playPauseBtn.innerHTML = '<i class="bi bi-exclamation-triangle"></i>';
-            playPauseBtn.setAttribute('aria-label', 'Audio Error');
-            showSourcePopup("Audio Error", "Unable to recover audio after multiple attempts. Please refresh the page or try again later.");
-        } else {
-            if (audio) {
-                const currentPos = lastPlaybackPosition || 0;
-                const setPositionAfterGenericRecovery = () => {
-                    if (currentPos > 0) {
-                        audio.currentTime = currentPos;
-                    }
-                    audio.removeEventListener('loadedmetadata', setPositionAfterGenericRecovery);
-                    audio.removeEventListener('canplay', setPositionAfterGenericRecovery);
-                };
-                
-                audio.addEventListener('loadedmetadata', setPositionAfterGenericRecovery);
-                audio.addEventListener('canplay', setPositionAfterGenericRecovery);
-                
-                recoverAudioSource();
-            }
-            showSourcePopup("Audio Error", "An audio error occurred. Attempting to resume from last position.");
-        }
-        
-        playPauseBtn.innerHTML = '<i class="bi bi-play"></i>';
-        playPauseBtn.setAttribute('aria-label', 'Play');
+
+        audio.addEventListener('loadedmetadata', onReady);
+        audio.addEventListener('canplay', onReady);
     }
 
-    async function togglePlay() {
-        if (!isPlayerActive) return;
-        
-        if (!audio.src || audio.src.trim() === '' || audio.src === window.location.href) {
-            return;
-        }
-        
-        try {
-            if (audio.paused) {
-                const resumePosition = audio.dataset.resumePosition;
-                if (resumePosition && parseFloat(resumePosition) > 0) {
-                    console.log('Resuming from stored position:', resumePosition);
-                    audio.currentTime = parseFloat(resumePosition);
-                    delete audio.dataset.resumePosition;
-                }
-
-                const ctx = initAudioContext();
-                if (ctx && ctx.state === 'suspended') {
-                    await ctx.resume();
-                }
-                
-                const playPromise = audio.play();
-                if (playPromise !== undefined) {
-                    playPromise.then(async () => {
-                        playPauseBtn.innerHTML = '<i class="bi bi-pause"></i>';
-                        playPauseBtn.setAttribute('aria-label', 'Pause');
-                        await requestWakeLock();
-                        retryCount = 0;
-                    }).catch(error => {
-                        handleAudioError(error);
-                    });
-                }
-            } else {
-                audio.pause();
-                playPauseBtn.innerHTML = '<i class="bi bi-play"></i>';
-                playPauseBtn.setAttribute('aria-label', 'Play');
-                await releaseWakeLock();
-            }
-        } catch (error) {
-            handleAudioError(error);
-        }
-    }
-    
-    audio.addEventListener('timeupdate', () => {
-        if (!isNaN(audio.currentTime) && isPlayerActive && audio.currentTime > 0) {
-            lastPlaybackPosition = audio.currentTime;
-            try {
-                localStorage.setItem('audioPosition', audio.currentTime.toString());
-            } catch (e) {}
-        }
-    });
-
-    const onlineHandler = () => {
-        if (audio.error && isPlayerActive) {
-            console.log('Network recovered, attempting to reload audio');
-            const savedPos = lastPlaybackPosition || 0;
-            const setPositionAfterOnline = () => {
-                if (savedPos > 0) {
-                    audio.currentTime = savedPos;
-                }
-                audio.removeEventListener('loadedmetadata', setPositionAfterOnline);
-                audio.removeEventListener('canplay', setPositionAfterOnline);
-            };
-            
-            audio.addEventListener('loadedmetadata', setPositionAfterOnline);
-            audio.addEventListener('canplay', setPositionAfterOnline);
-            
-            recoverAudioSource();
-        }
-    };
-    window.addEventListener('online', onlineHandler);
-    
-    playPauseBtn.addEventListener('click', togglePlay);
-    rewindBtn.addEventListener('click', () => seek(-10));
-    forwardBtn.addEventListener('click', () => seek(10));
-    audio.addEventListener('timeupdate', updateProgress);
-    audio.addEventListener('loadedmetadata', setDuration);
-    audio.addEventListener('ended', async () => {
-        playPauseBtn.innerHTML = '<i class="bi bi-play"></i>';
-        playPauseBtn.setAttribute('aria-label', 'Play');
-        await releaseWakeLock();
-        
-        try {
-            localStorage.removeItem('audioPosition');
-        } catch (e) {}
-        
-        audio.currentTime = 0;
-        if (progressBar) {
-            progressBar.style.width = '0%';
-        }
-        
-        announceToScreenReader('Audio playback completed');
-        showAdditionalInfo();
-    });
-    audio.addEventListener('pause', releaseWakeLock);
-    audio.addEventListener('error', (e) => {
-        handleAudioError(e);
-    });
-    
-    if (progressContainer) {
-        progressContainer.addEventListener('click', setProgress);
-    }
-    
-    audio.addEventListener('loadedmetadata', () => {
-        try {
-            const savedPosition = localStorage.getItem('audioPosition');
-            if (savedPosition && !isNaN(savedPosition) && parseFloat(savedPosition) > 0 && !screenWentAway && !wasPlayingWhenHidden) {
-                audio.currentTime = parseFloat(savedPosition);
-            }
-        } catch (e) {}
-    });
-    
-    audio.load();
-    
+    // ─── Seek ─────────────────────────────────────────────────────────────
     function seek(seconds) {
-        if (!isPlayerActive) return;
+        if (!isPlayerActive || !isFinite(audio.duration)) return;
         audio.currentTime = Math.max(0, Math.min(audio.currentTime + seconds, audio.duration));
+        updateMediaSessionPosition();
         const direction = seconds > 0 ? 'forward' : 'backward';
         announceToScreenReader(`Skipped ${Math.abs(seconds)} seconds ${direction}`);
     }
-    
+
+    // ─── Progress UI ──────────────────────────────────────────────────────
     function updateProgress() {
         if (!isPlayerActive || !isFinite(audio.duration)) return;
         const percent = (audio.currentTime / audio.duration) * 100;
         progressBar.style.width = `${percent}%`;
         currentTimeSpan.textContent = formatTime(audio.currentTime);
-    }
-    
-    function setProgress(e) {
-        if (!isPlayerActive) return;
-        const width = this.clientWidth;
-        const clickX = e.offsetX;
-        const duration = audio.duration;
-        if (isFinite(duration) && width > 0) {
-            audio.currentTime = (clickX / width) * duration;
-            const newTime = formatTime(audio.currentTime);
-            announceToScreenReader(`Jumped to ${newTime}`);
+
+        if (audio.currentTime > 0) {
+            lastPlaybackPosition = audio.currentTime;
+            throttledSavePosition(audio.currentTime);
         }
     }
-    
+
+    function setProgress(e) {
+        if (!isPlayerActive || !isFinite(audio.duration)) return;
+        // Use getBoundingClientRect for reliable coordinate calculation.
+        // offsetX is unreliable on mobile touch events (Android Chrome
+        // reports 0 or incorrect values for touches).
+        const rect = progressContainer.getBoundingClientRect();
+        const clientX = e.clientX ?? e.touches?.[0]?.clientX;
+        if (clientX === undefined || rect.width <= 0) return;
+        audio.currentTime = ((clientX - rect.left) / rect.width) * audio.duration;
+        updateMediaSessionPosition();
+        announceToScreenReader(`Jumped to ${formatTime(audio.currentTime)}`);
+    }
+
     function setDuration() {
         if (!isPlayerActive || !isFinite(audio.duration)) return;
         durationSpan.textContent = formatTime(audio.duration);
-    }
-    
-    function formatTime(time) {
-        if (!isFinite(time)) return "0:00";
-        const minutes = Math.floor(time / 60);
-        const seconds = Math.floor(time % 60);
-        return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+        updateMediaSessionPosition();
     }
 
-    // Cleanup — removes all event listeners and releases resources
-    // Does NOT close the shared AudioContext since other players may use it
-    return function cleanup() {
-        console.log('Audio player cleanup starting');
+    function formatTime(seconds) {
+        if (!isFinite(seconds) || seconds < 0) return "0:00";
+        const mins = Math.floor(seconds / 60);
+        const secs = Math.floor(seconds % 60);
+        return `${mins}:${secs.toString().padStart(2, '0')}`;
+    }
+
+    // ─── Event Bindings ───────────────────────────────────────────────────
+    playPauseBtn.addEventListener('click', togglePlay);
+    rewindBtn?.addEventListener('click', () => seek(-10));
+    forwardBtn?.addEventListener('click', () => seek(10));
+
+    audio.addEventListener('timeupdate', updateProgress);
+    audio.addEventListener('loadedmetadata', setDuration);
+    audio.addEventListener('durationchange', setDuration);
+
+    audio.addEventListener('ended', () => {
+        userWantsPlayback = false;
+        playPauseBtn.innerHTML = '<i class="bi bi-play"></i>';
+        playPauseBtn.setAttribute('aria-label', 'Play');
         releaseWakeLock();
+        progressBar.style.width = '0%';
+
+        try { localStorage.removeItem('audioPosition'); } catch (e) {}
+
+        if ('mediaSession' in navigator) {
+            navigator.mediaSession.playbackState = 'none';
+        }
+
+        announceToScreenReader('Audio playback completed');
+        showAdditionalInfo();
+    });
+
+    audio.addEventListener('error', (e) => {
+        console.error('[Audio] Element error:', audio.error?.code, audio.error?.message);
+        if (!isPlayerActive) return;
+
+        releaseWakeLock();
+        playPauseBtn.innerHTML = '<i class="bi bi-play"></i>';
+        playPauseBtn.setAttribute('aria-label', 'Play');
+
+        if (screenWentAway || wasPlayingWhenHidden) {
+            const pos = lastPlaybackPosition || 0;
+            audio.dataset.resumePosition = pos.toString();
+            showSourcePopup(
+                "Audio Interrupted",
+                `Audio was paused when you left the screen. Press play to resume from ${formatTime(pos)}.`
+            );
+            attemptRecovery();
+            screenWentAway = false;
+            wasPlayingWhenHidden = false;
+        } else if (retryCount < maxRetries) {
+            retryCount++;
+            setTimeout(() => attemptRecovery(), 1000 * retryCount);
+        } else {
+            playPauseBtn.innerHTML = '<i class="bi bi-exclamation-triangle"></i>';
+            playPauseBtn.setAttribute('aria-label', 'Audio Error');
+            showSourcePopup(
+                "Audio Error",
+                "Unable to recover audio. Please refresh and try again."
+            );
+        }
+    });
+
+    if (progressContainer) {
+        progressContainer.addEventListener('click', setProgress);
+    }
+
+    // Network recovery
+    const onlineHandler = () => {
+        if (audio.error && isPlayerActive) {
+            console.log('[Audio] Network recovered, attempting reload');
+            attemptRecovery();
+        }
+    };
+    window.addEventListener('online', onlineHandler);
+
+    // ─── Restore Saved Position ───────────────────────────────────────────
+    try {
+        const saved = localStorage.getItem('audioPosition');
+        if (saved && !isNaN(saved) && parseFloat(saved) > 0) {
+            const onLoaded = () => {
+                audio.currentTime = parseFloat(saved);
+                audio.removeEventListener('loadedmetadata', onLoaded);
+            };
+            audio.addEventListener('loadedmetadata', onLoaded);
+        }
+    } catch (e) {}
+
+    audio.load();
+
+    // ─── Cleanup ──────────────────────────────────────────────────────────
+    return function cleanup() {
+        console.log('[Audio] Cleanup starting');
         isPlayerActive = false;
+        releaseWakeLock();
 
         document.removeEventListener('visibilitychange', visibilityHandler);
         window.removeEventListener('blur', blurHandler);
@@ -8761,11 +8927,19 @@ function initAudioPlayer() {
 
         if (audio) {
             audio.pause();
-            audio.src = '';
-            audio.load();
+            userWantsPlayback = false;
+            // iOS-SAFE: Do NOT use audio.src = '' or removeAttribute('src').
+            // Do NOT call audio.load(). These permanently break the element
+            // on iOS if MediaElementSource was ever connected, and they
+            // suspend the AudioContext requiring a new user gesture.
+            // Simply pausing is sufficient for cleanup.
         }
 
-        console.log('Audio player cleaned up');
+        // Don't close the shared AudioContext — other players may need it,
+        // and iOS limits total contexts to ~6 per page lifetime. It will be
+        // garbage-collected when the page unloads.
+
+        console.log('[Audio] Cleanup complete');
     };
 }
         
