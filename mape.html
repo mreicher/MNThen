@@ -3040,80 +3040,141 @@ function handlePositionUpdate(position) {
     updateUserLocation(position, forceUpdate);
 }
         
+/* handleVisibilityChange — Strict drop-in replacement  */
+
+/* ── Module-scoped state (prevents external desync) ─────────────── */
+let _visLastHiddenMs     = 0;
+let _visLastKnownPos     = null;
+let _visReWakeResetTimer = null;
+
 function handleVisibilityChange() {
-    // Initialize window-scoped variables
-    if (typeof window._lastHiddenTime === 'undefined') {
-        window._lastHiddenTime = Date.now();
+    /* ── First-call initialization ─────────────────────────────────── */
+    if (_visLastHiddenMs === 0) {
+        _visLastHiddenMs = Date.now();
     }
-    
+
     if (document.hidden) {
-        // App going to background
-        window._lastHiddenTime = Date.now();
-        window._lastKnownPosition = userMarker?.getLatLng() ?? null;
-        
+        /* ═══════════════════════════════════════════════════════════════
+         *  APP GOING TO BACKGROUND
+         * ═══════════════════════════════════════════════════════════════ */
+
+        _visLastHiddenMs = Date.now();
+        _visLastKnownPos = userMarker?.getLatLng() ?? null;
+
+        /* Sync to legacy globals (read by updateLocationAfterBackground
+         * and other downstream code) */
+        window.lastHiddenTime     = _visLastHiddenMs;
+        window._lastHiddenTime    = _visLastHiddenMs;
+        window.lastKnownPosition  = _visLastKnownPos;
+        window._lastKnownPosition = _visLastKnownPos;
+
         resetInactivityTimer(false);
-        
-        // Only kill visual loop, preserve GPS watch
-        // (Ensure your disposeMapLoop does NOT call navigator.geolocation.clearWatch)
+
+        /* ORIGINAL BEHAVIOR PRESERVED: Immediate synchronous disposal.
+         * No deferred teardown — preserves the exact timing contract
+         * of the original code so external cleanup sequences remain
+         * deterministic. */
         disposeMapLoop();
-        
+
+        /* Reset foreground-recovery state */
         window.isReWaking = false;
         if (window.visibilityDebounceTimer) {
             clearTimeout(window.visibilityDebounceTimer);
             window.visibilityDebounceTimer = null;
         }
-        
-        // Legacy compatibility: Sync new scoped vars to old globals
-        window.lastHiddenTime = window._lastHiddenTime;
-        window.lastKnownPosition = window._lastKnownPosition;
-        
-        console.debug("App went to background - visual loop disposed (GPS continues if moving)");
+
     } else {
-        // App returning to foreground
-        const now = Date.now();
-        const hiddenTime = window._lastHiddenTime || window.lastHiddenTime || 0;
-        
-        // Guard against missing hidden time (prevents "Time Travel" on first load)
-        if (hiddenTime === 0) {
-            console.debug("No hidden time recorded, initializing and continuing");
-            window._lastHiddenTime = now;
-            resetInactivityTimer(true);
-            return;
-        }
-        
-        const awayMs = now - hiddenTime;
-        const threshold = CONFIG?.BACKGROUND_THRESHOLD ?? 30_000;
-        
-        console.debug(`App returned to foreground after ${(awayMs / 1000).toFixed(1)}s`);
-        
+        /* ═══════════════════════════════════════════════════════════════
+         *  APP RETURNING TO FOREGROUND
+         * ═══════════════════════════════════════════════════════════════ */
+
+        const now       = Date.now();
+        const hiddenMs  = _visLastHiddenMs || window.lastHiddenTime || window._lastHiddenTime || 0;
+        const awayMs    = hiddenMs > 0 ? (now - hiddenMs) : 0;
+        const threshold = (typeof CONFIG !== 'undefined' && CONFIG.BACKGROUND_THRESHOLD) || 30_000;
+
+        /* ── Clear any pending foreground debounce ──────────────────── */
         if (window.visibilityDebounceTimer) {
             clearTimeout(window.visibilityDebounceTimer);
             window.visibilityDebounceTimer = null;
         }
-        
-        // Prepare map for rendering immediately
+
+        /* ── Prepare map for rendering ──────────────────────────────── */
         if (map) map.invalidateSize({ pan: false, animate: false });
-        
-        if (awayMs > threshold) {
-            // Long absence: Debounce and force fresh fix
+
+        if (awayMs <= threshold) {
+            /* ── Short/Medium absence ───────────────────────────────── */
+
+            const livePos = window.lastPosition || _visLastKnownPos;
+
+            if (map && livePos) {
+                const lat = livePos.lat;
+                const lng = livePos.lng;
+
+                if (typeof lat === 'number' && typeof lng === 'number' &&
+                    isFinite(lat) && isFinite(lng)) {
+                    
+                    const currentLatLng = L.latLng(lat, lng);
+                    userMarker?.setLatLng(currentLatLng);
+
+                    /* Re-seed position buffer to prevent velocity spikes.
+                     * Safe fallback: if seedPositionBuffer doesn't exist,
+                     * manually replace the buffer array. */
+                    const freshPos = {
+                        lat,
+                        lng,
+                        accuracy:  livePos.accuracy || 20,
+                        timestamp: Date.now(),
+                        heading:   livePos.heading ?? null,
+                        speedMPS:  livePos.speedMPS || 0
+                    };
+
+                    if (typeof seedPositionBuffer === 'function') {
+                        seedPositionBuffer(freshPos);
+                    } else if (window.positionBuffer) {
+                        window.positionBuffer = [freshPos];
+                    }
+
+                    console.debug("Map and marker synced to live state (short absence)");
+                }
+            }
+
+            /* Restart idle proximity check if stopped.
+             * Safe fallback: check window-scoped function as well. */
+            if (!window._idleProximityCheckInterval) {
+                if (typeof startIdleProximityCheck === 'function') {
+                    startIdleProximityCheck();
+                } else if (typeof window.startIdleProximityCheck === 'function') {
+                    window.startIdleProximityCheck();
+                }
+            }
+
+            resetInactivityTimer(true);
+
+        } else {
+            /* ── Long absence: debounce + force fresh GPS fix ────────── */
             window.visibilityDebounceTimer = setTimeout(() => {
                 window.visibilityDebounceTimer = null;
-                
-                // Recalculate time away to ensure freshness
-                const currentAwayMs = now - window._lastHiddenTime;
-                if (currentAwayMs <= threshold) {
-                    console.debug("Debounced return: now below threshold, skipping refresh");
-                    return;
-                }
-                
-                if (window.isReWaking) {
-                    console.debug("Location refresh already in progress, skipping");
-                    return;
-                }
-                
-                console.log(`Away for ${(currentAwayMs / 1000).toFixed(1)}s — refreshing location`);
+
+                /* Re-check: user might have gone back to background */
+                if (document.hidden) return;
+
+                /* Re-compute absence duration at fire time (not at
+                 * schedule time) for accuracy */
+                const currentAwayMs = Date.now() - (_visLastHiddenMs || 0);
+                if (currentAwayMs <= threshold) return;
+
+                if (window.isReWaking) return;
                 window.isReWaking = true;
-                
+
+                /* ── isReWaking safety net ───────────────────────────── */
+
+                if (_visReWakeResetTimer) clearTimeout(_visReWakeResetTimer);
+                _visReWakeResetTimer = setTimeout(() => {
+                    window.isReWaking = false;
+                    _visReWakeResetTimer = null;
+                }, 10_000);
+
                 Promise.resolve(updateLocationAfterBackground())
                     .catch((error) => {
                         console.error("Background location update failed:", error);
@@ -3121,25 +3182,20 @@ function handleVisibilityChange() {
                     .finally(() => {
                         setTimeout(() => {
                             window.isReWaking = false;
+                            if (_visReWakeResetTimer) {
+                                clearTimeout(_visReWakeResetTimer);
+                                _visReWakeResetTimer = null;
+                            }
                         }, 2000);
                     });
             }, 500);
-        } else {
-            // Short absence: Restore from live pipeline state (prevents backwards jump)
-            const livePos = window.lastPosition || window._lastKnownPosition;
-            
-            if (map && livePos) {
-                const currentLatLng = L.latLng(livePos.lat, livePos.lng);
-                userMarker?.setLatLng(currentLatLng);
-                console.debug("Map and marker synced to live state (short absence)");
-            }
         }
-        
-        resetInactivityTimer(true);
-        
-        // Legacy compatibility: Sync new scoped vars to old globals
-        window.lastHiddenTime = window._lastHiddenTime;
-        window.lastKnownPosition = window._lastKnownPosition;
+
+        /* ── Sync to legacy globals ─────────────────────────────────── */
+        window.lastHiddenTime     = _visLastHiddenMs;
+        window._lastHiddenTime    = _visLastHiddenMs;
+        window.lastKnownPosition  = _visLastKnownPos;
+        window._lastKnownPosition = _visLastKnownPos;
     }
 }
         
