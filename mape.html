@@ -5119,15 +5119,15 @@ function updateUserLocation(position, forceUpdate = false) {
     }
 }
 
-/* Proximity zoom logic — smoothed transition version. */
+/* Proximity zoom logic — fluid continuous tracking version (backwards-compatible, non-breaking). */
 function _handleProximityZoomLogic(speedMPH, eastWestMove) {
-    const PROX_NEAR_M = 13.716;       // 45 ft
-    const PROX_FAR_M = 21.336;        // 70 ft  (entry threshold)
-    const PROX_EXIT_FAR_M = 24.384;   // 80 ft  (exit hysteresis — must get this far to leave)
+    const PROX_NEAR_M = 13.716;       // 45 ft  — full effect
+    const PROX_FAR_M = 21.336;        // 70 ft  — entry threshold
+    const PROX_EXIT_FAR_M = 24.384;   // 80 ft  — exit hysteresis (must get this far to leave)
     const PROX_ZOOM_IN = 19;
     const PROX_ZOOM_OUT = 17;
     const PROX_THROTTLE_MS = 250;
-    const TRANSITION_THROTTLE_MS = 600; // longer throttle while actively transitioning
+    const TRANSITION_THROTTLE_MS = 400; 
 
     if (!window.proximityState || !map || window.isMapInteracting) {
         window._zoomAuthorityThisFrame = false;
@@ -5140,7 +5140,7 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
     const distM = window.proximityState.distanceMeters;
     const nowMs = Date.now();
 
-    /* ── 1. Continuous zone factor (no more hard flip) ── */
+    /* ── 1. Continuous zone factor (no hard flip) ── */
     let zoneFactor;
     if (distM <= PROX_NEAR_M) {
         zoneFactor = 1.0;
@@ -5148,7 +5148,7 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
         zoneFactor = 0.0;
     } else {
         const t = Math.max(0, Math.min(1, (distM - PROX_NEAR_M) / (PROX_EXIT_FAR_M - PROX_NEAR_M)));
-        // Smoothstep: 3t² − 2t³  — zero derivative at boundaries prevents perceived "hit"
+        // Smoothstep: 3t² − 2t³ — zero derivative at boundaries prevents perceived "hit"
         zoneFactor = 1.0 - (t * t * (3 - 2 * t));
     }
 
@@ -5173,13 +5173,21 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
         const midLng = (userLL.lng + poiLL.lng) / 2;
         const midpoint = L.latLng(midLat, midLng);
 
-        // Replicate the asymmetric padding shift that fitBounds applies.
-        // paddingTopLeft: [64,64], paddingBottomRight: [64,96].
-        // Vertical asymmetry is 32 px; fitBounds shifts the center north by 16 px.
-        const midPx = map.latLngToContainerPoint(midpoint);
-        const shiftedPx = L.point(midPx.x, midPx.y - 16); // 16 px north
-        const shiftedLL = map.containerPointToLatLng(shiftedPx);
-        const paddedCenter = L.latLng(shiftedLL.lat, midpoint.lng);
+        // SAFETY FIX: Wrap pixel projection in try-catch
+        // This prevents crashes if the map isn't fully rendered or has 0 size.
+        let paddedCenter = midpoint; // Fallback to midpoint if pixel math fails
+        
+        try {
+            // Replicate the asymmetric padding shift that fitBounds applies.
+            // paddingTopLeft: [64,64], paddingBottomRight: [64,96].
+            // Vertical asymmetry is 32 px; fitBounds shifts the center north by 16 px.
+            const midPx = map.latLngToContainerPoint(midpoint);
+            const shiftedPx = L.point(midPx.x, midPx.y - 16); // 16 px north
+            paddedCenter = map.containerPointToLatLng(shiftedPx);
+        } catch (e) {
+            // Silent fail: keep midpoint as target if pixel projection throws
+            // (Common on init or if map container is hidden)
+        }
 
         // Linear interpolation: outside = userLL, inside = paddedCenter
         targetCenter = L.latLng(
@@ -5197,33 +5205,37 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
     const zoomDelta = Math.abs(targetZoom - currentZoom);
     const centerDelta = targetCenter ? map.getCenter().distanceTo(targetCenter) : 0;
 
-    // Use longer throttle while actively transitioning so the animation can finish
+    // Use longer throttle while actively transitioning so the animation can finish,
+    // but keep it low enough that the tracking feels glued to the user.
     const inTransition = zoneFactor > 0.01 && zoneFactor < 0.99;
     const throttleMs = inTransition ? TRANSITION_THROTTLE_MS : PROX_THROTTLE_MS;
     const throttleOk = !window._lastProxZoomRequest || (nowMs - window._lastProxZoomRequest) >= throttleMs;
     const proxZoomBlocked = window._zoomAuthorityThisFrame === true;
     window._zoomAuthorityThisFrame = false;
 
-    // Avoid restarting an animation for a micro-delta or if already near target
+    // Avoid restarting an animation for a micro-delta or if already near target.
+    // Thresholds tightened slightly for more responsive continuous tracking.
     const lastTarget = window._lastProxTarget;
     const targetChanged = !lastTarget ||
-        Math.abs(targetZoom - lastTarget.zoom) > 0.12 ||
-        (targetCenter && lastTarget.center && targetCenter.distanceTo(lastTarget.center) > 3);
+        Math.abs(targetZoom - lastTarget.zoom) > 0.08 ||
+        (targetCenter && lastTarget.center && targetCenter.distanceTo(lastTarget.center) > 2);
 
-    if ((zoomDelta >= 0.15 || centerDelta > 2) && throttleOk && !proxZoomBlocked && targetChanged) {
+    // Trigger thresholds slightly lowered so small proximity drifts still update the view
+    if ((zoomDelta >= 0.1 || centerDelta > 1.5) && throttleOk && !proxZoomBlocked && targetChanged) {
         window._lastProxZoomRequest = nowMs;
         window._lastProxTarget = { zoom: targetZoom, center: targetCenter };
 
-        // Duration: give transitions more time; quick corrections when settled
+        // Duration: snappier when settled, shorter but still smooth during transitions.
+        // The max cap is lowered so the user never feels "locked out" by a long animation.
         const isSettled = zoneFactor === 0.0 || zoneFactor === 1.0;
         const zoomDur = isSettled
-            ? Math.min(2.0, Math.max(0.8, zoomDelta * 0.55))
-            : Math.min(3.0, Math.max(1.4, zoomDelta * 0.7 + centerDelta * 0.015));
+            ? Math.min(1.2, Math.max(0.5, zoomDelta * 0.5))
+            : Math.min(1.8, Math.max(0.6, zoomDelta * 0.55 + centerDelta * 0.012));
 
-        // Single animation primitive for the entire range — no more fitBounds / flyTo mismatch
+        // Single animation primitive for the entire range — no fitBounds / flyTo mismatch
         map.flyTo(targetCenter, targetZoom, {
             duration: zoomDur,
-            easeLinearity: zoneFactor > 0.5 ? 0.25 : (eastWestMove ? 0.13 : 0.15)
+            easeLinearity: zoneFactor > 0.5 ? 0.28 : (eastWestMove ? 0.15 : 0.18)
         });
     }
 
