@@ -5039,14 +5039,15 @@ function updateUserLocation(position, forceUpdate = false) {
     }
 }
 
-/* Proximity zoom logic extracted for clarity.
- * Handles zoom-in when approaching a POI and zoom-out when leaving. */
+/* Proximity zoom logic — fluid continuous tracking version (backwards-compatible, non-breaking). */
 function _handleProximityZoomLogic(speedMPH, eastWestMove) {
-    const PROX_NEAR_M = 13.716;
-    const PROX_FAR_M = 21.336;
+    const PROX_NEAR_M = 13.716;       // 45 ft  — full effect
+    const PROX_FAR_M = 21.336;        // 70 ft  — entry threshold
+    const PROX_EXIT_FAR_M = 24.384;   // 80 ft  — exit hysteresis (must get this far to leave)
     const PROX_ZOOM_IN = 19;
     const PROX_ZOOM_OUT = 17;
     const PROX_THROTTLE_MS = 250;
+    const TRANSITION_THROTTLE_MS = 400; 
 
     if (!window.proximityState || !map || window.isMapInteracting) {
         window._zoomAuthorityThisFrame = false;
@@ -5057,62 +5058,111 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
     }
 
     const distM = window.proximityState.distanceMeters;
+    const nowMs = Date.now();
 
-    if (distM <= PROX_FAR_M) {
-        const t = Math.max(0, Math.min(1, (distM - PROX_NEAR_M) / (PROX_FAR_M - PROX_NEAR_M)));
-        const targetZoom = PROX_ZOOM_IN + t * (PROX_ZOOM_OUT - PROX_ZOOM_IN);
-        const currentZoom = map.getZoom();
-        const zoomDelta = Math.abs(targetZoom - currentZoom);
-        const nowMs = Date.now();
-        const throttleOk = !window._lastProxZoomRequest || (nowMs - window._lastProxZoomRequest) >= PROX_THROTTLE_MS;
-        const proxZoomBlocked = window._zoomAuthorityThisFrame === true;
-        window._zoomAuthorityThisFrame = false;
-
-        if (zoomDelta >= 0.15 && throttleOk && !proxZoomBlocked) {
-            window._lastProxZoomRequest = nowMs;
-            const zoomDur = Math.min(2.0, Math.max(0.6, zoomDelta * 0.55));
-            const userLL = userMarker?.getLatLng?.();
-            const proxLoc = window.proximityState.closestLocation;
-            const poiLL = (proxLoc?.lat != null && proxLoc?.lng != null)
-                ? L.latLng(proxLoc.lat, proxLoc.lng)
-                : null;
-
-            if (userLL && poiLL) {
-                map.fitBounds(L.latLngBounds([userLL, poiLL]), {
-                    paddingTopLeft: L.point(64, 64),
-                    paddingBottomRight: L.point(64, 96),
-                    animate: true,
-                    duration: zoomDur,
-                    maxZoom: PROX_ZOOM_IN
-                });
-            } else if (userLL) {
-                map.flyTo(userLL, targetZoom, { duration: zoomDur, easeLinearity: 0.25 });
-            }
-        }
-        window._inProximityZone = true;
-
-    } else if (window._inProximityZone) {
-        window._zoomAuthorityThisFrame = false;
-        const currentZoom = map.getZoom();
-        const exitDelta = Math.abs(currentZoom - PROX_ZOOM_OUT);
-
-        if (exitDelta >= 0.15) {
-            const exitDur = Math.min(2.0, Math.max(0.6, exitDelta * 0.55));
-            const userLL = userMarker?.getLatLng?.();
-
-            if (userLL) {
-                map.flyTo(userLL, PROX_ZOOM_OUT, {
-                    duration: exitDur,
-                    easeLinearity: eastWestMove ? 0.13 : 0.15
-                });
-            } else {
-                map.flyTo(map.getCenter(), PROX_ZOOM_OUT, { duration: exitDur, easeLinearity: 0.15 });
-            }
-        }
-        window._inProximityZone = false;
-        window._lastProxZoomRequest = null;
+    /* ── 1. Continuous zone factor (no hard flip) ── */
+    let zoneFactor;
+    if (distM <= PROX_NEAR_M) {
+        zoneFactor = 1.0;
+    } else if (distM >= PROX_EXIT_FAR_M) {
+        zoneFactor = 0.0;
     } else {
-        window._zoomAuthorityThisFrame = false;
+        const t = Math.max(0, Math.min(1, (distM - PROX_NEAR_M) / (PROX_EXIT_FAR_M - PROX_NEAR_M)));
+        // Smoothstep: 3t² − 2t³ — zero derivative at boundaries prevents perceived "hit"
+        zoneFactor = 1.0 - (t * t * (3 - 2 * t));
+    }
+
+    // Preserve boolean flag for any legacy consumers, but derived smoothly
+    const isEffectivelyInside = zoneFactor > 0.005;
+    window._inProximityZone = isEffectivelyInside;
+
+    /* ── 2. Target zoom (continuous) ── */
+    const targetZoom = PROX_ZOOM_OUT + zoneFactor * (PROX_ZOOM_IN - PROX_ZOOM_OUT);
+
+    /* ── 3. Target center (blend between user-only and fitBounds-style padded center) ── */
+    const userLL = userMarker?.getLatLng?.();
+    const proxLoc = window.proximityState.closestLocation;
+    const poiLL = (proxLoc?.lat != null && proxLoc?.lng != null)
+        ? L.latLng(proxLoc.lat, proxLoc.lng)
+        : null;
+
+    let targetCenter;
+    if (userLL && poiLL) {
+        // Midpoint of user and POI
+        const midLat = (userLL.lat + poiLL.lat) / 2;
+        const midLng = (userLL.lng + poiLL.lng) / 2;
+        const midpoint = L.latLng(midLat, midLng);
+
+        // SAFETY FIX: Wrap pixel projection in try-catch
+        // This prevents crashes if the map isn't fully rendered or has 0 size.
+        let paddedCenter = midpoint; // Fallback to midpoint if pixel math fails
+        
+        try {
+            // Replicate the asymmetric padding shift that fitBounds applies.
+            // paddingTopLeft: [64,64], paddingBottomRight: [64,96].
+            // Vertical asymmetry is 32 px; fitBounds shifts the center north by 16 px.
+            const midPx = map.latLngToContainerPoint(midpoint);
+            const shiftedPx = L.point(midPx.x, midPx.y - 16); // 16 px north
+            paddedCenter = map.containerPointToLatLng(shiftedPx);
+        } catch (e) {
+            // Silent fail: keep midpoint as target if pixel projection throws
+            // (Common on init or if map container is hidden)
+        }
+
+        // Linear interpolation: outside = userLL, inside = paddedCenter
+        targetCenter = L.latLng(
+            userLL.lat + zoneFactor * (paddedCenter.lat - userLL.lat),
+            userLL.lng + zoneFactor * (paddedCenter.lng - userLL.lng)
+        );
+    } else if (userLL) {
+        targetCenter = userLL;
+    } else {
+        targetCenter = map.getCenter();
+    }
+
+    /* ── 4. Decide whether to issue a new command ── */
+    const currentZoom = map.getZoom();
+    const zoomDelta = Math.abs(targetZoom - currentZoom);
+    const centerDelta = targetCenter ? map.getCenter().distanceTo(targetCenter) : 0;
+
+    // Use longer throttle while actively transitioning so the animation can finish,
+    // but keep it low enough that the tracking feels glued to the user.
+    const inTransition = zoneFactor > 0.01 && zoneFactor < 0.99;
+    const throttleMs = inTransition ? TRANSITION_THROTTLE_MS : PROX_THROTTLE_MS;
+    const throttleOk = !window._lastProxZoomRequest || (nowMs - window._lastProxZoomRequest) >= throttleMs;
+    const proxZoomBlocked = window._zoomAuthorityThisFrame === true;
+    window._zoomAuthorityThisFrame = false;
+
+    // Avoid restarting an animation for a micro-delta or if already near target.
+    // Thresholds tightened slightly for more responsive continuous tracking.
+    const lastTarget = window._lastProxTarget;
+    const targetChanged = !lastTarget ||
+        Math.abs(targetZoom - lastTarget.zoom) > 0.08 ||
+        (targetCenter && lastTarget.center && targetCenter.distanceTo(lastTarget.center) > 2);
+
+    // Trigger thresholds slightly lowered so small proximity drifts still update the view
+    if ((zoomDelta >= 0.1 || centerDelta > 1.5) && throttleOk && !proxZoomBlocked && targetChanged) {
+        window._lastProxZoomRequest = nowMs;
+        window._lastProxTarget = { zoom: targetZoom, center: targetCenter };
+
+        // Duration: snappier when settled, shorter but still smooth during transitions.
+        // The max cap is lowered so the user never feels "locked out" by a long animation.
+        const isSettled = zoneFactor === 0.0 || zoneFactor === 1.0;
+        const zoomDur = isSettled
+            ? Math.min(1.2, Math.max(0.5, zoomDelta * 0.5))
+            : Math.min(1.8, Math.max(0.6, zoomDelta * 0.55 + centerDelta * 0.012));
+
+        // Single animation primitive for the entire range — no fitBounds / flyTo mismatch
+        map.flyTo(targetCenter, targetZoom, {
+            duration: zoomDur,
+            easeLinearity: zoneFactor > 0.5 ? 0.28 : (eastWestMove ? 0.15 : 0.18)
+        });
+    }
+
+    // Reset tracking when fully outside so the next approach starts fresh
+    if (!isEffectivelyInside) {
+        window._lastProxZoomRequest = null;
+        window._lastProxTarget = null;
     }
 }
 
