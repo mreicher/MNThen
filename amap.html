@@ -4245,7 +4245,7 @@ function _prefetchMapTiles(location, now) {
 
 })();
         
- /* updateUserLocation */
+/* updateUserLocation */
 
 // ─── SIGNALS ───────────────────────────────────────────────────────────────────
 
@@ -4293,14 +4293,13 @@ const C = Object.freeze({
     BOOST_EXIT_PEAK:        1.35,
     BOOST_EXIT_MAX_SF:      0.60,
     BOOST_DURATION_MS:      1500,
-    // Inactivity flyTo tuning
-    RECENTER_MIN_PX:        40,      // skip flyTo if marker already within this many px of center
-    RECENTER_MIN_DUR:       0.6,     // minimum flyTo duration in seconds
-    RECENTER_MAX_DUR:       1.8,     // maximum flyTo duration in seconds
-    RECENTER_PX_PER_SEC:    400,     // px/s — controls how duration scales with distance
-    RECENTER_EASE:          0.15,    // easeLinearity for flyTo
-    RECENTER_GUARD_MS:      2000,    // don't re-center if user interacted within this window
-    RECENTER_ZOOM_THRESH:   0.5      // only change zoom if delta exceeds this
+    RECENTER_MIN_PX:        40,
+    RECENTER_MIN_DUR:       0.6,
+    RECENTER_MAX_DUR:       1.8,
+    RECENTER_PX_PER_SEC:    400,
+    RECENTER_EASE:          0.15,
+    RECENTER_GUARD_MS:      2000,
+    RECENTER_ZOOM_THRESH:   0.5
 });
 
 const ACCEL_REJECT = Object.freeze([
@@ -4388,10 +4387,11 @@ const _TM = (() => {
                 }
             }
             return [
-                `GPS Pipeline v5 (${runs.length} runs)`,
+                `GPS Pipeline v7.1 fixed (${runs.length} runs)`,
                 `Avg: ${avg.toFixed(2)}ms | Last: ${last.total.toFixed(2)}ms`,
                 `Halt: ${last.halt || 'none'} (${last.signal || 'COMPLETE'})`,
                 `Tier: ${last.m.tier || 'n/a'} | Boost: ${last.m.boost?.toFixed(2) || 'n/a'}`,
+                `Interp: ${last.m.interp || 'n/a'}`,
                 ...Object.entries(avgs).map(([n, d]) =>
                     `  ${n}: ${(d.sum / d.n).toFixed(2)}ms max=${d.max.toFixed(2)} (${d.n}x)`)
             ].join('\n');
@@ -4427,11 +4427,12 @@ const _CB = {
 // ─── PURE UTILITIES ────────────────────────────────────────────────────────────
 
 const U = {
-    valid(c)     { return c && Number.isFinite(c.latitude) && Number.isFinite(c.longitude); },
-    hDiff(a, b)  { if (a == null || b == null) return 0; const d = Math.abs(a - b); return d > 180 ? 360 - d : d; },
-    normH(f, t)  { if (f == null || t == null) return t; let d = t - f; if (d > 180) d -= 360; if (d < -180) d += 360; return f + d; },
-    smoothstep(t){ const c = Math.min(1, Math.max(0, t)); return c * c * (3 - 2 * c); },
-    lerp(a, b, t){ return a + (b - a) * t; }
+    valid(c)         { return c && Number.isFinite(c.latitude) && Number.isFinite(c.longitude); },
+    hDiff(a, b)      { if (a == null || b == null) return 0; const d = Math.abs(a - b); return d > 180 ? 360 - d : d; },
+    normH(f, t)      { if (f == null || t == null) return t; let d = t - f; if (d > 180) d -= 360; if (d < -180) d += 360; return f + d; },
+    smoothstep(t)    { const c = Math.min(1, Math.max(0, t)); return c * c * (3 - 2 * c); },
+    lerp(a, b, t)    { return a + (b - a) * t; },
+    clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
 };
 
 function resolveTier(mph) {
@@ -4460,32 +4461,163 @@ function resolveTier(mph) {
     return { p: TIERS[TIERS.length - 1].p, name: TIERS[TIERS.length - 1].name, blend: 1 };
 }
 
+// ─── POSITION INTERPOLATOR ────────────────────────────────────────────────────
+// Runs a rAF loop between GPS fixes to deliver smooth 60fps marker movement.
+// The pipeline remains the authority for all position state; the interpolator
+// only touches the visual marker and never writes to window.lastPosition.
+
+const _interp = {
+    _active:    false,
+    _rafId:     null,
+    _lastFrame: 0,
+    _vLat:  null, _vLng:  null, _vHead: null,
+    _tLat: 0,    _tLng: 0,    _tHead: null,
+    _tSpeed: 0,  _tTime: 0,
+    _velLat: 0,  _velLng: 0,
+
+    // Runtime-configurable thresholds (can be tuned from the console without a deploy)
+    get _minSpeed()  { return window._interpMinSpeed  ?? 1.5;  },
+    get _converge()  { return window._interpConverge  ?? 10.0; },
+    get _headRate()  { return window._interpHeadRate  ?? 6.0;  },
+    get _predSec()   { return window._interpPredSec   ?? 0.35; },
+    get _staleFade() { return window._interpStaleFade ?? 0.4;  },
+    get _staleMax()  { return window._interpStaleMax  ?? 3.0;  },
+
+    // Called by stageVisuals every time a new smoothed position is ready.
+    // velLat/velLng are the pipeline's smoothVel — already computed by stageSmooth,
+    // so this is always called with real velocity, never the zero from _makeCtx.
+    setTarget(lat, lng, heading, speedMPS, velLat, velLng) {
+        const now = performance.now();
+
+        if (this._vLat === null) {
+            this._vLat = lat; this._vLng = lng; this._vHead = heading;
+        }
+
+        if (velLat != null && velLng != null) {
+            // Lower alpha at high speed to prevent GPS jitter swinging the prediction
+            const alpha = speedMPS > 10 ? 0.20 : (speedMPS > 3 ? 0.35 : 0.55);
+            this._velLat = this._velLat * (1 - alpha) + velLat * alpha;
+            this._velLng = this._velLng * (1 - alpha) + velLng * alpha;
+        }
+
+        this._tLat = lat; this._tLng = lng; this._tHead = heading;
+        this._tSpeed = speedMPS; this._tTime = now;
+
+        if (!this._active && speedMPS >= this._minSpeed) this._start();
+    },
+
+    // Hard snap: jump the visual marker immediately and zero internal velocity.
+    // Used on large jumps, GPS recovery, fast-pass, and session gaps.
+    snapTo(lat, lng, heading) {
+        this._vLat = lat; this._vLng = lng;
+        if (heading != null) this._vHead = heading;
+        this._tLat = lat; this._tLng = lng; this._tHead = heading;
+        this._tTime = performance.now();
+        this._velLat = 0; this._velLng = 0;
+        if (userMarker) {
+            try { userMarker.setLatLng([lat, lng]); } catch (_) {}
+        }
+    },
+
+    halt() {
+        this._active = false;
+        if (this._rafId) { cancelAnimationFrame(this._rafId); this._rafId = null; }
+    },
+
+    isActive() { return this._active; },
+
+    _start() {
+        if (this._active) return;
+        this._active = true;
+        // Seed visual position from the live marker so there is no jump on start
+        if (userMarker) {
+            try {
+                const ll = userMarker.getLatLng();
+                if (ll) { this._vLat = ll.lat; this._vLng = ll.lng; }
+            } catch (_) {}
+        }
+        if (this._vLat === null) { this._vLat = this._tLat; this._vLng = this._tLng; }
+        this._lastFrame = performance.now();
+        this._tick();
+    },
+
+    _tick() {
+        if (!this._active) return;
+        const now = performance.now();
+        const dt = Math.min(0.1, (now - this._lastFrame) / 1000);
+        this._lastFrame = now;
+
+        if (this._tSpeed < this._minSpeed * 0.5) { this.halt(); return; }
+
+        const staleSec = (now - this._tTime) / 1000;
+        if (staleSec > this._staleMax) { this.halt(); return; }
+
+        // Fade out the lookahead prediction as the fix ages to prevent drift on stale data
+        const predFade = Math.max(0, 1 - staleSec * this._staleFade);
+        const predSec  = this._predSec * predFade;
+        const goalLat  = this._tLat + this._velLat * predSec;
+        const goalLng  = this._tLng + this._velLng * predSec;
+
+        // Exponential blend toward goal — frame-rate independent
+        const blend    = 1 - Math.exp(-this._converge * dt);
+        this._vLat    += (goalLat - this._vLat) * blend;
+        this._vLng    += (goalLng - this._vLng) * blend;
+
+        // Heading: blend toward target every frame; _tick owns _vHead fully
+        if (this._tHead != null) {
+            if (this._vHead == null) {
+                this._vHead = this._tHead;
+            } else {
+                const hBlend    = 1 - Math.exp(-this._headRate * dt);
+                const targetH   = U.normH(this._vHead, this._tHead);
+                this._vHead    += (targetH - this._vHead) * hBlend;
+            }
+        }
+
+        _interpUpdateMarker(this._vLat, this._vLng, this._vHead);
+
+        this._rafId = requestAnimationFrame(() => this._tick());
+    }
+};
+
+function _interpUpdateMarker(lat, lng, head) {
+    if (!userMarker) return;
+    try {
+        userMarker.setLatLng([lat, lng]);
+        if (head != null) {
+            if (typeof userMarker.setHeading === 'function') {
+                userMarker.setHeading(head);
+            } else if (typeof userMarker.setRotationAngle === 'function') {
+                userMarker.setRotationAngle(head);
+            }
+        }
+    } catch (_) {
+        // Silent fail — interpolator must never crash the pipeline
+    }
+}
+
+// Lifecycle hooks: halt the rAF loop when the page is hidden or unloading
+document.addEventListener('visibilitychange', () => { if (document.hidden) _interp.halt(); });
+window.addEventListener('beforeunload', () => { _interp.halt(); });
+
 // ─── INACTIVITY RE-CENTER ─────────────────────────────────────────────────────
-//
-// Called by whatever inactivity timer implementation exists outside this file.
-// Replaces any map.setView() snap that was previously in _onInactivityTimeout.
-// Exposed on window so the timer callback can call window._onInactivityTimeout()
-// without needing to know about pipeline internals.
-//
-// Pipeline protection: sets window._recentering = true for the duration of the
-// flyTo so stageVisuals skips its map pan logic and doesn't interrupt the animation.
+// Called by the external inactivity timer. Uses flyTo instead of setView so the
+// animation is smooth. Sets window._recentering for the duration so stageVisuals
+// does not interrupt the flyTo with a competing pan.
 
 function _onInactivityTimeout() {
     const pos = window.lastPosition;
     if (!map || !pos) return;
 
-    // Don't fight a recent deliberate pan
     const timeSinceInteraction = Date.now() - (window.lastInteractionTime || 0);
     if (timeSinceInteraction < C.RECENTER_GUARD_MS) return;
 
-    // Don't animate if already centered — no visible benefit, avoids micro-jitter
-    const markerLL = L.latLng(pos.lat, pos.lng);
-    const markerPx = map.latLngToContainerPoint(markerLL);
-    const centerPx = map.latLngToContainerPoint(map.getCenter());
+    const markerLL  = L.latLng(pos.lat, pos.lng);
+    const markerPx  = map.latLngToContainerPoint(markerLL);
+    const centerPx  = map.latLngToContainerPoint(map.getCenter());
     const pixelDist = markerPx.distanceTo(centerPx);
     if (pixelDist < C.RECENTER_MIN_PX) return;
 
-    // Zoom: only change if meaningfully different — pure pan is visually lighter
     const currentZoom = map.getZoom();
     const targetZoom  = (typeof getSpeedBasedZoom === 'function')
         ? getSpeedBasedZoom(pos.speedMPS || 0)
@@ -4494,25 +4626,17 @@ function _onInactivityTimeout() {
         ? targetZoom
         : currentZoom;
 
-    // Duration scales with pixel distance: short trips animate quickly
     const duration = Math.min(C.RECENTER_MAX_DUR,
         Math.max(C.RECENTER_MIN_DUR, pixelDist / C.RECENTER_PX_PER_SEC));
 
-    // Restore follow state
     window.isMapInteracting = false;
     window.followUser       = true;
-
-    // Gate the pipeline so stageVisuals won't pan-interrupt the flyTo
-    window._recentering = true;
+    window._recentering     = true;
 
     map.flyTo([pos.lat, pos.lng], zoom, {
-        animate:       true,
-        duration:      duration,
-        easeLinearity: C.RECENTER_EASE,
-        noMoveStart:   true   // prevents Leaflet firing movestart → isMapInteracting = true
+        animate: true, duration, easeLinearity: C.RECENTER_EASE, noMoveStart: true
     });
 
-    // Release pipeline gate after animation completes + small buffer
     if (window._recenteringTimer) clearTimeout(window._recenteringTimer);
     window._recenteringTimer = setTimeout(() => {
         window._recentering      = false;
@@ -4520,9 +4644,7 @@ function _onInactivityTimeout() {
     }, duration * 1000 + 100);
 }
 
-// Expose so external inactivity timer can call it
 window._onInactivityTimeout = _onInactivityTimeout;
-
 
 // ─── PIPELINE CONTEXT ─────────────────────────────────────────────────────────
 
@@ -4543,7 +4665,8 @@ function _makeCtx(position, forceUpdate) {
         bufferedPos: null, instantVel: { lat: 0, lng: 0 }, smoothVel: { lat: 0, lng: 0 },
         buffer: null,
         finalSF: 0, smoothedPos: null, boost: 1.0,
-        finalDur: 0, finalEase: 0, lookAhead: 0
+        finalDur: 0, finalEase: 0, lookAhead: 0,
+        useInterp: false
     };
 }
 
@@ -4556,7 +4679,7 @@ function _commit(position, time, force, buffer) {
     updateDistanceBox?.(force);
 }
 
-// Debug-only phase assertions — stripped at runtime when _gpsDebug is false
+// Debug-only phase assertions — no-ops when _gpsDebug is false
 function _assertPhase(phase, ctx) {
     if (!window._gpsDebug) return;
     const req = {
@@ -4573,7 +4696,7 @@ function _assertPhase(phase, ctx) {
     }
 }
 
-// PIPELINE STAGES
+// ─── PIPELINE STAGES ──────────────────────────────────────────────────────────
 // Every stage returns { ctx, sig }. No exceptions. No void returns.
 
 function stageValidate(ctx) {
@@ -4651,10 +4774,14 @@ function stageNormalize(ctx) {
         : 0;
 
     if (ctx.timeDelta > C.SESSION_GAP_SEC) {
-        window.positionBuffer    = [];
-        window.smoothedVelocity  = { lat: 0, lng: 0 };
-        window.isStationary      = false;
+        window.positionBuffer      = [];
+        window.smoothedVelocity    = { lat: 0, lng: 0 };
+        window.isStationary        = false;
         window.stationaryStartTime = null;
+        // Hard reset: halt the interpolator and clear its visual state so the
+        // next fix starts fresh rather than trying to blend across a session gap
+        _interp.halt();
+        _interp._vLat = null;
     }
 
     ctx.newPos = {
@@ -4683,9 +4810,9 @@ function stageSpeed(ctx) {
     ctx.emaFast = C.EMA_FAST * reliable + (1 - C.EMA_FAST) * ef;
     ctx.emaSlow = C.EMA_SLOW * reliable + (1 - C.EMA_SLOW) * es;
 
-    ctx.modeMPH      = Math.min(ctx.emaFast * C.MPS_MPH, C.SPEED_CAP_MPH);
-    ctx.displayMPH   = Math.min(ctx.emaSlow * C.MPS_MPH, C.SPEED_CAP_MPH);
-    ctx.speedMPS     = ctx.emaSlow;
+    ctx.modeMPH       = Math.min(ctx.emaFast * C.MPS_MPH, C.SPEED_CAP_MPH);
+    ctx.displayMPH    = Math.min(ctx.emaSlow * C.MPS_MPH, C.SPEED_CAP_MPH);
+    ctx.speedMPS      = ctx.emaSlow;
     ctx.reliableSpeed = reliable;
 
     const high    = SPEED_THRESHOLDS?.HIGH_SPEED ?? 45;
@@ -4706,9 +4833,6 @@ function stageMode(ctx) {
     ctx.modeChanged = ModeManager.update(ctx.rawSpeed * C.MPS_MPH);
     ctx.centered    = ModeManager.isCentered();
 
-    // Movement clears the inactivity re-center; stillness arms it.
-    // The actual timer implementation lives outside this file.
-    // _onInactivityTimeout (defined above) is what fires when it expires.
     if (ctx.displayMPH >= 1.0) _clearInactivityTimer();
     else _startInactivityTimer();
 
@@ -4717,13 +4841,16 @@ function stageMode(ctx) {
 
 function stageGPSRecovery(ctx) {
     if (!window.isGPSSearching) return { ctx, sig: SIG.CONTINUE };
-    window.isGPSSearching        = false;
-    window.positionBuffer        = [ctx.newPos];
-    window.lastVelocity          = { lat: 0, lng: 0 };
-    window.smoothedVelocity      = { lat: 0, lng: 0 };
-    window.isStationary          = false;
-    window.stationaryStartTime   = null;
+    window.isGPSSearching         = false;
+    window.positionBuffer         = [ctx.newPos];
+    window.lastVelocity           = { lat: 0, lng: 0 };
+    window.smoothedVelocity       = { lat: 0, lng: 0 };
+    window.isStationary           = false;
+    window.stationaryStartTime    = null;
     window.stationaryLockPosition = null;
+    // Snap the interpolator to the recovery fix so it doesn't try to blend
+    // from wherever it was before signal loss
+    _interp.snapTo(ctx.lat, ctx.lng, ctx.rawHead);
     hideGPSSearchingState?.();
     return { ctx, sig: SIG.CONTINUE };
 }
@@ -4745,7 +4872,7 @@ function stageProximity(ctx) {
     let cd = Infinity, cl = null;
     const out = [];
     if (Array.isArray(locs) && locs.length) {
-        const R = C.PROX_RADIUS;
+        const R      = C.PROX_RADIUS;
         const latMin = lat - R, latMax = lat + R;
         const lngMin = lng - R, lngMax = lng + R;
         for (const loc of locs) {
@@ -4807,7 +4934,7 @@ function stageMotion(ctx) {
         }
     }
 
-    let vHead    = rawHead;
+    let vHead      = rawHead;
     const lastHead = lastPos.heading ?? null;
     if (lastHead != null && rawHead != null) {
         const fs = (displayMPH < 8) ? 1.5 : C.HEAD_FILT_MPS;
@@ -4818,13 +4945,13 @@ function stageMotion(ctx) {
     const hd    = U.hDiff(vHead, lastHead);
     const df    = hd > C.HEAD_SMOOTH_DEG ? Math.max(0.5, 1 - hd / 240) : 1.0;
 
-    ctx.distance   = dist;
-    ctx.eastWest   = ew;
+    ctx.distance    = dist;
+    ctx.eastWest    = ew;
     ctx.speedFactor = sf;
-    ctx.validHead  = vHead;
+    ctx.validHead   = vHead;
     ctx.displayHead = dHead;
-    ctx.hDiff      = hd;
-    ctx.dirFactor  = df;
+    ctx.hDiff       = hd;
+    ctx.dirFactor   = df;
     return { ctx, sig: SIG.CONTINUE };
 }
 
@@ -4849,6 +4976,8 @@ function stageTier(ctx) {
 function stageLargeJump(ctx) {
     if (ctx.distance > C.LARGE_JUMP_M || ctx.forceUpdate) {
         _handleLargeDistanceJump(ctx.newPos, ctx.currentTime);
+        // Snap the interpolator so it doesn't animate across the jump gap
+        _interp.snapTo(ctx.lat, ctx.lng, ctx.validHead);
         _commit(ctx.newPos, ctx.currentTime, ctx.forceUpdate);
         return { ctx, sig: SIG.HALT };
     }
@@ -4864,6 +4993,7 @@ function stageStationary(ctx) {
 
         if (!window.isStationary && dur >= C.STAT_CONFIRM_MS) {
             _confirmStationary(ctx.newPos, currentTime);
+            _interp.halt();
             _cleanupMarkerStyles?.();
             return { ctx, sig: SIG.HALT };
         }
@@ -4893,7 +5023,12 @@ function stageStationary(ctx) {
         return { ctx, sig: SIG.HALT };
     }
 
-    // Movement confirmed — clear all stationary state
+    // Movement confirmed — clear all stationary state.
+    // FIX 1: The premature velocity seed that was here has been removed.
+    // ctx.instantVel is set by stageSmooth, which runs after this stage,
+    // so reading it here always returned { lat: 0, lng: 0 } from _makeCtx.
+    // The interpolator receives real velocity via setTarget() in stageVisuals,
+    // which is called after stageSmooth has populated ctx.smoothVel.
     window.stationaryStartTime    = null;
     window.isStationary           = false;
     window.stationaryLockPosition = null;
@@ -4941,9 +5076,10 @@ function stageQuality(ctx) {
         return { ctx, sig: SIG.HALT };
     }
 
-    // Fast-pass: large movement or accuracy jump — skip smoothing
+    // Fast-pass: large movement or accuracy jump — skip smoothing pipeline
     if (distance > C.FAST_PASS_M || newPos.accuracy < lastPos.accuracy * C.ACC_IMPROVE) {
         scheduleMarkerUpdate(ctx.lat, ctx.lng);
+        _interp.snapTo(ctx.lat, ctx.lng, ctx.validHead);
         _commit(newPos, ctx.currentTime, forceUpdate, [newPos]);
         return { ctx, sig: SIG.HALT };
     }
@@ -4955,7 +5091,7 @@ function stageSmooth(ctx) {
     const { lat, lng, timeDelta, rawAcc, validHead, speedMPS,
             speedFactor, displayMPH, currentTime, distance, lastPos } = ctx;
 
-    window.lastVelocity    = window.lastVelocity    || { lat: 0, lng: 0 };
+    window.lastVelocity     = window.lastVelocity     || { lat: 0, lng: 0 };
     window.smoothedVelocity = window.smoothedVelocity || { lat: 0, lng: 0 };
 
     const iv = {
@@ -5024,7 +5160,7 @@ function stageSmoothFactor(ctx) {
         ? Math.max(0, 0.04 - hDiff / 200 * 0.06) : 0;
     const sfEW = eastWest ? 0.018 : 0;
 
-    // Mode transition boost — directional, quadratic out easing
+    // Mode transition boost — directional, quadratic-out easing
     let boost = 1.0, maxSF = 0.52;
     let transTime = window._modeTransitionTime || 0;
 
@@ -5091,10 +5227,30 @@ function stageVisuals(ctx) {
             distance, modeChanged, centered, dirFactor, eastWest, bufferedPos,
             lastPos, lookAhead, currentTime } = ctx;
 
-    // ── Marker ────────────────────────────────────────────────────────
-    const opts = { animate: true, duration: finalDur, easeLinearity: finalEase };
-    if (displayHead != null) opts.heading = displayHead;
-    scheduleMarkerUpdate(smoothedPos.lat, smoothedPos.lng, opts);
+    // ── Marker decision ────────────────────────────────────────────────
+    // Interpolator takes over the marker at walking pace and above.
+    // Below that threshold, fall back to scheduleMarkerUpdate so low-speed
+    // micro-corrections still animate correctly.
+    const useInterp = ctx.speedMPS >= _interp._minSpeed;
+
+    if (useInterp) {
+        // Pass smoothVel (set by stageSmooth this frame) as the velocity input.
+        // This is always real velocity — never the zero from _makeCtx — because
+        // stageSmooth runs before stageVisuals in the pipeline.
+        _interp.setTarget(
+            smoothedPos.lat, smoothedPos.lng,
+            displayHead, smoothedPos.speedMPS,
+            ctx.smoothVel.lat, ctx.smoothVel.lng
+        );
+    } else {
+        if (_interp.isActive()) _interp.halt();
+        const opts = { animate: true, duration: finalDur, easeLinearity: finalEase };
+        if (displayHead != null) opts.heading = displayHead;
+        scheduleMarkerUpdate(smoothedPos.lat, smoothedPos.lng, opts);
+    }
+
+    ctx.useInterp = useInterp;
+    _TM.meta('interp', useInterp ? 'ACTIVE' : 'OFF');
 
     // ── Map pan decision ──────────────────────────────────────────────
     const agg = typeof highSpeedAggressiveness === 'function'
@@ -5102,15 +5258,15 @@ function stageVisuals(ctx) {
     let mapDist = speedTier.mapDist * (1 - 0.4 * agg);
     if (eastWest) mapDist *= C.EW_ADJ;
 
-    const high         = SPEED_THRESHOLDS?.HIGH_SPEED ?? 45;
-    const isHighDrift  = distance > 8.0 && modeMPH >= high;
-    const newDrift     = isHighDrift ? (window._driftCounter || 0) + 1 : 0;
+    const high        = SPEED_THRESHOLDS?.HIGH_SPEED ?? 45;
+    const isHighDrift = distance > 8.0 && modeMPH >= high;
+    const newDrift    = isHighDrift ? (window._driftCounter || 0) + 1 : 0;
 
     let interacting = window.isMapInteracting;
     if (interacting && displayMPH > C.MAP_TRAP_MPH &&
         currentTime - (window.lastMapUpdateTime || 0) > C.MAP_TRAP_MS) {
-        interacting        = false;
-        window.followUser  = true;
+        interacting       = false;
+        window.followUser = true;
     }
 
     const shouldMap = !window._recentering && (
@@ -5149,30 +5305,34 @@ function stageVisuals(ctx) {
     _handleProximityZoomLogic(displayMPH, eastWest);
     _enforceViewportSafety?.(displayMPH, userMarker?.getLatLng?.());
 
-    // ── RAF / fallback scheduling ─────────────────────────────────────
-    if (window._nextLocationUpdateRAF) cancelAnimationFrame(window._nextLocationUpdateRAF);
-    window._visualFallbackActive = true;
+    // ── RAF / fallback scheduling (only needed when interpolator is off) ──
+    if (!useInterp) {
+        if (window._nextLocationUpdateRAF) cancelAnimationFrame(window._nextLocationUpdateRAF);
+        window._visualFallbackActive = true;
 
-    window._nextLocationUpdateRAF = requestAnimationFrame(() => {
-        window._visualFallbackActive  = false;
-        window._nextLocationUpdateRAF = null;
-    });
-
-    if (window._visualFallbackTimer) clearTimeout(window._visualFallbackTimer);
-    window._visualFallbackTimer = setTimeout(() => {
-        if (window._visualFallbackActive && window._nextLocationUpdateRAF) {
-            cancelAnimationFrame(window._nextLocationUpdateRAF);
-            window._nextLocationUpdateRAF = null;
+        window._nextLocationUpdateRAF = requestAnimationFrame(() => {
             window._visualFallbackActive  = false;
-        }
-        window._visualFallbackTimer = null;
-    }, C.VISUAL_FB_MS);
+            window._nextLocationUpdateRAF = null;
+        });
+
+        if (window._visualFallbackTimer) clearTimeout(window._visualFallbackTimer);
+        window._visualFallbackTimer = setTimeout(() => {
+            if (window._visualFallbackActive && window._nextLocationUpdateRAF) {
+                cancelAnimationFrame(window._nextLocationUpdateRAF);
+                window._nextLocationUpdateRAF = null;
+                window._visualFallbackActive  = false;
+            }
+            window._visualFallbackTimer = null;
+        }, C.VISUAL_FB_MS);
+    }
 
     // ── Synchronous state commit ──────────────────────────────────────
+    // window.lastPosition always holds the pipeline's smoothedPos.
+    // The interpolator is purely visual and never writes here.
     window.lastPosition        = smoothedPos;
     window.lastVelocity        = ctx.instantVel;
     window.lastUpdateTime      = currentTime;
-    window.lastUpdateTimestamp  = currentTime;
+    window.lastUpdateTimestamp = currentTime;
     window.positionBuffer      = ctx.buffer;
     window.smoothedVelocity    = ctx.smoothVel;
     window._emaSpeedFast       = ctx.emaFast;
@@ -5210,7 +5370,8 @@ function _run(name, fn, ctx, optional = false) {
     }
 }
 
-// MAIN PIPELINE
+// ─── MAIN PIPELINE ────────────────────────────────────────────────────────────
+
 function updateUserLocation(position, forceUpdate = false) {
     _TM.start(forceUpdate);
     let ctx = _makeCtx(position, forceUpdate);
@@ -5308,6 +5469,7 @@ function updateUserLocation(position, forceUpdate = false) {
         if (window._nextLocationUpdateRAF) cancelAnimationFrame(window._nextLocationUpdateRAF);
         if (window._visualFallbackTimer)   clearTimeout(window._visualFallbackTimer);
         window._visualFallbackActive = false;
+        _interp.halt();
         scheduleMarkerUpdate(ctx.lat, ctx.lng, { animate: true, duration: 0.6, easeLinearity: 0.10 });
         _commit(ctx.newPos, ctx.currentTime, ctx.forceUpdate, ctx.newPos ? [ctx.newPos] : []);
         _TM.end('phase5', 'ERROR');
