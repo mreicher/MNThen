@@ -4891,34 +4891,41 @@ function stageProximity(ctx) {
         Math.abs(lng - lastPos.lng) > 1e-7
     );
 
+    let cd, cl, out;
+
     if (!changed && window._lastClosestDistance !== undefined && window._lastClosestLocation) {
-        ctx.closestDist = window._lastClosestDistance;
-        ctx.closestLoc  = window._lastClosestLocation;
-        return { ctx, sig: SIG.CONTINUE };
+        cd  = window._lastClosestDistance;
+        cl  = window._lastClosestLocation;
+        out = window._lastLocsWithDist || [];
+    } else {
+        cd = Infinity; cl = null; out = [];
+        if (Array.isArray(locs) && locs.length) {
+            const R      = C.PROX_RADIUS;
+            const latMin = lat - R, latMax = lat + R;
+            const lngMin = lng - R, lngMax = lng + R;
+            for (const loc of locs) {
+                if (!loc?.lat) continue;
+                if (loc.lat < latMin || loc.lat > latMax ||
+                    loc.lng < lngMin || loc.lng > lngMax) continue;
+                const d = calculateDistance(newPos, loc);
+                out.push({ location: loc, distance: d });
+                if (d < cd) { cd = d; cl = loc; }
+            }
+        }
+        window._lastClosestDistance = cd;
+        window._lastClosestLocation = cl;
+        window._lastLocsWithDist    = out;
     }
 
-    let cd = Infinity, cl = null;
-    const out = [];
-    if (Array.isArray(locs) && locs.length) {
-        const R      = C.PROX_RADIUS;
-        const latMin = lat - R, latMax = lat + R;
-        const lngMin = lng - R, lngMax = lng + R;
-        for (const loc of locs) {
-            if (!loc?.lat) continue;
-            if (loc.lat < latMin || loc.lat > latMax || loc.lng < lngMin || loc.lng > lngMax) continue;
-            const d = calculateDistance(newPos, loc);
-            out.push({ location: loc, distance: d });
-            if (d < cd) { cd = d; cl = loc; }
-        }
-    }
-    window._lastClosestDistance = cd;
-    window._lastClosestLocation = cl;
     ctx.closestDist  = cd;
     ctx.closestLoc   = cl;
     ctx.locsWithDist = out;
+
+    // ── ALWAYS write a fresh proximityState so zoom logic has current data ──
     window.proximityState = (cl && cd !== Infinity)
         ? { closestLocation: cl, distanceMeters: cd }
         : null;
+
     return { ctx, sig: SIG.CONTINUE };
 }
 
@@ -5286,7 +5293,7 @@ function stageVisuals(ctx) {
     ctx.useInterp = useInterp;
     _TM.meta('interp', useInterp ? 'ACTIVE' : 'OFF');
 
-    // ── Map pan decision ──────────────────────────────────────────────
+    // ── Pre-compute map motion metrics ─────────────────────────────────
     const agg = typeof highSpeedAggressiveness === 'function'
         ? Math.max(0.1, highSpeedAggressiveness(displayMPH)) : 0.5;
     let mapDist = speedTier.mapDist * (1 - 0.4 * agg);
@@ -5303,58 +5310,46 @@ function stageVisuals(ctx) {
         window.followUser = true;
     }
 
-    const shouldMap = !window._recentering && (
-        (modeChanged && centered) ||
-        (currentTime - (window.lastMapUpdateTime || 0)) > speedTier.mapInt ||
-        distance > mapDist ||
-        newDrift >= 2
-    );
+    // ── AUTHORITY FIRST: Proximity zoom ────────────────────────────────
+    // If this triggers a zoom animation, we MUST NOT run normal pan logic
+    // in the same frame or the animations will cancel each other.
+    const proxAnimated = _handleProximityZoomLogic(displayMPH, eastWest);
 
-    if (shouldMap && map) {
-        const laPos = {
-            lat: smoothedPos.lat + (bufferedPos.lat - lastPos.lat) * lookAhead,
-            lng: smoothedPos.lng + (bufferedPos.lng - lastPos.lng) * lookAhead
-        };
-        const bounds = map.getBounds?.();
+    // ── Normal map pan (defers to proximity zoom) ─────────────────────
+    if (!proxAnimated && !window._proxZoomAnimating && !window._recentering) {
+        const shouldMap = (modeChanged && centered) ||
+            (currentTime - (window.lastMapUpdateTime || 0)) > speedTier.mapInt ||
+            distance > mapDist ||
+            newDrift >= 2;
 
-        if (bounds && !interacting && window.followUser) {
-            // v10.0 Critical Fix: If a proximity zoom animation is currently running,
-            // skip ALL map panning to prevent overriding the flyTo zoom animation.
-            if (window._proxZoomAnimating) {
-                // Let the proximity flyTo handle both center and zoom undisturbed.
-            } 
-            // v10.0 Fix: When inside the proximity zone, the map pan must NOT 
-            // call flyTo() with a speed-based zoom, or it creates a perpetual
-            // oscillation. Use panTo() to preserve the proximity zoom level.
-            else if (window._inProximityZone) {
-                map.panTo([laPos.lat, laPos.lng], {
-                    animate: true,
-                    duration: Math.max(0.1, speedTier.panDur),
-                    easeLinearity: speedTier.easeLin
-                });
-            } 
-            else if (centered) {
-                const mLL  = L.latLng(smoothedPos.lat, smoothedPos.lng);
-                const ms   = map.getSize();
-                const mp   = map.latLngToContainerPoint(mLL);
-                const ep   = Math.max(60, ms.x * 0.18);
-                const epY  = Math.max(80, ms.y * 0.20);
-                const near = mp.x < ep || mp.x > (ms.x - ep) ||
-                             mp.y < epY || mp.y > (ms.y - epY);
-                if ((modeChanged && centered) || near || newDrift >= 2) {
-                    _panMapToCenter(laPos, speedTier, dirFactor, eastWest, displayMPH, lookAhead);
+        if (shouldMap && map) {
+            const laPos = {
+                lat: smoothedPos.lat + (bufferedPos.lat - lastPos.lat) * lookAhead,
+                lng: smoothedPos.lng + (bufferedPos.lng - lastPos.lng) * lookAhead
+            };
+            const bounds = map.getBounds?.();
+
+            if (bounds && !interacting && window.followUser) {
+                if (centered) {
+                    const mLL  = L.latLng(smoothedPos.lat, smoothedPos.lng);
+                    const ms   = map.getSize();
+                    const mp   = map.latLngToContainerPoint(mLL);
+                    const ep   = Math.max(60, ms.x * 0.18);
+                    const epY  = Math.max(80, ms.y * 0.20);
+                    const near = mp.x < ep || mp.x > (ms.x - ep) ||
+                                 mp.y < epY || mp.y > (ms.y - epY);
+                    if ((modeChanged && centered) || near || newDrift >= 2) {
+                        _panMapToCenter(laPos, speedTier, dirFactor, eastWest, displayMPH, lookAhead);
+                    }
+                } else if (_isNearViewportEdge(smoothedPos, bounds, displayMPH)) {
+                    _panMapIfNearEdge(laPos, speedTier, dirFactor, eastWest, bounds, displayMPH);
                 }
-            } else if (_isNearViewportEdge(smoothedPos, bounds, displayMPH)) {
-                _panMapIfNearEdge(laPos, speedTier, dirFactor, eastWest, bounds, displayMPH);
             }
+            window.lastMapUpdateTime = currentTime;
         }
-        window.lastMapUpdateTime = currentTime;
     }
 
     _enforceViewportSafety?.(displayMPH, userMarker?.getLatLng?.());
-
-    // v10.0 Fix: Proximity zoom logic must run after map pan logic so it is not overridden.
-    _handleProximityZoomLogic(displayMPH, eastWest);
 
     // ── RAF / fallback scheduling (only when interpolator is off) ─────
     if (!useInterp) {
@@ -5526,98 +5521,126 @@ function updateUserLocation(position, forceUpdate = false) {
 // ─── PROXIMITY ZOOM LOGIC ─────────────────────────────────────────────────────
 /* Extracted for clarity. Handles zoom-in when approaching a POI and zoom-out when leaving. */
 function _handleProximityZoomLogic(speedMPH, eastWestMove) {
-    // distances in meters (Leaflet default) — 13.716m ≈ 45 ft
-    const PROX_NEAR_M = 13.716;       // 45 ft  → full zoom 19
-    const PROX_FAR_M = 21.336;        // 70 ft  → zone entry
+    const PROX_NEAR_M     = 13.716;   // 45 ft  → zoom 19
+    const PROX_FAR_M      = 21.336;   // 70 ft  → zone entry
     const PROX_EXIT_FAR_M = 24.384;   // 80 ft  → zone exit (hysteresis)
-    const PROX_ZOOM_IN = 19;
-    const PROX_ZOOM_OUT = 17;
+    const PROX_ZOOM_IN    = 19;
+    const PROX_ZOOM_OUT   = 17;
     const PROX_THROTTLE_MS = 250;
 
-    if (!window.proximityState || !map || window.isMapInteracting) {
-        // If we are no longer in proximity state, but an exit zoom animation is
-        // still running, preserve it so it isn't abruptly overridden.
-        if (!window._proxZoomAnimating && window._inProximityZone) {
+    if (!map) return false;
+
+    // ── No proximity data: exit if we were in the zone ─────────────────
+    if (!window.proximityState) {
+        if (window._inProximityZone && !window._proxZoomAnimating) {
             window._inProximityZone = false;
-        }
-        if (typeof _handleProximityZoom === 'function') {
-            _handleProximityZoom(speedMPH, eastWestMove);
-        }
-        return;
-    }
-
-    const distM = window.proximityState.distanceMeters;
-
-    if (distM <= PROX_FAR_M) {
-        const t = Math.max(0, Math.min(1, (distM - PROX_NEAR_M) / (PROX_FAR_M - PROX_NEAR_M)));
-        const targetZoom = PROX_ZOOM_IN + t * (PROX_ZOOM_OUT - PROX_ZOOM_IN);
-        const currentZoom = map.getZoom();
-        const zoomDelta = Math.abs(targetZoom - currentZoom);
-        const nowMs = Date.now();
-        const throttleOk = !window._lastProxZoomRequest || (nowMs - window._lastProxZoomRequest) >= PROX_THROTTLE_MS;
-
-        if (zoomDelta >= 0.15 && throttleOk) {
-            window._lastProxZoomRequest = nowMs;
-            const zoomDur = Math.min(2.0, Math.max(0.6, zoomDelta * 0.55));
-            const userLL = userMarker?.getLatLng?.();
-            const proxLoc = window.proximityState.closestLocation;
-            const poiLL = (proxLoc?.lat != null && proxLoc?.lng != null)
-                ? L.latLng(proxLoc.lat, proxLoc.lng)
-                : null;
-
-            // Frame BOTH user + POI so context is visible
-            if (userLL && poiLL) {
-                map.fitBounds(L.latLngBounds([userLL, poiLL]), {
-                    paddingTopLeft: L.point(64, 64),
-                    paddingBottomRight: L.point(64, 96),
-                    animate: true,
-                    duration: zoomDur,
-                    maxZoom: PROX_ZOOM_IN // Cap zoom level so it doesn't over-zoom
-                });
-            } else if (userLL) {
-                map.flyTo(userLL, targetZoom, { duration: zoomDur, easeLinearity: 0.25 });
-            }
-
-            // v10.0 Fix: Set animation guard to stop map pan from cancelling this fitBounds/flyTo
-            window._proxZoomAnimating = true;
-            if (window._proxZoomAnimTimer) clearTimeout(window._proxZoomAnimTimer);
-            window._proxZoomAnimTimer = setTimeout(() => {
-                window._proxZoomAnimating = false;
-                window._proxZoomAnimTimer = null;
-            }, zoomDur * 1000 + 50); // Duration + small buffer
-        }
-        window._inProximityZone = true;
-
-    } else if (distM >= PROX_EXIT_FAR_M && window._inProximityZone) {
-        const currentZoom = map.getZoom();
-        const exitDelta = Math.abs(currentZoom - PROX_ZOOM_OUT);
-
-        if (exitDelta >= 0.15) {
-            const exitDur = Math.min(2.0, Math.max(0.6, exitDelta * 0.55));
-            const userLL = userMarker?.getLatLng?.();
-
-            if (userLL) {
-                map.flyTo(userLL, PROX_ZOOM_OUT, {
+            const currentZoom = map.getZoom();
+            const exitDelta   = Math.abs(currentZoom - PROX_ZOOM_OUT);
+            if (exitDelta >= 0.15) {
+                const exitDur = Math.min(2.0, Math.max(0.6, exitDelta * 0.55));
+                const userLL  = userMarker?.getLatLng?.();
+                const target  = userLL || map.getCenter();
+                map.flyTo(target, PROX_ZOOM_OUT, {
                     duration: exitDur,
                     easeLinearity: eastWestMove ? 0.13 : 0.15
                 });
-            } else {
-                map.flyTo(map.getCenter(), PROX_ZOOM_OUT, { duration: exitDur, easeLinearity: 0.15 });
+                _setProxZoomGuard(exitDur);
+                return true;
             }
-
-            // v10.0 Fix: Set animation guard for the exit zoom out
-            window._proxZoomAnimating = true;
-            if (window._proxZoomAnimTimer) clearTimeout(window._proxZoomAnimTimer);
-            window._proxZoomAnimTimer = setTimeout(() => {
-                window._proxZoomAnimating = false;
-                window._proxZoomAnimTimer = null;
-            }, exitDur * 1000 + 50);
+            window._lastProxZoomRequest = null;
         }
-        window._inProximityZone = false;
-        window._lastProxZoomRequest = null;
+        return false;
     }
+
+    const distM = window.proximityState.distanceMeters;
+    let didAnimate = false;
+
+    // ── Zone entry / in-zone ───────────────────────────────────────────
+    if (distM <= PROX_FAR_M) {
+        const t = Math.max(0, Math.min(1,
+                       (distM - PROX_NEAR_M) / (PROX_FAR_M - PROX_NEAR_M)));
+        const targetZoom  = PROX_ZOOM_IN + t * (PROX_ZOOM_OUT - PROX_ZOOM_IN);
+        const currentZoom = map.getZoom();
+        const zoomDelta   = Math.abs(targetZoom - currentZoom);
+        const nowMs       = Date.now();
+        const throttleOk  = !window._lastProxZoomRequest ||
+                            (nowMs - window._lastProxZoomRequest) >= PROX_THROTTLE_MS;
+
+        if (zoomDelta >= 0.15 && throttleOk && !window._proxZoomAnimating) {
+            window._lastProxZoomRequest = nowMs;
+            const zoomDur = Math.min(2.0, Math.max(0.6, zoomDelta * 0.55));
+            const userLL  = userMarker?.getLatLng?.();
+            const proxLoc = window.proximityState.closestLocation;
+            const poiLL   = (proxLoc?.lat != null && proxLoc?.lng != null)
+                ? L.latLng(proxLoc.lat, proxLoc.lng)
+                : null;
+
+            if (userLL && poiLL) {
+                map.fitBounds(
+                    L.latLngBounds([userLL, poiLL]),
+                    {
+                        paddingTopLeft:     L.point(64, 64),
+                        paddingBottomRight: L.point(64, 96),
+                        animate:  true,
+                        duration: zoomDur,
+                        maxZoom:  PROX_ZOOM_IN
+                    }
+                );
+                _setProxZoomGuard(zoomDur);
+                didAnimate = true;
+            } else if (userLL) {
+                map.flyTo(userLL, targetZoom, {
+                    duration: zoomDur,
+                    easeLinearity: 0.25
+                });
+                _setProxZoomGuard(zoomDur);
+                didAnimate = true;
+            } else if (proxLoc?.lat != null && proxLoc?.lng != null) {
+                map.flyTo([proxLoc.lat, proxLoc.lng], targetZoom, {
+                    duration: zoomDur,
+                    easeLinearity: 0.25
+                });
+                _setProxZoomGuard(zoomDur);
+                didAnimate = true;
+            }
+        }   // ← closes if (zoomDelta >= 0.15 ...)
+
+        window._inProximityZone = true;
+
+    // ── Zone exit (hysteresis) ─────────────────────────────────────────
+    } else if (distM >= PROX_EXIT_FAR_M && window._inProximityZone) {
+        window._inProximityZone     = false;
+        window._lastProxZoomRequest = null;
+
+        if (!window._proxZoomAnimating) {
+            const currentZoom = map.getZoom();
+            const exitDelta   = Math.abs(currentZoom - PROX_ZOOM_OUT);
+            if (exitDelta >= 0.15) {
+                const exitDur = Math.min(2.0, Math.max(0.6, exitDelta * 0.55));
+                const userLL  = userMarker?.getLatLng?.();
+                const target  = userLL || map.getCenter();
+                map.flyTo(target, PROX_ZOOM_OUT, {
+                    duration:     exitDur,
+                    easeLinearity: eastWestMove ? 0.13 : 0.15
+                });
+                _setProxZoomGuard(exitDur);
+                didAnimate = true;
+            }
+        }
+    }
+
+    return didAnimate;
 }
         
+function _setProxZoomGuard(durationSec) {
+    window._proxZoomAnimating = true;
+    if (window._proxZoomAnimTimer) clearTimeout(window._proxZoomAnimTimer);
+    window._proxZoomAnimTimer = setTimeout(() => {
+        window._proxZoomAnimating = false;
+        window._proxZoomAnimTimer = null;
+    }, durationSec * 1000 + 75);
+}
+       
 /* Calculates a new map center in roaming mode when user approaches viewport edge. */
 function _calculateRoamingTarget(userPos, bounds, speedMPH) {
     const currentCenter = map.getCenter();
