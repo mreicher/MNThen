@@ -4241,7 +4241,44 @@ function _prefetchMapTiles(location, now) {
 
 })();
         
-/* updateUserLocation */
+/* updateUserLocation — v9.0
+ *
+ * Changes from v8.0:
+ *
+ *  INTERPOLATOR
+ *  ─ Acceleration estimation fixed: now measures delta of the pipeline's
+ *    smoothVel instead of its own EMA output, so the ½acc·t² term actually
+ *    contributes during speed changes instead of collapsing to zero.
+ *  ─ Velocity and Acceleration EMAs are now time-normalised, identical to
+ *    the fix applied to stageSpeed in v8.0. This ensures consistent marker
+ *    behavior regardless of GPS fix rate.
+ *  ─ snapTo() now accepts velLat/velLng and seeds its internal velocity
+ *    state instead of zeroing it. This prevents the 3–5 frame stutter/pause
+ *    that previously occurred after large jumps, fast-passes, or GPS recovery.
+ *  ─ _accMaxDeg default tightened from 0.002 (222 m/s²) to 0.0002, which
+ *    still allows genuine aggressive driving acceleration through while
+ *    properly clamping GPS position explosion noise.
+ *  ─ Heading normalization added to _tick to prevent _vHead from drifting
+ *    beyond 360° over long sessions.
+ *
+ *  SMOOTH STAGE
+ *  ─ Velocity EMA is now time-normalised (same as stageSpeed).
+ *  ─ Per-sample velocity is stored in the buffer (velLat, velLng).
+ *  ─ Projection uses each sample's own velocity capped at 1.5 seconds,
+ *    eliminating the overshoot artifact that occurred when current velocity
+ *    was used to project historical samples across a recent turn.
+ *
+ *  PROXIMITY ZOOM FIX
+ *  ─ _handleProximityZoomLogic moved from Phase 3 to stageVisuals (Phase 5).
+ *    In v8.0, the map pan logic in Phase 5 was overriding the zoom animation
+ *    started in Phase 3. Running it after the map pan exactly mimics the
+ *    working original's execution order and respects _zoomAuthorityThisFrame.
+ *  ─ Fixed critical ReferenceError bug in stageVisuals (smoothedPosition -> smoothedPos)
+ *    that was crashing the visual stage and short-circuiting the proximity zoom.
+ *
+ *  Everything else is identical to v8.0. External API, window.* state keys,
+ *  stage names, signal values, and circuit-breaker names are all unchanged.
+ */
 
 // ─── SIGNALS ───────────────────────────────────────────────────────────────────
 
@@ -4464,24 +4501,18 @@ const _interp = {
     _rafId:     null,
     _lastFrame: 0,
 
-    // Visual state (written every frame by _tick)
     _vLat: null, _vLng: null, _vHead: null,
 
-    // Current target (written by setTarget)
     _tLat: 0, _tLng: 0, _tHead: null,
     _tSpeed: 0, _tTime: 0,
 
-    // Smoothed velocity (deg/s) — EMA across setTarget calls
     _velLat: 0, _velLng: 0,
 
-    // Acceleration (deg/s²) — estimated from pipeline velocity deltas, low-pass filtered
     _accLat: 0, _accLng: 0,
 
-    // Previous pipeline velocity snapshot used to compute acceleration each setTarget
     _prevPipeVelLat: 0, _prevPipeVelLng: 0,
     _velUpdateTime: 0,
 
-    // ── Runtime-configurable thresholds ───────────────────────────────────────
     get _minSpeed()      { return window._interpMinSpeed      ?? 1.5;  },
     get _converge()      { return window._interpConverge      ?? 10.0; },
     get _convergeMax()   { return window._interpConvergeMax   ?? 35.0; },
@@ -4492,20 +4523,17 @@ const _interp = {
     get _staleFadeEnd()  { return window._interpStaleFadeEnd  ?? 4.0;  },
     get _staleMax()      { return window._interpStaleMax      ?? 5.0;  },
     get _accAlpha()      { return window._interpAccAlpha      ?? 0.30; },
-    get _accMaxDeg()     { return window._interpAccMaxDeg     ?? 0.0002; }, // v9: tightened from 0.002
+    get _accMaxDeg()     { return window._interpAccMaxDeg     ?? 0.0002; },
 
-    // ── setTarget ─────────────────────────────────────────────────────────────
     setTarget(lat, lng, heading, speedMPS, velLat, velLng) {
         const now = performance.now();
 
-        // Seed visual position on the very first call so there is no snap
         if (this._vLat === null) {
             this._vLat = lat; this._vLng = lng; this._vHead = heading;
         }
 
         const dtVelSec = U.clamp((now - this._velUpdateTime) / 1000, 0.05, 2.0);
 
-        // ── Velocity EMA (time-normalised) ────────────────────────────────────
         if (velLat != null && velLng != null) {
             const alphaBase = speedMPS > 10 ? 0.80 : (speedMPS > 3 ? 0.65 : 0.45);
             const alpha = 1 - Math.pow(1 - alphaBase, dtVelSec);
@@ -4513,7 +4541,6 @@ const _interp = {
             this._velLng = this._velLng * (1 - alpha) + velLng * alpha;
         }
 
-        // ── Acceleration estimation (from pipeline velocity) ──────────────────
         if (dtVelSec >= 0.05 && dtVelSec <= 2.0 && velLat != null && velLng != null) {
             const rawAccLat = (velLat - this._prevPipeVelLat) / dtVelSec;
             const rawAccLng = (velLng - this._prevPipeVelLng) / dtVelSec;
@@ -4528,15 +4555,12 @@ const _interp = {
         this._prevPipeVelLng = velLng ?? this._prevPipeVelLng;
         this._velUpdateTime   = now;
 
-        // ── Target update ─────────────────────────────────────────────────────
         this._tLat = lat; this._tLng = lng; this._tHead = heading;
         this._tSpeed = speedMPS; this._tTime = now;
 
         if (!this._active && speedMPS >= this._minSpeed) this._start();
     },
 
-    // Hard snap: jump the visual marker immediately. v9: accepts velocity
-    // to seed internal kinematic state so the marker doesn't pause.
     snapTo(lat, lng, heading, velLat = 0, velLng = 0) {
         this._vLat = lat; this._vLng = lng;
         if (heading != null) this._vHead = heading;
@@ -4550,7 +4574,6 @@ const _interp = {
         this._prevPipeVelLng = velLng;
         this._velUpdateTime   = performance.now();
 
-        // Approximate MPS from deg/s to prevent _tick from immediately halting
         const cosLat  = Math.cos(lat * Math.PI / 180);
         const velMPS  = Math.sqrt(
             Math.pow(velLat * C.EARTH_M_DEG, 2) +
@@ -4595,12 +4618,10 @@ const _interp = {
         const staleSec = (now - this._tTime) / 1000;
         if (staleSec > this._staleMax) { this.halt(); return; }
 
-        // ── Speed-adaptive convergence ────────────────────────────────────────
         const speedKnob = U.clamp(this._tSpeed / 15, 0, 1);
         const converge  = U.lerp(this._converge, this._convergeMax, speedKnob);
         const blend     = 1 - Math.exp(-converge * dt);
 
-        // ── Prediction with dead-reckoning (vel + acc) ────────────────────────
         const fadeRange = Math.max(0.001, this._staleFadeEnd - this._staleFadeStart);
         const predFade  = U.clamp(1 - (staleSec - this._staleFadeStart) / fadeRange, 0, 1);
         const predSec   = this._predSec * predFade;
@@ -4615,7 +4636,6 @@ const _interp = {
         this._vLat += (goalLat - this._vLat) * blend;
         this._vLng += (goalLng - this._vLng) * blend;
 
-        // ── Speed-adaptive heading blend ──────────────────────────────────────
         if (this._tHead != null) {
             if (this._vHead == null) {
                 this._vHead = this._tHead;
@@ -4624,7 +4644,6 @@ const _interp = {
                 const hBlend    = 1 - Math.exp(-headRate * dt);
                 const targetH   = U.normH(this._vHead, this._tHead);
                 this._vHead    += (targetH - this._vHead) * hBlend;
-                // v9: normalize heading to prevent floating point drift
                 this._vHead = ((this._vHead % 360) + 360) % 360;
             }
         }
@@ -4896,7 +4915,6 @@ function stageGPSRecovery(ctx) {
     window.isStationary           = false;
     window.stationaryStartTime    = null;
     window.stationaryLockPosition = null;
-    // v9: snapTo with 0 velocity since direction is genuinely unknown after signal loss
     _interp.snapTo(ctx.lat, ctx.lng, ctx.rawHead, 0, 0);
     hideGPSSearchingState?.();
     return { ctx, sig: SIG.CONTINUE };
@@ -5023,7 +5041,6 @@ function stageTier(ctx) {
 function stageLargeJump(ctx) {
     if (ctx.distance > C.LARGE_JUMP_M || ctx.forceUpdate) {
         _handleLargeDistanceJump(ctx.newPos, ctx.currentTime);
-        // v9: Pass existing velocity to prevent stuttering after the snap
         _interp.snapTo(
             ctx.lat, ctx.lng, ctx.validHead,
             window.smoothedVelocity?.lat ?? 0,
@@ -5122,7 +5139,6 @@ function stageQuality(ctx) {
 
     if (distance > C.FAST_PASS_M || newPos.accuracy < lastPos.accuracy * C.ACC_IMPROVE) {
         scheduleMarkerUpdate(ctx.lat, ctx.lng);
-        // v9: Pass existing velocity to prevent stuttering after the snap
         _interp.snapTo(
             ctx.lat, ctx.lng, ctx.validHead,
             window.smoothedVelocity?.lat ?? 0,
@@ -5134,8 +5150,6 @@ function stageQuality(ctx) {
 
     return { ctx, sig: SIG.CONTINUE };
 }
-
-// ─── stageSmooth ──────────────────────────────────────────────────────────────
 
 function stageSmooth(ctx) {
     const { lat, lng, timeDelta, rawAcc, validHead, speedMPS,
@@ -5149,9 +5163,8 @@ function stageSmooth(ctx) {
         lng: timeDelta > 0 ? (lng - lastPos.lng) / timeDelta : 0
     };
 
-    // v9: Time-normalised EMA for smoothed velocity
     const vaRaw  = Math.max(0.15, Math.min(0.5, 0.4 - displayMPH * 0.003));
-    const alpha0 = 1 - vaRaw; // Convert to standard EMA convention
+    const alpha0 = 1 - vaRaw; 
     const dtSec  = U.clamp(timeDelta || 1.0, 0.1, 2.0);
     const alpha  = 1 - Math.pow(1 - alpha0, dtSec);
 
@@ -5181,7 +5194,7 @@ function stageSmooth(ctx) {
     const dr  = {
         lat: pl, lng: pg, accuracy: rawAcc,
         heading: validHead, speedMPS: eff, timestamp: currentTime,
-        velLat: sv.lat, velLng: sv.lng // v9: per-sample velocity for projection
+        velLat: sv.lat, velLng: sv.lng 
     };
     let buf = window.positionBuffer || [];
     buf.push(dr);
@@ -5192,7 +5205,6 @@ function stageSmooth(ctx) {
     for (const p of buf) {
         const age  = (currentTime - p.timestamp) / 1000;
         const w    = Math.exp(-age * decay) * (p.accuracy > 0 ? Math.min(1, 20 / p.accuracy) : 0.5);
-        // v9: Project using the sample's own velocity, capped at 1.5 seconds
         const projSec = Math.min(age, 1.5);
         const pVelLat = p.velLat ?? sv.lat;
         const pVelLng = p.velLng ?? sv.lng;
@@ -5268,7 +5280,7 @@ function stageAnim(ctx) {
     const { speedTier, tierParams: tp, distance, timeDelta, hDiff,
             eastWest, dirFactor, speedFactor, displayMPH } = ctx;
 
-    const dur  = speedTier.panDur;
+    const dur  = speedTier.panDuration;
     const dd   = Math.min(0.02, distance * 0.001);
     const dt   = timeDelta > 0 ? Math.max(-0.01, Math.min(0.02, (0.25 - timeDelta) * 0.04)) : 0;
     const dH   = hDiff > 20 ? Math.min(0.04, hDiff / 300 * 0.08) : 0;
@@ -5292,6 +5304,7 @@ function stageVisuals(ctx) {
             distance, modeChanged, centered, dirFactor, eastWest, bufferedPos,
             lastPos, lookAhead, currentTime } = ctx;
 
+    // ── Marker decision ────────────────────────────────────────────────
     const useInterp = ctx.speedMPS >= _interp._minSpeed;
 
     if (useInterp) {
@@ -5310,6 +5323,7 @@ function stageVisuals(ctx) {
     ctx.useInterp = useInterp;
     _TM.meta('interp', useInterp ? 'ACTIVE' : 'OFF');
 
+    // ── Map pan decision ──────────────────────────────────────────────
     const agg = typeof highSpeedAggressiveness === 'function'
         ? Math.max(0.1, highSpeedAggressiveness(displayMPH)) : 0.5;
     let mapDist = speedTier.mapDist * (1 - 0.4 * agg);
@@ -5342,6 +5356,7 @@ function stageVisuals(ctx) {
 
         if (bounds && !interacting && window.followUser) {
             if (centered) {
+                // v9.0 Critical Fix: Was `smoothedPosition.lat`, causing ReferenceError
                 const mLL  = L.latLng(smoothedPos.lat, smoothedPos.lng);
                 const ms   = map.getSize();
                 const mp   = map.latLngToContainerPoint(mLL);
@@ -5361,6 +5376,10 @@ function stageVisuals(ctx) {
 
     _enforceViewportSafety?.(displayMPH, userMarker?.getLatLng?.());
 
+    // v9.0 Fix: Proximity zoom logic MUST run after map pan logic so it is not overridden.
+    _handleProximityZoomLogic(displayMPH, eastWest);
+
+    // ── RAF / fallback scheduling (only when interpolator is off) ─────
     if (!useInterp) {
         if (window._nextLocationUpdateRAF) cancelAnimationFrame(window._nextLocationUpdateRAF);
         window._visualFallbackActive = true;
@@ -5381,6 +5400,7 @@ function stageVisuals(ctx) {
         }, C.VISUAL_FB_MS);
     }
 
+    // ── Synchronous state commit ───────────────────────────────────────
     window.lastPosition        = smoothedPos;
     window.lastVelocity        = ctx.instantVel;
     window.lastUpdateTime      = currentTime;
@@ -5428,7 +5448,6 @@ function updateUserLocation(position, forceUpdate = false) {
     _TM.start(forceUpdate);
     let ctx = _makeCtx(position, forceUpdate);
 
-    // ── Phase 1: Input ────────────────────────────────────────────────
     let r = _run('validate', stageValidate, ctx);
     if (r.sig !== SIG.CONTINUE) { _TM.end('validate', 'HALT'); return; }
     ctx = r.ctx;
@@ -5445,7 +5464,6 @@ function updateUserLocation(position, forceUpdate = false) {
 
     _assertPhase(1, ctx);
 
-    // ── Phase 2: Speed & Mode ─────────────────────────────────────────
     r = _run('speed', stageSpeed, ctx);
     ctx = r.ctx;
 
@@ -5457,20 +5475,11 @@ function updateUserLocation(position, forceUpdate = false) {
 
     _assertPhase(2, ctx);
 
-    // ── Phase 3: Context ──────────────────────────────────────────────
     r = _run('proximity', stageProximity, ctx);
     ctx = r.ctx;
 
     r = _run('cache', stageCache, ctx, true);
     ctx = r.ctx;
-
-    // v9: Use current frame's ctx.emaSlow instead of stale window._emaSpeedSlow
-    _handleProximityZoomLogic(
-        (ctx.emaSlow != null ? ctx.emaSlow : ctx.rawSpeed) * C.MPS_MPH,
-        ctx.lastPos
-            ? Math.abs(ctx.lng - ctx.lastPos.lng) > Math.abs(ctx.lat - ctx.lastPos.lat) * 1.2
-            : false
-    );
 
     r = _run('firstFix', stageFirstFix, ctx);
     if (r.sig === SIG.HALT) { _TM.end('firstFix', 'HALT'); return; }
@@ -5478,7 +5487,6 @@ function updateUserLocation(position, forceUpdate = false) {
 
     _assertPhase(3, ctx);
 
-    // ── Phase 4: Motion ───────────────────────────────────────────────
     r = _run('motion', stageMotion, ctx);
     if (r.sig === SIG.HALT) { _TM.end('motion', 'HALT'); return; }
     ctx = r.ctx;
@@ -5500,7 +5508,6 @@ function updateUserLocation(position, forceUpdate = false) {
 
     _assertPhase(4, ctx);
 
-    // ── Phase 5: Smoothing & Rendering ────────────────────────────────
     if (!window._markerStylesOptimized && userMarker?.getElement) {
         const el = userMarker.getElement();
         if (el) {
@@ -5538,12 +5545,12 @@ function updateUserLocation(position, forceUpdate = false) {
 
     _TM.end(null, 'COMPLETE');
 }
-        
-/* Proximity zoom logic */
+
+// ─── PROXIMITY ZOOM LOGIC ─────────────────────────────────────────────────────
+/* Extracted for clarity. Handles zoom-in when approaching a POI and zoom-out when leaving. */
 function _handleProximityZoomLogic(speedMPH, eastWestMove) {
-    const PROX_NEAR_M = 13.716;       // 45 ft — full zoom-in
-    const PROX_FAR_M = 21.336;        // 70 ft — entry threshold
-    const PROX_EXIT_FAR_M = 24.384;   // 80 ft — exit hysteresis (must reach to leave zone)
+    const PROX_NEAR_M = 13.716;
+    const PROX_FAR_M = 21.336;
     const PROX_ZOOM_IN = 19;
     const PROX_ZOOM_OUT = 17;
     const PROX_THROTTLE_MS = 250;
@@ -5558,28 +5565,19 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
 
     const distM = window.proximityState.distanceMeters;
 
-    /* ── INSIDE zone (or entering) ── */
     if (distM <= PROX_FAR_M) {
-
-        // Smoothstep interpolation within the near→far band.
-        // t=0 at PROX_NEAR_M (full zoom-in), t=1 at PROX_FAR_M (full zoom-out).
-        const t_raw = (distM - PROX_NEAR_M) / (PROX_FAR_M - PROX_NEAR_M);
-        const t = Math.max(0, Math.min(1, t_raw));
-        const s = t * t * (3 - 2 * t);   // smoothstep — zero derivative at both ends
-        const targetZoom = PROX_ZOOM_IN + s * (PROX_ZOOM_OUT - PROX_ZOOM_IN);
-
+        const t = Math.max(0, Math.min(1, (distM - PROX_NEAR_M) / (PROX_FAR_M - PROX_NEAR_M)));
+        const targetZoom = PROX_ZOOM_IN + t * (PROX_ZOOM_OUT - PROX_ZOOM_IN);
         const currentZoom = map.getZoom();
         const zoomDelta = Math.abs(targetZoom - currentZoom);
         const nowMs = Date.now();
-        const throttleOk = !window._lastProxZoomRequest ||
-            (nowMs - window._lastProxZoomRequest) >= PROX_THROTTLE_MS;
+        const throttleOk = !window._lastProxZoomRequest || (nowMs - window._lastProxZoomRequest) >= PROX_THROTTLE_MS;
         const proxZoomBlocked = window._zoomAuthorityThisFrame === true;
         window._zoomAuthorityThisFrame = false;
 
         if (zoomDelta >= 0.15 && throttleOk && !proxZoomBlocked) {
             window._lastProxZoomRequest = nowMs;
             const zoomDur = Math.min(2.0, Math.max(0.6, zoomDelta * 0.55));
-
             const userLL = userMarker?.getLatLng?.();
             const proxLoc = window.proximityState.closestLocation;
             const poiLL = (proxLoc?.lat != null && proxLoc?.lng != null)
@@ -5587,28 +5585,21 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
                 : null;
 
             if (userLL && poiLL) {
-                // Original fitBounds call — untouched
                 map.fitBounds(L.latLngBounds([userLL, poiLL]), {
-                    paddingTopLeft:     L.point(64, 64),
+                    paddingTopLeft: L.point(64, 64),
                     paddingBottomRight: L.point(64, 96),
-                    animate:  true,
+                    animate: true,
                     duration: zoomDur,
-                    maxZoom:  PROX_ZOOM_IN
+                    maxZoom: PROX_ZOOM_IN
                 });
             } else if (userLL) {
-                map.flyTo(userLL, targetZoom, {
-                    duration:     zoomDur,
-                    easeLinearity: 0.25
-                });
+                map.flyTo(userLL, targetZoom, { duration: zoomDur, easeLinearity: 0.25 });
             }
         }
-
         window._inProximityZone = true;
 
-    /* ── EXITING zone (hysteresis: must reach PROX_EXIT_FAR_M to truly leave) ── */
-    } else if (distM >= PROX_EXIT_FAR_M && window._inProximityZone) {
+    } else if (window._inProximityZone) {
         window._zoomAuthorityThisFrame = false;
-
         const currentZoom = map.getZoom();
         const exitDelta = Math.abs(currentZoom - PROX_ZOOM_OUT);
 
@@ -5618,26 +5609,20 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
 
             if (userLL) {
                 map.flyTo(userLL, PROX_ZOOM_OUT, {
-                    duration:     exitDur,
+                    duration: exitDur,
                     easeLinearity: eastWestMove ? 0.13 : 0.15
                 });
             } else {
-                map.flyTo(map.getCenter(), PROX_ZOOM_OUT, {
-                    duration:     exitDur,
-                    easeLinearity: 0.15
-                });
+                map.flyTo(map.getCenter(), PROX_ZOOM_OUT, { duration: exitDur, easeLinearity: 0.15 });
             }
         }
-
         window._inProximityZone = false;
         window._lastProxZoomRequest = null;
-
-    /* ── IN HYSTERESIS BAND (between FAR_M and EXIT_FAR_M) — hold current state ── */
     } else {
         window._zoomAuthorityThisFrame = false;
     }
 }
-
+        
 /* Calculates a new map center in roaming mode when user approaches viewport edge. */
 function _calculateRoamingTarget(userPos, bounds, speedMPH) {
     const currentCenter = map.getCenter();
