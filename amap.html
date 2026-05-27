@@ -4241,7 +4241,7 @@ function _prefetchMapTiles(location, now) {
 
 })();
         
-/* updateUserLocation */
+/* updateUserLocation — v10.1 (proximity-zoom entry fix) */
 
 // ─── SIGNALS ───────────────────────────────────────────────────────────────────
 
@@ -4383,7 +4383,7 @@ const _TM = (() => {
                 }
             }
             return [
-                `GPS Pipeline v10.0 (${runs.length} runs)`,
+                `GPS Pipeline v10.1 (${runs.length} runs)`,
                 `Avg: ${avg.toFixed(2)}ms | Last: ${last.total.toFixed(2)}ms`,
                 `Halt: ${last.halt || 'none'} (${last.signal || 'COMPLETE'})`,
                 `Tier: ${last.m.tier || 'n/a'} | Boost: ${last.m.boost?.toFixed(2) || 'n/a'}`,
@@ -4697,7 +4697,8 @@ function _makeCtx(position, forceUpdate) {
         buffer: null,
         finalSF: 0, smoothedPos: null, boost: 1.0,
         finalDur: 0, finalEase: 0, lookAhead: 0,
-        useInterp: false
+        useInterp: false,
+        proxAnimated: false
     };
 }
 
@@ -5022,6 +5023,15 @@ function stageLargeJump(ctx) {
     return { ctx, sig: SIG.CONTINUE };
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// NEW STAGE v10.1 — Proximity zoom runs BEFORE stationary/quality so it fires
+// even when those stages later HALT.
+// ═══════════════════════════════════════════════════════════════════════════════
+function stageProxZoom(ctx) {
+    ctx.proxAnimated = _handleProximityZoomLogic(ctx.displayMPH, ctx.eastWest);
+    return { ctx, sig: SIG.CONTINUE };
+}
+
 function stageStationary(ctx) {
     const { distance, lat, lng, currentTime, forceUpdate, lastPos } = ctx;
 
@@ -5114,7 +5124,7 @@ function stageQuality(ctx) {
             window.smoothedVelocity?.lat ?? 0,
             window.smoothedVelocity?.lng ?? 0
         );
-        _commit(newPos, ctx.currentTime, forceUpdate, [newPos]);
+        _commit(newPos, ctx.currentTime, ctx.forceUpdate, [newPos]);
         return { ctx, sig: SIG.HALT };
     }
 
@@ -5310,13 +5320,10 @@ function stageVisuals(ctx) {
         window.followUser = true;
     }
 
-    // ── AUTHORITY FIRST: Proximity zoom ────────────────────────────────
-    // If this triggers a zoom animation, we MUST NOT run normal pan logic
-    // in the same frame or the animations will cancel each other.
-    const proxAnimated = _handleProximityZoomLogic(displayMPH, eastWest);
-
     // ── Normal map pan (defers to proximity zoom) ─────────────────────
-    if (!proxAnimated && !window._proxZoomAnimating && !window._recentering) {
+    // Proximity zoom was already evaluated in stageProxZoom; just respect
+    // the animation guard so we don't cancel it with a competing pan.
+    if (!window._proxZoomAnimating && !window._recentering) {
         const shouldMap = (modeChanged && centered) ||
             (currentTime - (window.lastMapUpdateTime || 0)) > speedTier.mapInt ||
             distance > mapDist ||
@@ -5470,6 +5477,12 @@ function updateUserLocation(position, forceUpdate = false) {
     if (r.sig === SIG.HALT) { _TM.end('largeJump', 'HALT'); return; }
     ctx = r.ctx;
 
+    // ═════════════════════════════════════════════════════════════════
+    // v10.1 — Proximity zoom fires here, before stationary/quality HALT
+    // ═════════════════════════════════════════════════════════════════
+    r = _run('proxZoom', stageProxZoom, ctx, true);
+    ctx = r.ctx;
+
     r = _run('stationary', stageStationary, ctx);
     if (r.sig === SIG.HALT) { _TM.end('stationary', 'HALT'); return; }
     ctx = r.ctx;
@@ -5533,7 +5546,9 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
     // ── No proximity data: exit if we were in the zone ─────────────────
     if (!window.proximityState) {
         if (window._inProximityZone && !window._proxZoomAnimating) {
-            window._inProximityZone = false;
+            window._inProximityZone     = false;
+            window._lastProxZoomRequest = null;
+
             const currentZoom = map.getZoom();
             const exitDelta   = Math.abs(currentZoom - PROX_ZOOM_OUT);
             if (exitDelta >= 0.15) {
@@ -5541,34 +5556,46 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
                 const userLL  = userMarker?.getLatLng?.();
                 const target  = userLL || map.getCenter();
                 map.flyTo(target, PROX_ZOOM_OUT, {
-                    duration: exitDur,
+                    duration:      exitDur,
                     easeLinearity: eastWestMove ? 0.13 : 0.15
                 });
                 _setProxZoomGuard(exitDur);
                 return true;
             }
-            window._lastProxZoomRequest = null;
         }
         return false;
     }
 
-    const distM = window.proximityState.distanceMeters;
-    let didAnimate = false;
+    const distM     = window.proximityState.distanceMeters;
+    const wasInZone = !!window._inProximityZone;
+    const inZone    = distM <= PROX_FAR_M;
+    let didAnimate  = false;
 
-    // ── Zone entry / in-zone ───────────────────────────────────────────
-    if (distM <= PROX_FAR_M) {
+    // ═══════════════════════════════════════════════════════════════════
+    // ZONE ENTRY / IN-ZONE
+    // ═══════════════════════════════════════════════════════════════════
+    if (inZone) {
         const t = Math.max(0, Math.min(1,
-                       (distM - PROX_NEAR_M) / (PROX_FAR_M - PROX_NEAR_M)));
+            (distM - PROX_NEAR_M) / (PROX_FAR_M - PROX_NEAR_M)
+        ));
         const targetZoom  = PROX_ZOOM_IN + t * (PROX_ZOOM_OUT - PROX_ZOOM_IN);
         const currentZoom = map.getZoom();
         const zoomDelta   = Math.abs(targetZoom - currentZoom);
         const nowMs       = Date.now();
-        const throttleOk  = !window._lastProxZoomRequest ||
-                            (nowMs - window._lastProxZoomRequest) >= PROX_THROTTLE_MS;
 
-        if (zoomDelta >= 0.15 && throttleOk && !window._proxZoomAnimating) {
-            window._lastProxZoomRequest = nowMs;
-            const zoomDur = Math.min(2.0, Math.max(0.6, zoomDelta * 0.55));
+        const throttleOk = !window._lastProxZoomRequest ||
+                           (nowMs - window._lastProxZoomRequest) >= PROX_THROTTLE_MS;
+
+        // CRITICAL FIX: On first entry, FORCE the animation even if zoomDelta
+        // is small. The fitBounds will show both user + POI; we just need to
+        // ensure it actually runs. The zoomDelta gate only applies to re-zooms.
+        const isEntry      = !wasInZone;
+        const shouldAnimate = isEntry || (zoomDelta >= 0.15 && throttleOk && !window._proxZoomAnimating);
+
+        if (shouldAnimate) {
+            // Use a slightly longer duration on entry so the user perceives it.
+            const zoomDur = Math.min(2.0, Math.max(0.8, isEntry ? 1.0 : zoomDelta * 0.55));
+
             const userLL  = userMarker?.getLatLng?.();
             const proxLoc = window.proximityState.closestLocation;
             const poiLL   = (proxLoc?.lat != null && proxLoc?.lng != null)
@@ -5603,12 +5630,18 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
                 _setProxZoomGuard(zoomDur);
                 didAnimate = true;
             }
-        }   // ← closes if (zoomDelta >= 0.15 ...)
+
+            if (didAnimate) {
+                window._lastProxZoomRequest = nowMs;
+            }
+        }
 
         window._inProximityZone = true;
 
-    // ── Zone exit (hysteresis) ─────────────────────────────────────────
-    } else if (distM >= PROX_EXIT_FAR_M && window._inProximityZone) {
+    // ═══════════════════════════════════════════════════════════════════
+    // ZONE EXIT (hysteresis)
+    // ═══════════════════════════════════════════════════════════════════
+    } else if (distM >= PROX_EXIT_FAR_M && wasInZone) {
         window._inProximityZone     = false;
         window._lastProxZoomRequest = null;
 
@@ -5620,7 +5653,7 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
                 const userLL  = userMarker?.getLatLng?.();
                 const target  = userLL || map.getCenter();
                 map.flyTo(target, PROX_ZOOM_OUT, {
-                    duration:     exitDur,
+                    duration:      exitDur,
                     easeLinearity: eastWestMove ? 0.13 : 0.15
                 });
                 _setProxZoomGuard(exitDur);
@@ -5640,7 +5673,7 @@ function _setProxZoomGuard(durationSec) {
         window._proxZoomAnimTimer = null;
     }, durationSec * 1000 + 75);
 }
-       
+        
 /* Calculates a new map center in roaming mode when user approaches viewport edge. */
 function _calculateRoamingTarget(userPos, bounds, speedMPH) {
     const currentCenter = map.getCenter();
