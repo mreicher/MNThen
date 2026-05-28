@@ -3733,6 +3733,39 @@ function _handleInactivityReset() {
     window.inactivityTimer = null;
 }
 
+/**
+ * Preloads location assets into the browser cache so the location page
+ * renders instantly when opened by the proximity system.
+ */
+function preloadLocationData(location) {
+    if (!location) return;
+
+    /* Respect the user's Data Saver / low-data preference.
+       navigator.connection is available in Chrome, Edge, Opera, Samsung
+       Internet.  Firefox and Safari don't support it yet, so the guard
+       defaults to "allow preload" on those browsers — the correct
+       behaviour since we can't know the user's preference. */
+    var conn = navigator.connection;
+    if (conn && conn.saveData) return;
+
+    /* ── Image preload ──────────────────────────────────────────────
+       Warms the browser HTTP cache so the hero image renders instantly
+       when showLocationHunt() opens the location page.  new Image() is
+       preferred over fetch() because:
+         • No CORS preflight for simple image loads
+         • Browser decodes and caches the bitmap automatically
+         • Works identically on every browser since IE6 */
+    if (location.image && typeof location.image === 'string') {
+        var img = new Image();
+        img.decoding = 'async';                        // Don't block main thread
+        if ('fetchPriority' in img) {
+            img.fetchPriority = 'low';                 // Don't compete with visible content
+        }
+        img.src = location.image;
+        img.onerror = function () {};                  // Silence 404 / network console noise
+    }
+}
+
 function handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, closestDistance) {
     const now = performance.now();
 
@@ -3747,6 +3780,7 @@ function handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, c
         if (window.currentProximityLocationId) {
             _cleanupProximityZoomState();
         }
+        window._currentProximityZone = 'OUTSIDE'; // Reset zone on invalid data
         return;
     }
 
@@ -3790,16 +3824,55 @@ function handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, c
         lastUpdateTime: now
     };
 
-    // ── Zone Routing ──
+    // ── Zone Routing with Hysteresis ──
+    // Prevents GPS jitter from rapidly oscillating users between zones, which destroyed preloaded data
     const PREFETCH_DISTANCE = 80;
     const TRIGGER_DISTANCE  = PROXIMITY_THRESHOLD;
+    const TRIGGER_EXIT_DISTANCE  = TRIGGER_DISTANCE + 10;  // e.g., 30ft
+    const PREFETCH_EXIT_DISTANCE = PREFETCH_DISTANCE + 20; // e.g., 100ft
 
-    if (distanceFeet <= TRIGGER_DISTANCE) {
+    const previousZone = window._currentProximityZone || 'OUTSIDE';
+    let currentZone;
+
+    if (previousZone === 'TRIGGER') {
+        currentZone = distanceFeet > TRIGGER_EXIT_DISTANCE 
+            ? (distanceFeet <= PREFETCH_DISTANCE ? 'PREFETCH' : 'OUTSIDE') 
+            : 'TRIGGER';
+    } else if (previousZone === 'PREFETCH') {
+        if (distanceFeet <= TRIGGER_DISTANCE) currentZone = 'TRIGGER';
+        else if (distanceFeet > PREFETCH_EXIT_DISTANCE) currentZone = 'OUTSIDE';
+        else currentZone = 'PREFETCH';
+    } else {
+        // OUTSIDE - uses strict ENTER thresholds
+        if (distanceFeet <= TRIGGER_DISTANCE) currentZone = 'TRIGGER';
+        else if (distanceFeet <= PREFETCH_DISTANCE) currentZone = 'PREFETCH';
+        else currentZone = 'OUTSIDE';
+    }
+    window._currentProximityZone = currentZone;
+
+    if (currentZone === 'TRIGGER') {
+        // Ensure data is preloaded before evaluating triggers (eliminates emergency preload delays)
+        _handlePrefetchZone(closestLocation, distanceFeet, now);
         _handleTriggerZone(closestLocation, distanceFeet, now, false);
-    } else if (distanceFeet <= PREFETCH_DISTANCE) {
+    } else if (currentZone === 'PREFETCH') {
         _handlePrefetchZone(closestLocation, distanceFeet, now);
     } else {
-        window._prefetchState = null;
+        // Run stale prefetch cleanup since we won't be entering _handlePrefetchZone
+        if (window._prefetchState && (!window._lastPrefetchCleanup || (now - window._lastPrefetchCleanup) > 300000)) {
+            const MAX_AGE = 10 * 60 * 1000;
+            const toDelete = [];
+            for (const [id, state] of Object.entries(window._prefetchState)) {
+                if (
+                    (now - state.startTime) > MAX_AGE &&
+                    (!window.proximityState?.closestLocation ||
+                        window.proximityState.closestLocation.id !== id)
+                ) {
+                    toDelete.push(id);
+                }
+            }
+            toDelete.forEach(id => delete window._prefetchState[id]);
+            window._lastPrefetchCleanup = now;
+        }
         console.debug(`[Proximity] Outside all zones: ${distanceFeet.toFixed(1)}ft`);
     }
 }
@@ -3875,7 +3948,11 @@ function _handlePrefetchZone(location, distanceFeet, now) {
 
     // ── TILE PREFETCH (Priority 2 - at 50ft or closer) ──
     if (distanceFeet <= 50 && !prefetchState.tilesPreloaded) {
-        _prefetchMapTiles(location, now);
+        try {
+            _prefetchMapTiles(location, now);
+        } catch (err) {
+            console.warn('[Proximity] Tile prefetch failed:', err);
+        }
         prefetchState.tilesPreloaded = true;
     }
 
@@ -3917,16 +3994,22 @@ function _handleTriggerZone(location, distanceFeet, now, isOnCooldown) {
         const distanceTraveled = approach.startDistance - distanceFeet;
 
         if (approachTime > 0 && distanceTraveled > 0) {
-            const approachSpeed = distanceTraveled / (approachTime / 1000);
-            if (approachSpeed > 5) {
+            let approachSpeed = distanceTraveled / (approachTime / 1000);
+            // Clamp speed to prevent negative/jitter values from breaking the debounce time
+            approachSpeed = Math.max(0, Math.min(5, approachSpeed));
+
+            if (approachSpeed >= 5) {
                 debounceTime = MIN_DEBOUNCE;
-            } else if (approachSpeed < 1) {
+            } else if (approachSpeed <= 1) {
                 debounceTime = MAX_DEBOUNCE;
             } else {
                 debounceTime = MIN_DEBOUNCE + (MAX_DEBOUNCE - MIN_DEBOUNCE) * (1 - approachSpeed / 5);
             }
         }
     }
+    
+    // Hard clamp debounce time to ensure it never falls outside 2s-5s bounds
+    debounceTime = Math.max(MIN_DEBOUNCE, Math.min(MAX_DEBOUNCE, debounceTime));
 
     if (timeSinceLastTrigger < debounceTime) {
         console.log(`[Proximity] Debounced - opened ${locationId} ${(timeSinceLastTrigger / 1000).toFixed(1)}s ago`);
@@ -3940,10 +4023,17 @@ function _handleTriggerZone(location, distanceFeet, now, isOnCooldown) {
     if (window.cooldownManager) {
         const status = window.cooldownManager.checkCooldown(locationToOpen.id);
         if (status.isOnCooldown) {
-            // On cooldown: show UI but do NOT stamp debounce
+            // On cooldown: show UI but do NOT stamp trigger debounce so it opens instantly when expired
             console.log(`[Proximity] Location ${locationId} on cooldown. Skipping debounce stamp.`);
-            if (typeof _openLocationPage === 'function') {
-                _openLocationPage(locationToOpen);
+            
+            // Prevent spamming _openLocationPage while standing on cooldown
+            if (!window._lastCooldownShowByLocation) window._lastCooldownShowByLocation = {};
+            const lastCooldownShow = window._lastCooldownShowByLocation[locationId] || 0;
+            if ((now - lastCooldownShow) >= 2000) { 
+                if (typeof _openLocationPage === 'function') {
+                    _openLocationPage(locationToOpen);
+                }
+                window._lastCooldownShowByLocation[locationId] = now;
             }
             return;
         } else {
@@ -6103,105 +6193,72 @@ function _isAtCriticalEdge(targetPos) {
         
 function _emergencyCenterMap(position, speedTier, directionChangeFactor, eastWestMovement, speedMPH) {
     if (!window.map || !window.map.getContainer || !position) return;
-    
-    // Validate position coordinates
     if (!isFinite(position.lat) || !isFinite(position.lng)) {
         console.warn('[Emergency Center] Invalid position coordinates');
         return;
     }
-    
+
     const mapContainer = window.map.getContainer();
     if (!mapContainer) return;
-    
-    // Add distance check FIRST (prevents unnecessary animations)
+
     const currentCenter = window.map.getCenter();
     if (!currentCenter) return;
-    
-    const targetCenter = L.latLng(position.lat, position.lng);
-    const distanceMoved = currentCenter.distanceTo(targetCenter);
-    
-    if (distanceMoved < 0.5) {
-        return; // Too small to animate
-    }
-    
-    // Add hardware acceleration
-    mapContainer.style.willChange = 'transform';
-    mapContainer.style.transform = 'translateZ(0)';
-    
-    // Speed-based timing with safe defaults
+
+    if (currentCenter.distanceTo(L.latLng(position.lat, position.lng)) < 0.5) return;
+
     const safeSpeed = isFinite(speedMPH) && speedMPH > 0 ? speedMPH : 0;
-    const HIGH_SPEED = (window.SPEED_THRESHOLDS && window.SPEED_THRESHOLDS.HIGH_SPEED) || 25;
-    
-    // Declare cleanup variables BEFORE defining cleanup function
+
+    mapContainer.style.willChange = 'transform';
+
     let cleanupExecuted = false;
     let fallbackTimeout = null;
-    let moveEndHandler = null;
-    let zoomEndHandler = null;
-    
+    let moveEndHandler  = null;
+
     const cleanup = () => {
         if (cleanupExecuted) return;
         cleanupExecuted = true;
-        
-        // Clear timeout
+
         if (fallbackTimeout) {
             clearTimeout(fallbackTimeout);
             fallbackTimeout = null;
         }
-        
-        // Remove event listeners
+
         if (moveEndHandler) {
             window.map.off('moveend', moveEndHandler);
             moveEndHandler = null;
         }
-        if (zoomEndHandler) {
-            window.map.off('zoomend', zoomEndHandler);
-            zoomEndHandler = null;
-        }
-        
-        // Reset styles safely
-        if (mapContainer && mapContainer.isConnected) {
+
+        if (mapContainer?.isConnected) {
             mapContainer.style.willChange = 'auto';
-            mapContainer.style.transform = '';
         }
     };
-    
-    // Execute pan with speed-appropriate settings
+
     try {
         if (safeSpeed > 30) {
             window.map.panTo(position, { animate: false, noMoveStart: true });
-            cleanup(); // Immediate cleanup for instant pan
+            cleanup();
         } else if (safeSpeed > 15) {
-            window.map.panTo(position, { 
-                animate: true, 
-                duration: 0.12, 
-                easeLinearity: 0.5, 
-                noMoveStart: true 
+            window.map.panTo(position, {
+                animate:       true,
+                duration:      0.12,
+                easeLinearity: 0.5,
+                noMoveStart:   true
             });
-            
+
+            moveEndHandler = cleanup;
+            window.map.once('moveend', moveEndHandler);
             fallbackTimeout = setTimeout(cleanup, 250);
-            moveEndHandler = () => {
-                clearTimeout(fallbackTimeout);
-                cleanup();
-            };
-            window.map.once('moveend', moveEndHandler);
-            zoomEndHandler = cleanup;
-            window.map.once('zoomend', zoomEndHandler);
         } else {
-            window.map.panTo(position, { 
-                animate: true, 
-                duration: 0.30, 
-                easeLinearity: 0.3, 
-                noMoveStart: true 
+            window.map.panTo(position, {
+                animate:       true,
+                duration:      0.30,
+                easeLinearity: 0.3,
+                noMoveStart:   true
             });
-            
-            fallbackTimeout = setTimeout(cleanup, 450);
-            moveEndHandler = () => {
-                clearTimeout(fallbackTimeout);
-                cleanup();
-            };
+
+            moveEndHandler = cleanup;
             window.map.once('moveend', moveEndHandler);
-            zoomEndHandler = cleanup;
-            window.map.once('zoomend', zoomEndHandler);
+            fallbackTimeout = setTimeout(cleanup, 450);
         }
     } catch (error) {
         console.error('[Emergency Center] Pan failed:', error);
@@ -6299,10 +6356,9 @@ function _panMapIfNearEdge(
     speedTier,
     directionChangeFactor,
     eastWestMovement,
-    bounds,           // passed by callers for API compatibility; edge detection is
-    speedMPH          // delegated to _isNearViewportEdge / _isAtCriticalEdge internally
+    bounds,
+    speedMPH
 ) {
-    // ── Safety & interaction guards
     if (!window.map || !userPos || !bounds) return;
     if (!isFinite(userPos.lat) || !isFinite(userPos.lng)) {
         console.warn('[Pan Near Edge] Invalid coordinates');
@@ -6311,15 +6367,11 @@ function _panMapIfNearEdge(
     if (window.isMapInteracting) return;
     if (!window.followUser) return;
 
-    // ── Zone detection
     const isInCriticalZone = _isAtCriticalEdge(userPos);
     const isNearEdge       = _isNearViewportEdge(userPos, bounds, speedMPH || 0);
 
     if (!isNearEdge && !isInCriticalZone) return;
 
-    // ── isPanning guard
-    // Critical zone: cancel any in-flight pan and force a new one.
-    // Normal zone: wait for the current pan to finish.
     if (window.isPanning) {
         if (isInCriticalZone) {
             window.isPanning = false;
@@ -6328,25 +6380,20 @@ function _panMapIfNearEdge(
         }
     }
 
-    // ── Throttle: 16ms floor prevents judder on high-frequency GPS (10 Hz+)
     const now              = performance.now();
     const MIN_PAN_INTERVAL = isInCriticalZone ? 16 : 80;
     if (now - (window.lastCenteringTime || 0) < MIN_PAN_INTERVAL) return;
 
-    // ── Animation parameters
     const urgencyMultiplier = isInCriticalZone ? 0.6 : 0.8;
     const basePanDuration   = (speedTier?.panDuration ?? 0.2) * urgencyMultiplier;
     const rawDuration       = basePanDuration * (directionChangeFactor || 1) * (eastWestMovement ? 0.9 : 1);
     const panDuration       = Math.max(0.05, Math.min(0.8, rawDuration));
+    const baseEase          = speedTier?.easeLinearity ?? 0.25;
+    const easeLinearity     = Math.max(0.1, Math.min(0.9, baseEase * (eastWestMovement ? 0.8 : 1)));
 
-    const baseEase      = speedTier?.easeLinearity ?? 0.25;
-    const easeLinearity = Math.max(0.1, Math.min(0.9, baseEase * (eastWestMovement ? 0.8 : 1)));
-
-    // ── GPU hint
     const mapContainer = window.map.getContainer?.();
     if (!mapContainer) return;
 
-    // ── Set flags BEFORE async work
     window.isPanning = true;
     mapContainer.style.willChange = 'transform';
 
@@ -6360,16 +6407,12 @@ function _panMapIfNearEdge(
 
         window.isPanning = false;
 
-        // Safe null check in case map was disposed mid-animation
-        if (mapContainer && mapContainer.isConnected) {
+        if (mapContainer?.isConnected) {
             mapContainer.style.willChange = 'auto';
         }
 
         window.lastCenteringTime = performance.now();
 
-        // .off() is safe even after .once() auto-removed (idempotent in Leaflet).
-        // We call it intentionally to handle the case where cleanup runs before
-        // moveend fires (e.g. map disposed mid-animation).
         if (moveEndHandler) {
             window.map.off('moveend', moveEndHandler);
             moveEndHandler = null;
@@ -6383,7 +6426,6 @@ function _panMapIfNearEdge(
 
     try {
         if (isInCriticalZone) {
-            // Instant pan — cleanup runs synchronously so no moveend listener needed.
             window.map.panTo(userPos, { animate: false, noMoveStart: true });
             cleanup();
         } else {
@@ -6394,17 +6436,13 @@ function _panMapIfNearEdge(
                 noMoveStart:   true
             });
 
-            // Primary cleanup: map signals completion
             moveEndHandler = cleanup;
             window.map.once('moveend', moveEndHandler);
-
-            // Safety valve: if moveend never fires (e.g. map disposed mid-animation),
-            // release the isPanning lock after the animation window has elapsed.
             timeoutId = setTimeout(cleanup, panDuration * 1000 + 100);
         }
     } catch (err) {
         console.warn('[Pan Near Edge] Unexpected error during panTo():', err);
-        cleanup(); // ensure isPanning is never left stuck
+        cleanup();
     }
 }
         
@@ -6516,7 +6554,6 @@ function _enforceViewportSafety(speedMPH, currentMarkerPos) {
     const map    = window.map;
     const marker = window.userMarker;
 
-    // Standard guards
     if (!map || !marker) return;
     if (window.isMapInteracting) return;
     if (window.followUser === false) return;
@@ -6524,89 +6561,70 @@ function _enforceViewportSafety(speedMPH, currentMarkerPos) {
     const pos = currentMarkerPos || (marker.getLatLng ? marker.getLatLng() : null);
     if (!pos || !isFinite(pos.lat) || !isFinite(pos.lng)) return;
 
-    // Mode determination
     const isCentered = (typeof ModeManager !== 'undefined' &&
                         typeof ModeManager.isCentered === 'function')
                         ? ModeManager.isCentered()
                         : window.followUser;
 
-    // ── Per-mode soft corrections (edge nudging, centering, etc.)
     if (isCentered) {
         if (typeof _enforceCenteredMode === 'function') {
             _enforceCenteredMode(pos, map, marker);
         }
-    } else {
-        if (typeof _enforceRoamingMode === 'function') {
-            _enforceRoamingMode(pos, map, marker, speedMPH);
-        }
+        return;
     }
 
-    // ── EMERGENCY OFF-SCREEN RECOVERY (roaming mode only)
-    // In centered mode the pan/zoom system already keeps the marker on screen
-    // continuously — emergency recovery there would fight those animations.
-    if (isCentered) return;
+    if (typeof _enforceRoamingMode === 'function') {
+        _enforceRoamingMode(pos, map, marker, speedMPH);
+    }
 
     const mapSize = map.getSize ? map.getSize() : null;
     if (!mapSize || !mapSize.x || !mapSize.y) return;
 
-    // Recompute pixel AFTER roaming mode may have panned the map.
-    // V4.0's instant pan (animate:false) completes synchronously, so
-    // if it already recovered the marker, this check sees the updated
-    // position and won't fire a redundant second pan.
     const pixel = map.latLngToContainerPoint ? map.latLngToContainerPoint(pos) : null;
     if (!pixel || typeof pixel.x !== 'number') return;
 
-    // Tighter margins than original — V4.0 handles near-edge cases at 150px+,
-    // so this is a last-resort safety net for when the marker is truly off screen.
-    const emergencyMargin = speedMPH > 30 ? 60 : 30;
+    // Positive inset so recovery fires BEFORE the marker reaches the edge.
+    // Higher speeds get a larger buffer to absorb fast GPS jumps.
+    const inset = speedMPH > 30 ? 80 : speedMPH > 10 ? 50 : 30;
 
     const isOffScreen = (
-        pixel.x < -emergencyMargin ||
-        pixel.x > (mapSize.x + emergencyMargin) ||
-        pixel.y < -emergencyMargin ||
-        pixel.y > (mapSize.y + emergencyMargin)
+        pixel.x < inset ||
+        pixel.x > (mapSize.x - inset) ||
+        pixel.y < inset ||
+        pixel.y > (mapSize.y - inset)
     );
 
     if (!isOffScreen) {
-        // Marker is back in bounds — clear the correction lock so the next genuine
-        // off-screen event triggers a fresh recovery rather than waiting for a timer.
         window._viewportSafetyEnforced = false;
         clearTimeout(window._viewportSafetyResetTimer);
         window._viewportSafetyResetTimer = null;
         return;
     }
 
-    // Prevent thrashing: skip if we corrected this frame and the animation is
-    // still in flight. The lock is cleared above as soon as the marker is back
-    // in bounds, so it will not block a second correction if the first one failed.
     if (window._viewportSafetyEnforced) return;
 
     if (window.DEBUG_PANNING) {
-        console.warn(`[Viewport] Marker off-screen (${speedMPH.toFixed(1)} mph), emergency recovery`);
+        console.warn(`[Viewport] Marker near/off edge (${speedMPH.toFixed(1)} mph), recovering`);
     }
 
     try {
         map.panTo([pos.lat, pos.lng], {
-            animate:      true,
-            duration:     0.4,
+            animate:       true,
+            duration:      0.4,
             easeLinearity: 0.25,
-            noMoveStart:  false
+            noMoveStart:   false
         });
 
         window._viewportSafetyEnforced = true;
 
-        // Safety-valve reset: if the marker somehow never re-enters bounds
-        // (e.g. GPS jumps again mid-animation), release the lock after the
-        // animation would have completed so recovery can try again.
         clearTimeout(window._viewportSafetyResetTimer);
         window._viewportSafetyResetTimer = setTimeout(() => {
             window._viewportSafetyEnforced  = false;
             window._viewportSafetyResetTimer = null;
-        }, 600); // slightly longer than the 0.4 s pan animation
+        }, 600);
 
     } catch (error) {
         console.error('[Viewport] Emergency recovery failed, falling back:', error);
-        // Last resort only
         if (map.setView) {
             map.setView([pos.lat, pos.lng], map.getZoom(), { animate: false });
         }
@@ -6724,6 +6742,36 @@ function _enforceRoamingMode(markerPos, map, marker, speedMPH) {
     }
 }
         
+/**
+ * updateDistanceBox — rewritten for smooth marker animation.
+ *
+ * ROOT CAUSE OF JITTER:
+ *   The old countdown used setInterval(fn, 1000) which fired DOM writes
+ *   on an arbitrary timer thread tick, forcing the browser into a
+ *   synchronous style-recalc/layout pass that competed with the
+ *   RAF-driven marker animation. Result: choppy user-icon movement
+ *   every time the countdown ticked.
+ *
+ * FIX:
+ *   Countdown DOM updates are now scheduled via setTimeout → RAF so they
+ *   land during the browser's natural paint phase — the same phase where
+ *   the marker's willChange:transform update lands. Both writes are
+ *   batched into a single frame; the compositor never has to stall.
+ *   Text is also dirty-checked so unchanged strings never touch the DOM.
+ *
+ * GLOBALS USED (all pre-existing unless marked NEW):
+ *   window.distanceBoxCountdownInterval  — truthy flag (true, not an ID)
+ *   window._countdownNextFrame           — setTimeout handle
+ *   window._countdownRafId               — (NEW) RAF handle; global so
+ *                                          _stopCountdown can always cancel
+ *                                          it regardless of call site
+ *   window._countdownVisibilityHandler   — visibilitychange ref
+ *   window._cooldownExpiryTimeout        — one-shot safety-net setTimeout
+ *   window._cooldownExpiryLocationId     — location id for the above
+ *   window.lastClosestDistance           — unchanged
+ *   window.lastClosestLocation           — unchanged
+ *   window.currentlyArrived              — unchanged
+ */
 function updateDistanceBox() {
     const distanceBox = cachedElements.distanceBox || document.getElementById('distanceBox');
     if (!distanceBox) {
@@ -6789,7 +6837,9 @@ function updateDistanceBox() {
 
     const distanceFeet = Math.round(closestDistance * 3.28084);
 
-    const PROXIMITY_THRESHOLD = (typeof CONFIG !== 'undefined' && CONFIG.DISTANCE_THRESHOLD) ? CONFIG.DISTANCE_THRESHOLD : 20;
+    const PROXIMITY_THRESHOLD = (typeof CONFIG !== 'undefined' && CONFIG.DISTANCE_THRESHOLD)
+        ? CONFIG.DISTANCE_THRESHOLD
+        : 20;
     const isArrived = distanceFeet <= PROXIMITY_THRESHOLD;
 
     let cooldownStatus = null;
@@ -6799,64 +6849,212 @@ function updateDistanceBox() {
         isOnCooldown = !!cooldownStatus?.isOnCooldown;
     }
 
-    // Clear any existing countdown interval before starting a new one
-    if (window.distanceBoxCountdownInterval) {
-        clearInterval(window.distanceBoxCountdownInterval);
+    // ─────────────────────────────────────────────────────────────────────────
+    // _stopCountdown — tears down every handle for the running countdown.
+    //
+    // rafId lives in window._countdownRafId (not a closure variable) so this
+    // function can always cancel the correct frame regardless of where it is
+    // called from. Previously rafId was closure-scoped, meaning calls from
+    // outside the start block would cancelAnimationFrame(null) — a no-op —
+    // leaving a stale RAF callback free to re-schedule itself.
+    //
+    // Safe to call multiple times; fully idempotent.
+    // ─────────────────────────────────────────────────────────────────────────
+    function _stopCountdown() {
+        if (window._countdownRafId) {
+            cancelAnimationFrame(window._countdownRafId);
+            window._countdownRafId = null;
+        }
+        if (window._countdownNextFrame) {
+            clearTimeout(window._countdownNextFrame);
+            window._countdownNextFrame = null;
+        }
+        // Keep as null (falsy) so all existing `if (window.distanceBoxCountdownInterval)`
+        // checks continue to work without modification.
         window.distanceBoxCountdownInterval = null;
+
+        if (window._countdownVisibilityHandler) {
+            document.removeEventListener('visibilitychange', window._countdownVisibilityHandler);
+            window._countdownVisibilityHandler = null;
+        }
     }
 
+    // ── CLEANUP: user has left the arrival threshold ──────────────────────────
+    if (window.distanceBoxCountdownInterval && !isArrived) {
+        _stopCountdown();
+
+        if (window._cooldownExpiryTimeout) {
+            clearTimeout(window._cooldownExpiryTimeout);
+            window._cooldownExpiryTimeout = null;
+            window._cooldownExpiryLocationId = null;
+        }
+        if (window.cooldownManager) {
+            window.cooldownManager.clearToast?.();
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ARRIVED BRANCH
+    // ─────────────────────────────────────────────────────────────────────────
     if (isArrived) {
         if (isOnCooldown && cooldownStatus?.remainingSeconds !== undefined) {
-            const updateCountdown = () => {
-                // Pause countdown updates when tab is hidden
-                if (document.hidden) return;
+            // ── Start RAF-aligned countdown (only if not already running) ──
+            if (!window.distanceBoxCountdownInterval) {
 
-                if (!closestLocation?.id || !window.cooldownManager) {
-                    if (window.distanceBoxCountdownInterval) {
-                        clearInterval(window.distanceBoxCountdownInterval);
-                        window.distanceBoxCountdownInterval = null;
+                // Closure-scoped display state. Not a global because it only
+                // needs to live as long as this countdown instance.
+                let lastDisplayedText = null;
+
+                /**
+                 * scheduleNext — queue the next tick via setTimeout(~1s) → RAF.
+                 * The RAF call ensures the DOM write lands during the browser's
+                 * paint phase, batched with the marker's transform update.
+                 */
+                const scheduleNext = () => {
+                    if (!window.distanceBoxCountdownInterval) return;
+                    window._countdownNextFrame = setTimeout(() => {
+                        window._countdownNextFrame = null;
+                        if (!window.distanceBoxCountdownInterval) return;
+                        window._countdownRafId = requestAnimationFrame(tick);
+                    }, 1000);
+                };
+
+                /**
+                 * tick — the work unit. Always runs inside an RAF callback
+                 * (except for the immediate first call below).
+                 */
+                const tick = () => {
+                    window._countdownRafId = null; // RAF has fired; clear so scheduleNext works
+
+                    // Tab hidden — skip DOM work but keep the countdown alive.
+                    if (document.hidden) {
+                        scheduleNext();
+                        return;
                     }
-                    return;
-                }
-                
-                const status = window.cooldownManager.checkCooldown(closestLocation.id);
-                if (!status?.isOnCooldown) {
-                    distanceBox.textContent = 'Arrived.';
-                    applyArrivedStyling(distanceBox);
-                    window.currentlyArrived = true;
-                    if (window.distanceBoxCountdownInterval) {
-                        clearInterval(window.distanceBoxCountdownInterval);
-                        window.distanceBoxCountdownInterval = null;
+
+                    // Location or manager disappeared mid-countdown.
+                    if (!closestLocation?.id || !window.cooldownManager) {
+                        _stopCountdown();
+                        return;
                     }
-                } else {
+
+                    const status = window.cooldownManager.checkCooldown(closestLocation.id);
+
+                    if (!status?.isOnCooldown) {
+                        // ── Cooldown just expired ──
+                        const arrivedText = 'Arrived.';
+                        if (lastDisplayedText !== arrivedText) {
+                            distanceBox.textContent = arrivedText;
+                            applyArrivedStyling(distanceBox);
+                            lastDisplayedText = arrivedText;
+                        }
+                        window.currentlyArrived = true;
+
+                        if (typeof handleProximityAndAutoOpen === 'function') {
+                            handleProximityAndAutoOpen(userPos, performance.now(), closestLocation, closestDistance);
+                        }
+
+                        _stopCountdown();
+
+                        // RAF countdown handled expiry; cancel the backup timeout.
+                        if (window._cooldownExpiryTimeout) {
+                            clearTimeout(window._cooldownExpiryTimeout);
+                            window._cooldownExpiryTimeout = null;
+                            window._cooldownExpiryLocationId = null;
+                        }
+                        return;
+                    }
+
+                    // ── Still counting down — dirty-check before any DOM write ──
                     const mins = Math.floor(status.remainingSeconds / 60);
                     const secs = status.remainingSeconds % 60;
-                    const timeStr = `${mins}:${secs.toString().padStart(2, '0')}`;
-                    distanceBox.textContent = `Open in ${timeStr}`;
-                    applyArrivedStyling(distanceBox);
-                }
-            };
-            
-            updateCountdown();
-            window.distanceBoxCountdownInterval = setInterval(updateCountdown, 1000);
+                    const newText = `Open in ${mins}:${secs.toString().padStart(2, '0')}`;
 
-            // Also refresh the countdown display when the tab becomes visible again
-            const resumeCountdownOnVisible = () => {
-                if (!document.hidden && window.distanceBoxCountdownInterval) {
-                    updateCountdown();
+                    if (newText !== lastDisplayedText) {
+                        distanceBox.textContent = newText;
+                        applyArrivedStyling(distanceBox);
+                        lastDisplayedText = newText;
+                    }
+
+                    scheduleNext();
+                };
+
+                // ── Mark countdown as running ────────────────────────────────
+                // true is truthy, so all existing `if (window.distanceBoxCountdownInterval)`
+                // checks pass unchanged. We deliberately do NOT store a numeric
+                // interval ID here because there is no interval anymore.
+                window.distanceBoxCountdownInterval = true;
+
+                // First tick fires immediately so the display updates the
+                // instant the user arrives, with no 1-second delay.
+                tick();
+
+                // ── Visibility handler: resume after tab un-hides ────────────
+                // Uses window._countdownRafId (not the old closure rafId) so
+                // the guard is accurate even when called from outside the closure.
+                const resumeOnVisible = () => {
+                    if (!document.hidden && window.distanceBoxCountdownInterval) {
+                        if (!window._countdownNextFrame && !window._countdownRafId) {
+                            window._countdownRafId = requestAnimationFrame(tick);
+                        }
+                    }
+                };
+                if (window._countdownVisibilityHandler) {
+                    document.removeEventListener('visibilitychange', window._countdownVisibilityHandler);
                 }
-            };
-            // Store reference so we can remove it when interval is cleared
-            if (window._countdownVisibilityHandler) {
-                document.removeEventListener('visibilitychange', window._countdownVisibilityHandler);
+                window._countdownVisibilityHandler = resumeOnVisible;
+                document.addEventListener('visibilitychange', resumeOnVisible);
+
+                // ── Guaranteed cooldown-expiry backup (one-shot setTimeout) ──
+                // Safety net: fires ~200ms after the cooldown expires and opens
+                // the location page if the user is still within the threshold.
+                // Cancelled by the RAF countdown if it catches expiry first.
+                if (cooldownStatus.remainingMs > 0) {
+                    if (window._cooldownExpiryTimeout) {
+                        clearTimeout(window._cooldownExpiryTimeout);
+                    }
+                    window._cooldownExpiryLocationId = closestLocation.id;
+                    window._cooldownExpiryTimeout = setTimeout(() => {
+                        window._cooldownExpiryTimeout = null;
+                        const locId = window._cooldownExpiryLocationId;
+                        window._cooldownExpiryLocationId = null;
+
+                        const currentUserLatLng = userMarker?.getLatLng();
+                        const loc = gameLocations?.find(l => l?.id === locId);
+                        if (currentUserLatLng && loc) {
+                            const dist = calculateDistance(
+                                { lat: currentUserLatLng.lat, lng: currentUserLatLng.lng },
+                                { lat: loc.lat, lng: loc.lng }
+                            );
+                            if ((dist * 3.28084) <= PROXIMITY_THRESHOLD &&
+                                typeof window._openLocationPage === 'function') {
+                                console.log('[Cooldown] Guaranteed expiry timeout fired — opening location', locId);
+                                window._openLocationPage(loc);
+                            }
+                        }
+                    }, cooldownStatus.remainingMs + 200);
+                }
             }
-            window._countdownVisibilityHandler = resumeCountdownOnVisible;
-            document.addEventListener('visibilitychange', resumeCountdownOnVisible);
+            // Countdown already running — it self-manages; nothing to do.
 
         } else {
+            // ── Arrived but not on cooldown — clear any leftover state ───────
+            if (window.distanceBoxCountdownInterval) {
+                _stopCountdown();
+            }
+            if (window._cooldownExpiryTimeout) {
+                clearTimeout(window._cooldownExpiryTimeout);
+                window._cooldownExpiryTimeout = null;
+                window._cooldownExpiryLocationId = null;
+            }
+
             distanceBox.textContent = 'Arrived.';
             applyArrivedStyling(distanceBox);
         }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // OUTSIDE THRESHOLD BRANCH
+    // ─────────────────────────────────────────────────────────────────────────
     } else {
         const distanceText = distanceFeet < 5280
             ? `${distanceFeet.toLocaleString()} feet`
@@ -6864,10 +7062,15 @@ function updateDistanceBox() {
         distanceBox.textContent = `Closest Stop: ${distanceText}`;
         applyDefaultStyling(distanceBox);
 
-        // Clean up visibility handler if user has moved away from the location
+        // Visibility handler cleanup (countdown already fully cleared by the
+        // early-exit block above if it was running).
         if (window._countdownVisibilityHandler) {
             document.removeEventListener('visibilitychange', window._countdownVisibilityHandler);
             window._countdownVisibilityHandler = null;
+        }
+        if (window._countdownNextFrame) {
+            clearTimeout(window._countdownNextFrame);
+            window._countdownNextFrame = null;
         }
     }
 
