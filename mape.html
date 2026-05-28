@@ -3747,6 +3747,7 @@ function handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, c
         if (window.currentProximityLocationId) {
             _cleanupProximityZoomState();
         }
+        window._currentProximityZone = 'OUTSIDE'; // Reset zone on invalid data
         return;
     }
 
@@ -3790,16 +3791,55 @@ function handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, c
         lastUpdateTime: now
     };
 
-    // ── Zone Routing ──
+    // ── Zone Routing with Hysteresis ──
+    // Prevents GPS jitter from rapidly oscillating users between zones, which destroyed preloaded data
     const PREFETCH_DISTANCE = 80;
     const TRIGGER_DISTANCE  = PROXIMITY_THRESHOLD;
+    const TRIGGER_EXIT_DISTANCE  = TRIGGER_DISTANCE + 10;  // e.g., 30ft
+    const PREFETCH_EXIT_DISTANCE = PREFETCH_DISTANCE + 20; // e.g., 100ft
 
-    if (distanceFeet <= TRIGGER_DISTANCE) {
+    const previousZone = window._currentProximityZone || 'OUTSIDE';
+    let currentZone;
+
+    if (previousZone === 'TRIGGER') {
+        currentZone = distanceFeet > TRIGGER_EXIT_DISTANCE 
+            ? (distanceFeet <= PREFETCH_DISTANCE ? 'PREFETCH' : 'OUTSIDE') 
+            : 'TRIGGER';
+    } else if (previousZone === 'PREFETCH') {
+        if (distanceFeet <= TRIGGER_DISTANCE) currentZone = 'TRIGGER';
+        else if (distanceFeet > PREFETCH_EXIT_DISTANCE) currentZone = 'OUTSIDE';
+        else currentZone = 'PREFETCH';
+    } else {
+        // OUTSIDE - uses strict ENTER thresholds
+        if (distanceFeet <= TRIGGER_DISTANCE) currentZone = 'TRIGGER';
+        else if (distanceFeet <= PREFETCH_DISTANCE) currentZone = 'PREFETCH';
+        else currentZone = 'OUTSIDE';
+    }
+    window._currentProximityZone = currentZone;
+
+    if (currentZone === 'TRIGGER') {
+        // Ensure data is preloaded before evaluating triggers (eliminates emergency preload delays)
+        _handlePrefetchZone(closestLocation, distanceFeet, now);
         _handleTriggerZone(closestLocation, distanceFeet, now, false);
-    } else if (distanceFeet <= PREFETCH_DISTANCE) {
+    } else if (currentZone === 'PREFETCH') {
         _handlePrefetchZone(closestLocation, distanceFeet, now);
     } else {
-        window._prefetchState = null;
+        // Run stale prefetch cleanup since we won't be entering _handlePrefetchZone
+        if (window._prefetchState && (!window._lastPrefetchCleanup || (now - window._lastPrefetchCleanup) > 300000)) {
+            const MAX_AGE = 10 * 60 * 1000;
+            const toDelete = [];
+            for (const [id, state] of Object.entries(window._prefetchState)) {
+                if (
+                    (now - state.startTime) > MAX_AGE &&
+                    (!window.proximityState?.closestLocation ||
+                        window.proximityState.closestLocation.id !== id)
+                ) {
+                    toDelete.push(id);
+                }
+            }
+            toDelete.forEach(id => delete window._prefetchState[id]);
+            window._lastPrefetchCleanup = now;
+        }
         console.debug(`[Proximity] Outside all zones: ${distanceFeet.toFixed(1)}ft`);
     }
 }
@@ -3875,7 +3915,11 @@ function _handlePrefetchZone(location, distanceFeet, now) {
 
     // ── TILE PREFETCH (Priority 2 - at 50ft or closer) ──
     if (distanceFeet <= 50 && !prefetchState.tilesPreloaded) {
-        _prefetchMapTiles(location, now);
+        try {
+            _prefetchMapTiles(location, now);
+        } catch (err) {
+            console.warn('[Proximity] Tile prefetch failed:', err);
+        }
         prefetchState.tilesPreloaded = true;
     }
 
@@ -3917,16 +3961,22 @@ function _handleTriggerZone(location, distanceFeet, now, isOnCooldown) {
         const distanceTraveled = approach.startDistance - distanceFeet;
 
         if (approachTime > 0 && distanceTraveled > 0) {
-            const approachSpeed = distanceTraveled / (approachTime / 1000);
-            if (approachSpeed > 5) {
+            let approachSpeed = distanceTraveled / (approachTime / 1000);
+            // Clamp speed to prevent negative/jitter values from breaking the debounce time
+            approachSpeed = Math.max(0, Math.min(5, approachSpeed));
+
+            if (approachSpeed >= 5) {
                 debounceTime = MIN_DEBOUNCE;
-            } else if (approachSpeed < 1) {
+            } else if (approachSpeed <= 1) {
                 debounceTime = MAX_DEBOUNCE;
             } else {
                 debounceTime = MIN_DEBOUNCE + (MAX_DEBOUNCE - MIN_DEBOUNCE) * (1 - approachSpeed / 5);
             }
         }
     }
+    
+    // Hard clamp debounce time to ensure it never falls outside 2s-5s bounds
+    debounceTime = Math.max(MIN_DEBOUNCE, Math.min(MAX_DEBOUNCE, debounceTime));
 
     if (timeSinceLastTrigger < debounceTime) {
         console.log(`[Proximity] Debounced - opened ${locationId} ${(timeSinceLastTrigger / 1000).toFixed(1)}s ago`);
@@ -3940,10 +3990,17 @@ function _handleTriggerZone(location, distanceFeet, now, isOnCooldown) {
     if (window.cooldownManager) {
         const status = window.cooldownManager.checkCooldown(locationToOpen.id);
         if (status.isOnCooldown) {
-            // On cooldown: show UI but do NOT stamp debounce
+            // On cooldown: show UI but do NOT stamp trigger debounce so it opens instantly when expired
             console.log(`[Proximity] Location ${locationId} on cooldown. Skipping debounce stamp.`);
-            if (typeof _openLocationPage === 'function') {
-                _openLocationPage(locationToOpen);
+            
+            // Prevent spamming _openLocationPage while standing on cooldown
+            if (!window._lastCooldownShowByLocation) window._lastCooldownShowByLocation = {};
+            const lastCooldownShow = window._lastCooldownShowByLocation[locationId] || 0;
+            if ((now - lastCooldownShow) >= 2000) { 
+                if (typeof _openLocationPage === 'function') {
+                    _openLocationPage(locationToOpen);
+                }
+                window._lastCooldownShowByLocation[locationId] = now;
             }
             return;
         } else {
