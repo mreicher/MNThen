@@ -6652,6 +6652,36 @@ function _enforceRoamingMode(markerPos, map, marker, speedMPH) {
     }
 }
         
+/**
+ * updateDistanceBox — rewritten for smooth marker animation.
+ *
+ * ROOT CAUSE OF JITTER:
+ *   The old countdown used setInterval(fn, 1000) which fired DOM writes
+ *   on an arbitrary timer thread tick, forcing the browser into a
+ *   synchronous style-recalc/layout pass that competed with the
+ *   RAF-driven marker animation. Result: choppy user-icon movement
+ *   every time the countdown ticked.
+ *
+ * FIX:
+ *   Countdown DOM updates are now scheduled via setTimeout → RAF so they
+ *   land during the browser's natural paint phase — the same phase where
+ *   the marker's willChange:transform update lands. Both writes are
+ *   batched into a single frame; the compositor never has to stall.
+ *   Text is also dirty-checked so unchanged strings never touch the DOM.
+ *
+ * GLOBALS USED (all pre-existing unless marked NEW):
+ *   window.distanceBoxCountdownInterval  — truthy flag (true, not an ID)
+ *   window._countdownNextFrame           — setTimeout handle
+ *   window._countdownRafId               — (NEW) RAF handle; global so
+ *                                          _stopCountdown can always cancel
+ *                                          it regardless of call site
+ *   window._countdownVisibilityHandler   — visibilitychange ref
+ *   window._cooldownExpiryTimeout        — one-shot safety-net setTimeout
+ *   window._cooldownExpiryLocationId     — location id for the above
+ *   window.lastClosestDistance           — unchanged
+ *   window.lastClosestLocation           — unchanged
+ *   window.currentlyArrived              — unchanged
+ */
 function updateDistanceBox() {
     const distanceBox = cachedElements.distanceBox || document.getElementById('distanceBox');
     if (!distanceBox) {
@@ -6717,7 +6747,9 @@ function updateDistanceBox() {
 
     const distanceFeet = Math.round(closestDistance * 3.28084);
 
-    const PROXIMITY_THRESHOLD = (typeof CONFIG !== 'undefined' && CONFIG.DISTANCE_THRESHOLD) ? CONFIG.DISTANCE_THRESHOLD : 20;
+    const PROXIMITY_THRESHOLD = (typeof CONFIG !== 'undefined' && CONFIG.DISTANCE_THRESHOLD)
+        ? CONFIG.DISTANCE_THRESHOLD
+        : 20;
     const isArrived = distanceFeet <= PROXIMITY_THRESHOLD;
 
     let cooldownStatus = null;
@@ -6727,96 +6759,166 @@ function updateDistanceBox() {
         isOnCooldown = !!cooldownStatus?.isOnCooldown;
     }
 
-    // ── COUNTDOWN INTERVAL MANAGEMENT ──
-    // Only clear the countdown when the user has left the arrival threshold.
-    // GPS jitter must NOT kill the interval — that caused the ~10s delay bug.
-    if (window.distanceBoxCountdownInterval && !isArrived) {
-        clearInterval(window.distanceBoxCountdownInterval);
+    // ─────────────────────────────────────────────────────────────────────────
+    // _stopCountdown — tears down every handle for the running countdown.
+    //
+    // rafId lives in window._countdownRafId (not a closure variable) so this
+    // function can always cancel the correct frame regardless of where it is
+    // called from. Previously rafId was closure-scoped, meaning calls from
+    // outside the start block would cancelAnimationFrame(null) — a no-op —
+    // leaving a stale RAF callback free to re-schedule itself.
+    //
+    // Safe to call multiple times; fully idempotent.
+    // ─────────────────────────────────────────────────────────────────────────
+    function _stopCountdown() {
+        if (window._countdownRafId) {
+            cancelAnimationFrame(window._countdownRafId);
+            window._countdownRafId = null;
+        }
+        if (window._countdownNextFrame) {
+            clearTimeout(window._countdownNextFrame);
+            window._countdownNextFrame = null;
+        }
+        // Keep as null (falsy) so all existing `if (window.distanceBoxCountdownInterval)`
+        // checks continue to work without modification.
         window.distanceBoxCountdownInterval = null;
 
         if (window._countdownVisibilityHandler) {
             document.removeEventListener('visibilitychange', window._countdownVisibilityHandler);
             window._countdownVisibilityHandler = null;
         }
+    }
 
-        // Also clear the guaranteed-expiry timeout since user left the threshold
+    // ── CLEANUP: user has left the arrival threshold ──────────────────────────
+    if (window.distanceBoxCountdownInterval && !isArrived) {
+        _stopCountdown();
+
         if (window._cooldownExpiryTimeout) {
             clearTimeout(window._cooldownExpiryTimeout);
             window._cooldownExpiryTimeout = null;
             window._cooldownExpiryLocationId = null;
         }
-
-        // Clean up cooldown manager's popup/badge since user left
         if (window.cooldownManager) {
-            window.cooldownManager.clearToast();
+            window.cooldownManager.clearToast?.();
         }
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // ARRIVED BRANCH
+    // ─────────────────────────────────────────────────────────────────────────
     if (isArrived) {
         if (isOnCooldown && cooldownStatus?.remainingSeconds !== undefined) {
-            // Only start a new interval if one isn't already running
+            // ── Start RAF-aligned countdown (only if not already running) ──
             if (!window.distanceBoxCountdownInterval) {
-                const updateCountdown = () => {
-                    if (document.hidden) return;
 
-                    if (!closestLocation?.id || !window.cooldownManager) {
-                        if (window.distanceBoxCountdownInterval) {
-                            clearInterval(window.distanceBoxCountdownInterval);
-                            window.distanceBoxCountdownInterval = null;
-                        }
+                // Closure-scoped display state. Not a global because it only
+                // needs to live as long as this countdown instance.
+                let lastDisplayedText = null;
+
+                /**
+                 * scheduleNext — queue the next tick via setTimeout(~1s) → RAF.
+                 * The RAF call ensures the DOM write lands during the browser's
+                 * paint phase, batched with the marker's transform update.
+                 */
+                const scheduleNext = () => {
+                    if (!window.distanceBoxCountdownInterval) return;
+                    window._countdownNextFrame = setTimeout(() => {
+                        window._countdownNextFrame = null;
+                        if (!window.distanceBoxCountdownInterval) return;
+                        window._countdownRafId = requestAnimationFrame(tick);
+                    }, 1000);
+                };
+
+                /**
+                 * tick — the work unit. Always runs inside an RAF callback
+                 * (except for the immediate first call below).
+                 */
+                const tick = () => {
+                    window._countdownRafId = null; // RAF has fired; clear so scheduleNext works
+
+                    // Tab hidden — skip DOM work but keep the countdown alive.
+                    if (document.hidden) {
+                        scheduleNext();
                         return;
                     }
-                    
+
+                    // Location or manager disappeared mid-countdown.
+                    if (!closestLocation?.id || !window.cooldownManager) {
+                        _stopCountdown();
+                        return;
+                    }
+
                     const status = window.cooldownManager.checkCooldown(closestLocation.id);
+
                     if (!status?.isOnCooldown) {
-                        distanceBox.textContent = 'Arrived.';
-                        applyArrivedStyling(distanceBox);
+                        // ── Cooldown just expired ──
+                        const arrivedText = 'Arrived.';
+                        if (lastDisplayedText !== arrivedText) {
+                            distanceBox.textContent = arrivedText;
+                            applyArrivedStyling(distanceBox);
+                            lastDisplayedText = arrivedText;
+                        }
                         window.currentlyArrived = true;
-                        
+
                         if (typeof handleProximityAndAutoOpen === 'function') {
                             handleProximityAndAutoOpen(userPos, performance.now(), closestLocation, closestDistance);
                         }
-                        
-                        if (window.distanceBoxCountdownInterval) {
-                            clearInterval(window.distanceBoxCountdownInterval);
-                            window.distanceBoxCountdownInterval = null;
-                        }
 
-                        // Clear the guaranteed-expiry timeout since the interval handled it
+                        _stopCountdown();
+
+                        // RAF countdown handled expiry; cancel the backup timeout.
                         if (window._cooldownExpiryTimeout) {
                             clearTimeout(window._cooldownExpiryTimeout);
                             window._cooldownExpiryTimeout = null;
                             window._cooldownExpiryLocationId = null;
                         }
-                    } else {
-                        const mins = Math.floor(status.remainingSeconds / 60);
-                        const secs = status.remainingSeconds % 60;
-                        const timeStr = `${mins}:${secs.toString().padStart(2, '0')}`;
-                        distanceBox.textContent = `Open in ${timeStr}`;
-                        applyArrivedStyling(distanceBox);
+                        return;
                     }
-                };
-                
-                updateCountdown();
-                window.distanceBoxCountdownInterval = setInterval(updateCountdown, 1000);
 
-                const resumeCountdownOnVisible = () => {
+                    // ── Still counting down — dirty-check before any DOM write ──
+                    const mins = Math.floor(status.remainingSeconds / 60);
+                    const secs = status.remainingSeconds % 60;
+                    const newText = `Open in ${mins}:${secs.toString().padStart(2, '0')}`;
+
+                    if (newText !== lastDisplayedText) {
+                        distanceBox.textContent = newText;
+                        applyArrivedStyling(distanceBox);
+                        lastDisplayedText = newText;
+                    }
+
+                    scheduleNext();
+                };
+
+                // ── Mark countdown as running ────────────────────────────────
+                // true is truthy, so all existing `if (window.distanceBoxCountdownInterval)`
+                // checks pass unchanged. We deliberately do NOT store a numeric
+                // interval ID here because there is no interval anymore.
+                window.distanceBoxCountdownInterval = true;
+
+                // First tick fires immediately so the display updates the
+                // instant the user arrives, with no 1-second delay.
+                tick();
+
+                // ── Visibility handler: resume after tab un-hides ────────────
+                // Uses window._countdownRafId (not the old closure rafId) so
+                // the guard is accurate even when called from outside the closure.
+                const resumeOnVisible = () => {
                     if (!document.hidden && window.distanceBoxCountdownInterval) {
-                        updateCountdown();
+                        if (!window._countdownNextFrame && !window._countdownRafId) {
+                            window._countdownRafId = requestAnimationFrame(tick);
+                        }
                     }
                 };
                 if (window._countdownVisibilityHandler) {
                     document.removeEventListener('visibilitychange', window._countdownVisibilityHandler);
                 }
-                window._countdownVisibilityHandler = resumeCountdownOnVisible;
-                document.addEventListener('visibilitychange', resumeCountdownOnVisible);
+                window._countdownVisibilityHandler = resumeOnVisible;
+                document.addEventListener('visibilitychange', resumeOnVisible);
 
-                // ── GUARANTEED COOLDOWN EXPIRY BACKUP ──
-                // A one-shot setTimeout that fires at the exact moment the
-                // cooldown expires. This is the safety net that guarantees
-                // the page opens within ~1 second of cooldown reaching 0,
-                // even if GPS jitter kills the 1-second interval.
-                // ONLY opens if user is within the distance threshold.
+                // ── Guaranteed cooldown-expiry backup (one-shot setTimeout) ──
+                // Safety net: fires ~200ms after the cooldown expires and opens
+                // the location page if the user is still within the threshold.
+                // Cancelled by the RAF countdown if it catches expiry first.
                 if (cooldownStatus.remainingMs > 0) {
                     if (window._cooldownExpiryTimeout) {
                         clearTimeout(window._cooldownExpiryTimeout);
@@ -6827,7 +6929,6 @@ function updateDistanceBox() {
                         const locId = window._cooldownExpiryLocationId;
                         window._cooldownExpiryLocationId = null;
 
-                        // Verify user is still within the distance threshold
                         const currentUserLatLng = userMarker?.getLatLng();
                         const loc = gameLocations?.find(l => l?.id === locId);
                         if (currentUserLatLng && loc) {
@@ -6835,9 +6936,8 @@ function updateDistanceBox() {
                                 { lat: currentUserLatLng.lat, lng: currentUserLatLng.lng },
                                 { lat: loc.lat, lng: loc.lng }
                             );
-                            const distFeet = dist * 3.28084;
-
-                            if (distFeet <= PROXIMITY_THRESHOLD && typeof window._openLocationPage === 'function') {
+                            if ((dist * 3.28084) <= PROXIMITY_THRESHOLD &&
+                                typeof window._openLocationPage === 'function') {
                                 console.log('[Cooldown] Guaranteed expiry timeout fired — opening location', locId);
                                 window._openLocationPage(loc);
                             }
@@ -6845,32 +6945,42 @@ function updateDistanceBox() {
                     }, cooldownStatus.remainingMs + 200);
                 }
             }
-            // If countdown interval is already running, do nothing — it handles itself
+            // Countdown already running — it self-manages; nothing to do.
+
         } else {
-            // Not on cooldown — clean up any running countdown
+            // ── Arrived but not on cooldown — clear any leftover state ───────
             if (window.distanceBoxCountdownInterval) {
-                clearInterval(window.distanceBoxCountdownInterval);
-                window.distanceBoxCountdownInterval = null;
+                _stopCountdown();
             }
             if (window._cooldownExpiryTimeout) {
                 clearTimeout(window._cooldownExpiryTimeout);
                 window._cooldownExpiryTimeout = null;
                 window._cooldownExpiryLocationId = null;
             }
+
             distanceBox.textContent = 'Arrived.';
             applyArrivedStyling(distanceBox);
         }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // OUTSIDE THRESHOLD BRANCH
+    // ─────────────────────────────────────────────────────────────────────────
     } else {
-        // Outside threshold — always show distance, never show countdown
         const distanceText = distanceFeet < 5280
             ? `${distanceFeet.toLocaleString()} feet`
             : `${(distanceFeet / 5280).toFixed(2)} miles`;
         distanceBox.textContent = `Closest Stop: ${distanceText}`;
         applyDefaultStyling(distanceBox);
 
+        // Visibility handler cleanup (countdown already fully cleared by the
+        // early-exit block above if it was running).
         if (window._countdownVisibilityHandler) {
             document.removeEventListener('visibilitychange', window._countdownVisibilityHandler);
             window._countdownVisibilityHandler = null;
+        }
+        if (window._countdownNextFrame) {
+            clearTimeout(window._countdownNextFrame);
+            window._countdownNextFrame = null;
         }
     }
 
