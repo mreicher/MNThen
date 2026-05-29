@@ -430,8 +430,25 @@ const locations = [
   "imageSource": "https://mnthen.com/images/exhibit/w8.jpg",
   "additionalInfo": "The Willmar 8 helped shift the conversation toward comparable worth, contributing to Minnesota passing some of the strongest pay equity laws in the country.",
   difficulty: 1
+},
+{
+  "id": "1033",
+  "lat": 44.94648432105931,
+  "lng": -93.10618623809177,
+  "name": "Selby Avenue Line (1888 – 1953)",
+  "title": "Selby Avenue Line (1888 – 1953)",
+  "image": "https://mnthen.com/images/selby_line.jpg",
+  "creator": "Matt Reicher",
+  "city": "St. Paul",
+  "audio": "/audio/exhibit/selby_tunnel.mp3",
+  "tours": "place",
+  "summary": "A treacherous 16% grade blocked St. Paul's westward expansion until a 1907 tunnel carved through the bluff.",
+  "today": "Sealed tunnel portal near the intersection of Selby and Summit Avenues",
+  "link": "https://mnthen.com/blog/place/selby_line.html",
+  "imageSource": "https://mnthen.com/images/exhibit/selby_line.jpg",
+  "additionalInfo": "By 1910, the tunnel allowed streetcar travel from Lake Minnetonka to the St. Croix River.",
+  "difficulty": 1
 }
-
 
     // Add more locations here
 ];
