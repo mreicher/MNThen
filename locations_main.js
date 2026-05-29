@@ -443,7 +443,7 @@ const locations = [
   "audio": "/audio/exhibit/selby_tunnel.mp3",
   "tours": "place",
   "summary": "A treacherous 16% grade blocked St. Paul's westward expansion until a 1907 tunnel carved through the bluff.",
-  "today": "Sealed tunnel portal near the intersection of Selby and Summit Avenues",
+  "today": "Near the intersection of Selby and Summit Avenues",
   "link": "https://mnthen.com/blog/place/selby_line.html",
   "imageSource": "https://mnthen.com/images/exhibit/selby_line.jpg",
   "additionalInfo": "By 1910, the tunnel allowed streetcar travel from Lake Minnetonka to the St. Croix River.",
