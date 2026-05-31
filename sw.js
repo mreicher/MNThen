@@ -1,5 +1,5 @@
 // sw.js – Minnesota Then Service Worker
-// Version: 4.5.1 (hybrid: update + timer + CORS audio)
+// Version: 4.5.2 (hybrid: update + timer + CORS audio + offline hardening)
 
 const CACHE_NAME = 'mnthen-v4-ios-5';
 const SHELL_CACHE = 'mnthen-shell-v5';
@@ -48,12 +48,17 @@ function isCORSAudio(url) {
 }
 
 async function trimCache(cacheName, maxEntries) {
-  const cache = await caches.open(cacheName);
-  const keys = await cache.keys();
-  if (keys.length > maxEntries) {
-    for (let i = 0; i < keys.length - maxEntries; i++) {
-      await cache.delete(keys[i]);
+  try {
+    const cache = await caches.open(cacheName);
+    const keys = await cache.keys();
+    if (keys.length > maxEntries) {
+      // Delete in parallel for massive speed improvement over sequential await
+      await Promise.all(
+        keys.slice(0, keys.length - maxEntries).map(key => cache.delete(key))
+      );
     }
+  } catch (e) {
+    console.warn('[SW] trimCache failed safely:', e);
   }
 }
 
@@ -71,11 +76,12 @@ async function cacheFirst(req, cacheName = CACHE_NAME) {
     clearTimeout(timeoutId);
     
     if (res.ok && res.status === 200 && res.type !== 'opaque') {
-      cache.put(req, res.clone());
+      cache.put(req, res.clone()).catch(() => {});
     }
     return res;
   } catch (e) {
-    return hit || new Response('Offline', { status: 503 });
+    // hit is guaranteed null here, avoiding dead code
+    return new Response('Offline', { status: 503 });
   }
 }
 
@@ -104,31 +110,39 @@ async function staleWhileRevalidate(req) {
 
   const update = fetch(req)
     .then(res => {
-      if (res.ok && res.status === 200) cache.put(req, res.clone());
+      if (res.ok && res.status === 200) cache.put(req, res.clone()).catch(() => {});
       return res;
     })
-    .catch(() => cached);
+    // If network fails and cache is null, returning undefined crashes e.respondWith. 
+    // Return 503 instead.
+    .catch(() => new Response('Offline', { status: 503 })); 
 
   return cached || update;
 }
 
 async function handleAudio(req) {
   if (req.headers.has('range')) {
-    return fetch(req);
+    // Must catch offline failure on range requests to prevent SW crash
+    return fetch(req).catch(() => new Response('Offline', { status: 503 }));
   }
   
   const cache = await caches.open(AUDIO_CACHE);
   const hit = await cache.match(req);
   if (hit) return hit;
 
-  const corsMode = isCORSAudio(req.url) ? 'cors' : 'same-origin';
-  const res = await fetch(req, { mode: corsMode, credentials: 'same-origin' });
-  
-  if (res.ok && res.status === 200 && res.type !== 'opaque') {
-    cache.put(req, res.clone()).catch(() => {});
-    trimCache(AUDIO_CACHE, MAX_AUDIO);
+  // Wrap in try/catch to prevent unhandled rejections when offline
+  try {
+    const corsMode = isCORSAudio(req.url) ? 'cors' : 'same-origin';
+    const res = await fetch(req, { mode: corsMode, credentials: 'same-origin' });
+    
+    if (res.ok && res.status === 200 && res.type !== 'opaque') {
+      cache.put(req, res.clone()).catch(() => {});
+      trimCache(AUDIO_CACHE, MAX_AUDIO);
+    }
+    return res;
+  } catch (e) {
+    return new Response('Offline', { status: 503 });
   }
-  return res;
 }
 
 // ---------- fetch ----------
@@ -144,13 +158,14 @@ self.addEventListener('fetch', e => {
     return;
   }
 
-  if (AUDIO_EXTS.test(url) || VIDEO_EXTS.test(url)) {
-    e.respondWith(handleAudio(req));
+  // Performance: Evaluate high-traffic/cheap checks before expensive regexes
+  if (TILE_REGEX.test(url)) {
+    e.respondWith(cacheFirst(req, TILE_CACHE));
     return;
   }
 
-  if (TILE_REGEX.test(url)) {
-    e.respondWith(cacheFirst(req, TILE_CACHE));
+  if (url.includes('/api/')) {
+    e.respondWith(networkFirst(req));
     return;
   }
 
@@ -159,13 +174,13 @@ self.addEventListener('fetch', e => {
     return;
   }
 
-  if (/\.(css|js|png|jpg|jpeg|gif|svg|webp|ico|woff|woff2)$/i.test(url)) {
-    e.respondWith(cacheFirst(req));
+  if (AUDIO_EXTS.test(url) || VIDEO_EXTS.test(url)) {
+    e.respondWith(handleAudio(req));
     return;
   }
 
-  if (url.includes('/api/')) {
-    e.respondWith(networkFirst(req));
+  if (/\.(css|js|png|jpg|jpeg|gif|svg|webp|ico|woff|woff2)$/i.test(url)) {
+    e.respondWith(cacheFirst(req));
     return;
   }
 
@@ -175,7 +190,7 @@ self.addEventListener('fetch', e => {
 // ---------- lifecycle ----------
 
 self.addEventListener('install', e => {
-  console.log('[SW] 4.5.1 installing');
+  console.log('[SW] 4.5.2 installing');
   e.waitUntil(
     caches.open(SHELL_CACHE)
       .then(c => c.addAll(SHELL_RESOURCES))
@@ -188,7 +203,7 @@ self.addEventListener('install', e => {
 });
 
 self.addEventListener('activate', e => {
-  console.log('[SW] 4.5.1 activating');
+  console.log('[SW] 4.5.2 activating');
   e.waitUntil(
     caches.keys().then(names =>
       Promise.all(
@@ -246,4 +261,4 @@ self.addEventListener('unhandledrejection', e => {
   e.preventDefault();
 });
 
-console.log('[SW] 4.5.1 ready (hybrid: update + timeouts + CORS audio)');
+console.log('[SW] 4.5.2 ready (hybrid: update + timeouts + CORS audio + offline hardening)');
