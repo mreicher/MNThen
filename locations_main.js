@@ -447,7 +447,7 @@ const locations = [
   "link": "https://mnthen.com/blog/place/selby_line.html",
   "imageSource": "https://mnthen.com/images/exhibit/selby_line.jpg",
   "additionalInfo": "By 1910, the tunnel allowed streetcar travel from Lake Minnetonka to the St. Croix River.",
-  "difficulty": 1
+  "difficulty": 2
 }
 
     // Add more locations here
