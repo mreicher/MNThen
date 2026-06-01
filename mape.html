@@ -3639,8 +3639,6 @@ function _prefetchMapTiles(location, now) {
         
 /* ──────────────────────────────────────────────
    SPEED TIER CONFIGURATION — module-level constants
-   Moved out of updateUserLocation to avoid
-   re-creating 30 objects on every GPS tick.
    ────────────────────────────────────────────── */
 const TIER_CONFIGS = [
     { micro: 0.08, minDist: 0.25, maxAcc: 32, maxSpd: 3,   mapInt: 1000, mapDist: 2.0,  panDur: 2.20, easeLin: 0.05 },
@@ -3776,6 +3774,8 @@ function updateUserLocation(position, forceUpdate = false) {
         window.smoothedVelocity = { lat: 0, lng: 0 };
         window.isStationary = false;
         window.stationaryStartTime = null;
+        window._emaSpeedFast = null;
+        window._emaSpeedSlow = null;
     }
 
     const newPosition = {
@@ -3787,7 +3787,9 @@ function updateUserLocation(position, forceUpdate = false) {
         speedMPS: rawSpeedMPS
     };
 
- // SECTION 5: SPEED CALCULATION
+    // SECTION 5: SPEED CALCULATION
+    // reliableSpeedMPS fills in GPS speed gaps using position-delta
+    // when the device reports zero or implausibly low speed.
     let reliableSpeedMPS = rawSpeedMPS;
 
     if (lastPos && timeDelta > 0.15 && timeDelta < 5.0) {
@@ -3806,40 +3808,51 @@ function updateUserLocation(position, forceUpdate = false) {
         }
     }
 
+    // _emaSpeedFast: smoothed speed for mode decisions and tier selection.
+    // Weights corrected to 0.25 new / 0.75 history — the original 0.95/0.05
+    // was effectively unsmoothed (95% raw reading every tick) causing jitter
+    // at low speeds and unstable tier transitions. 0.25/0.75 still responds
+    // quickly to real acceleration while rejecting single noisy fixes.
     window._emaSpeedFast = window._emaSpeedFast ?? reliableSpeedMPS;
-    window._emaSpeedFast = 0.95 * reliableSpeedMPS + 0.05 * window._emaSpeedFast;
+    window._emaSpeedFast = 0.25 * reliableSpeedMPS + 0.75 * window._emaSpeedFast;
 
+    // _emaSpeedSlow: heavily smoothed speed for animation parameters only.
+    // Unchanged — this is intentionally laggy to keep animations stable.
     window._emaSpeedSlow = window._emaSpeedSlow ?? reliableSpeedMPS;
     window._emaSpeedSlow = 0.35 * reliableSpeedMPS + 0.65 * window._emaSpeedSlow;
 
-    // ── Mode decision speed ─────────────────────────────────────────────
-    // CONFIG flag: set window.CONFIG.USE_RESPONSIVE_MODE = true to enable
-    // faster mode transitions using unfiltered position-delta speed.
-    // Default (false/unset): preserves original _emaSpeedFast behavior.
-    const useResponsiveMode = (typeof CONFIG !== 'undefined' && CONFIG.USE_RESPONSIVE_MODE) === true;
-
-    let modeSpeedMPS;
-    if (useResponsiveMode && lastPos && timeDelta > 0.15 && timeDelta < 3.0) {
-        const dist = calculateDistance(lastPos, newPosition);
-        // Reject obvious GPS spikes (>50m in <1s = 112+ MPH, not real acceleration)
-        const isObviousJump = dist > 50 && timeDelta < 1.0;
-        const calcSpeed = isObviousJump ? 0 : Math.min(dist / timeDelta, 25);
-        // Use whichever is higher: GPS-derived (smoothed) or calculated (current)
-        modeSpeedMPS = Math.max(reliableSpeedMPS, calcSpeed);
-    } else {
-        // Original behavior: derive mode speed from fast EMA
-        modeSpeedMPS = window._emaSpeedFast;
-    }
-
-    let modeSpeedMPH = Math.min(modeSpeedMPS * 2.23694, 120);
+    let modeSpeedMPH = Math.min(window._emaSpeedFast * 2.23694, 120);
     const speedMPH = Math.min(window._emaSpeedSlow * 2.23694, 120);
     const speedMPS = window._emaSpeedSlow;
 
-    // EMERGENCY BURST OVERRIDE (safety net — now primarily covers the
-    // responsive mode path where calcSpeed might undershoot)
+    // EMERGENCY BURST OVERRIDE — if raw reliable speed already exceeds
+    // the smoothed value, let it through immediately so the mode
+    // transition never waits longer than one GPS tick at high speed.
     const reliableSpeedMPH = reliableSpeedMPS * 2.23694;
     if (reliableSpeedMPH > modeSpeedMPH) {
         modeSpeedMPH = Math.min(reliableSpeedMPH, 120);
+    }
+
+    // SECTION 6: MODE & INACTIVITY
+    const modeChanged = ModeManager.update(modeSpeedMPH);
+    const isInCenteredMode = ModeManager.isCentered();
+
+    if (speedMPH >= 1.0) {
+        _clearInactivityTimer();
+    } else {
+        _startInactivityTimer();
+    }
+
+    // SECTION 7: GPS RECOVERY STATE
+    if (window.isGPSSearching) {
+        window.isGPSSearching = false;
+        window.positionBuffer = [newPosition];
+        window.lastVelocity = { lat: 0, lng: 0 };
+        window.smoothedVelocity = { lat: 0, lng: 0 };
+        window.isStationary = false;
+        window.stationaryStartTime = null;
+        window.stationaryLockPosition = null;
+        if (typeof hideGPSSearchingState === 'function') hideGPSSearchingState();
     }
 
     // SECTION 8: PROXIMITY CALCULATIONS
@@ -3909,7 +3922,7 @@ function updateUserLocation(position, forceUpdate = false) {
     const eastWestMove = lngDelta > latDelta * 1.2;
     const speedFactor = Math.min(1, Math.max(0.01, speedMPS / 15));
 
-    // Improbable acceleration rejection (with state update to prevent time explosions)
+    // Improbable acceleration rejection
     if (timeDelta > 0 && timeDelta < 5) {
         const lastSpeedMPH = (lastPos.speedMPS || 0) * 2.23694;
         const accel = Math.abs(speedMPH - lastSpeedMPH) / timeDelta;
@@ -3982,7 +3995,7 @@ function updateUserLocation(position, forceUpdate = false) {
         easeLinearity: baseTier.easeLin * (eastWestMove ? 0.92 : 1.0)
     };
 
-   // SECTION 13: LARGE-JUMP HANDLING
+    // SECTION 13: LARGE-JUMP HANDLING
     if (distance > 50 || forceUpdate) {
         _handleLargeDistanceJump(newPosition, currentTime);
         window.lastUpdateTime = currentTime;
@@ -4212,11 +4225,12 @@ function updateUserLocation(position, forceUpdate = false) {
         };
 
         // SECTION 19: ANIMATION PARAMETERS
-        // Centered mode pan multiplier: 40% faster with tighter bounds
-        let animDur = isInCenteredMode 
+        // In centered mode the map moves, not the marker, so pan durations
+        // are tightened to keep the map surface flush with device movement.
+        let animDur = isInCenteredMode
             ? Math.max(0.03, Math.min(0.3, speedTier.panDuration * 0.6))
             : speedTier.panDuration;
-            
+
         const durDist = Math.min(0.02, distance * 0.001);
         const durTime = timeDelta > 0 ? Math.max(-0.01, Math.min(0.02, (0.25 - timeDelta) * 0.04)) : 0;
         const durDir = headingDiff > 20 ? Math.min(0.04, headingDiff / 300 * 0.08) : 0;
@@ -4227,153 +4241,153 @@ function updateUserLocation(position, forceUpdate = false) {
             ? Math.max(0.07, Math.min(0.19, (0.13 - speedMPH * 0.0006) * directionChangeFactor))
             : Math.max(0.08, Math.min(0.23, (0.15 - speedMPH * 0.0011) * directionChangeFactor));
 
-        // Look-ahead factor (Boosted for centered mode)
+        // Look-ahead factor — boosted in centered mode so the map
+        // anticipates direction and doesn't feel like it's chasing.
         const lab = LOOK_AHEAD[currentTierIndex];
         const laBase = lab.base + speedFactor * lab.mult;
         const laBoost = speedMPH < 15 ? Math.min(0.08, distance * 0.0055) : 0;
         const laDir = headingDiff > 25 ? Math.min(0.14, headingDiff / 200 * 0.22) : 0;
         const laEW = (speedMPH < 15 && eastWestMove) ? Math.min(0.055, distance * 0.0013) : 0;
         let lookAheadFactor = Math.max(0.01, Math.min(lab.max, laBase + laBoost - laDir + laEW));
-        
+
         if (isInCenteredMode) {
             lookAheadFactor = Math.min(lab.max * 1.5, lookAheadFactor * 1.8);
         }
 
         // SECTION 20: VISUAL UPDATES
-                const performVisualUpdates = () => {
-                    try {
-                        // Update marker
-                        const updateOptions = {
-                            animate: true,
-                            duration: finalAnimDur,
-                            easeLinearity: finalEaseLin
-                        };
-                        if (displayHeading != null) updateOptions.heading = displayHeading;
-                        scheduleMarkerUpdate(smoothedPosition.lat, smoothedPosition.lng, updateOptions);
-        
-                        // Determine if map should update
-                        const mapInterval = speedTier.mapUpdateInterval;
-                        const highSpeedThr = SPEED_THRESHOLDS?.HIGH_SPEED ?? 45;
-                        const aggressiveness = typeof highSpeedAggressiveness === 'function'
-                            ? Math.max(0.1, highSpeedAggressiveness(speedMPH))
-                            : 0.5;
-        
-                        let mapDistThr = speedTier.mapUpdateDistance * (1 - 0.4 * aggressiveness);
-                        if (eastWestMove) mapDistThr *= 0.92;
-        
-                        const isHighDrift = distance > 8.0 && modeSpeedMPH >= highSpeedThr;
-                        window._driftCounter = isHighDrift ? (window._driftCounter || 0) + 1 : 0;
-        
-                        const justCentered = modeChanged && isInCenteredMode;
-                        const shouldUpdateMap = justCentered ||
-                            (currentTime - (window.lastMapUpdateTime || 0)) > mapInterval ||
-                            distance > mapDistThr ||
-                            window._driftCounter >= 2;
-        
-                        if (shouldUpdateMap && map) {
-                            const lookAheadPos = {
-                                lat: smoothedPosition.lat + (bufferedPosition.lat - lastPos.lat) * lookAheadFactor,
-                                lng: smoothedPosition.lng + (bufferedPosition.lng - lastPos.lng) * lookAheadFactor
-                            };
-        
-                            const bounds = map.getBounds?.();
-        
-                            if (bounds && !window.isMapInteracting && window.followUser) {
-                                if (isInCenteredMode) {
-                                    // CENTERED MODE: Always keep marker centered, not just near edges
-                                    const markerLL = L.latLng(smoothedPosition.lat, smoothedPosition.lng);
-                                    const mapSize = map.getSize();
-                                    const markerPx = map.latLngToContainerPoint(markerLL);
-                                    const centerPx = { x: mapSize.x / 2, y: mapSize.y / 2 };
-                                    const driftPx = Math.hypot(markerPx.x - centerPx.x, markerPx.y - centerPx.y);
-                                    
-                                    // Drift tolerance: faster = tighter following
-                                    const tolerance = Math.max(3, Math.min(12, 12 - speedMPH * 0.3));
-                                    
-                                    if (justCentered || driftPx > tolerance || window._driftCounter >= 2) {
-                                        _panMapToCenter(lookAheadPos, speedTier, directionChangeFactor, eastWestMove, speedMPH, lookAheadFactor);
-                                    }
-                                } else {
-                                    // ROAMING MODE: only pan near edges
-                                    if (_isNearViewportEdge(smoothedPosition, bounds, speedMPH)) {
-                                        _panMapIfNearEdge(lookAheadPos, speedTier, directionChangeFactor, eastWestMove, bounds, speedMPH);
-                                    }
-                                }
-                            }
-                            window.lastMapUpdateTime = currentTime;
-                        }
-        
-                        // Proximity zoom
-                        _handleProximityZoomLogic(modeSpeedMPH, eastWestMove);
-        
-                        // Viewport safety
-                        if (typeof _enforceViewportSafety === 'function') {
-                            _enforceViewportSafety(speedMPH, userMarker.getLatLng?.());
-                        }
-                    } catch (err) {
-                        console.error("updateUserLocation: visual update error:", err);
-                    }
+        const performVisualUpdates = () => {
+            try {
+                // In roaming mode the marker moves across the static map.
+                // In centered mode the marker is pinned to center and the
+                // map pans — we still call scheduleMarkerUpdate so the
+                // marker's internal LatLng stays current for proximity math.
+                const updateOptions = {
+                    animate: !isInCenteredMode,
+                    duration: finalAnimDur,
+                    easeLinearity: finalEaseLin
                 };
-        
-                // Schedule visual update with RAF + fallback
-                if (window._nextLocationUpdateRAF) cancelAnimationFrame(window._nextLocationUpdateRAF);
-                window._visualFallbackActive = true;
-        
-                window._nextLocationUpdateRAF = requestAnimationFrame(() => {
-                    window._visualFallbackActive = false;
-                    window._nextLocationUpdateRAF = null;
-                    // Clear the fallback timer since RAF won the race
-                    if (window._visualFallbackTimer) {
-                        clearTimeout(window._visualFallbackTimer);
-                        window._visualFallbackTimer = null;
+                if (displayHeading != null) updateOptions.heading = displayHeading;
+                scheduleMarkerUpdate(smoothedPosition.lat, smoothedPosition.lng, updateOptions);
+
+                // Determine if map should update
+                const mapInterval = speedTier.mapUpdateInterval;
+                const highSpeedThr = SPEED_THRESHOLDS?.HIGH_SPEED ?? 45;
+                const aggressiveness = typeof highSpeedAggressiveness === 'function'
+                    ? Math.max(0.1, highSpeedAggressiveness(speedMPH))
+                    : 0.5;
+
+                let mapDistThr = speedTier.mapUpdateDistance * (1 - 0.4 * aggressiveness);
+                if (eastWestMove) mapDistThr *= 0.92;
+
+                const isHighDrift = distance > 8.0 && modeSpeedMPH >= highSpeedThr;
+                window._driftCounter = isHighDrift ? (window._driftCounter || 0) + 1 : 0;
+
+                const justCentered = modeChanged && isInCenteredMode;
+                const shouldUpdateMap = justCentered ||
+                    (currentTime - (window.lastMapUpdateTime || 0)) > mapInterval ||
+                    distance > mapDistThr ||
+                    window._driftCounter >= 2;
+
+                if (shouldUpdateMap && map) {
+                    const lookAheadPos = {
+                        lat: smoothedPosition.lat + (bufferedPosition.lat - lastPos.lat) * lookAheadFactor,
+                        lng: smoothedPosition.lng + (bufferedPosition.lng - lastPos.lng) * lookAheadFactor
+                    };
+
+                    const bounds = map.getBounds?.();
+
+                    if (bounds && !window.isMapInteracting && window.followUser) {
+                        if (isInCenteredMode) {
+                            // CENTERED MODE: map always pans to keep marker
+                            // at center. Check pixel drift so we only pan
+                            // when the marker has visibly moved off center.
+                            const markerLL = L.latLng(smoothedPosition.lat, smoothedPosition.lng);
+                            const mapSize = map.getSize();
+                            const markerPx = map.latLngToContainerPoint(markerLL);
+                            const centerPx = { x: mapSize.x / 2, y: mapSize.y / 2 };
+                            const driftPx = Math.hypot(markerPx.x - centerPx.x, markerPx.y - centerPx.y);
+
+                            // Tighter tolerance at higher speeds so the map
+                            // never lags behind the user's actual position.
+                            const tolerance = Math.max(2, Math.min(10, 10 - speedMPH * 0.25));
+
+                            if (justCentered || driftPx > tolerance || window._driftCounter >= 2) {
+                                _panMapToCenter(lookAheadPos, speedTier, directionChangeFactor, eastWestMove, speedMPH, lookAheadFactor);
+                            }
+                        } else {
+                            // ROAMING MODE: map only pans when marker nears edge.
+                            if (_isNearViewportEdge(smoothedPosition, bounds, speedMPH)) {
+                                _panMapIfNearEdge(lookAheadPos, speedTier, directionChangeFactor, eastWestMove, bounds, speedMPH);
+                            }
+                        }
                     }
-                    performVisualUpdates();
-                });
-        
-                if (window._visualFallbackTimer) clearTimeout(window._visualFallbackTimer);
-                window._visualFallbackTimer = createTrackedTimeout(() => {
-                    if (window._visualFallbackActive && window._nextLocationUpdateRAF) {
-                        cancelAnimationFrame(window._nextLocationUpdateRAF);
-                        window._nextLocationUpdateRAF = null;
-                        window._visualFallbackActive = false;
-                        performVisualUpdates();
-                    }
-                    window._visualFallbackTimer = null;
-                }, 160);
-        
-                // Commit state
-                window.lastPosition = smoothedPosition;
-                window.lastVelocity = instantVelocity;
-                window.lastUpdateTime = currentTime;
-                window.lastUpdateTimestamp = currentTime;
-        
-                // Pass precalculated values from Section 8 to avoid a redundant distance loop.
-                // Uses newPosition (raw GPS) so distance math aligns with what Section 8 computed.
-                // Callers without arguments (idle check, stationary confirm, etc.) hit the slow
-                // path inside updateDistanceBox automatically — no changes needed elsewhere.
-                if (typeof updateDistanceBox === 'function') {
-                    updateDistanceBox(forceUpdate, newPosition, closestLocation, closestDistance);
+                    window.lastMapUpdateTime = currentTime;
                 }
-        
+
+                // Proximity zoom
+                _handleProximityZoomLogic(modeSpeedMPH, eastWestMove);
+
+                // Viewport safety
+                if (typeof _enforceViewportSafety === 'function') {
+                    _enforceViewportSafety(speedMPH, userMarker.getLatLng?.());
+                }
             } catch (err) {
-                console.error("updateUserLocation: recoverable error:", err);
-                
-                if (window.animationFrameId) cancelAnimationFrame(window.animationFrameId);
-                if (window._nextLocationUpdateRAF) cancelAnimationFrame(window._nextLocationUpdateRAF);
-                window.animationFrameId = null;
-                window._nextLocationUpdateRAF = null;
-        
-                scheduleMarkerUpdate(lat, lng, { animate: true, duration: 0.6, easeLinearity: 0.10 });
-                window.lastPosition = newPosition;
-                window.positionBuffer = [newPosition];
-                window.lastUpdateTime = currentTime;
-                window.lastUpdateTimestamp = currentTime;
-        
-                // In the catch path, closestLocation/closestDistance may not be fully resolved,
-                // so fall back to no-arg call and let updateDistanceBox recalculate safely.
-                if (typeof updateDistanceBox === 'function') updateDistanceBox(forceUpdate);
+                console.error("updateUserLocation: visual update error:", err);
             }
+        };
+
+        // Schedule visual update with RAF + fallback
+        if (window._nextLocationUpdateRAF) cancelAnimationFrame(window._nextLocationUpdateRAF);
+        window._visualFallbackActive = true;
+
+        window._nextLocationUpdateRAF = requestAnimationFrame(() => {
+            window._visualFallbackActive = false;
+            window._nextLocationUpdateRAF = null;
+            if (window._visualFallbackTimer) {
+                clearTimeout(window._visualFallbackTimer);
+                window._visualFallbackTimer = null;
+            }
+            performVisualUpdates();
+        });
+
+        if (window._visualFallbackTimer) clearTimeout(window._visualFallbackTimer);
+        window._visualFallbackTimer = createTrackedTimeout(() => {
+            if (window._visualFallbackActive && window._nextLocationUpdateRAF) {
+                cancelAnimationFrame(window._nextLocationUpdateRAF);
+                window._nextLocationUpdateRAF = null;
+                window._visualFallbackActive = false;
+                performVisualUpdates();
+            }
+            window._visualFallbackTimer = null;
+        }, 160);
+
+        // Commit state
+        window.lastPosition = smoothedPosition;
+        window.lastVelocity = instantVelocity;
+        window.lastUpdateTime = currentTime;
+        window.lastUpdateTimestamp = currentTime;
+
+        if (typeof updateDistanceBox === 'function') {
+            updateDistanceBox(forceUpdate, newPosition, closestLocation, closestDistance);
         }
+
+    } catch (err) {
+        console.error("updateUserLocation: recoverable error:", err);
+
+        if (window.animationFrameId) cancelAnimationFrame(window.animationFrameId);
+        if (window._nextLocationUpdateRAF) cancelAnimationFrame(window._nextLocationUpdateRAF);
+        window.animationFrameId = null;
+        window._nextLocationUpdateRAF = null;
+
+        scheduleMarkerUpdate(lat, lng, { animate: true, duration: 0.6, easeLinearity: 0.10 });
+        window.lastPosition = newPosition;
+        window.positionBuffer = [newPosition];
+        window.lastUpdateTime = currentTime;
+        window.lastUpdateTimestamp = currentTime;
+
+        if (typeof updateDistanceBox === 'function') updateDistanceBox(forceUpdate);
+    }
+}
         
 /* ──────────────────────────────────────────────
    PROXIMITY ZOOM LOGIC
