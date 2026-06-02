@@ -3709,7 +3709,7 @@ function updateUserLocation(position, forceUpdate = false) {
         isStationaryCandidate = dLat < 0.00001 && dLng < 0.00001;
     }
 
-    const debounceDelay = isStationaryCandidate ? 500 : 50;
+    const debounceDelay = isStationaryCandidate && !window._movementOnsetBoost ? 500 : 50;
     const lastDebounce = window._lastDebounceTime || 0;
 
     if (!forceUpdate && (now - lastDebounce) < debounceDelay) {
@@ -3806,14 +3806,31 @@ function updateUserLocation(position, forceUpdate = false) {
     }
     
     window._emaSpeedFast = window._emaSpeedFast ?? reliableSpeedMPS;
+    window._emaSpeedSlow = window._emaSpeedSlow ?? reliableSpeedMPS;
+    
+    // Detect movement onset: snap slow EMA toward reality to eliminate startup lag
+    const isNowMoving = reliableSpeedMPS > 0.8;
+    const wasStationaryFlag = !!window.isStationary;
+    
+    if (wasStationaryFlag && isNowMoving) {
+        // Strictly gated: only fires when transitioning from a confirmed stationary state
+        window._movementOnsetBoost = true;
+        window._movementOnsetTicks = 0;
+        window._emaSpeedSlow = 0.65 * reliableSpeedMPS + 0.35 * window._emaSpeedSlow;
+    } else {
+        window._emaSpeedSlow = 0.35 * reliableSpeedMPS + 0.65 * window._emaSpeedSlow;
+    }
+    
     window._emaSpeedFast = 0.95 * reliableSpeedMPS + 0.05 * window._emaSpeedFast;
     
-    window._emaSpeedSlow = window._emaSpeedSlow ?? reliableSpeedMPS;
-    window._emaSpeedSlow = 0.35 * reliableSpeedMPS + 0.65 * window._emaSpeedSlow;
-    
     let modeSpeedMPH = Math.min(window._emaSpeedFast * 2.23694, 120);
-    const speedMPH = Math.min(window._emaSpeedSlow * 2.23694, 120);
-    const speedMPS = window._emaSpeedSlow;
+    
+    // During onset, blend fast EMA in so downstream calculations see realistic speed immediately
+    const blendedSpeedMPS = window._movementOnsetBoost
+        ? Math.max(window._emaSpeedSlow, window._emaSpeedFast)
+        : window._emaSpeedSlow;
+    const speedMPH = Math.min(blendedSpeedMPS * 2.23694, 120);
+    const speedMPS = blendedSpeedMPS;
     
     // EMERGENCY BURST OVERRIDE
     const reliableSpeedMPH = reliableSpeedMPS * 2.23694;
@@ -3999,13 +4016,30 @@ function updateUserLocation(position, forceUpdate = false) {
     const STAT_LOCK = 0.3;
     const STAT_CONFIRM_MS = 2000;
 
-    if (distance < STAT_THRESHOLD) {
+    // Onset bypass: if movement onset is detected, bypass stationary trapping entirely
+    // so tiny first steps aren't forced into the slow 1.2s stationary animation
+    if (window._movementOnsetBoost) {
+        if (window.isStationary || window.stationaryLockPosition) {
+            window.lastVelocity = timeDelta > 0 ? {
+                lat: (lat - lastPos.lat) / timeDelta,
+                lng: (lng - lastPos.lng) / timeDelta
+            } : { lat: 0, lng: 0 };
+            window.smoothedVelocity = { ...window.lastVelocity };
+            window.positionBuffer = [{ ...newPosition }];
+            window.stationaryStartTime = null;
+            window.isStationary = false;
+            window.stationaryLockPosition = null;
+        }
+        // Skip the stationary block entirely to reach the snappy moving pipeline
+    } else if (distance < STAT_THRESHOLD) {
         if (!window.stationaryStartTime) window.stationaryStartTime = currentTime;
         const statDuration = currentTime - window.stationaryStartTime;
 
         if (!window.isStationary && statDuration >= STAT_CONFIRM_MS) {
             _confirmStationary(newPosition, currentTime);
             if (typeof _cleanupMarkerStyles === 'function') _cleanupMarkerStyles();
+            window._movementOnsetBoost = false;
+            window._movementOnsetTicks = 0;
             window.lastUpdateTime = currentTime;
             window.lastUpdateTimestamp = currentTime;
             return;
@@ -4021,6 +4055,8 @@ function updateUserLocation(position, forceUpdate = false) {
                     updateDistanceBox(forceUpdate, newPosition, closestLocation, closestDistance);
                 }
             }
+            window._movementOnsetBoost = false;
+            window._movementOnsetTicks = 0;
             window.lastUpdateTime = currentTime;
             window.lastUpdateTimestamp = currentTime;
             return;
@@ -4048,6 +4084,18 @@ function updateUserLocation(position, forceUpdate = false) {
         window.lastUpdateTimestamp = currentTime;
         return;
     } else {
+        // Prime velocity and clear stale buffer so the first movement tick
+        // isn't anchored to ancient stationary data
+        if (window.isStationary || window.stationaryLockPosition) {
+            window.lastVelocity = timeDelta > 0 ? {
+                lat: (lat - lastPos.lat) / timeDelta,
+                lng: (lng - lastPos.lng) / timeDelta
+            } : { lat: 0, lng: 0 };
+            window.smoothedVelocity = { ...window.lastVelocity };
+            window.positionBuffer = [{ ...newPosition }];
+            window._movementOnsetBoost = true;
+            window._movementOnsetTicks = 0;
+        }
         window.stationaryStartTime = null;
         window.isStationary = false;
         window.stationaryLockPosition = null;
@@ -4055,12 +4103,17 @@ function updateUserLocation(position, forceUpdate = false) {
 
     // SECTION 15: QUALITY GATES
     if (!forceUpdate) {
+        // Always enforce the accuracy gate to prevent snapping to bad GPS fixes,
+        // even during movement onset.
         if (newPosition.accuracy > speedTier.maxAccuracy) {
             window.lastUpdateTime = currentTime;
             window.lastUpdateTimestamp = currentTime;
             return;
         }
-        if (distance < speedTier.minDistanceThreshold) {
+        
+        // Bypass min-distance gate during movement onset so tiny first steps
+        // aren't dropped while the GPS ramps up.
+        if (distance < speedTier.minDistanceThreshold && !window._movementOnsetBoost) {
             window.lastPosition = newPosition;
             window.lastUpdateTime = currentTime;
             window.lastUpdateTimestamp = currentTime;
@@ -4069,6 +4122,7 @@ function updateUserLocation(position, forceUpdate = false) {
             }
             return;
         }
+        
         if (timeDelta > 0 && distance / timeDelta > speedTier.maxSpeedThreshold) {
             window.lastUpdateTime = currentTime;
             window.lastUpdateTimestamp = currentTime;
@@ -4200,7 +4254,21 @@ function updateUserLocation(position, forceUpdate = false) {
         const sfEW = eastWestMove ? 0.018 : 0;
 
         const rawSF = (baseSF + sfDist + sfTime - sfDir + sfEW) * directionChangeFactor;
-        const finalSF = Math.min(0.52, Math.max(0.11, rawSF));
+        let finalSF = Math.min(0.52, Math.max(0.11, rawSF));
+
+        // Movement onset boost with decay: allow faster convergence when transitioning
+        // from stationary, fading out over 8 ticks to prevent marker overshoot
+        if (window._movementOnsetBoost) {
+            const onsetProgress = (window._movementOnsetTicks || 0) / 8;
+            const boost = 0.22 * (1 - onsetProgress); // Decays from +0.22 to +0
+            finalSF = Math.min(0.62, finalSF + boost);
+            
+            window._movementOnsetTicks = (window._movementOnsetTicks || 0) + 1;
+            if (window._movementOnsetTicks > 8) {
+                window._movementOnsetBoost = false;
+                window._movementOnsetTicks = 0;
+            }
+        }
 
         // Apply smoothing
         const smoothedPosition = {
@@ -4380,6 +4448,10 @@ function updateUserLocation(position, forceUpdate = false) {
    PROXIMITY ZOOM LOGIC
    Handles zoom-in when approaching a POI and zoom-out when leaving.
    ────────────────────────────────────────────── */
+/* ──────────────────────────────────────────────
+   PROXIMITY ZOOM LOGIC
+   Handles zoom-in when approaching a POI and zoom-out when leaving.
+   ────────────────────────────────────────────── */
 function _handleProximityZoomLogic(speedMPH, eastWestMove) {
     const PROX_NEAR_M = 13.716;   // ~45ft
     const PROX_FAR_M = 21.336;    // ~70ft
@@ -4390,19 +4462,54 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
     // (which take 600-2000ms), preventing tiles from fully reloading on
     // iOS/Android, resulting in blur and lag.
     const PROX_THROTTLE_MS = 800;
+    
+    // SPEED GATE: Do not trigger proximity zoom if moving faster than this.
+    // Prevents violent bouncing/jitter when driving past locations.
+    const MAX_PROX_SPEED_MPH = 10; 
 
     // ── Not in proximity or map is being manipulated → skip proximity logic
     if (!window.proximityState || !map || window.isMapInteracting) {
-        window._zoomAuthorityThisFrame = false;
+        // If the user started interacting, abort any ongoing proximity zoom
+        // so the map doesn't fight their gestures.
+        if (window._isProximityZoomAnimating) {
+            if (typeof map.stop === 'function') map.stop();
+            window._isProximityZoomAnimating = false;
+            if (window._currentProximityZoomCleanup) {
+                map.off('moveend', window._currentProximityZoomCleanup);
+                map.off('zoomend', window._currentProximityZoomCleanup);
+                window._currentProximityZoomCleanup = null;
+            }
+        }
+        return;
+    }
+
+    // ── SPEED GATE: Skip and cancel proximity zoom if moving too fast
+    if (speedMPH > MAX_PROX_SPEED_MPH) {
+        if (window._inProximityZone || window._isProximityZoomAnimating) {
+            // Cleanly exit proximity state and let the main map speed tiers take over zooming
+            // GUARD: Only call map.stop() if the user isn't currently mid-gesture
+            if (!window.isMapInteracting && window._isProximityZoomAnimating) {
+                if (typeof map.stop === 'function') map.stop();
+                window._isProximityZoomAnimating = false;
+                if (window._currentProximityZoomCleanup) {
+                    map.off('moveend', window._currentProximityZoomCleanup);
+                    map.off('zoomend', window._currentProximityZoomCleanup);
+                    window._currentProximityZoomCleanup = null;
+                }
+            }
+            window._inProximityZone = false;
+            // DO NOT null _lastProxZoomRequest here; preserving the throttle timestamp
+            // prevents oscillation/thrashing if GPS noise bounces us right back into the zone.
+        }
         return;
     }
 
     const distM = window.proximityState.distanceMeters;
 
     // ── Shared animation completion handler
-    // Prevents double-firing from zoomend + moveend, and the 1px nudge's
-    // moveend. Uses .on() with manual detach and a guard flag instead of
-    // .once() which can't prevent the second event from firing.
+    // Prevents double-firing from zoomend + moveend. Uses .on() with manual 
+    // detach and a guard flag instead of .once() which can't prevent the 
+    // second event from firing.
     function attachAnimEndHandler(fallbackMs) {
         let handled = false;
         let fallbackId = null;
@@ -4418,14 +4525,12 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
             window._isProximityZoomAnimating = false;
             window._currentProximityZoomCleanup = null;
     
-            requestAnimationFrame(() => {
-                if (!map) return;
-                if (typeof map.invalidateSize === 'function') {
-                    map.invalidateSize({ animate: false });
-                }
-                map.panBy([1, 0], { animate: false });
-                map.panBy([-1, 0], { animate: false });
-            });
+            // Removed the 1px panBy nudge; it causes visual jumps and tile
+            // tearing on iOS/Android. If tile blur persists, it's better
+            // addressed by not interrupting animations than by forcing redraws.
+            if (typeof map.invalidateSize === 'function') {
+                map.invalidateSize({ animate: false, debounceMoveend: true });
+            }
         };
     
         map.on('moveend', onDone);
@@ -4447,34 +4552,34 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
         const zoomDelta = Math.abs(targetZoom - currentZoom);
         const nowMs = Date.now();
         const throttleOk = !window._lastProxZoomRequest || (nowMs - window._lastProxZoomRequest) >= PROX_THROTTLE_MS;
-        const proxZoomBlocked = window._zoomAuthorityThisFrame === true;
-        window._zoomAuthorityThisFrame = false;
 
-        // Do not interrupt an ongoing zoom animation.
-        // Constantly interrupting fitBounds/flyTo on iOS/Android aborts
-        // tile requests mid-flight, causing blurry tiles and heavy lag.
         const isAnimating = window._isProximityZoomAnimating;
+        
+        // If we are animating an EXIT but the user walked back in, cancel it
+        const isExitAnimating = isAnimating && !window._inProximityZone;
 
-        if (zoomDelta >= 0.15 && throttleOk && !proxZoomBlocked && !isAnimating) {
+        if (zoomDelta >= 0.15 && throttleOk && (!isAnimating || isExitAnimating)) {
+            // Clear the previous animation's event listener to prevent deadlocks
+            // when Leaflet interrupts an animation without firing moveend/zoomend.
+            if (window._currentProximityZoomCleanup) {
+                map.off('moveend', window._currentProximityZoomCleanup);
+                map.off('zoomend', window._currentProximityZoomCleanup);
+                window._currentProximityZoomCleanup = null;
+            }
+            if (isExitAnimating && typeof map.stop === 'function') {
+                map.stop(); // Halt the outgoing flyTo
+            }
+            
             window._lastProxZoomRequest = nowMs;
             window._isProximityZoomAnimating = true;
 
             const zoomDur = Math.min(2.0, Math.max(0.6, zoomDelta * 0.55));
             const userLL = userMarker?.getLatLng?.();
-            const proxLoc = window.proximityState.closestLocation;
-            const poiLL = (proxLoc?.lat != null && proxLoc?.lng != null)
-                ? L.latLng(proxLoc.lat, proxLoc.lng)
-                : null;
 
-            if (userLL && poiLL) {
-                map.fitBounds(L.latLngBounds([userLL, poiLL]), {
-                    paddingTopLeft: L.point(64, 64),
-                    paddingBottomRight: L.point(64, 96),
-                    animate: true,
-                    duration: zoomDur,
-                    maxZoom: PROX_ZOOM_IN
-                });
-            } else if (userLL) {
+            // Prefer flyTo over fitBounds. fitBounds recenters the map between
+            // user and POI, causing violent map jumps as the user walks around the
+            // POI. flyTo keeps the user centered, and zoom 17-19 keeps POI in view.
+            if (userLL) {
                 map.flyTo(userLL, targetZoom, { duration: zoomDur, easeLinearity: 0.25 });
             }
 
@@ -4484,11 +4589,17 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
 
     // ── EXITING PROXIMITY ZONE
     } else if (window._inProximityZone) {
-        window._zoomAuthorityThisFrame = false;
         const currentZoom = map.getZoom();
         const exitDelta = Math.abs(currentZoom - PROX_ZOOM_OUT);
 
         if (exitDelta >= 0.15) {
+            // Clean up any lingering listeners before starting exit animation
+            if (window._currentProximityZoomCleanup) {
+                map.off('moveend', window._currentProximityZoomCleanup);
+                map.off('zoomend', window._currentProximityZoomCleanup);
+                window._currentProximityZoomCleanup = null;
+            }
+            
             window._isProximityZoomAnimating = true;
             const exitDur = Math.min(2.0, Math.max(0.6, exitDelta * 0.55));
             const userLL = userMarker?.getLatLng?.();
@@ -4508,11 +4619,12 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
             attachAnimEndHandler(2500);
         }
         window._inProximityZone = false;
-        window._lastProxZoomRequest = null;
+        // DO NOT null _lastProxZoomRequest here; preserving the throttle timestamp
+        // prevents oscillation/thrashing if GPS noise bounces us right back into the zone.
 
     // ── OUTSIDE PROXIMITY ZONE
     } else {
-        window._zoomAuthorityThisFrame = false;
+        // No action needed
     }
 }
         
