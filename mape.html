@@ -4445,29 +4445,25 @@ function updateUserLocation(position, forceUpdate = false) {
     }
         }
         
+        
 /* ──────────────────────────────────────────────
    PROXIMITY ZOOM LOGIC
    Handles zoom-in when approaching a POI and zoom-out when leaving.
    ────────────────────────────────────────────── */
 function _handleProximityZoomLogic(speedMPH, eastWestMove) {
-    const PROX_NEAR_M = 13.716;   // ~45ft
-    const PROX_FAR_M = 21.336;    // ~70ft
+    const PROX_NEAR_M = 15.24;   // ~50ft (Trigger / Entry point)
+    const PROX_FAR_M = 22.86;    // ~75ft (Release / Exit point - provides hysteresis)
     const PROX_ZOOM_IN = 19;
     const PROX_ZOOM_OUT = 17;
 
-    // 800ms throttle — lower values repeatedly interrupt zoom animations
-    // (which take 600-2000ms), preventing tiles from fully reloading on
-    // iOS/Android, resulting in blur and lag.
-    const PROX_THROTTLE_MS = 800;
-    
     // SPEED GATE: Do not trigger proximity zoom if moving faster than this.
-    // Prevents violent bouncing/jitter when driving past locations.
     const MAX_PROX_SPEED_MPH = 10; 
+
+    // Throttle for smooth continuous tracking.
+    const PROX_THROTTLE_MS = 400;
 
     // ── Not in proximity or map is being manipulated → skip proximity logic
     if (!window.proximityState || !map || window.isMapInteracting) {
-        // If the user started interacting, abort any ongoing proximity zoom
-        // so the map doesn't fight their gestures.
         if (window._isProximityZoomAnimating) {
             if (typeof map.stop === 'function') map.stop();
             window._isProximityZoomAnimating = false;
@@ -4477,14 +4473,16 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
                 window._currentProximityZoomCleanup = null;
             }
         }
+        // Reset smoothing state when leaving proximity so it doesn't snap on re-entry
+        window._proxSmoothDist = null;
+        window._proxTargetZoom = null;
+        window._inProximityZone = false;
         return;
     }
 
     // ── SPEED GATE: Skip and cancel proximity zoom if moving too fast
     if (speedMPH > MAX_PROX_SPEED_MPH) {
         if (window._inProximityZone || window._isProximityZoomAnimating) {
-            // Cleanly exit proximity state and let the main map speed tiers take over zooming
-            // GUARD: Only call map.stop() if the user isn't currently mid-gesture
             if (!window.isMapInteracting && window._isProximityZoomAnimating) {
                 if (typeof map.stop === 'function') map.stop();
                 window._isProximityZoomAnimating = false;
@@ -4495,18 +4493,80 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
                 }
             }
             window._inProximityZone = false;
-            // DO NOT null _lastProxZoomRequest here; preserving the throttle timestamp
-            // prevents oscillation/thrashing if GPS noise bounces us right back into the zone.
+            window._proxSmoothDist = null;
+            window._proxTargetZoom = null;
         }
         return;
     }
 
-    const distM = window.proximityState.distanceMeters;
+    const rawDistM = window.proximityState.distanceMeters;
+
+    // --- 1. DISTANCE SMOOTHING (EMA) ---
+    // Filter GPS noise so the zoom target doesn't jitter at threshold boundaries.
+    window._proxSmoothDist = window._proxSmoothDist ?? rawDistM;
+    window._proxSmoothDist += (rawDistM - window._proxSmoothDist) * 0.3;
+    const distM = window._proxSmoothDist;
+
+    // --- 2. TARGET ZOOM CALCULATION & SMOOTHING ---
+    let rawTargetZoom;
+    if (distM <= PROX_NEAR_M) {
+        rawTargetZoom = PROX_ZOOM_IN;
+    } else if (distM >= PROX_FAR_M) {
+        rawTargetZoom = PROX_ZOOM_OUT;
+    } else {
+        const t = (distM - PROX_NEAR_M) / (PROX_FAR_M - PROX_NEAR_M);
+        rawTargetZoom = PROX_ZOOM_IN + t * (PROX_ZOOM_OUT - PROX_ZOOM_IN);
+    }
+
+    // Smooth the target zoom itself to prevent rapid micro-adjustments
+    window._proxTargetZoom = window._proxTargetZoom ?? map.getZoom();
+    
+    // Fast EMA: ensures the target zoom hits 19 almost instantly upon crossing 50ft
+    const alpha = rawTargetZoom < window._proxTargetZoom ? 0.4 : 0.3; 
+    window._proxTargetZoom += (rawTargetZoom - window._proxTargetZoom) * alpha;
+
+    const targetZoom = window._proxTargetZoom;
+    const currentZoom = map.getZoom();
+    const zoomDelta = Math.abs(targetZoom - currentZoom);
+    const nowMs = Date.now();
+    const throttleOk = !window._lastProxZoomRequest || (nowMs - window._lastProxZoomRequest) >= PROX_THROTTLE_MS;
+
+    // --- 3. ANIMATION EXECUTION ---
+    if (zoomDelta >= 0.15 && throttleOk) {
+        window._lastProxZoomRequest = nowMs;
+        window._isProximityZoomAnimating = true;
+
+        // Sped up animation duration
+        const zoomDur = Math.min(1.0, Math.max(0.3, zoomDelta * 0.3));
+        const userLL = userMarker?.getLatLng?.();
+
+        if (userLL) {
+            const easeLinearity = targetZoom < currentZoom 
+                ? (eastWestMove ? 0.13 : 0.15) // Ease for zooming out
+                : 0.25;                        // Ease for zooming in
+                
+            map.flyTo(userLL, targetZoom, { 
+                duration: zoomDur, 
+                easeLinearity: easeLinearity 
+            });
+        }
+
+        // Attach or extend the completion handler
+        if (!window._currentProximityZoomCleanup) {
+            attachAnimEndHandler(2500);
+        }
+    }
+
+    // Update proximity zone state with proper hysteresis
+    if (distM <= PROX_NEAR_M) {
+        window._inProximityZone = true;
+    } else if (distM > PROX_FAR_M) {
+        window._inProximityZone = false;
+    }
+    // If distM is between NEAR and FAR, maintain current state (hysteresis)
 
     // ── Shared animation completion handler
-    // Prevents double-firing from zoomend + moveend. Uses .on() with manual 
-    // detach and a guard flag instead of .once() which can't prevent the 
-    // second event from firing.
+    // Prevents double-firing from zoomend + moveend.
     function attachAnimEndHandler(fallbackMs) {
         let handled = false;
         let fallbackId = null;
@@ -4522,9 +4582,6 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
             window._isProximityZoomAnimating = false;
             window._currentProximityZoomCleanup = null;
     
-            // Removed the 1px panBy nudge; it causes visual jumps and tile
-            // tearing on iOS/Android. If tile blur persists, it's better
-            // addressed by not interrupting animations than by forcing redraws.
             if (typeof map.invalidateSize === 'function') {
                 map.invalidateSize({ animate: false, debounceMoveend: true });
             }
@@ -4540,90 +4597,7 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
             if (!handled) onDone();
         }, fallbackMs);
     }
-
-    // ── INSIDE PROXIMITY ZONE
-    if (distM <= PROX_FAR_M) {
-        const t = Math.max(0, Math.min(1, (distM - PROX_NEAR_M) / (PROX_FAR_M - PROX_NEAR_M)));
-        const targetZoom = PROX_ZOOM_IN + t * (PROX_ZOOM_OUT - PROX_ZOOM_IN);
-        const currentZoom = map.getZoom();
-        const zoomDelta = Math.abs(targetZoom - currentZoom);
-        const nowMs = Date.now();
-        const throttleOk = !window._lastProxZoomRequest || (nowMs - window._lastProxZoomRequest) >= PROX_THROTTLE_MS;
-
-        const isAnimating = window._isProximityZoomAnimating;
-        
-        // If we are animating an EXIT but the user walked back in, cancel it
-        const isExitAnimating = isAnimating && !window._inProximityZone;
-
-        if (zoomDelta >= 0.15 && throttleOk && (!isAnimating || isExitAnimating)) {
-            // Clear the previous animation's event listener to prevent deadlocks
-            // when Leaflet interrupts an animation without firing moveend/zoomend.
-            if (window._currentProximityZoomCleanup) {
-                map.off('moveend', window._currentProximityZoomCleanup);
-                map.off('zoomend', window._currentProximityZoomCleanup);
-                window._currentProximityZoomCleanup = null;
-            }
-            if (isExitAnimating && typeof map.stop === 'function') {
-                map.stop(); // Halt the outgoing flyTo
-            }
-            
-            window._lastProxZoomRequest = nowMs;
-            window._isProximityZoomAnimating = true;
-
-            const zoomDur = Math.min(2.0, Math.max(0.6, zoomDelta * 0.55));
-            const userLL = userMarker?.getLatLng?.();
-
-            // Prefer flyTo over fitBounds. fitBounds recenters the map between
-            // user and POI, causing violent map jumps as the user walks around the
-            // POI. flyTo keeps the user centered, and zoom 17-19 keeps POI in view.
-            if (userLL) {
-                map.flyTo(userLL, targetZoom, { duration: zoomDur, easeLinearity: 0.25 });
-            }
-
-            attachAnimEndHandler(2500);
-        }
-        window._inProximityZone = true;
-
-    // ── EXITING PROXIMITY ZONE
-    } else if (window._inProximityZone) {
-        const currentZoom = map.getZoom();
-        const exitDelta = Math.abs(currentZoom - PROX_ZOOM_OUT);
-
-        if (exitDelta >= 0.15) {
-            // Clean up any lingering listeners before starting exit animation
-            if (window._currentProximityZoomCleanup) {
-                map.off('moveend', window._currentProximityZoomCleanup);
-                map.off('zoomend', window._currentProximityZoomCleanup);
-                window._currentProximityZoomCleanup = null;
-            }
-            
-            window._isProximityZoomAnimating = true;
-            const exitDur = Math.min(2.0, Math.max(0.6, exitDelta * 0.55));
-            const userLL = userMarker?.getLatLng?.();
-
-            if (userLL) {
-                map.flyTo(userLL, PROX_ZOOM_OUT, {
-                    duration: exitDur,
-                    easeLinearity: eastWestMove ? 0.13 : 0.15
-                });
-            } else {
-                map.flyTo(map.getCenter(), PROX_ZOOM_OUT, {
-                    duration: exitDur,
-                    easeLinearity: 0.15
-                });
-            }
-
-            attachAnimEndHandler(2500);
-        }
-        window._inProximityZone = false;
-        // DO NOT null _lastProxZoomRequest here; preserving the throttle timestamp
-        // prevents oscillation/thrashing if GPS noise bounces us right back into the zone.
-
-    // ── OUTSIDE PROXIMITY ZONE
-    } else {
-        // No action needed
-    }
-} 
+}
         
 /*  Pans the map to keep the user centered — **centered mode only**. */
 function _panMapToCenter(target, speedTier, directionChangeFactor, eastWestMovement, speedMPH, lookAheadFactor) {
