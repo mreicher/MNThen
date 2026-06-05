@@ -2881,8 +2881,8 @@ function seedPositionBuffer(seedPosition, count) {
     const SPEED_THRESHOLDS = {
     WALKING: 2,
     JOGGING: 5,
-    HIGH_SPEED: 23,        // Centered mode now activates at 23 MPH
-    HYSTERESIS_RETURN: 18   // Hysteresis band: 18–23 MPH prevents oscillation
+    HIGH_SPEED: 15,        // Centered mode activates at 15 MPH
+    HYSTERESIS_RETURN: 10  // Hysteresis band: 10–15 MPH prevents oscillation
 };
 
     const ModeManager = {
@@ -5383,7 +5383,8 @@ function _enforceRoamingMode(markerPos, map, marker, speedMPH) {
     var pixel = map.latLngToContainerPoint(markerPos);
     if (!pixel || !isFinite(pixel.x) || !isFinite(pixel.y)) return;
 
-    var safeSpeed = (isFinite(speedMPH) && speedMPH > 0) ? speedMPH : 0;
+    var safeSpeed = (isFinite(speedMPH) && speedMPH > 0) ? Math.min(speedMPH, 14) : 0;
+    var speedFrac = safeSpeed / 14; // 0.0 → 1.0 across the full roaming range
 
     // ── HARD SAFETY: Already off-screen → instant snap (recovery) ──
     if (pixel.x < 0 || pixel.x > mapSize.x ||
@@ -5395,23 +5396,23 @@ function _enforceRoamingMode(markerPos, map, marker, speedMPH) {
         return;
     }
 
-    // ── PREVENTIVE SAFETY MARGIN: Speed-scaled, never smaller than 15% ──
-    // At 0 MPH: 18% margin (plenty for GPS jitter)
-    // At 23 MPH: 35% margin (prevents escape between GPS updates)
-    // Above 23 MPH: capped at 40% but with faster pan response
-    var marginFraction = Math.min(0.40, 0.18 + (safeSpeed / 23) * 0.17);
+    // ── SAFETY MARGIN: Aggressively speed-scaled ──
+    // At  0 MPH → 22% (absorbs GPS jitter)
+    // At 11 MPH → 35%
+    // At 22 MPH → 50% (marker stays near centre at highway speed)
+    var marginFraction = 0.22 + speedFrac * 0.28;
+
     var marginX = mapSize.x * marginFraction;
     var marginY = mapSize.y * marginFraction;
 
-    // Minimum absolute margin (px) for tiny viewports / high-DPI phones
-    var MIN_MARGIN_PX = 120;
+    // Minimum absolute margin so tiny/hi-DPI viewports are still protected
+    var MIN_MARGIN_PX = 140;
     marginX = Math.max(marginX, MIN_MARGIN_PX);
     marginY = Math.max(marginY, MIN_MARGIN_PX);
 
-    // Maximum margin: never consume more than 45% of viewport
-    var MAX_MARGIN_FRAC = 0.45;
-    marginX = Math.min(marginX, mapSize.x * MAX_MARGIN_FRAC);
-    marginY = Math.min(marginY, mapSize.y * MAX_MARGIN_FRAC);
+    // Cap: never consume more than 50% of each axis
+    marginX = Math.min(marginX, mapSize.x * 0.50);
+    marginY = Math.min(marginY, mapSize.y * 0.50);
 
     var isNearEdge = (
         pixel.x < marginX ||
@@ -5422,13 +5423,11 @@ function _enforceRoamingMode(markerPos, map, marker, speedMPH) {
 
     if (!isNearEdge) return;
 
-    // ── PAN TO SAFETY: Offset target so marker lands INSIDE the margin ──
-    // Calculate how far past the margin we are, then add buffer
-    var targetLat = markerPos.lat;
-    var targetLng = markerPos.lng;
+    // ── PAN TARGET: Land the marker well inside the safe zone ──
+    // safetyBufferFrac grows with speed so fast-moving markers recentre more
+    var safetyBufferFrac = 0.06 + speedFrac * 0.09; // 6% → 15%
     var offsetX = 0;
     var offsetY = 0;
-    var safetyBufferFrac = 0.05; // Extra 5% inside the margin
 
     if (pixel.x < marginX) {
         offsetX = marginX - pixel.x + (mapSize.x * safetyBufferFrac);
@@ -5442,47 +5441,54 @@ function _enforceRoamingMode(markerPos, map, marker, speedMPH) {
         offsetY = (mapSize.y - marginY) - pixel.y - (mapSize.y * safetyBufferFrac);
     }
 
-    // Convert pixel offset to lat/lng offset
     var centerPx = map.latLngToContainerPoint(map.getCenter());
     var newCenterPx = { x: centerPx.x + offsetX, y: centerPx.y + offsetY };
-    var newCenter = map.containerPointToLatLng(newCenterPx);
+    var newCenter  = map.containerPointToLatLng(newCenterPx);
 
-    // Validate conversion didn't produce garbage
     if (!newCenter || !isFinite(newCenter.lat) || !isFinite(newCenter.lng)) {
-        // Fallback: center on marker directly
-        newCenter = markerPos;
+        newCenter = markerPos; // fallback: centre on marker
     }
 
-    // ── EXECUTE PAN: Speed-scaled animation ──
+    // ── THROTTLE: Never block when the marker is already past the margin ──
+    // At higher speeds we allow more frequent pan calls; critically-close
+    // markers bypass throttle entirely.
     var now = performance.now();
     var timeSinceLastPan = now - (window._lastRoamingPanTime || 0);
 
-    // Throttle pans to 60fps max, but never block critical recovery
-    var PAN_THROTTLE_MS = safeSpeed > 15 ? 16 : safeSpeed > 5 ? 33 : 50;
-    if (timeSinceLastPan < PAN_THROTTLE_MS) return;
+    // How deep into the margin is the marker? 0 = at boundary, 1 = at edge
+    var penetrationX = 0, penetrationY = 0;
+    if (pixel.x < marginX)               penetrationX = 1 - (pixel.x / marginX);
+    else if (pixel.x > mapSize.x - marginX) penetrationX = 1 - ((mapSize.x - pixel.x) / marginX);
+    if (pixel.y < marginY)               penetrationY = 1 - (pixel.y / marginY);
+    else if (pixel.y > mapSize.y - marginY)  penetrationY = 1 - ((mapSize.y - pixel.y) / marginY);
+    var penetration = Math.max(penetrationX, penetrationY); // 0.0 → 1.0
+
+    // Penetration > 60% or high speed → always act immediately
+    var isUrgent = penetration > 0.60 || safeSpeed > 12;
+    if (!isUrgent) {
+        // Low-speed gentle approach: throttle to ~20 fps max
+        var PAN_THROTTLE_MS = 50;
+        if (timeSinceLastPan < PAN_THROTTLE_MS) return;
+    }
 
     window._lastRoamingPanTime = now;
 
-    // High speed or very near edge: snap instantly (no animation lag)
-    var criticalFraction = Math.min(0.10, 0.04 + (safeSpeed / 23) * 0.06);
-    var isCritical = (
-        pixel.x < (mapSize.x * criticalFraction) ||
-        pixel.x > (mapSize.x * (1 - criticalFraction)) ||
-        pixel.y < (mapSize.y * criticalFraction) ||
-        pixel.y > (mapSize.y * (1 - criticalFraction))
-    );
+    // ── EXECUTE PAN ──
+    // Instant snap when: urgent, high speed, or very deep into margin (>80%)
+    var snapImmediately = isUrgent && (penetration > 0.80 || safeSpeed > 15);
 
-    if (isCritical || safeSpeed > 20) {
+    if (snapImmediately) {
         map.setView([newCenter.lat, newCenter.lng], map.getZoom(), {
             animate: false, noMoveStart: true, noMoveEnd: true
         });
     } else {
-        // Smooth pan for low-speed edge approach
-        var panDuration = Math.max(0.08, 0.25 - (safeSpeed * 0.008));
+        // Smooth pan — duration shrinks as speed rises so animation never lags
+        // 0 MPH → 220 ms, 22 MPH → 80 ms
+        var panDuration = Math.max(0.08, 0.22 - speedFrac * 0.14);
         map.panTo([newCenter.lat, newCenter.lng], {
             animate: true,
             duration: panDuration,
-            easeLinearity: 0.25,
+            easeLinearity: 0.3,
             noMoveStart: true
         });
     }
