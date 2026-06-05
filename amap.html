@@ -2790,9 +2790,27 @@ function updatePositionBuffer(position) {
 
     if (Math.abs(position.lat) > 90 || Math.abs(position.lng) > 180) return;
 
-    // Use window.positionBuffer to ensure we're pushing to the
-    // globally-initialized array, not a shadowed local variable
     const buffer = window.positionBuffer;
+    const now = position.timestamp || Date.now();
+    const STALE_THRESHOLD_MS = 10000;  // 10 seconds — entries older than this are stale
+
+    // Evict stale entries before pushing new ones. After background
+    // recovery or a GPS outage, the buffer can contain entries that are
+    // minutes old. The exponential-decay smoothing gives them near-zero
+    // weight (correct), but they waste buffer slots — with MAX_BUFFER_SIZE=5,
+    // even 2 stale entries reduce effective smoothing to 3 points. Worse,
+    // the velocity estimates derived from stale→fresh transitions are
+    // wildly wrong, causing the marker to jump on the first few ticks
+    // after recovery.
+    while (buffer.length > 0) {
+        const oldest = buffer[0];
+        const age = now - (oldest.timestamp || 0);
+        if (age > STALE_THRESHOLD_MS || age < -5000) {  // Also evict future-timestamped entries
+            buffer.shift();
+        } else {
+            break;  // Buffer is in order; if the oldest isn't stale, none are
+        }
+    }
 
     buffer.push({
         lat: position.lat,
@@ -2887,19 +2905,37 @@ const SPEED_THRESHOLDS = {
 
 const ModeManager = {
     current: 'roaming', // 'roaming' | 'centered'
+    _entryTime: 0,      // Timestamp when the current mode was entered
+    _minDwellMs: 3000,  // Minimum time in a mode before switching (prevents oscillation)
 
     update(speedMPH) {
+        const now = Date.now();
         const wasCentered = this.current === 'centered';
+        const dwellTime = now - this._entryTime;
+
         const shouldEnter = speedMPH >= SPEED_THRESHOLDS.HIGH_SPEED;
         const shouldExit = speedMPH <= SPEED_THRESHOLDS.HYSTERESIS_RETURN;
 
         if (shouldEnter && !wasCentered) {
-            this.current = 'centered';
-            return true;
+            // Require minimum dwell time in roaming before entering centered.
+            // Prevents rapid oscillation when speed hovers at the boundary (e.g., 13-15 MPH).
+            if (dwellTime >= this._minDwellMs || this._entryTime === 0) {
+                this.current = 'centered';
+                this._entryTime = now;
+                return true;
+            }
+            return false;
         } else if (shouldExit && wasCentered) {
-            this.current = 'roaming';
-            return true;
+            // Same dwell requirement for exiting centered mode.
+            // Prevents a single low-speed GPS tick from dropping out of centered mode.
+            if (dwellTime >= this._minDwellMs) {
+                this.current = 'roaming';
+                this._entryTime = now;
+                return true;
+            }
+            return false;
         }
+
         return false;
     },
 
@@ -2909,14 +2945,15 @@ const ModeManager = {
     /* ── Backward-compat shims (no-ops if unused, safe if called) ── */
     getMode()      { return this.current; },
     getLastSpeed() { return 0; },  // Not tracked in this version; safe fallback
-    _reset()       { this.current = 'roaming'; },
+    _reset()       { this.current = 'roaming'; this._entryTime = 0; },
     _setModeDirect(mode) {
         this.current = (mode === 'centered' || mode === 'roaming') ? mode : 'roaming';
+        this._entryTime = Date.now();
     }
 };
 
 window.ModeManager = ModeManager;
-
+        
 // Expose threshold for backward compatibility
 const HIGH_SPEED_THRESHOLD_MPH = SPEED_THRESHOLDS.HIGH_SPEED;
 
@@ -3699,16 +3736,16 @@ const TIER_CONFIGS = [
 ];
 
 const SMOOTHING = [
-    { base: 0.25, mult: 0.10, max: 0.45, min: 0.20 },
-    { base: 0.30, mult: 0.12, max: 0.50, min: 0.25 },
-    { base: 0.36, mult: 0.16, max: 0.56, min: 0.30 },
-    { base: 0.42, mult: 0.12, max: 0.60, min: 0.36 },
-    { base: 0.46, mult: 0.10, max: 0.62, min: 0.40 },
-    { base: 0.48, mult: 0.08, max: 0.62, min: 0.42 },
-    { base: 0.46, mult: 0.07, max: 0.60, min: 0.40 },
-    { base: 0.44, mult: 0.06, max: 0.58, min: 0.38 },
-    { base: 0.42, mult: 0.05, max: 0.56, min: 0.36 },
-    { base: 0.40, mult: 0.04, max: 0.54, min: 0.34 }
+    { base: 0.45, mult: 0.12, max: 0.68, min: 0.35 },  
+    { base: 0.48, mult: 0.13, max: 0.70, min: 0.38 },  
+    { base: 0.52, mult: 0.14, max: 0.72, min: 0.42 },  
+    { base: 0.56, mult: 0.12, max: 0.74, min: 0.46 },  
+    { base: 0.58, mult: 0.10, max: 0.76, min: 0.50 },  
+    { base: 0.60, mult: 0.08, max: 0.78, min: 0.52 },  
+    { base: 0.58, mult: 0.07, max: 0.76, min: 0.50 },  
+    { base: 0.56, mult: 0.06, max: 0.74, min: 0.48 },  
+    { base: 0.54, mult: 0.05, max: 0.72, min: 0.46 },  
+    { base: 0.52, mult: 0.04, max: 0.70, min: 0.44 }   
 ];
 
 const LOOK_AHEAD = [
@@ -4080,13 +4117,13 @@ function updateUserLocation(position, forceUpdate = false) {
         return;
     }
 
-    // SECTION 14: STATIONARY DETECTION
+       // SECTION 14: STATIONARY DETECTION
     const STAT_THRESHOLD = 0.5;
-    const STAT_LOCK = 0.3;
+    const STAT_LOCK = 0.8;            // FIX: Was 0.3 — too tight for real GPS accuracy
     const STAT_CONFIRM_MS = 2000;
-    const FAST_EXIT_DIST = 1.0;      // meters — immediate exit if moved this far
-    const FAST_EXIT_SPEED = 1.2;     // m/s — immediate exit if calc speed exceeds this
-    
+    const FAST_EXIT_DIST = 0.5;       // FIX: Was 1.0 — a full meter of frozen marker is visible at zoom 17
+    const FAST_EXIT_SPEED = 0.8;      // FIX: Was 1.2 — lowered to catch slow walking onset
+
     const accuracyFactor = Math.max(0.4, Math.min(1.0, 20 / rawAccuracy));
     const velocityPrimeFactor = 1.0 + (0.5 * accuracyFactor);
 
@@ -4143,18 +4180,38 @@ function updateUserLocation(position, forceUpdate = false) {
 
         if (window.isStationary) {
             const distFromLock = calculateDistance(window.stationaryLockPosition, newPosition);
-            if (distFromLock < STAT_LOCK && newPosition.accuracy < lastPos.accuracy * 0.85) {
-                scheduleMarkerUpdate(lat, lng);
-                window.lastPosition = newPosition;
-                window.stationaryLockPosition = { lat, lng };
-                if (typeof updateDistanceBox === 'function') {
-                    updateDistanceBox(forceUpdate, newPosition, closestLocation, closestDistance);
-                }
+
+            // FIX: Always nudge the marker toward the latest GPS fix while stationary,
+            // with heavy smoothing (0.15 = slow drift toward truth). The old code only
+            // updated if accuracy improved AND distance from lock was < 0.3m, which left
+            // the marker frozen at a stale or slightly wrong position for the entire
+            // stationary duration. Now we continuously correct drift without visible jitter.
+            if (distFromLock < 2.0) {
+                const lockSF = 0.15;
+                const nudgeLat = window.stationaryLockPosition.lat * (1 - lockSF) + lat * lockSF;
+                const nudgeLng = window.stationaryLockPosition.lng * (1 - lockSF) + lng * lockSF;
+                scheduleMarkerUpdate(nudgeLat, nudgeLng, { animate: true, duration: 0.3, easeLinearity: 0.06 });
+                window.stationaryLockPosition = { lat: nudgeLat, lng: nudgeLng };
             }
+
+            // If accuracy improved significantly, snap to the better fix
+            if (newPosition.accuracy < lastPos.accuracy * 0.7) {
+                scheduleMarkerUpdate(lat, lng, { animate: true, duration: 0.3, easeLinearity: 0.06 });
+                window.stationaryLockPosition = { lat, lng };
+            }
+
+            // FIX: Always update lastPosition while stationary, not just on accuracy
+            // improvement. Stale lastPosition causes wrong delta calculations when
+            // movement resumes, leading to the "shifting" bug where the first frame
+            // after stationary exit jumps to a wrong location.
+            window.lastPosition = newPosition;
             window._movementOnsetBoost = false;
             window._movementOnsetTicks = 0;
             window.lastUpdateTime = currentTime;
             window.lastUpdateTimestamp = currentTime;
+            if (typeof updateDistanceBox === 'function') {
+                updateDistanceBox(forceUpdate, newPosition, closestLocation, closestDistance);
+            }
             return;
         }
 
@@ -4162,20 +4219,28 @@ function updateUserLocation(position, forceUpdate = false) {
             const cur = userMarker.getLatLng();
             const tgt = L.latLng(lat, lng);
             if (cur.distanceTo(tgt) > 0.3) {
-                scheduleMarkerUpdate(lat, lng, { animate: true, duration: 0.6, easeLinearity: 0.35 });
-                window.lastPosition = newPosition;
-                window.lastUpdateTime = currentTime;
-                window.lastUpdateTimestamp = currentTime;
-                if (typeof updateDistanceBox === 'function') {
-                    updateDistanceBox(forceUpdate, newPosition, closestLocation, closestDistance);
-                }
-            } else {
-                window.lastUpdateTime = currentTime;
-                window.lastUpdateTimestamp = currentTime;
+                scheduleMarkerUpdate(lat, lng, { animate: true, duration: 0.25, easeLinearity: 0.35 });
+            }
+            // FIX: Always update lastPosition for micro-movements, not just when the
+            // marker visibly moved. The old code only set lastPosition inside the
+            // `if (cur.distanceTo(tgt) > 0.3)` branch, leaving lastPosition stale
+            // when the marker stayed within 0.3m. Stale deltas compound over time
+            // and cause the marker to drift on the next movement cycle.
+            window.lastPosition = newPosition;
+            window.lastUpdateTime = currentTime;
+            window.lastUpdateTimestamp = currentTime;
+            if (typeof updateDistanceBox === 'function') {
+                updateDistanceBox(forceUpdate, newPosition, closestLocation, closestDistance);
             }
             return;
         }
 
+        // FIX: Also update lastPosition for very tiny movements (< 0.15m).
+        // The old code returned without updating, which meant that if the user
+        // shifted by 0.1m ten times in a row, lastPosition was still stuck at
+        // the position from before the first shift — a 1.0m accumulated error
+        // that the smoothing system would then have to chase.
+        window.lastPosition = newPosition;
         window.lastUpdateTime = currentTime;
         window.lastUpdateTimestamp = currentTime;
         return;
@@ -4198,31 +4263,46 @@ function updateUserLocation(position, forceUpdate = false) {
         window.stationaryLockPosition = null;
     }
 
-    // SECTION 15: QUALITY GATES
-    if (!forceUpdate) {
-        if (newPosition.accuracy > speedTier.maxAccuracy) {
-            window.lastUpdateTime = currentTime;
-            window.lastUpdateTimestamp = currentTime;
-            return;
-        }
-        
-        if (distance < speedTier.minDistanceThreshold && !window._movementOnsetBoost) {
-            window.lastPosition = newPosition;
-            window.lastUpdateTime = currentTime;
-            window.lastUpdateTimestamp = currentTime;
-            if (typeof updateDistanceBox === 'function') {
-                updateDistanceBox(forceUpdate, newPosition, closestLocation, closestDistance);
-            }
-            return;
-        }
-        
-        if (timeDelta > 0 && distance / timeDelta > speedTier.maxSpeedThreshold) {
+   // SECTION 15: QUALITY GATES
+if (!forceUpdate) {
+    // FIX: Instead of hard-rejecting low-accuracy updates (which freezes
+    // the marker in urban canyons), apply an accuracy penalty that makes
+    // the smoothing more conservative for poor fixes. A 40m accuracy fix
+    // is still better than no fix at all — it just needs heavier smoothing.
+    var accuracyPenalty = 1.0;
+    if (newPosition.accuracy > speedTier.maxAccuracy) {
+        // Scale penalty: 32m → 1.0 (no penalty), 50m → 0.5, 100m → 0.25
+        accuracyPenalty = Math.max(0.25, speedTier.maxAccuracy / newPosition.accuracy);
+        // For extremely poor fixes (>3x threshold), still reject — they're
+        // more likely to be completely wrong than just noisy
+        if (newPosition.accuracy > speedTier.maxAccuracy * 3) {
             window.lastUpdateTime = currentTime;
             window.lastUpdateTimestamp = currentTime;
             return;
         }
     }
+    // Store the penalty for use in smoothing factor calculation (Section 18)
+    window._accuracyPenalty = accuracyPenalty;
 
+    if (distance < speedTier.minDistanceThreshold && !window._movementOnsetBoost) {
+        window.lastPosition = newPosition;
+        window.lastUpdateTime = currentTime;
+        window.lastUpdateTimestamp = currentTime;
+        if (typeof updateDistanceBox === 'function') {
+            updateDistanceBox(forceUpdate, newPosition, closestLocation, closestDistance);
+        }
+        return;
+    }
+    
+    if (timeDelta > 0 && distance / timeDelta > speedTier.maxSpeedThreshold) {
+        window.lastUpdateTime = currentTime;
+        window.lastUpdateTimestamp = currentTime;
+        return;
+    }
+} else {
+    window._accuracyPenalty = 1.0;
+}
+    
     // SECTION 16: INTERMEDIATE DISTANCE HANDLING (8-50m jumps)
     // FIX: Split accuracy snap from distance jump. 
     // Intermediate jumps now receive boosted smoothing instead of a hard snap.
@@ -4238,24 +4318,27 @@ function updateUserLocation(position, forceUpdate = false) {
         return;
     }
 
-    if (distance > 8) {
-        // Apply heavy smoothing scaled by distance so the marker glides rather than snaps
-        const snapSF = Math.min(0.85, 0.3 + (distance / 50) * 0.5);
-        const smoothedLat = lastPos.lat * (1 - snapSF) + lat * snapSF;
-        const smoothedLng = lastPos.lng * (1 - snapSF) + lng * snapSF;
-        
-        scheduleMarkerUpdate(smoothedLat, smoothedLng, { animate: true, duration: 0.4, easeLinearity: 0.25 });
-        
-        // Update position to the visually smoothed coordinate, but retain raw GPS metrics for future deltas
-        window.lastPosition = { ...newPosition, lat: smoothedLat, lng: smoothedLng };
-        window.positionBuffer = [window.lastPosition];
-        window.lastUpdateTime = currentTime;
-        window.lastUpdateTimestamp = currentTime;
-        if (typeof updateDistanceBox === 'function') {
-            updateDistanceBox(forceUpdate, newPosition, closestLocation, closestDistance);
-        }
-        return;
+   if (distance > 8) {
+    // Visually smooth the marker toward the new position so it glides
+    const snapSF = Math.min(0.85, 0.3 + (distance / 50) * 0.5);
+    const smoothedLat = lastPos.lat * (1 - snapSF) + lat * snapSF;
+    const smoothedLng = lastPos.lng * (1 - snapSF) + lng * snapSF;
+    
+    scheduleMarkerUpdate(smoothedLat, smoothedLng, { animate: true, duration: 0.25, easeLinearity: 0.25 });
+
+    // Store the RAW GPS position as lastPosition so future delta
+    // calculations are measured from where you actually are, not from
+    // a visual interpolation point. The smoothed coordinates are only
+    // for display — they must never feed back into the tracking math.
+    window.lastPosition = newPosition;  // raw GPS, not smoothed
+    window.positionBuffer = [{ ...newPosition }];  // raw GPS in buffer too
+    window.lastUpdateTime = currentTime;
+    window.lastUpdateTimestamp = currentTime;
+    if (typeof updateDistanceBox === 'function') {
+        updateDistanceBox(forceUpdate, newPosition, closestLocation, closestDistance);
     }
+    return;
+}
 
     // SECTION 17: SMOOTHING, DEAD-RECKONING & PREDICTION
     try {
@@ -4328,7 +4411,7 @@ function updateUserLocation(position, forceUpdate = false) {
             speedMPS: drPosition.speedMPS
         };
 
-        // SECTION 18: SMOOTHING FACTOR CALCULATION
+               // SECTION 18: SMOOTHING FACTOR CALCULATION
         const sb = SMOOTHING[currentTierIndex];
         const baseSF = Math.min(sb.max, Math.max(sb.min, sb.base + speedFactor * sb.mult));
         const sfDist = Math.min(0.05, distance * 0.0035);
@@ -4339,31 +4422,40 @@ function updateUserLocation(position, forceUpdate = false) {
         const sfEW = eastWestMove ? 0.018 : 0;
 
         const rawSF = (baseSF + sfDist + sfTime - sfDir + sfEW) * directionChangeFactor;
-        
-        let finalSF = Math.min(0.52, Math.max(0.11, rawSF)) * accuracyFactor;
-        finalSF = Math.max(0.11, finalSF); 
+
+        // FIX: Raised ceiling from 0.52→0.72 and floor from 0.11→0.25.
+        // The old floor of 0.11 meant a 9-update time constant (9+ seconds
+        // to converge) — way too slow for a walking user. The new floor of
+        // 0.25 gives ~4 updates (~4 seconds) which is still smooth but
+        // actually catches up to the user. The ceiling was also raised so
+        // that at higher speeds the marker can track more aggressively.
+        let finalSF = Math.min(0.72, Math.max(0.25, rawSF)) * accuracyFactor;
+
+        // FIX (from Section 15 quality gate): Apply accuracy penalty for
+        // poor-accuracy fixes instead of hard-rejecting them. A 40m accuracy
+        // fix is still better than no fix — it just needs heavier smoothing
+        // so the marker doesn't jump to a potentially wrong position.
+        finalSF *= (window._accuracyPenalty || 1.0);
+
+        finalSF = Math.max(0.20, finalSF);  // FIX: Was 0.11 minimum
 
         if (window._movementOnsetBoost) {
-            // Decay over 5 ticks instead of 8 — faster convergence to steady-state
-            const onsetProgress = (window._movementOnsetTicks || 0) / 5;
-            const boost = 0.22 * (1 - onsetProgress); 
-            finalSF = Math.min(0.62, finalSF + boost);
-            
+            // FIX: Extended decay from 5 ticks to 8 ticks. The old 5-tick
+            // decay was too aggressive — the boost would cut out before the
+            // EMA speed had caught up to actual walking speed, causing a
+            // brief "stall" where the marker lagged behind the user right
+            // after they started moving from a standstill. 8 ticks gives
+            // the speed estimator ~8 seconds to converge at 1 fix/second.
+            const onsetProgress = (window._movementOnsetTicks || 0) / 8;
+            const boost = 0.22 * (1 - onsetProgress);
+            finalSF = Math.min(0.72, finalSF + boost);  // FIX: Ceiling was 0.62, now matches max SF
+
             window._movementOnsetTicks = (window._movementOnsetTicks || 0) + 1;
-            if (window._movementOnsetTicks > 5) {
+            if (window._movementOnsetTicks > 8) {  // FIX: Was 5, now 8
                 window._movementOnsetBoost = false;
                 window._movementOnsetTicks = 0;
             }
         }
-
-        const smoothedPosition = {
-            lat: lastPos.lat * (1 - finalSF) + bufferedPosition.lat * finalSF,
-            lng: lastPos.lng * (1 - finalSF) + bufferedPosition.lng * finalSF,
-            accuracy: bufferedPosition.accuracy,
-            heading: bufferedPosition.heading,
-            timestamp: currentTime,
-            speedMPS: bufferedPosition.speedMPS
-        };
         
         // SECTION 19: ANIMATION PARAMETERS
         let animDur = isInCenteredMode 
@@ -4404,9 +4496,18 @@ function updateUserLocation(position, forceUpdate = false) {
                 scheduleMarkerUpdate(smoothedPosition.lat, smoothedPosition.lng, updateOptions);
 
                 // ── 2. Compute look-ahead and shared state ──
+                // The old code used (bufferedPosition - lastPos) as the
+                // look-ahead vector, but bufferedPosition is already a dead-
+                // reckoned prediction — so this effectively applied the velocity
+                // TWICE, causing the map to overshoot on GPS jitter and snap
+                // back on the next fix (rubber-banding). Now we use the smoothed
+                // velocity, which is a stable, low-noise estimate of actual
+                // movement direction and speed. The look-ahead factor simply
+                // projects this velocity forward by a time window.
+                const sv = window.smoothedVelocity || { lat: 0, lng: 0 };
                 const lookAheadPos = {
-                    lat: smoothedPosition.lat + (bufferedPosition.lat - lastPos.lat) * lookAheadFactor,
-                    lng: smoothedPosition.lng + (bufferedPosition.lng - lastPos.lng) * lookAheadFactor
+                    lat: smoothedPosition.lat + (sv.lat * lookAheadFactor * 0.015),
+                    lng: smoothedPosition.lng + (sv.lng * lookAheadFactor * 0.015 * Math.cos(smoothedPosition.lat * Math.PI / 180))
                 };
 
                 const mapInterval = speedTier.mapUpdateInterval;
@@ -4737,16 +4838,23 @@ function _executeCenteredModePan(target, speedTier, directionChangeFactor, eastW
     let centerLat = target.lat;
     let centerLng = target.lng;
 
-    /* ── Look-ahead via smoothed velocity ── */
+       /* ── Look-ahead via smoothed velocity ── */
     if (lookAheadFactor > 0 && window.smoothedVelocity) {
         const svLat = window.smoothedVelocity.lat;
         const svLng = window.smoothedVelocity.lng;
         if (svLat != null && svLng != null && isFinite(svLat) && isFinite(svLng)) {
-            const biasScale    = 0.00002;
+            // The old biasScale of 0.00002 was far too small — at
+            // walking speed the look-ahead offset was ~0.00000000002 degrees
+            // (essentially zero meters). The smoothed velocity is in
+            // degrees/second, so to project 1-2 seconds ahead we just
+            // multiply by the look-ahead factor (which ranges 0.01–0.30)
+            // and a time window. The cosLat correction is needed because
+            // longitude degrees shrink as you move away from the equator.
             const lngMultiplier = eastWestMovement ? 0.85 : 1.0;
+            const cosLat = Math.cos(centerLat * Math.PI / 180);
 
-            centerLat += svLat * lookAheadFactor * biasScale;
-            centerLng += svLng * lookAheadFactor * biasScale * lngMultiplier;
+            centerLat += svLat * lookAheadFactor;
+            centerLng += svLng * lookAheadFactor * lngMultiplier / Math.max(0.5, cosLat);
         }
     }
 
@@ -5025,27 +5133,31 @@ function _confirmStationary(newPosition, currentTime) {
     window.isStationary = true;
     window.stationaryLockPosition = { lat: newPosition.lat, lng: newPosition.lng };
 
-    /* ── Marker repositioning (guarded against missing dependencies) ── */
+    /* ── Marker repositioning ── */
     if (userMarker && newPosition) {
         var currentLatLng = userMarker.getLatLng();
         var finalDistance  = 0;
 
-        // Safely calculate distance only if Leaflet and the method are available
         if (currentLatLng && typeof currentLatLng.distanceTo === 'function' &&
             typeof L !== 'undefined' && typeof L.latLng === 'function') {
             var targetLatLng = L.latLng(newPosition.lat, newPosition.lng);
             finalDistance = currentLatLng.distanceTo(targetLatLng);
         }
 
+        // FIX: Leaflet's L.Marker.setLatLng() does NOT support animation
+        // options — the { animate, duration } object is silently ignored,
+        // causing an instant snap that looks like a freeze. Use
+        // scheduleMarkerUpdate instead, which applies a CSS transition
+        // on the marker's transform property for a smooth glide to the
+        // locked position. This eliminates the visual "snap freeze".
         if (finalDistance > 0.5) {
-            // Animate the small snap (requires a smooth-animation plugin or custom extension)
-            userMarker.setLatLng([newPosition.lat, newPosition.lng], {
+            scheduleMarkerUpdate(newPosition.lat, newPosition.lng, {
                 animate: true,
                 duration: 0.8,
                 easeLinearity: 0.06
             });
         } else {
-            userMarker.setLatLng([newPosition.lat, newPosition.lng]);
+            scheduleMarkerUpdate(newPosition.lat, newPosition.lng);
         }
     }
 
@@ -5134,6 +5246,13 @@ function _enforceViewportSafety(speedMPH, currentMarkerPos) {
     if (window.isMapInteracting) return;
     if (window.followUser === false) return;
 
+    // If a proximity zoom animation is in progress, do NOT run
+    // viewport enforcement. map.flyTo and map.panTo interrupt each
+    // other — running them simultaneously causes violent zoom/pan jitter
+    // when approaching a POI. Let the zoom finish, then the next GPS
+    // tick will correct any viewport drift.
+    if (window._isProximityZoomAnimating) return;
+
     var pos = currentMarkerPos || (marker.getLatLng ? marker.getLatLng() : null);
     if (!pos || !isFinite(pos.lat) || !isFinite(pos.lng)) return;
 
@@ -5158,6 +5277,11 @@ function _enforceViewportSafety(speedMPH, currentMarkerPos) {
  * Uses setView (not panTo) for sub-frame correction at high speed.
  */
 function _enforceCenteredMode(markerPos, map, marker) {
+    // FIX: Bail out if a proximity zoom animation is in progress.
+    // flyTo and panTo interrupt each other, causing violent zoom/pan jitter
+    // when approaching a POI at high speed.
+    if (window._isProximityZoomAnimating) return;
+
     var mapSize = map.getSize();
     if (!mapSize || mapSize.x <= 0 || mapSize.y <= 0) return;
 
@@ -5168,15 +5292,14 @@ function _enforceCenteredMode(markerPos, map, marker) {
     var dy = markerPixel.y - mapSize.y / 2;
     var distanceFromCenter = Math.sqrt(dx * dx + dy * dy);
 
-    // Tolerance: 3px at rest, 8px when moving (allows for GPS jitter)
     var speedMPS = window.lastPosition?.speedMPS || 0;
-    var tolerance = speedMPS > 2 ? 8 : 3;
+    // FIX: Raised tolerance from 3→6px at rest and 8→12px when moving.
+    // At zoom 17, 3px is ~0.6m — GPS noise alone can move the marker
+    // 3px between frames, triggering constant micro-pans that stutter.
+    var tolerance = speedMPS > 2 ? 12 : 6;
 
     if (distanceFromCenter <= tolerance) return;
 
-    // ── Offset map center to bring marker back ──
-    // Don't just center on marker — that ignores look-ahead.
-    // Instead, calculate how far off we are and shift by that amount.
     var currentCenter = map.getCenter();
     var currentCenterPx = map.latLngToContainerPoint(currentCenter);
     var correctedCenterPx = {
@@ -5189,19 +5312,18 @@ function _enforceCenteredMode(markerPos, map, marker) {
         correctedCenter = markerPos;
     }
 
-    // Large drift (>30px) = instant snap; small drift = smooth pan
-    if (distanceFromCenter > 30 || speedMPS > 10) {
-        map.setView([correctedCenter.lat, correctedCenter.lng], map.getZoom(), {
-            animate: false, noMoveStart: true, noMoveEnd: true
-        });
-    } else {
-        map.panTo([correctedCenter.lat, correctedCenter.lng], {
-            animate: true,
-            duration: 0.06,  // 60ms — fast but perceptually smooth
-            easeLinearity: 0.5,
-            noMoveStart: true
-        });
-    }
+    // Use setView for ALL corrections in centered mode. The old code
+    // used panTo with duration:0.06 for small drifts, but GPS updates
+    // arrive every ~100ms. Leaflet can't finish a 60ms pan before the next
+    // one interrupts it, causing constant stop/start stuttering. setView
+    // with no animation completes synchronously in one frame — no stutter.
+    // The noMoveStart/noMoveEnd flags prevent Leaflet from firing move
+    // events that would re-trigger the interaction handler.
+    map.setView([correctedCenter.lat, correctedCenter.lng], map.getZoom(), {
+        animate: false,
+        noMoveStart: true,
+        noMoveEnd: true
+    });
 }
         
 /**
@@ -5212,6 +5334,7 @@ function _enforceRoamingMode(markerPos, map, marker, speedMPH) {
     if (!map || !marker) return;
     if (window.isMapInteracting) return;
     if (window.followUser === false) return;
+    if (window._isProximityZoomAnimating) return; 
 
     var mapSize = map.getSize();
     if (!mapSize || mapSize.x <= 0 || mapSize.y <= 0) return;
@@ -5232,18 +5355,21 @@ function _enforceRoamingMode(markerPos, map, marker, speedMPH) {
         return;
     }
 
-    // ── SAFETY MARGIN: Speed-scaled, capped ──
-    var marginFraction = 0.30 + speedFrac * 0.08;  // 30% → 38%
+    // ── SAFETY MARGIN: Smaller minimum for phones ──
+    // FIX: Was MIN_MARGIN_PX=140 which left only 95px safe zone on a
+    // 375px phone. Now 60px minimum gives 255px safe zone — the marker
+    // can actually move around before hitting the edge.
+    var marginFraction = 0.22 + speedFrac * 0.06;  // 22% → 28% (was 30%→38%)
 
     var marginX = mapSize.x * marginFraction;
     var marginY = mapSize.y * marginFraction;
 
-    var MIN_MARGIN_PX = 140;
+    var MIN_MARGIN_PX = 60;   // FIX: Was 140
     marginX = Math.max(marginX, MIN_MARGIN_PX);
     marginY = Math.max(marginY, MIN_MARGIN_PX);
 
-    marginX = Math.min(marginX, mapSize.x * 0.35);
-    marginY = Math.min(marginY, mapSize.y * 0.35);
+    marginX = Math.min(marginX, mapSize.x * 0.30);  // FIX: Was 0.35
+    marginY = Math.min(marginY, mapSize.y * 0.30);
 
     var isNearEdge = (
         pixel.x < marginX ||
@@ -5254,24 +5380,37 @@ function _enforceRoamingMode(markerPos, map, marker, speedMPH) {
 
     if (!isNearEdge) return;
 
-    // ── PAN TARGET: Bring marker to the edge of the safe zone, NOT deep inside ──
-    // This prevents the map from jumping ahead of the user's real movement.
-    // The icon will "ride" the margin boundary as the user moves, creating
-    // continuous smooth motion that mirrors actual device movement.
-    var offsetX = 0;
-    var offsetY = 0;
+    // ── PAN TARGET: Move marker 40% toward center, not just to the edge ──
+    // FIX: The old code only moved the marker to the margin boundary
+    // (edge-riding), which caused the marker to creep outward until it
+    // escaped. Now we blend between the edge offset and a full centering
+    // offset, pulling the marker inward on each pan.
+    var centerX = mapSize.x / 2;
+    var centerY = mapSize.y / 2;
+
+    var fullOffsetX = centerX - pixel.x;  // Offset to center
+    var fullOffsetY = centerY - pixel.y;
+
+    var edgeOffsetX = 0;
+    var edgeOffsetY = 0;
 
     if (pixel.x < marginX) {
-        offsetX = marginX - pixel.x;
+        edgeOffsetX = marginX - pixel.x;
     } else if (pixel.x > (mapSize.x - marginX)) {
-        offsetX = (mapSize.x - marginX) - pixel.x;
+        edgeOffsetX = (mapSize.x - marginX) - pixel.x;
     }
 
     if (pixel.y < marginY) {
-        offsetY = marginY - pixel.y;
+        edgeOffsetY = marginY - pixel.y;
     } else if (pixel.y > (mapSize.y - marginY)) {
-        offsetY = (mapSize.y - marginY) - pixel.y;
+        edgeOffsetY = (mapSize.y - marginY) - pixel.y;
     }
+
+    // Blend: 40% toward center, 60% to edge — prevents outward drift
+    // while keeping the marker from jumping to dead-center on every tick.
+    var blendFactor = 0.4;
+    var offsetX = edgeOffsetX * (1 - blendFactor) + fullOffsetX * blendFactor;
+    var offsetY = edgeOffsetY * (1 - blendFactor) + fullOffsetY * blendFactor;
 
     var centerPx = map.latLngToContainerPoint(map.getCenter());
     var newCenterPx = { x: centerPx.x + offsetX, y: centerPx.y + offsetY };
@@ -5292,25 +5431,23 @@ function _enforceRoamingMode(markerPos, map, marker, speedMPH) {
     else if (pixel.y > mapSize.y - marginY)  penetrationY = 1 - ((mapSize.y - pixel.y) / marginY);
     var penetration = Math.max(penetrationX, penetrationY);
 
-    var isUrgent = penetration > 0.60 || safeSpeed > 12;
+    var isUrgent = penetration > 0.50 || safeSpeed > 10;  // FIX: Lowered thresholds
     if (!isUrgent) {
-        var PAN_THROTTLE_MS = 50;
+        var PAN_THROTTLE_MS = 30;  // FIX: Was 50 — faster response to edge approach
         if (timeSinceLastPan < PAN_THROTTLE_MS) return;
     }
 
     window._lastRoamingPanTime = now;
 
     // ── EXECUTE PAN ──
-    var snapImmediately = isUrgent && (penetration > 0.80 || safeSpeed > 14);
+    var snapImmediately = isUrgent && (penetration > 0.70 || safeSpeed > 12);  // FIX: Lowered
 
     if (snapImmediately) {
         map.setView([newCenter.lat, newCenter.lng], map.getZoom(), {
             animate: false, noMoveStart: true, noMoveEnd: true
         });
     } else {
-        // Duration scales inversely with speed: faster movement = faster pan
-        // so the map keeps up with the user without lagging behind
-        var panDuration = Math.max(0.06, 0.18 - speedFrac * 0.12);
+        var panDuration = Math.max(0.06, 0.20 - speedFrac * 0.12);
         map.panTo([newCenter.lat, newCenter.lng], {
             animate: true,
             duration: panDuration,
@@ -5343,17 +5480,26 @@ function updateDistanceBox(forceUpdate = false, precalcUserPos = null, precalcCl
         userPos = precalcUserPos;
         closestDistance = precalcClosestDistance;
         closestLocation = precalcClosestLocation;
-    } else {
-        const userLatLng = userMarker.getLatLng();
-        let userLat = userLatLng.lat;
-        let userLng = userLatLng.lng;
+       } else {
+        // Prefer window.lastPosition (raw latest GPS fix) over
+        // userMarker.getLatLng(). The marker position is RAF-coalesced
+        // via scheduleMarkerUpdate, so it's always 1–2 frames behind
+        // reality. At walking speed that's ~3-5 feet of stale distance.
+        // window.lastPosition is updated immediately on each GPS tick.
+        const latestPos = window.lastPosition;
+        const userLatLng = latestPos
+            ? { lat: latestPos.lat, lng: latestPos.lng }
+            : (userMarker ? userMarker.getLatLng() : null);
 
-        if (!isFinite(userLat) || !isFinite(userLng)) {
-            console.warn('Invalid user coordinates:', userLat, userLng);
+        if (!userLatLng || !isFinite(userLatLng.lat) || !isFinite(userLatLng.lng)) {
+            console.warn('Invalid user coordinates:', userLatLng);
             distanceBox.textContent = 'Initializing...';
             resetDistanceBoxStyling(distanceBox);
             return;
         }
+
+        let userLat = userLatLng.lat;
+        let userLng = userLatLng.lng;
 
         if (userLat === 0 && userLng === 0) {
             const center = map.getCenter();
