@@ -923,6 +923,9 @@
     <div id="accuracyIndicator"></div>
     <div id="distanceBox" aria-live="polite">Initializing...</div>
 
+    <div id="accessibility-announcements" class="sr-only" aria-live="assertive" aria-atomic="true"></div>
+    <div id="proximity-announcements" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+
     <div class="lochunt-container">
         <img id="locationImage" alt="Location photo">
         <div class="lochunt-content">
@@ -966,13 +969,14 @@
         <button id="returnButton" class="map-button" aria-label="Return to main page"><i class="fas fa-sign-out-alt" aria-hidden="true"></i></button>
         <button id="tipsButton" class="map-button" aria-label="Show navigation tips"><i class="fas fa-question-circle" aria-hidden="true"></i></button>
     </div>
-
+<!--
     <div id="summaryModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="summaryTitle" style="display: none;">
         <div class="modal-content">
             <h2 id="summaryTitle" class="sr-only">Summary</h2>
             <p id="summaryContent" tabindex="-1"></p>
         </div>
     </div>
+    -->
     <div id="pwaPostInstallNotice" class="pwa-post-install-notice" role="alert">
         <div class="pwa-notice-content">
             <p><span aria-hidden="true">✅</span> Minnesota Then is installed!</p>
@@ -1306,6 +1310,685 @@ class EnterpriseBackgroundSync {
 }
 
 /* ──────────────────────────────────────────────
+   SENSOR FUSION — Device Orientation for heading
+   ────────────────────────────────────────────── */
+class SensorFusionManager {
+    constructor() {
+        this.deviceHeading = null;
+        this.headingAccuracy = null;
+        this.hasCompass = false;
+        this.isAvailable = false;
+        this._listener = null;
+        this._kalmanFilter = null;
+        this._accelerometer = null;
+        this._accelAvailable = false;
+        this._isMoving = false;
+        this._lastAccelMagnitude = 0;
+        this._filteredSpeedMPS = 0;       // From Kalman velocity state
+        this._filteredVelocity = null;     // { vNorth, vEast } from Kalman
+    }
+
+    init() {
+        this._initDeviceOrientation();
+        this._initAccelerometer();
+        this._initKalmanFilter();
+        return this;
+    }
+
+    /* ─── Kalman Filter Initialization ─────────────────────────────── */
+
+    _initKalmanFilter() {
+        this._kalmanFilter = new PositionKalmanFilter({
+            accelNoise:       1.0,   // m/s² — reasonable for mixed walking/driving
+            measurementNoise: 15,    // meters — typical urban GPS
+        });
+    }
+
+    /* ─── Device Orientation (Compass Heading) ─────────────────────── */
+
+    _initDeviceOrientation() {
+        // Test if the device actually provides absolute heading
+        const testHandler = (e) => {
+            // webkitCompassHeading: iOS Safari
+            // alpha + absolute: Android Chrome
+            const heading = e.webkitCompassHeading ?? 
+                           (e.alpha != null && e.absolute === true 
+                               ? (360 - e.alpha) % 360 
+                               : null);
+            
+            if (heading != null && isFinite(heading)) {
+                this.hasCompass = true;
+                this.isAvailable = true;
+                
+                // Stop listening for the test — switch to production handler
+                window.removeEventListener('deviceorientation', testHandler);
+                this._attachOrientationListener();
+            }
+        };
+
+        // Give the test 3 seconds to see a heading
+        window.addEventListener('deviceorientation', testHandler);
+        setTimeout(() => {
+            window.removeEventListener('deviceorientation', testHandler);
+            if (!this.hasCompass) {
+                console.log('[SensorFusion] No compass available on this device');
+            }
+        }, 3000);
+    }
+
+    _attachOrientationListener() {
+        // Use the absolute event if available (Android), fallback to
+        // regular event (iOS gives webkitCompassHeading on both)
+        const eventName = 'ondeviceorientationabsolute' in window
+            ? 'deviceorientationabsolute'
+            : 'deviceorientation';
+
+        this._listener = (e) => {
+            const heading = e.webkitCompassHeading ?? 
+                           (e.alpha != null && e.absolute === true 
+                               ? (360 - e.alpha) % 360 
+                               : null);
+            
+            const accuracy = e.webkitCompassAccuracy ?? null;
+
+            if (heading != null && isFinite(heading) && heading >= 0 && heading < 360) {
+                // Reject wild jumps (sensor glitch, not user turning)
+                if (this.deviceHeading != null) {
+                    let diff = Math.abs(heading - this.deviceHeading);
+                    if (diff > 180) diff = 360 - diff;
+                    if (diff > 90 && accuracy != null && accuracy > 25) {
+                        return; // Unreliable reading
+                    }
+                }
+
+                this.deviceHeading = heading;
+                this.headingAccuracy = accuracy;
+            }
+        };
+
+        window.addEventListener(eventName, this._listener, true);
+
+        if (typeof memoryManager !== 'undefined' && memoryManager?.trackEventListener) {
+            memoryManager.trackEventListener(window, eventName, this._listener, true);
+        }
+    }
+
+    /* ─── Accelerometer for Movement Detection ─────────────────────── */
+
+_initAccelerometer() {
+    if (!('Accelerometer' in window)) return;
+
+    // ── Path 1: Permission already granted → start immediately ──
+    // No user gesture needed. This is the common case on Android
+    // and on repeat visits to iOS Safari (permission is remembered).
+    if (navigator.permissions && typeof navigator.permissions.query === 'function') {
+        navigator.permissions.query({ name: 'accelerometer' })
+            .then(result => {
+                if (result.state === 'granted') {
+                    this._startAccelerometer();
+                } else if (result.state === 'prompt') {
+                    // Not yet decided — must wait for a user gesture.
+                    // We'll attach a one-time tap listener that triggers
+                    // the permission prompt on iOS.
+                    this._accelPendingPermission = true;
+                    this._attachPermissionGestureHandler();
+                } else {
+                    // 'denied' — user or policy blocked it. Nothing we can do.
+                    this._accelAvailable = false;
+                }
+
+                // Listen for external permission changes (e.g., user
+                // changes it in Safari Settings and returns to the page).
+                result.addEventListener('change', () => {
+                    if (result.state === 'granted' && !this._accelAvailable) {
+                        this._startAccelerometer();
+                        this._removePermissionGestureHandler();
+                    }
+                });
+            })
+            .catch(() => {
+                // permissions.query doesn't support 'accelerometer'
+                // (older browsers). Try starting directly — works on
+                // Android Chrome where no permission is needed.
+                this._startAccelerometer();
+            });
+    } else {
+        // No Permissions API at all — try directly.
+        this._startAccelerometer();
+    }
+}
+
+/**
+ * Creates and starts the Accelerometer sensor.
+ * On iOS, this MUST be called from within a user gesture handler
+ * or after permission has already been granted.
+ */
+_startAccelerometer() {
+    // Don't start twice
+    if (this._accelAvailable && this._accelerometer) return;
+
+    try {
+        this._accelerometer = new Accelerometer({ frequency: 10 });
+
+        this._accelerometer.addEventListener('reading', () => {
+            const a = this._accelerometer;
+            if (a.x == null || a.y == null || a.z == null) return;
+
+            // Subtract gravity (~9.8) to get linear acceleration
+            const magnitude = Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
+            const linearAccel = Math.abs(magnitude - 9.8);
+
+            this._lastAccelMagnitude = linearAccel;
+
+            // Threshold: ~0.3 m/s² of linear acceleration indicates movement
+            this._isMoving = linearAccel > 0.3;
+        });
+
+        this._accelerometer.addEventListener('error', (e) => {
+            // error.error.name tells us why it failed:
+            //   'NotAllowedError'  → permission denied
+            //   'NotReadableError' → sensor hardware issue
+            //   'NotSupportedError' → sensor missing entirely
+            if (e.error?.name === 'NotAllowedError') {
+                console.warn('[SensorFusion] Accelerometer permission denied');
+            }
+            this._accelAvailable = false;
+            this._accelPendingPermission = false;
+        });
+
+        this._accelerometer.start();
+        this._accelAvailable = true;
+        this._accelPendingPermission = false;
+
+    } catch (e) {
+        // Creation can throw NotAllowedError on iOS if not in a gesture.
+        // Can also throw if the sensor simply isn't available.
+        if (e.name === 'NotAllowedError') {
+            console.warn('[SensorFusion] Accelerometer creation blocked — not in user gesture context');
+            this._accelPendingPermission = true;
+            this._attachPermissionGestureHandler();
+        } else {
+            console.warn('[SensorFusion] Accelerometer not available:', e.message);
+        }
+        this._accelAvailable = false;
+    }
+}
+
+/**
+ * Attaches a one-time gesture listener to the document.
+ * When the user first taps anywhere, we try to create the Accelerometer.
+ * On iOS, the browser permission prompt appears during this gesture.
+ */
+_attachPermissionGestureHandler() {
+    if (this._accelGestureHandler) return; // Already attached
+
+    this._accelGestureHandler = async () => {
+        if (!this._accelPendingPermission) return;
+
+        // Verify we still need permission before showing the prompt
+        try {
+            const result = await navigator.permissions.query({ name: 'accelerometer' });
+            if (result.state === 'granted') {
+                this._startAccelerometer();
+                this._removePermissionGestureHandler();
+                return;
+            }
+            // state is 'prompt' — creating the Accelerometer during this
+            // gesture will trigger the iOS permission dialog.
+        } catch (_) {
+            // permissions.query failed — try anyway
+        }
+
+        this._startAccelerometer();
+
+        // Whether it succeeded or failed, we're done with the gesture
+        // handler. If it failed with NotAllowedError (user declined the
+        // prompt), _startAccelerometer sets _accelAvailable = false and
+        // we won't retry.
+        this._removePermissionGestureHandler();
+    };
+
+    // Use capture phase so we fire before any stopPropagation calls
+    document.addEventListener('click', this._accelGestureHandler, true);
+    document.addEventListener('touchend', this._accelGestureHandler, true);
+}
+
+/**
+ * Removes the gesture-based permission request handler.
+ */
+_removePermissionGestureHandler() {
+    if (this._accelGestureHandler) {
+        document.removeEventListener('click', this._accelGestureHandler, true);
+        document.removeEventListener('touchend', this._accelGestureHandler, true);
+        this._accelGestureHandler = null;
+    }
+    this._accelPendingPermission = false;
+}
+
+    /* ─── Public API ───────────────────────────────────────────────── */
+
+    /**
+     * Smooth a raw GPS position through the constant-velocity Kalman filter.
+     * Returns { lat, lng, vNorth, vEast, speedMPS }.
+     */
+    smoothPosition(rawLat, rawLng, accuracyMeters, timestampMs) {
+        if (!this._kalmanFilter) return { lat: rawLat, lng: rawLng, vNorth: 0, vEast: 0, speedMPS: 0 };
+
+        const result = this._kalmanFilter.update(rawLat, rawLng, accuracyMeters, timestampMs);
+
+        // Cache for isDeviceMoving() and other consumers
+        this._filteredSpeedMPS = result.speedMPS;
+        this._filteredVelocity = { vNorth: result.vNorth, vEast: result.vEast };
+
+        return result;
+    }
+
+    /**
+     * Velocity in degrees/second — direct replacement for window.smoothedVelocity.
+     * NOTE: The Kalman filter already applies cosLat correction when converting 
+     * m/s to degrees/second for longitude. Do NOT apply cosLat again in look-ahead.
+     */
+    getSmoothedVelocityDegPerSec() {
+        if (!this._kalmanFilter) return { lat: 0, lng: 0 };
+        return this._kalmanFilter.getVelocityDegPerSec();
+    }
+
+    /**
+     * Speed in m/s from the Kalman filter's velocity state.
+     * More reliable than raw GPS speed because it's derived from
+     * multiple measurements over time.
+     */
+    getFilteredSpeedMPS() {
+        return this._filteredSpeedMPS || 0;
+    }
+
+    /**
+     * Heading from the Kalman filter's velocity state (compass degrees).
+     * Only valid when speed > 0.3 m/s.
+     */
+    getFilteredHeading() {
+        if (!this._kalmanFilter) return null;
+        return this._kalmanFilter.getHeading();
+    }
+
+    /**
+     * Is the device actually moving? Uses Kalman speed when available,
+     * falls back to accelerometer, then raw GPS speed.
+     */
+    isDeviceMoving(gpsSpeedMPS) {
+        // Best: Kalman filter speed (multi-measurement, denoised)
+        if (this._filteredSpeedMPS > 0) {
+            return this._filteredSpeedMPS > 0.5;
+        }
+        // Good: accelerometer
+        if (this._accelAvailable) {
+            return this._isMoving;
+        }
+        // Fallback: raw GPS speed
+        return (gpsSpeedMPS || 0) > 0.5;
+    }
+
+    /**
+     * Returns the best available heading: GPS heading if reliable
+     * (speed > 2 m/s), otherwise compass heading.
+     */
+    getHeading(gpsHeading, speedMPS) {
+        // GPS heading is reliable at speed
+        if (gpsHeading != null && isFinite(gpsHeading) && speedMPS > 2) {
+            return gpsHeading;
+        }
+        
+        // Fall back to compass when slow/stationary
+        if (this.deviceHeading != null) {
+            return this.deviceHeading;
+        }
+        
+        return gpsHeading; // May be null — that's fine
+    }
+
+    /* ─── Cleanup ──────────────────────────────────────────────────── */
+
+   destroy() {
+    if (this._listener) {
+        window.removeEventListener('deviceorientation', this._listener, true);
+        window.removeEventListener('deviceorientationabsolute', this._listener, true);
+        this._listener = null;
+    }
+    if (this._accelerometer) {
+        this._accelerometer.stop();
+        this._accelerometer = null;
+    }
+    this._removePermissionGestureHandler(); 
+    if (this._kalmanFilter) {
+        this._kalmanFilter.reset();
+        this._kalmanFilter = null;
+    }
+    this.isAvailable = false;
+    this._accelAvailable = false; 
+}
+    }
+
+/* ──────────────────────────────────────────────
+   POSITION KALMAN FILTER
+   Replaces the 10-tier speed-based smoothing with
+   a mathematically optimal estimator.
+   ────────────────────────────────────────────── */
+class PositionKalmanFilter {
+    constructor(options = {}) {
+        /**
+         * Spectral density of the acceleration noise (m²/s³).
+         * sqrt(this) ≈ expected acceleration standard deviation in m/s².
+         *
+         *   0.3 — very smooth (highway cruise)
+         *   1.0 — mixed use (default)
+         *   3.0 — aggressive (city driving, rapid turns)
+         *
+         * Higher values = filter responds faster to movement changes
+         * but trusts GPS noise more when stationary.
+         * The stationary lock in updateUserLocation handles the latter.
+         */
+        this.accelNoise = options.accelNoise ?? 1.0;
+        this.measurementNoise = options.measurementNoise ?? 15;
+
+        // State vector: [north, east, vNorth, vEast]
+        //   north/east : meters from reference point
+        //   vNorth/vEast : m/s
+        this.x = null;
+        this.P = null;       // 4×4 covariance (array of 4 arrays)
+        this.lastTimestamp = null;
+        this.refLat = null;  // Reference point for local ↔ global conversion
+        this.refLng = null;
+    }
+
+    /* ─── Public API ─────────────────────────────────────────────── */
+
+    update(lat, lng, accuracyMeters, timestampMs) {
+        const R = Math.max(5, accuracyMeters || this.measurementNoise);
+
+        // ── First fix: initialize ──
+        if (this.x === null) {
+            this._initialize(lat, lng, R, timestampMs);
+            return this._makeResult(lat, lng);
+        }
+
+        const dt = (timestampMs - this.lastTimestamp) / 1000;
+        this.lastTimestamp = timestampMs;
+
+        // ── Stale or impossible dt: reset ──
+        if (dt <= 0 || dt > 10) {
+            this._initialize(lat, lng, R, timestampMs);
+            return this._makeResult(lat, lng);
+        }
+
+        // ── Predict (constant-velocity model) ──
+        this._predict(dt);
+
+        // ── Update with measurement ──
+        const local = this._toLocal(lat, lng);
+        this._update(local.north, local.east, R);
+
+        // ── Prevent floating-point drift in local coordinates ──
+        if (Math.abs(this.x[0]) > 2000 || Math.abs(this.x[1]) > 2000) {
+            this._shiftReference();
+        }
+
+        const pos = this._toGlobal(this.x[0], this.x[1]);
+        return this._makeResult(pos.lat, pos.lng);
+    }
+
+    /** Velocity in m/s (north-positive, east-positive). */
+    getVelocity() {
+        if (!this.x) return { vNorth: 0, vEast: 0 };
+        return { vNorth: this.x[2], vEast: this.x[3] };
+    }
+
+    /** Speed in m/s from the filter's velocity state. */
+    getSpeedMPS() {
+        if (!this.x) return 0;
+        return Math.sqrt(this.x[2] * this.x[2] + this.x[3] * this.x[3]);
+    }
+
+    /**
+     * Velocity in degrees/second — ready for look-ahead calculations.
+     * Replaces the separate window.smoothedVelocity EMA.
+     */
+    getVelocityDegPerSec() {
+        if (!this.x || this.refLat == null) return { lat: 0, lng: 0 };
+        const cosLat = Math.cos(this.refLat * Math.PI / 180);
+        return {
+            lat: this.x[2] / 111111,
+            lng: this.x[3] / (111111 * cosLat)
+        };
+    }
+
+    /**
+     * Heading in compass degrees [0, 360) from the filter's velocity.
+     * Returns null when speed < 0.3 m/s (heading is unreliable).
+     */
+    getHeading() {
+        if (!this.x) return null;
+        const speed = Math.sqrt(this.x[2] * this.x[2] + this.x[3] * this.x[3]);
+        if (speed < 0.3) return null;
+        // atan2(east, north) → compass bearing (clockwise from north)
+        return (Math.atan2(this.x[3], this.x[2]) * 180 / Math.PI + 360) % 360;
+    }
+
+    reset() {
+        this.x = null;
+        this.P = null;
+        this.lastTimestamp = null;
+        this.refLat = null;
+        this.refLng = null;
+    }
+
+    /* ─── Private: Initialization ──────────────────────────────────── */
+
+    _initialize(lat, lng, R, timestampMs) {
+        this.refLat = lat;
+        this.refLng = lng;
+        this.x = [0, 0, 0, 0]; // [north, east, vNorth, vEast]
+
+        const R2 = R * R;
+        const v0 = 1.0; // Initial velocity variance (m/s)²
+        this.P = [
+            [R2, 0,  0,  0 ],
+            [0,  R2, 0,  0 ],
+            [0,  0,  v0, 0 ],
+            [0,  0,  0,  v0]
+        ];
+        this.lastTimestamp = timestampMs;
+    }
+
+    /* ─── Private: Prediction Step ─────────────────────────────────── */
+
+    _predict(dt) {
+        const x = this.x;
+        const P = this.P;
+
+        // ── State prediction: x = F · x ──
+        // F = [[1,0,dt,0],[0,1,0,dt],[0,0,1,0],[0,0,0,1]]
+        this.x = [
+            x[0] + x[2] * dt,   // north + vNorth·dt
+            x[1] + x[3] * dt,   // east  + vEast·dt
+            x[2],                 // vNorth (constant)
+            x[3]                  // vEast  (constant)
+        ];
+
+        // ── Process noise Q (piecewise white noise acceleration) ──
+        //   q = acceleration spectral density (m²/s³)
+        //   Q[0,0] = q·dt³/3    Q[0,2] = q·dt²/2
+        //   Q[2,2] = q·dt       (symmetric)
+        const q  = this.accelNoise;
+        const dt2 = dt * dt;
+        const dt3 = dt2 * dt;
+        const dt4 = dt3 * dt;
+        const qdt2 = q * dt2;
+        const qdt3 = q * dt3;
+        const qdt4 = q * dt4;
+
+        const Q = [
+            [qdt4 / 4, 0,         qdt3 / 2, 0        ],
+            [0,         qdt4 / 4, 0,         qdt3 / 2 ],
+            [qdt3 / 2, 0,         qdt2,      0        ],
+            [0,         qdt3 / 2, 0,         qdt2     ]
+        ];
+
+        // ── Covariance prediction: P = F·P·Fᵀ + Q ──
+        // F·P: add dt·row2 to row0, dt·row3 to row1
+        const FP = [
+            [P[0][0] + dt * P[2][0], P[0][1] + dt * P[2][1],
+             P[0][2] + dt * P[2][2], P[0][3] + dt * P[2][3]],
+            [P[1][0] + dt * P[3][0], P[1][1] + dt * P[3][1],
+             P[1][2] + dt * P[3][2], P[1][3] + dt * P[3][3]],
+            [P[2][0], P[2][1], P[2][2], P[2][3]],
+            [P[3][0], P[3][1], P[3][2], P[3][3]]
+        ];
+
+        // (F·P)·Fᵀ: add dt·col2 to col0, dt·col3 to col1; then + Q
+        this.P = [
+            [FP[0][0] + dt * FP[0][2] + Q[0][0],
+             FP[0][1] + dt * FP[0][3] + Q[0][1],
+             FP[0][2] + Q[0][2],
+             FP[0][3] + Q[0][3]],
+            [FP[1][0] + dt * FP[1][2] + Q[1][0],
+             FP[1][1] + dt * FP[1][3] + Q[1][1],
+             FP[1][2] + Q[1][2],
+             FP[1][3] + Q[1][3]],
+            [FP[2][0] + dt * FP[2][2] + Q[2][0],
+             FP[2][1] + dt * FP[2][3] + Q[2][1],
+             FP[2][2] + Q[2][2],
+             FP[2][3] + Q[2][3]],
+            [FP[3][0] + dt * FP[3][2] + Q[3][0],
+             FP[3][1] + dt * FP[3][3] + Q[3][1],
+             FP[3][2] + Q[3][2],
+             FP[3][3] + Q[3][3]]
+        ];
+    }
+
+    /* ─── Private: Update Step ──────────────────────────────────────── */
+
+    _update(zNorth, zEast, R) {
+        const P = this.P;
+        const R2 = R * R;
+
+        // ── Innovation: y = z − H·x ──
+        // H = [[1,0,0,0],[0,1,0,0]]  (we only observe position)
+        const y0 = zNorth - this.x[0];
+        const y1 = zEast  - this.x[1];
+
+        // ── Innovation covariance: S = H·P·Hᵀ + R·I ──
+        const S00 = P[0][0] + R2;
+        const S11 = P[1][1] + R2;
+        const S01 = P[0][1];         // cross-term (usually small)
+
+        // ── Kalman gain: K = P·Hᵀ·S⁻¹  (4×2 matrix) ──
+        const detS = S00 * S11 - S01 * S01;
+        let K;
+
+        if (Math.abs(detS) < 1e-15) {
+            // Degenerate — diagonal fallback
+            K = [
+                [P[0][0] / S00, 0],
+                [0, P[1][1] / S11],
+                [P[2][0] / S00, 0],
+                [0, P[2][1] / S11]
+            ];
+        } else {
+            const iS00 =  S11 / detS;
+            const iS11 =  S00 / detS;
+            const iS01 = -S01 / detS;
+
+            // K = P[:,0:2] · S⁻¹
+            K = [
+                [P[0][0] * iS00 + P[0][1] * iS01,
+                 P[0][0] * iS01 + P[0][1] * iS11],
+                [P[1][0] * iS00 + P[1][1] * iS01,
+                 P[1][0] * iS01 + P[1][1] * iS11],
+                [P[2][0] * iS00 + P[2][1] * iS01,
+                 P[2][0] * iS01 + P[2][1] * iS11],
+                [P[3][0] * iS00 + P[3][1] * iS01,
+                 P[3][0] * iS01 + P[3][1] * iS11]
+            ];
+        }
+
+        // ── State update: x = x + K·y ──
+        this.x[0] += K[0][0] * y0 + K[0][1] * y1;
+        this.x[1] += K[1][0] * y0 + K[1][1] * y1;
+        this.x[2] += K[2][0] * y0 + K[2][1] * y1;
+        this.x[3] += K[3][0] * y0 + K[3][1] * y1;
+
+        // ── Covariance update: P = (I − K·H) · P ──
+        // (I − K·H) rows:
+        //   row 0: [1−K00, −K01, 0, 0]
+        //   row 1: [−K10, 1−K11, 0, 0]
+        //   row 2: [−K20, −K21, 1, 0]
+        //   row 3: [−K30, −K31, 0, 1]
+        const newP = [[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]];
+
+        for (let j = 0; j < 4; j++) {
+            // Row 0
+            newP[0][j] = (1 - K[0][0]) * P[0][j] - K[0][1] * P[1][j];
+            // Row 1
+            newP[1][j] = -K[1][0] * P[0][j] + (1 - K[1][1]) * P[1][j];
+            // Row 2
+            newP[2][j] = -K[2][0] * P[0][j] - K[2][1] * P[1][j] + P[2][j];
+            // Row 3
+            newP[3][j] = -K[3][0] * P[0][j] - K[3][1] * P[1][j] + P[3][j];
+        }
+
+        // ── Enforce symmetry (prevents numerical drift) ──
+        for (let i = 0; i < 4; i++) {
+            for (let j = i + 1; j < 4; j++) {
+                const avg = (newP[i][j] + newP[j][i]) * 0.5;
+                newP[i][j] = avg;
+                newP[j][i] = avg;
+            }
+        }
+
+        this.P = newP;
+    }
+
+    /* ─── Private: Coordinate Conversion ────────────────────────────── */
+
+    _toLocal(lat, lng) {
+        return {
+            north: (lat - this.refLat) * 111111,
+            east:  (lng - this.refLng) * 111111 * Math.cos(this.refLat * Math.PI / 180)
+        };
+    }
+
+    _toGlobal(north, east) {
+        const cosRef = Math.cos(this.refLat * Math.PI / 180);
+        return {
+            lat: this.refLat + north / 111111,
+            lng: this.refLng + east / (111111 * cosRef)
+        };
+    }
+
+    _shiftReference() {
+        const pos = this._toGlobal(this.x[0], this.x[1]);
+        this.refLat = pos.lat;
+        this.refLng = pos.lng;
+        this.x[0] = 0;
+        this.x[1] = 0;
+        // Velocity and covariance are unchanged — they're
+        // independent of the reference point origin.
+    }
+
+    /** Build the return object with all derived quantities. */
+    _makeResult(lat, lng) {
+        const vNorth = this.x ? this.x[2] : 0;
+        const vEast  = this.x ? this.x[3] : 0;
+        const speed  = Math.sqrt(vNorth * vNorth + vEast * vEast);
+
+        return { lat, lng, vNorth, vEast, speedMPS: speed };
+    }
+}
+
+// ── Global instance ──
+window.sensorFusion = new SensorFusionManager().init();
+
+/* ──────────────────────────────────────────────
    ZOOM CONTROLLER
    ────────────────────────────────────────────── */
 (function() {
@@ -1439,7 +2122,6 @@ window.animationFrameId = null;
 window._driftHysteresisCounter = window._driftHysteresisCounter || 0;
 
 let accessibilityState = {
-    highContrast: localStorage.getItem('highContrast') === 'true',
     lastAnnouncement: ''
 };
 
@@ -1456,7 +2138,6 @@ function cacheElements() {
         additionalInfoContainer: document.querySelector('.additional-info-container'),
         accessibilityAnnouncements: document.getElementById('accessibility-announcements'),
         proximityAnnouncements: document.getElementById('proximity-announcements'),
-        contrastToggle: document.getElementById('contrastToggle')
     };
 }
 
@@ -1473,18 +2154,6 @@ function announceToScreenReader(message, priority = 'polite') {
                 accessibilityState.lastAnnouncement = '';
             }
         }, 1000);
-    }
-}
-
-function toggleHighContrast() {
-    accessibilityState.highContrast = !accessibilityState.highContrast;
-    localStorage.setItem('highContrast', accessibilityState.highContrast);
-    if (accessibilityState.highContrast) {
-        document.body.classList.add('high-contrast');
-        announceToScreenReader('High contrast mode enabled');
-    } else {
-        document.body.classList.remove('high-contrast');
-        announceToScreenReader('High contrast mode disabled');
     }
 }
 
@@ -2294,61 +2963,55 @@ function getWatchOptions() {
 /* ──────────────────────────────────────────────
    POSITION UPDATES — GPS watch + power manager
    ────────────────────────────────────────────── */
+/* ──────────────────────────────────────────────
+   GPS POWER MANAGER — fixed version
+   No more watchPosition restarts.
+   ────────────────────────────────────────────── */
 function startPositionUpdates() {
     try {
-        // Clean up existing watch
+        // Clean up existing watch — only ONCE
         if (window.positionWatchId != null) {
             navigator.geolocation.clearWatch(window.positionWatchId);
             window.positionWatchId = null;
         }
 
-        // Clean up existing power interval
+        // Single persistent watch with maximumAge=0 for best accuracy
+        // The GPS chip maintains its own internal fix strategy;
+        // restarting it is always counterproductive.
+        window.positionWatchId = navigator.geolocation.watchPosition(
+            handlePositionUpdate,
+            handleLocationError,
+            { enableHighAccuracy: true, timeout: 30000, maximumAge: 0 }
+        );
+
+        // ── Dynamic maximumAge adjustment WITHOUT restarting the watch ──
+        // The watch always delivers fresh fixes. We throttle consumption
+        // in handlePositionUpdate based on speed state instead.
         if (window._gpsPowerInterval) {
             clearInterval(window._gpsPowerInterval);
             window._gpsPowerInterval = null;
         }
 
-        // Start the watch with current power mode
-        window.positionWatchId = navigator.geolocation.watchPosition(
-            handlePositionUpdate,
-            handleLocationError,
-            getWatchOptions()
-        );
-
-        // ── Dynamic GPS Power Manager ──
-        // Checks speed/stationary state every 5 seconds and
-        // restarts the watch with appropriate settings.
-        // No monkey-patching needed — the interval polls
-        // window.isStationary and window.lastPosition directly.
-        let lastPowerMode = null;
-
-        function adjustGPSPower() {
+        // This interval NO LONGER restarts the watch.
+        // It just updates the consumption throttle window._gpsConsumeInterval.
+        window._gpsConsumeInterval = 1000; // ms between accepted fixes (default: 1s)
+        
+        window._gpsPowerInterval = setInterval(() => {
             if (!navigator.onLine) return;
-
-            const speedMPS = window.lastPosition?.speedMPS ?? 0;
-            const speedMPH = speedMPS * 2.23694;
-            let newMode;
-
-            if (window.isStationary || speedMPH < 0.5) newMode = 'low';
-            else if (speedMPH < 5) newMode = 'medium';
-            else newMode = 'high';
-
-            if (newMode === lastPowerMode) return;
-            lastPowerMode = newMode;
-
-            if (window.positionWatchId != null) {
-                navigator.geolocation.clearWatch(window.positionWatchId);
+            const speedMPH = (window.lastPosition?.speedMPS ?? 0) * 2.23694;
+            
+            // Adjust consumption rate, not the watch itself
+            if (window.isStationary || speedMPH < 0.5) {
+                window._gpsConsumeInterval = 3000;  // Stationary: accept every 3s
+            } else if (speedMPH < 5) {
+                window._gpsConsumeInterval = 1000;  // Walking: every 1s
+            } else if (speedMPH < 15) {
+                window._gpsConsumeInterval = 500;   // Cycling: every 500ms
+            } else {
+                window._gpsConsumeInterval = 200;   // Driving: every 200ms
             }
-            window.positionWatchId = navigator.geolocation.watchPosition(
-                handlePositionUpdate,
-                handleLocationError,
-                getWatchOptions()
-            );
-        }
+        }, 5000);
 
-        window._gpsPowerInterval = setInterval(adjustGPSPower, 5000);
-
-        // Register power interval for cleanup
         if (memoryManager?.registerCleanupTask) {
             memoryManager.registerCleanupTask(() => {
                 if (window._gpsPowerInterval) {
@@ -2358,21 +3021,21 @@ function startPositionUpdates() {
             });
         }
 
-        // ── Network & Lifecycle Listeners ──
+        // ── Network listeners (same as before, no watch restart) ──
         if (!window._positionUpdatesListenersSetup) {
             window._positionUpdatesListenersSetup = true;
 
             const onlineHandler = () => {
                 if (window.onlineRestartTimeout) clearTimeout(window.onlineRestartTimeout);
                 window.onlineRestartTimeout = createTrackedTimeout(() => {
-                    if (window.positionWatchId != null) {
-                        navigator.geolocation.clearWatch(window.positionWatchId);
+                    // Only restart if the watch was killed by going offline
+                    if (window.positionWatchId == null) {
+                        window.positionWatchId = navigator.geolocation.watchPosition(
+                            handlePositionUpdate,
+                            handleLocationError,
+                            { enableHighAccuracy: true, timeout: 30000, maximumAge: 0 }
+                        );
                     }
-                    window.positionWatchId = navigator.geolocation.watchPosition(
-                        handlePositionUpdate,
-                        handleLocationError,
-                        getWatchOptions()
-                    );
                     window.onlineRestartTimeout = null;
                 }, 500);
             };
@@ -2382,16 +3045,14 @@ function startPositionUpdates() {
                     clearTimeout(window.onlineRestartTimeout);
                     window.onlineRestartTimeout = null;
                 }
-                if (window.positionWatchId != null) {
-                    navigator.geolocation.clearWatch(window.positionWatchId);
-                    window.positionWatchId = null;
-                }
+                // Don't kill the watch on offline — fixes may still arrive
+                // from cached satellite data. Only clear if we explicitly
+                // need to stop.
             };
 
             window.addEventListener('online', onlineHandler);
             window.addEventListener('offline', offlineHandler);
 
-            // Track for memory manager cleanup
             if (memoryManager?.trackEventListener) {
                 memoryManager.trackEventListener(window, 'online', onlineHandler);
                 memoryManager.trackEventListener(window, 'offline', offlineHandler);
@@ -2410,7 +3071,21 @@ function startPositionUpdates() {
 /* ──────────────────────────────────────────────
    POSITION UPDATE HANDLER
    ────────────────────────────────────────────── */
+/**
+ * Core GPS position update handler.
+ * 
+ * CHANGES FROM ORIGINAL:
+ * 1. Consumption Throttle: Replaces watchPosition restarts. Skips fixes 
+ *    that arrive faster than the current speed-based interval.
+ * 2. Kalman Filter: Smooths raw lat/lng before passing to the state machine.
+ * 3. Sensor Fusion: Merges GPS heading with DeviceOrientation compass, 
+ *    and GPS speed with Accelerometer movement detection.
+ * 4. Read-Only Safety: Constructs a new plain object for the position, 
+ *    because native position.coords is often read-only and will throw 
+ *    errors if we try to overwrite its properties directly.
+ */
 function handlePositionUpdate(position) {
+    // ── 1. VALIDATION ──────────────────────────────────────────────────
     if (!position?.coords ||
         isNaN(position.coords.latitude) ||
         isNaN(position.coords.longitude)) {
@@ -2423,7 +3098,8 @@ function handlePositionUpdate(position) {
     // Discard stale fixes (> 30 seconds old)
     if (currentTime - positionTimestamp > 30_000) return;
 
-    // Throttle background updates to once every 30 seconds
+    // ── 2. BACKGROUND THROTTLING ───────────────────────────────────────
+    // When the tab is hidden, process at most one fix every 30 seconds
     if (document.hidden) {
         if (!window._lastBackgroundUpdate || currentTime - window._lastBackgroundUpdate > 30_000) {
             window._lastBackgroundUpdate = currentTime;
@@ -2432,19 +3108,61 @@ function handlePositionUpdate(position) {
         }
     }
 
-    const accuracy = position.coords.accuracy || 0;
-    window.lastPositionAccuracy = accuracy;
+    // ── 3. CONSUMPTION THROTTLE (Replaces watchPosition restarts) ──────
+    // The power manager adjusts window._gpsConsumeInterval based on speed.
+    // We simply ignore fixes that arrive too quickly, allowing the GPS 
+    // chip to maintain its warm fix uninterrupted.
+    const consumeInterval = window._gpsConsumeInterval ?? 1000;
+    if (currentTime - (window._lastConsumedFixTime || 0) < consumeInterval) {
+        return;
+    }
+    window._lastConsumedFixTime = currentTime;
 
+    // ── 4. EXTRACT RAW GPS DATA ────────────────────────────────────────
+    const rawLat = position.coords.latitude;
+    const rawLng = position.coords.longitude;
+    const rawAccuracy = position.coords.accuracy || 20; // Default fallback
     const rawSpeedMPS = position.coords.speed || 0;
+    const rawHeading = position.coords.heading ?? null;
 
-    // Store valid position — smoothing happens in updateUserLocation
+    // ── 5. SENSOR FUSION & SMOOTHING ───────────────────────────────────
+    let fusedLat = rawLat;
+    let fusedLng = rawLng;
+    let fusedHeading = rawHeading;
+    let isMoving = rawSpeedMPS > 0.5; // Default to GPS speed
+
+    if (window.sensorFusion) {
+        // A. Position Smoothing via Kalman Filter
+        // Filters out GPS jitter mathematically instead of relying on 
+        // arbitrary speed-tier constants.
+        const smoothed = window.sensorFusion.smoothPosition(
+            rawLat, rawLng, rawAccuracy, positionTimestamp
+        );
+        fusedLat = smoothed.lat;
+        fusedLng = smoothed.lng;
+
+        // B. Heading Fusion
+        // Uses compass (DeviceOrientation) when walking/standing 
+        // because GPS heading is null below ~5mph.
+        fusedHeading = window.sensorFusion.getHeading(rawHeading, rawSpeedMPS);
+
+        // C. Movement Fusion
+        // Uses accelerometer to detect if the device is actually moving,
+        // which helps distinguish real movement from GPS drift when stationary.
+        isMoving = window.sensorFusion.isDeviceMoving(rawSpeedMPS);
+    }
+
+    // ── 6. UPDATE GLOBAL TRACKING STATE ────────────────────────────────
+    window.lastPositionAccuracy = rawAccuracy;
+
     window.lastValidPosition = {
-        lat: position.coords.latitude,
-        lng: position.coords.longitude,
+        lat: fusedLat,
+        lng: fusedLng,
         timestamp: positionTimestamp,
-        accuracy: accuracy,
+        accuracy: rawAccuracy,
         speedMPS: rawSpeedMPS,
-        heading: position.coords.heading || null
+        heading: fusedHeading,
+        isMoving: isMoving // New flag for the state machine
     };
 
     if (window.lastUpdateTime) {
@@ -2452,10 +3170,28 @@ function handlePositionUpdate(position) {
     }
     window.lastUpdateTime = currentTime;
 
+    // ── 7. CONSTRUCT ENHANCED POSITION OBJECT ──────────────────────────
+    // Native position.coords is often read-only. We must build a new 
+    // plain object to pass the fused data downstream without throwing 
+    // "Cannot set property latitude of #<Coordinates> which has only a getter"
+    const enhancedPosition = {
+        timestamp: positionTimestamp,
+        coords: {
+            latitude: fusedLat,
+            longitude: fusedLng,
+            accuracy: rawAccuracy,
+            altitude: position.coords.altitude,
+            altitudeAccuracy: position.coords.altitudeAccuracy,
+            heading: fusedHeading,
+            speed: rawSpeedMPS
+        }
+    };
+
+    // ── 8. DISPATCH TO STATE MACHINE ───────────────────────────────────
     // Force update more frequently at high speeds
     const forceUpdate = rawSpeedMPS > 10; // > ~22 mph
 
-    updateUserLocation(position, forceUpdate);
+    updateUserLocation(enhancedPosition, forceUpdate);
 }
         
 /* ──────────────────────────────────────────────
@@ -3661,89 +4397,6 @@ function _prefetchMapTiles(location, now) {
 })();
         
 /* ──────────────────────────────────────────────
-   SPEED TIER CONFIGURATION — module-level constants
-   ────────────────────────────────────────────── */
-const TIER_CONFIGS = [
-    { micro: 0.08, minDist: 0.25, maxAcc: 32, maxSpd: 3,   mapInt: 1000, mapDist: 2.0,  panDur: 0.90, easeLin: 0.20 },
-    { micro: 0.16, minDist: 0.35, maxAcc: 28, maxSpd: 5,   mapInt: 800,  mapDist: 3.0,  panDur: 0.65, easeLin: 0.22 },
-    { micro: 0.24, minDist: 0.48, maxAcc: 26, maxSpd: 10,  mapInt: 600,  mapDist: 4.5,  panDur: 0.45, easeLin: 0.26 },
-    { micro: 0.38, minDist: 0.65, maxAcc: 23, maxSpd: 16,  mapInt: 200,  mapDist: 6.5,  panDur: 0.28, easeLin: 0.28 },
-    { micro: 0.52, minDist: 0.85, maxAcc: 21, maxSpd: 24,  mapInt: 150,  mapDist: 9.0,  panDur: 0.12, easeLin: 0.22 },
-    { micro: 0.68, minDist: 1.15, maxAcc: 20, maxSpd: 34,  mapInt: 120,  mapDist: 16.5, panDur: 0.08, easeLin: 0.18 },
-    { micro: 0.88, minDist: 1.45, maxAcc: 20, maxSpd: 48,  mapInt: 100,  mapDist: 21.0, panDur: 0.06, easeLin: 0.15 },
-    { micro: 1.12, minDist: 1.85, maxAcc: 20, maxSpd: 65,  mapInt: 80,   mapDist: 26.0, panDur: 0.05, easeLin: 0.13 },
-    { micro: 1.42, minDist: 2.35, maxAcc: 20, maxSpd: 85,  mapInt: 60,   mapDist: 32.0, panDur: 0.04, easeLin: 0.11 },
-    { micro: 1.78, minDist: 2.95, maxAcc: 20, maxSpd: 120, mapInt: 50,   mapDist: 32.0, panDur: 0.03, easeLin: 0.09 }
-];
-
-const SMOOTHING = [
-  // Tier 0: 0–1 MPH (Stationary / Start-up)
-  // min: 0.20 guarantees the marker moves immediately (no start-up lag).
-  // max: 0.45 keeps it smooth and prevents low-speed GPS jitter.
-  { base: 0.30, mult: 0.10, max: 0.45, min: 0.20 },
-  
-  // Tier 1: 1–5 MPH (Walking)
-  { base: 0.35, mult: 0.10, max: 0.50, min: 0.25 },
-  
-  // Tier 2: 5–12 MPH (Jogging / Biking)
-  { base: 0.40, mult: 0.10, max: 0.55, min: 0.30 },
-  
-  // Tier 3: 12–16 MPH (Fast Biking)
-  { base: 0.45, mult: 0.08, max: 0.55, min: 0.35 },
-  
-  // Tier 4: 16–24 MPH (Slow Driving)
-  { base: 0.48, mult: 0.06, max: 0.55, min: 0.40 },
-  
-  // Tier 5: 24–34 MPH (City Driving)
-  { base: 0.50, mult: 0.05, max: 0.55, min: 0.42 },
-  
-  // Tier 6: 34–48 MPH (Highway)
-  { base: 0.50, mult: 0.04, max: 0.55, min: 0.42 },
-  
-  // Tier 7: 48–65 MPH (Fast Highway)
-  // Base tapers slightly at very high speeds to rely more on the look-ahead 
-  // prediction rather than raw, noisy GPS spikes.
-  { base: 0.48, mult: 0.04, max: 0.55, min: 0.40 },
-  
-  // Tier 8: 65–85 MPH
-  { base: 0.45, mult: 0.04, max: 0.55, min: 0.38 },
-  
-  // Tier 9: 85+ MPH
-  { base: 0.42, mult: 0.04, max: 0.55, min: 0.35 }
-];
-
-const LOOK_AHEAD = [
-    { base: 0.01,  mult: 0.04, max: 0.06  },
-    { base: 0.01,  mult: 0.08, max: 0.12  },
-    { base: 0.06,  mult: 0.18, max: 0.28  },
-    { base: 0.12,  mult: 0.22, max: 0.32  },
-    { base: 0.09,  mult: 0.16, max: 0.24  },
-    { base: 0.06,  mult: 0.10, max: 0.16  },
-    { base: 0.04,  mult: 0.07, max: 0.10  },
-    { base: 0.02,  mult: 0.04, max: 0.06  },
-    { base: 0.01,  mult: 0.02, max: 0.04  },
-    { base: 0.01,  mult: 0.01, max: 0.03  }
-];
-
-/* ──────────────────────────────────────────────
-   Helper: Speed Tier Index with Hysteresis
-   ────────────────────────────────────────────── */
-function getSpeedTierIndex(speedMPH, previousTier) {
-    const BOUNDS = [1, 5, 12, 16, 24, 34, 48, 65, 85];
-    const HYSTERESIS = 0.15; // 15% overlap to prevent oscillation at boundaries
-    let tier = 0;
-    for (let i = 0; i < BOUNDS.length; i++) {
-        // Apply hysteresis: if we are in this tier, require higher speed to leave it
-        const threshold = previousTier === i
-            ? BOUNDS[i] * (1 + HYSTERESIS)
-            : BOUNDS[i];
-        if (speedMPH < threshold) break;
-        tier = i + 1;
-    }
-    return Math.min(tier, 9);
-}
-
-/* ──────────────────────────────────────────────
    updateUserLocation — Core position processing
    ────────────────────────────────────────────── */
 function updateUserLocation(position, forceUpdate = false) {
@@ -3815,6 +4468,7 @@ function updateUserLocation(position, forceUpdate = false) {
     const timeDelta = (lastPos && window.lastUpdateTime) ? (currentTime - window.lastUpdateTime) / 1000 : 0;
 
     if (timeDelta > 10) {
+        if (window.sensorFusion) window.sensorFusion._kalmanFilter?.reset();
         window.smoothedVelocity = { lat: 0, lng: 0 };
         window.isStationary = false;
         window.stationaryStartTime = null;
@@ -3822,7 +4476,6 @@ function updateUserLocation(position, forceUpdate = false) {
     }
 
     const newPosition = { lat, lng, accuracy: rawAccuracy, heading: rawHeading, timestamp: currentTime, speedMPS: rawSpeedMPS };
-    const accuracyFactor = Math.max(0.4, Math.min(1.0, 20 / rawAccuracy));
 
     // ── Speed calculation ──
     let reliableSpeedMPS = rawSpeedMPS;
@@ -3835,7 +4488,6 @@ function updateUserLocation(position, forceUpdate = false) {
         }
     }
 
-    // Mode EMA uses aggressive 0.7 alpha so it tracks actual device speed instantly
     window._modeSpeedEMA = window._modeSpeedEMA ?? reliableSpeedMPS;
     window._modeSpeedEMA = 0.7 * reliableSpeedMPS + 0.3 * window._modeSpeedEMA;
     const modeSpeedMPH = Math.min(window._modeSpeedEMA * 2.23694, 120);
@@ -3906,7 +4558,6 @@ function updateUserLocation(position, forceUpdate = false) {
     const latMeters = latDelta * 111111;
     const lngMeters = lngDelta * 111111 * Math.cos(lat * Math.PI / 180);
     const eastWestMove = lngMeters > latMeters * 1.2;
-    const speedFactor = Math.min(1, Math.max(0.01, speedMPS / 15));
 
     // Improbable acceleration rejection
     if (timeDelta > 0 && timeDelta < 5) {
@@ -3919,13 +4570,18 @@ function updateUserLocation(position, forceUpdate = false) {
         }
     }
 
-    // Heading validation
-    let validatedHeading = rawHeading;
+    // ── Sensor Fusion Heading ──
+    // Replaces raw GPS heading with compass (when standing/walking) or GPS (when driving)
+    const fusedHeading = window.sensorFusion
+        ? window.sensorFusion.getHeading(rawHeading, speedMPS)
+        : rawHeading;
+
+    let validatedHeading = fusedHeading;
     const lastHeading = lastPos.heading ?? null;
-    if (lastHeading != null && rawHeading != null) {
-        let diff = Math.abs(rawHeading - lastHeading);
+    if (lastHeading != null && fusedHeading != null) {
+        let diff = Math.abs(fusedHeading - lastHeading);
         if (diff > 180) diff = 360 - diff;
-        if (rawSpeedMPS < 4 && diff > 90) validatedHeading = lastHeading;
+        if (speedMPS < 2.0 && diff > 90) validatedHeading = lastHeading;
     }
     let displayHeading = validatedHeading;
     if (lastHeading != null && validatedHeading != null && Math.abs(validatedHeading - lastHeading) > 180) {
@@ -3938,23 +4594,29 @@ function updateUserLocation(position, forceUpdate = false) {
         if (headingDiff > 12) directionChangeFactor = Math.max(0.5, 1 - headingDiff / 240);
     }
 
-    // ── Speed tier ──
-    window._prevTierIndex = window._prevTierIndex ?? 0;
-    const currentTierIndex = getSpeedTierIndex(speedMPH, window._prevTierIndex);
-    window._prevTierIndex = currentTierIndex;
-    const baseTier = TIER_CONFIGS[currentTierIndex];
+    // ── Simplified 3-Band Speed Tier ──
+    // Replaces the 10-tier TIER_CONFIGS array
+    let panDuration, easeLinearity, mapUpdateInterval, mapUpdateDistance, maxAccuracy, minDistThreshold, maxSpeedThreshold;
+    if (speedMPH >= 15) {
+        panDuration = 0.12; easeLinearity = 0.22; mapUpdateInterval = 150; mapUpdateDistance = 6.5; maxAccuracy = 20; minDistThreshold = 0.85; maxSpeedThreshold = 40;
+    } else if (speedMPH >= 3) {
+        panDuration = 0.35; easeLinearity = 0.18; mapUpdateInterval = 800; mapUpdateDistance = 3.0; maxAccuracy = 28; minDistThreshold = 0.35; maxSpeedThreshold = 5;
+    } else {
+        panDuration = 0.60; easeLinearity = 0.12; mapUpdateInterval = 1000; mapUpdateDistance = 2.0; maxAccuracy = 32; minDistThreshold = 0.25; maxSpeedThreshold = 3;
+    }
+
     const ewAdj = eastWestMove ? 0.88 : 1.0;
     const speedTier = {
-        minDistanceThreshold: baseTier.minDist * (eastWestMove ? 0.92 : 1.0),
-        maxAccuracy: baseTier.maxAcc,
-        maxSpeedThreshold: baseTier.maxSpd,
-        mapUpdateInterval: Math.max(33, baseTier.mapInt * ewAdj),
-        mapUpdateDistance: baseTier.mapDist,
-        panDuration: baseTier.panDur * ewAdj,
-        easeLinearity: baseTier.easeLin * (eastWestMove ? 0.92 : 1.0)
+        panDuration: panDuration * ewAdj,
+        easeLinearity: easeLinearity * (eastWestMove ? 0.92 : 1.0),
+        mapUpdateInterval: Math.max(33, mapUpdateInterval * ewAdj),
+        mapUpdateDistance: mapUpdateDistance,
+        maxAccuracy: maxAccuracy,
+        minDistanceThreshold: minDistThreshold * (eastWestMove ? 0.92 : 1.0),
+        maxSpeedThreshold: maxSpeedThreshold
     };
 
-    // ── Large jump ──
+    // ── Large jump (> 50m) ──
     if (distance > 50 || forceUpdate) {
         _handleLargeDistanceJump(newPosition, currentTime);
         window.lastUpdateTime = currentTime;
@@ -3963,12 +4625,14 @@ function updateUserLocation(position, forceUpdate = false) {
         return;
     }
 
-    // ── Stationary detection ──
+    // ── Stationary detection (Accelerometer-Backed) ──
     const STAT_THRESHOLD = 0.5;
     const STAT_CONFIRM_MS = 2000;
     const FAST_EXIT_DIST = 0.5;
     const FAST_EXIT_SPEED = 0.8;
+    
     const isStationaryLocked = window.isStationary && window.stationaryLockPosition;
+    const isDeviceMoving = window.lastValidPosition?.isMoving ?? null;
 
     function doStationaryNudge() {
         const distFromLock = calculateDistance(window.stationaryLockPosition, newPosition);
@@ -3990,42 +4654,53 @@ function updateUserLocation(position, forceUpdate = false) {
     }
 
     if (isStationaryLocked) {
-        if (distance >= FAST_EXIT_DIST) {
+        let shouldBreakLock = false;
+        if (isDeviceMoving === true) {
+            shouldBreakLock = true;
+        } else if (isDeviceMoving === null && distance >= FAST_EXIT_DIST) {
             const calcSpeed = timeDelta > 0 ? distance / timeDelta : 0;
             if (calcSpeed > FAST_EXIT_SPEED || distance >= FAST_EXIT_DIST * 1.5) {
-                // Instant unlock on movement onset, fall straight through
-                window.isStationary = false;
-                window.stationaryLockPosition = null;
-                window.stationaryStartTime = null;
-                window.smoothedVelocity = timeDelta > 0 ? {
-                    lat: (lat - lastPos.lat) / timeDelta,
-                    lng: (lng - lastPos.lng) / timeDelta
-                } : { lat: 0, lng: 0 };
-            } else {
-                doStationaryNudge();
-                return;
+                shouldBreakLock = true;
             }
+        }
+
+        if (shouldBreakLock) {
+            window.isStationary = false;
+            window.stationaryLockPosition = null;
+            window.stationaryStartTime = null;
+            window.smoothedVelocity = timeDelta > 0 ? {
+                lat: (lat - lastPos.lat) / timeDelta,
+                lng: (lng - lastPos.lng) / timeDelta
+            } : { lat: 0, lng: 0 };
         } else {
             doStationaryNudge();
             return;
         }
     }
 
-    if (distance < STAT_THRESHOLD) {
+    const isEffectivelyStill = isDeviceMoving === false 
+        ? (distance < STAT_THRESHOLD * 2) 
+        : (distance < STAT_THRESHOLD);
+
+    if (isEffectivelyStill) {
         if (!window.stationaryStartTime) window.stationaryStartTime = currentTime;
-        if (currentTime - window.stationaryStartTime >= STAT_CONFIRM_MS) {
+        const confirmTime = (isDeviceMoving === false) ? 500 : STAT_CONFIRM_MS;
+        
+        if (currentTime - window.stationaryStartTime >= confirmTime) {
             _confirmStationary(newPosition, currentTime);
             if (typeof _cleanupMarkerStyles === 'function') _cleanupMarkerStyles();
             window.lastUpdateTime = currentTime;
             window.lastUpdateTimestamp = currentTime;
             return;
         }
+        
         if (distance > 0.15) {
             const cur = userMarker.getLatLng(), tgt = L.latLng(lat, lng);
             if (cur.distanceTo(tgt) > 0.3) {
                 scheduleMarkerUpdate(lat, lng, { animate: true, duration: 0.25, easeLinearity: 0.35 });
             }
         }
+        
         window.lastPosition = newPosition;
         window.lastUpdateTime = currentTime;
         window.lastUpdateTimestamp = currentTime;
@@ -4038,15 +4713,11 @@ function updateUserLocation(position, forceUpdate = false) {
     window.stationaryLockPosition = null;
 
     // ── Quality gates ──
-    let accuracyPenalty = 1.0;
     if (!forceUpdate) {
-        if (newPosition.accuracy > speedTier.maxAccuracy) {
-            accuracyPenalty = Math.max(0.25, speedTier.maxAccuracy / newPosition.accuracy);
-            if (newPosition.accuracy > speedTier.maxAccuracy * 3) {
-                window.lastUpdateTime = currentTime;
-                window.lastUpdateTimestamp = currentTime;
-                return;
-            }
+        if (newPosition.accuracy > speedTier.maxAccuracy * 3) {
+            window.lastUpdateTime = currentTime;
+            window.lastUpdateTimestamp = currentTime;
+            return;
         }
         if (distance < speedTier.minDistanceThreshold) {
             window.lastPosition = newPosition;
@@ -4062,104 +4733,50 @@ function updateUserLocation(position, forceUpdate = false) {
         }
     }
 
-    // ── Accuracy snap ──
-    if (newPosition.accuracy < lastPos.accuracy * 0.6) {
-        scheduleMarkerUpdate(lat, lng);
-        window.lastPosition = newPosition;
-        window.lastUpdateTime = currentTime;
-        window.lastUpdateTimestamp = currentTime;
-        if (typeof updateDistanceBox === 'function') updateDistanceBox(forceUpdate, newPosition, closestLocation, closestDistance);
-        return;
-    }
-
-    // ── Intermediate jumps (8–50m) ──
-    if (distance > 8) {
-        const snapSF = Math.min(0.85, 0.3 + (distance / 50) * 0.5);
-        const visLat = lastPos.lat * (1 - snapSF) + lat * snapSF;
-        const visLng = lastPos.lng * (1 - snapSF) + lng * snapSF;
-        scheduleMarkerUpdate(visLat, visLng, { animate: true, duration: 0.25, easeLinearity: 0.25 });
-        window.lastPosition = newPosition;
-        window.lastUpdateTime = currentTime;
-        window.lastUpdateTimestamp = currentTime;
-        if (typeof updateDistanceBox === 'function') updateDistanceBox(forceUpdate, newPosition, closestLocation, closestDistance);
-        return;
-    }
-
     // ══════════════════════════════════════════════
-    //  Smoothing Factor & Smoothed Position
+    //  Kalman Smoothing & Smoothed Position
     // ══════════════════════════════════════════════
-    const sb = SMOOTHING[currentTierIndex];
-    const baseSF = Math.min(sb.max, Math.max(sb.min, sb.base + speedFactor * sb.mult));
-    const sfDist = Math.min(0.05, distance * 0.0035);
-    const sfTime = timeDelta > 0 ? Math.min(0.03, Math.max(-0.015, (timeDelta - 0.35) * 0.045)) : 0;
-    const sfDir = (headingDiff > 20 && (speedMPH < 45 || headingDiff > 45))
-        ? Math.max(0, 0.04 - headingDiff / 200 * 0.06) : 0;
-    const sfEW = eastWestMove ? 0.018 : 0;
-    const rawSF = (baseSF + sfDist + sfTime - sfDir + sfEW) * directionChangeFactor;
-    let finalSF = Math.min(0.55, Math.max(0.20, rawSF)) * accuracyFactor;
-    finalSF *= accuracyPenalty;
-    finalSF = Math.max(0.20, finalSF);
+    // The Kalman filter replaces the 10-tier smoothing constants, accuracy snaps,
+    // and 8-50m intermediate jump logic. It mathematically optimizes the blend
+    // between the predicted position and the new GPS measurement based on accuracy.
 
-    const currentMarkerLL = userMarker?.getLatLng() || { lat, lng };
-
-    // No prediction, no overshooting, pure mirroring.
     const smoothedPosition = {
-        lat: currentMarkerLL.lat * (1 - finalSF) + lat * finalSF,
-        lng: currentMarkerLL.lng * (1 - finalSF) + lng * finalSF,
-        accuracy: newPosition.accuracy,
-        heading: validatedHeading,
-        timestamp: currentTime,
-        speedMPS: speedMPS
-    };
+    lat,                              // already Kalman-filtered
+    lng,                              // already Kalman-filtered
+    accuracy: rawAccuracy,
+    heading: validatedHeading,
+    timestamp: currentTime,
+    speedMPS: speedMPS
+};
 
-    // Velocity tracking for map look-ahead only
-    window.smoothedVelocity = window.smoothedVelocity || { lat: 0, lng: 0 };
-    const instantVelocity = {
-        lat: timeDelta > 0 ? (lat - lastPos.lat) / timeDelta : 0,
-        lng: timeDelta > 0 ? (lng - lastPos.lng) / timeDelta : 0
-    };
-    const vAlpha = Math.max(0.20, Math.min(0.5, 0.4 - speedMPH * 0.003));
-    window.smoothedVelocity = {
-        lat: window.smoothedVelocity.lat * vAlpha + instantVelocity.lat * (1 - vAlpha),
-        lng: window.smoothedVelocity.lng * vAlpha + instantVelocity.lng * (1 - vAlpha)
-    };
+    // Velocity tracking for map look-ahead
+    const kalmanVelocity = window.sensorFusion
+        ? window.sensorFusion.getSmoothedVelocityDegPerSec()
+        : { lat: 0, lng: 0 };
+
+    // Keep window.smoothedVelocity in sync so _executeCenteredModePan 
+    // and reset functions still work without rewriting them.
+    window.smoothedVelocity = kalmanVelocity;
 
     // ── Animation parameters ──
-    const baseDur = isInCenteredMode
-        ? Math.max(0.05, Math.min(0.3, speedTier.panDuration * 0.6))
-        : speedTier.panDuration;
-    const durDist = Math.min(0.02, distance * 0.001);
-    const durTime = timeDelta > 0 ? Math.max(-0.01, Math.min(0.02, (0.25 - timeDelta) * 0.04)) : 0;
-    const durDir = headingDiff > 20 ? Math.min(0.04, headingDiff / 300 * 0.08) : 0;
-    const durEW = eastWestMove ? Math.min(0.025, distance * 0.0005) : 0;
-    const animDur = Math.max(0.05, (baseDur - durDist + durTime + durDir + durEW) * directionChangeFactor);
-
-    const easeLin = eastWestMove
-        ? Math.max(0.07, Math.min(0.19, (0.13 - speedMPH * 0.0006) * directionChangeFactor))
-        : Math.max(0.08, Math.min(0.23, (0.15 - speedMPH * 0.0011) * directionChangeFactor));
+    const animDur = Math.max(0.05, speedTier.panDuration * directionChangeFactor);
+    const easeLin = speedTier.easeLinearity;
 
     // Look-ahead for map centering (map only, never marker)
-    const lab = LOOK_AHEAD[currentTierIndex];
-    const laBase = lab.base + speedFactor * lab.mult;
-    const laBoost = speedMPH < 15 ? Math.min(0.08, distance * 0.0055) : 0;
-    const laDir = headingDiff > 25 ? Math.min(0.14, headingDiff / 200 * 0.22) : 0;
-    const laEW = (speedMPH < 15 && eastWestMove) ? Math.min(0.055, distance * 0.0013) : 0;
-    let lookAheadFactor = Math.max(0.01, Math.min(lab.max, laBase + laBoost - laDir + laEW));
-    if (isInCenteredMode) lookAheadFactor = Math.min(lab.max * 1.5, lookAheadFactor * 1.8);
+    const lookAheadFactor = Math.min(0.3, 0.05 + speedMPH * 0.008);
+    const cosLat = Math.cos(smoothedPosition.lat * Math.PI / 180);
 
+    const lookAheadPos = {
+        lat: smoothedPosition.lat,
+        lng: smoothedPosition.lng
+    };
+        
     // ── Visual updates (RAF-gated) ──
     const performVisualUpdates = () => {
         try {
             const opts = { animate: true, duration: animDur, easeLinearity: easeLin };
             if (displayHeading != null) opts.heading = displayHeading;
             scheduleMarkerUpdate(smoothedPosition.lat, smoothedPosition.lng, opts);
-
-            const sv = window.smoothedVelocity;
-            const cosLat = Math.cos(smoothedPosition.lat * Math.PI / 180);
-            const lookAheadPos = {
-                lat: smoothedPosition.lat + (sv.lat * lookAheadFactor * 0.015),
-                lng: smoothedPosition.lng + (sv.lng * lookAheadFactor * 0.015 * cosLat)
-            };
 
             const mapInterval = speedTier.mapUpdateInterval;
             const highSpeedThr = SPEED_THRESHOLDS?.HIGH_SPEED ?? 45;
@@ -4239,7 +4856,7 @@ function updateUserLocation(position, forceUpdate = false) {
     }, 160);
 
     window.lastPosition = newPosition;
-    window.lastVelocity = instantVelocity;
+    window.lastVelocity = window.smoothedVelocity;
     window.lastUpdateTime = currentTime;
     window.lastUpdateTimestamp = currentTime;
 
@@ -4469,7 +5086,7 @@ function _executeCenteredModePan(target, speedTier, directionChangeFactor, eastW
             const cosLat = Math.cos(centerLat * Math.PI / 180);
 
             centerLat += svLat * lookAheadFactor;
-            centerLng += svLng * lookAheadFactor * lngMultiplier / Math.max(0.5, cosLat);
+            centerLng += svLng * lookAheadFactor * lngMultiplier;
         }
     }
 
@@ -8892,19 +9509,7 @@ function setupEventListeners() {
         });
     };
 
-    const setupAccessibilityEvents = () => {
-        try {
-            const contrastToggle = cachedElements?.contrastToggle;
-            if (contrastToggle && typeof toggleHighContrast === 'function') {
-                contrastToggle.addEventListener('click', toggleHighContrast);
-                if (typeof accessibilityState !== 'undefined' && accessibilityState.highContrast) {
-                    document.body.classList.add('high-contrast');
-                }
-            }
-        } catch (error) {
-            console.error('Error setting up accessibility events:', error);
-        }
-    };
+       const setupAccessibilityEvents = () => {};
 
     const setupSystemEvents = () => {
         try {
