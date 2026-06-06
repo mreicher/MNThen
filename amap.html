@@ -1677,18 +1677,24 @@ class PositionKalmanFilter {
     constructor(options = {}) {
         /**
          * Spectral density of the acceleration noise (m²/s³).
+         * This is now a DYNAMIC property, updated every prediction step
+         * based on the current speed state of the filter.
+         *
+         * The base value is set here, but _updateAccelNoise() will
+         * scale it up at high speeds to allow the filter to track
+         * aggressive maneuvers (turns, braking) without lagging.
+         *
          * sqrt(this) ≈ expected acceleration standard deviation in m/s².
-         *
-         *   0.3 — very smooth (highway cruise)
-         *   1.0 — mixed use (default)
-         *   3.0 — aggressive (city driving, rapid turns)
-         *
          * Higher values = filter responds faster to movement changes
          * but trusts GPS noise more when stationary.
          * The stationary lock in updateUserLocation handles the latter.
          */
         this.accelNoise = options.accelNoise ?? 1.0;
         this.measurementNoise = options.measurementNoise ?? 15;
+
+        // ── Speed-adaptive accelNoise properties ──
+        this._baseAccelNoise = this.accelNoise;
+        this._currentSpeedMPS = 0;
 
         // State vector: [north, east, vNorth, vEast]
         //   north/east : meters from reference point
@@ -1719,6 +1725,9 @@ class PositionKalmanFilter {
             this._initialize(lat, lng, R, timestampMs);
             return this._makeResult(lat, lng);
         }
+
+        // ── Update process noise based on current speed ──
+        this._updateAccelNoise();
 
         // ── Predict (constant-velocity model) ──
         this._predict(dt);
@@ -1779,6 +1788,10 @@ class PositionKalmanFilter {
         this.lastTimestamp = null;
         this.refLat = null;
         this.refLng = null;
+        
+        // Reset noise state on filter reset
+        this.accelNoise = this._baseAccelNoise;
+        this._currentSpeedMPS = 0;
     }
 
     /* ─── Private: Initialization ──────────────────────────────────── */
@@ -1787,6 +1800,10 @@ class PositionKalmanFilter {
         this.refLat = lat;
         this.refLng = lng;
         this.x = [0, 0, 0, 0]; // [north, east, vNorth, vEast]
+
+        // Reset noise state on re-initialization
+        this.accelNoise = this._baseAccelNoise;
+        this._currentSpeedMPS = 0;
 
         const R2 = R * R;
         const v0 = 1.0; // Initial velocity variance (m/s)²
@@ -1797,6 +1814,31 @@ class PositionKalmanFilter {
             [0,  0,  0,  v0]
         ];
         this.lastTimestamp = timestampMs;
+    }
+
+    /* ─── Private: Speed-Adaptive Noise ─────────────────────────────── */
+
+    /**
+     * Adjusts the process noise (accelNoise) based on the filter's current 
+     * velocity state. This allows the filter to respond quickly to maneuvers 
+     * (turns, braking) at high speeds, while remaining stable and smooth 
+     * when stationary or walking.
+     */
+    _updateAccelNoise() {
+        if (!this.x) return;
+
+        const speed = Math.sqrt(this.x[2] * this.x[2] + this.x[3] * this.x[3]);
+        this._currentSpeedMPS = speed;
+
+        if (speed > 15) {        // ~34 MPH: highway driving
+            this.accelNoise = 5.0;
+        } else if (speed > 8) {  // ~18 MPH: city driving
+            this.accelNoise = 3.0;
+        } else if (speed > 2) {  // ~4.5 MPH: jogging/cycling
+            this.accelNoise = 1.5;
+        } else {
+            this.accelNoise = 0.5; // Walking: very smooth
+        }
     }
 
     /* ─── Private: Prediction Step ─────────────────────────────────── */
@@ -1987,6 +2029,152 @@ class PositionKalmanFilter {
 
 // ── Global instance ──
 window.sensorFusion = new SensorFusionManager().init();
+
+/* ──────────────────────────────────────────────
+   DEAD RECKONING LOOP
+   Interpolates marker position between GPS fixes
+   using the Kalman filter's velocity state.
+   Without this, the marker freezes for 1+ seconds
+   between fixes at high speed.
+   ────────────────────────────────────────────── */
+(function initDeadReckoning() {
+    let _lastFrameTime = performance.now();
+    let _rafId = null;
+    let _active = false;
+
+    const MIN_DT_MS = 16;      // ~60fps cap
+    const MIN_SPEED_MPS = 0.3; // Don't bother below this
+    const MAX_PREDICT_AHEAD_S = 3.0; // Never project more than 3 seconds
+
+    function frame(now) {
+        _rafId = null;
+
+        // ── Gate: only run when we have a valid position and are moving ──
+        const lastPos = window.lastPosition;
+        if (!lastPos || window.isStationary || window.isLocationHuntVisible) {
+            _lastFrameTime = now;
+            _rafId = requestAnimationFrame(frame);
+            return;
+        }
+
+        // ── Don't interpolate if the map is being dragged ──
+        if (window.isMapInteracting) {
+            _lastFrameTime = now;
+            _rafId = requestAnimationFrame(frame);
+            return;
+        }
+
+        // ── Don't interfere with proximity zoom animations ──
+        if (window._isProximityZoomAnimating) {
+            _lastFrameTime = now;
+            _rafId = requestAnimationFrame(frame);
+            return;
+        }
+
+        const dtMs = now - _lastFrameTime;
+        if (dtMs < MIN_DT_MS) {
+            _rafId = requestAnimationFrame(frame);
+            return;
+        }
+
+        const dtSec = dtMs / 1000;
+        _lastFrameTime = now;
+
+        // ── Get velocity from Kalman filter ──
+        const vel = window.sensorFusion
+            ? window.sensorFusion.getSmoothedVelocityDegPerSec()
+            : (window.smoothedVelocity || { lat: 0, lng: 0 });
+
+        const speedMPS = window.sensorFusion
+            ? window.sensorFusion.getFilteredSpeedMPS()
+            : (lastPos.speedMPS || 0);
+
+        if (speedMPS < MIN_SPEED_MPS) {
+            _rafId = requestAnimationFrame(frame);
+            return;
+        }
+
+        // ── Clamp prediction window ──
+        // How long since the last REAL GPS fix?
+        const timeSinceFix = (Date.now() - (window.lastUpdateTimestamp || Date.now())) / 1000;
+        // Only predict up to MAX_PREDICT_AHEAD_S past the last fix
+        const maxPrediction = Math.min(MAX_PREDICT_AHEAD_S, timeSinceFix + dtSec);
+        // Use the SMALLER of: the frame dt, or the remaining prediction budget
+        const predictDt = Math.min(dtSec, Math.max(0, maxPrediction - timeSinceFix + dtSec));
+
+        if (predictDt <= 0) {
+            _rafId = requestAnimationFrame(frame);
+            return;
+        }
+
+        // ── Compute predicted position ──
+        // vel.lat is in degrees/second (already cosLat-corrected by the Kalman filter)
+        const predictedLat = lastPos.lat + vel.lat * predictDt;
+        const predictedLng = lastPos.lng + vel.lng * predictDt;
+
+        // Sanity check: predicted position shouldn't be more than 200m from last real fix
+        const jumpLat = Math.abs(predictedLat - lastPos.lat) * 111111;
+        const jumpLng = Math.abs(predictedLng - lastPos.lng) * 111111 * 
+                        Math.cos(lastPos.lat * Math.PI / 180);
+        if (jumpLat > 200 || jumpLng > 200) {
+            _rafId = requestAnimationFrame(frame);
+            return;
+        }
+
+        // ── Update marker ──
+        if (typeof scheduleMarkerUpdate === 'function') {
+            scheduleMarkerUpdate(predictedLat, predictedLng);
+        }
+
+        // ── Update map center if in centered mode ──
+        const isCentered = typeof ModeManager !== 'undefined' && ModeManager.isCentered();
+        if (isCentered && window.followUser && map) {
+            // Use setView with animate:false for instantaneous re-center.
+            // panTo with animation fights the next dead-reckoning frame.
+            map.setView([predictedLat, predictedLng], map.getZoom(), {
+                animate: false,
+                noMoveStart: true,
+                noMoveEnd: true
+            });
+        }
+
+        _rafId = requestAnimationFrame(frame);
+    }
+
+    // ── Start the loop ──
+    _active = true;
+    _rafId = requestAnimationFrame(frame);
+
+    // ── Register cleanup ──
+    if (typeof memoryManager !== 'undefined' && memoryManager.registerCleanupTask) {
+        memoryManager.registerCleanupTask(() => {
+            if (_rafId != null) {
+                cancelAnimationFrame(_rafId);
+                _rafId = null;
+            }
+            _active = false;
+        });
+    }
+
+    // ── Expose control ──
+    window.deadReckoning = {
+        stop() {
+            if (_rafId != null) {
+                cancelAnimationFrame(_rafId);
+                _rafId = null;
+            }
+            _active = false;
+        },
+        start() {
+            if (!_active) {
+                _active = true;
+                _lastFrameTime = performance.now();
+                _rafId = requestAnimationFrame(frame);
+            }
+        },
+        isActive() { return _active; }
+    };
+})();
 
 /* ──────────────────────────────────────────────
    ZOOM CONTROLLER
@@ -3000,15 +3188,18 @@ function startPositionUpdates() {
             if (!navigator.onLine) return;
             const speedMPH = (window.lastPosition?.speedMPS ?? 0) * 2.23694;
             
-            // Adjust consumption rate, not the watch itself
             if (window.isStationary || speedMPH < 0.5) {
-                window._gpsConsumeInterval = 3000;  // Stationary: accept every 3s
-            } else if (speedMPH < 5) {
-                window._gpsConsumeInterval = 1000;  // Walking: every 1s
+                window._gpsConsumeInterval = 3000;  // Stationary: every 3s
+            } else if (speedMPH < 3) {
+                window._gpsConsumeInterval = 1000;  // Slow walk: every 1s
+            } else if (speedMPH < 8) {
+                window._gpsConsumeInterval = 700;   // Walk/jog: every 700ms
             } else if (speedMPH < 15) {
-                window._gpsConsumeInterval = 500;   // Cycling: every 500ms
+                window._gpsConsumeInterval = 400;   // Cycling: every 400ms
+            } else if (speedMPH < 45) {
+                window._gpsConsumeInterval = 200;   // City driving: every 200ms
             } else {
-                window._gpsConsumeInterval = 200;   // Driving: every 200ms
+                window._gpsConsumeInterval = 100;   // Highway: every 100ms (accept all)
             }
         }, 5000);
 
@@ -4432,7 +4623,7 @@ function updateUserLocation(position, forceUpdate = false) {
         if (typeof hideGPSSearchingState === 'function') hideGPSSearchingState();
     }
 
-    // Proximity calculations
+       // Proximity calculations
     let closestDistance = Infinity, closestLocation = null;
     const locationsWithDistance = [];
     const posChanged = lastPos &&
@@ -4442,7 +4633,13 @@ function updateUserLocation(position, forceUpdate = false) {
         closestDistance = window._lastClosestDistance;
         closestLocation = window._lastClosestLocation;
     } else if (Array.isArray(window.gameLocations) && window.gameLocations.length) {
-        const R = 0.015;
+        // ── Speed-scaled bounding box ──
+        // At walking speed, 1.7 km is plenty (you won't reach farther
+        // locations for 20+ minutes). At highway speed, you need to
+        // see locations 5+ km away so the prefetch engine has time
+        // to warm caches before you arrive.
+        const speedFactor = Math.min(speedMPH / 15, 4); // 0 at 0 MPH, 1 at 15, 4 at 60+
+        const R = 0.015 + 0.01 * speedFactor; // 0.015° (~1.7km) to 0.055° (~6km)
         for (const loc of window.gameLocations) {
             if (!loc?.lat || loc.lat < lat - R || loc.lat > lat + R ||
                 loc.lng < lng - R || loc.lng > lng + R) continue;
@@ -4467,7 +4664,7 @@ function updateUserLocation(position, forceUpdate = false) {
         }
         window._lastCacheUpdate = currentTime;
     }
-
+    
     // First fix
     if (!lastPos) {
         _initializeUserLocationState(newPosition, currentTime, forceUpdate);
@@ -4520,13 +4717,20 @@ function updateUserLocation(position, forceUpdate = false) {
     // Speed tiers
     let panDuration, easeLinearity, mapUpdateInterval, mapUpdateDistance,
         maxAccuracy, minDistThreshold, maxSpeedThreshold;
-    if (speedMPH >= 15) {
+        if (speedMPH >= 15) {
+        // ── Driving ──
         panDuration = 0.12; easeLinearity = 0.22; mapUpdateInterval = 150;
-        mapUpdateDistance = 6.5; maxAccuracy = 20; minDistThreshold = 0.85; maxSpeedThreshold = 40;
+        mapUpdateDistance = 6.5; maxAccuracy = 20; minDistThreshold = 0.85; maxSpeedThreshold = 80;
+    } else if (speedMPH >= 8) {
+        // ── Cycling / Fast Jogging ──
+        panDuration = 0.25; easeLinearity = 0.18; mapUpdateInterval = 400;
+        mapUpdateDistance = 4.0; maxAccuracy = 25; minDistThreshold = 0.5; maxSpeedThreshold = 15;
     } else if (speedMPH >= 3) {
-        panDuration = 0.35; easeLinearity = 0.18; mapUpdateInterval = 800;
-        mapUpdateDistance = 3.0; maxAccuracy = 28; minDistThreshold = 0.35; maxSpeedThreshold = 5;
+        // ── Walking / Slow Jogging ──
+        panDuration = 0.35; easeLinearity = 0.15; mapUpdateInterval = 800;
+        mapUpdateDistance = 3.0; maxAccuracy = 28; minDistThreshold = 0.35; maxSpeedThreshold = 8;
     } else {
+        // ── Stationary / Very Slow ──
         panDuration = 0.60; easeLinearity = 0.12; mapUpdateInterval = 1000;
         mapUpdateDistance = 2.0; maxAccuracy = 32; minDistThreshold = 0.25; maxSpeedThreshold = 3;
     }
@@ -4665,7 +4869,19 @@ function updateUserLocation(position, forceUpdate = false) {
 
     const animDur = Math.max(0.05, speedTier.panDuration * directionChangeFactor);
     const easeLin = speedTier.easeLinearity;
-    const lookAheadFactor = Math.min(0.3, 0.05 + speedMPH * 0.008);
+    
+    // ── Speed-scaled look-ahead ──
+    // At walking speed: 0.3s ahead (minimal offset)
+    // At cycling speed: 1.0s ahead
+    // At city driving:  1.8s ahead  
+    // At highway:       2.5s ahead
+    // This ensures the map center leads the GPS fix, showing
+    // where the user IS rather than where they WERE.
+    const lookAheadSeconds = speedMPH < 3  ? 0.3 :
+                             speedMPH < 15 ? 0.3 + (speedMPH - 3) * 0.06 :  // 0.3→1.02
+                             speedMPH < 45 ? 1.0 + (speedMPH - 15) * 0.027 : // 1.0→1.81
+                                            Math.min(2.5, 1.81 + (speedMPH - 45) * 0.02); // →2.5
+    
     const lookAheadPos = { lat: smoothedPosition.lat, lng: smoothedPosition.lng };
 
     const performVisualUpdates = () => {
@@ -4700,7 +4916,7 @@ function updateUserLocation(position, forceUpdate = false) {
 
                 if (justCentered || driftPx > tolerance || window._driftCounter >= 2) {
                     _panMapToCenter(lookAheadPos, speedTier, directionChangeFactor,
-                        eastWestMove, speedMPH, lookAheadFactor);
+                        eastWestMove, speedMPH, lookAheadSeconds);
                     window.lastMapUpdateTime = currentTime;
                 }
             } else if (!isInCenteredMode && map && !window.isMapInteracting && window.followUser) {
@@ -4964,23 +5180,22 @@ function _executeCenteredModePan(target, speedTier, directionChangeFactor, eastW
     let centerLat = target.lat;
     let centerLng = target.lng;
 
-       /* ── Look-ahead via smoothed velocity ── */
-    if (lookAheadFactor > 0 && window.smoothedVelocity) {
+    // ── Look-ahead: project center ahead of current position ──
+    // lookAheadSeconds is computed in updateUserLocation based on speed.
+    // velDegPerSec comes from the Kalman filter's velocity state.
+    const laSec = lookAheadFactor || 0; // Reusing the parameter name, now holds seconds
+
+    if (laSec > 0 && window.smoothedVelocity) {
         const svLat = window.smoothedVelocity.lat;
         const svLng = window.smoothedVelocity.lng;
         if (svLat != null && svLng != null && isFinite(svLat) && isFinite(svLng)) {
-            // The old biasScale of 0.00002 was far too small — at
-            // walking speed the look-ahead offset was ~0.00000000002 degrees
-            // (essentially zero meters). The smoothed velocity is in
-            // degrees/second, so to project 1-2 seconds ahead we just
-            // multiply by the look-ahead factor (which ranges 0.01–0.30)
-            // and a time window. The cosLat correction is needed because
-            // longitude degrees shrink as you move away from the equator.
-            const lngMultiplier = eastWestMovement ? 0.85 : 1.0;
-            const cosLat = Math.cos(centerLat * Math.PI / 180);
+            // smoothedVelocity is in degrees/second (Kalman filter
+            // already applies cosLat correction for longitude).
+            // Multiply by seconds to get the offset.
+            const lngMultiplier = eastWestMovement ? 0.90 : 1.0;
 
-            centerLat += svLat * lookAheadFactor;
-            centerLng += svLng * lookAheadFactor * lngMultiplier;
+            centerLat += svLat * laSec;
+            centerLng += svLng * laSec * lngMultiplier;
         }
     }
 
@@ -5023,13 +5238,32 @@ function _executeCenteredModePan(target, speedTier, directionChangeFactor, eastW
 
     easeLinearity = Math.max(0.1, Math.min(0.5, easeLinearity));
 
-    /* ── Execute pan ── */
-    map.panTo([centerLat, centerLng], {
-        animate:       true,
-        duration:      panDuration,
-        easeLinearity: easeLinearity,
-        noMoveStart:   true
-    });
+        /* ── Execute pan ── */
+    // At high speed, use setView(animate:false) to avoid animation queueing.
+    // panTo animations stack up at high fix rates, causing visible jitter.
+    // setView snaps the center instantly, which looks smoother because
+    // the dead reckoning loop is already providing 60fps interpolation.
+
+    // Reuse the safeSpeed variable declared earlier in this function
+
+    if (safeSpeed >= 15 && window.deadReckoning?.isActive()) {
+        // High speed + dead reckoning active: snap center directly.
+        // The DR loop provides visual smoothness; we just need the
+        // map center to be at the right position.
+        map.setView([centerLat, centerLng], map.getZoom(), {
+            animate: false,
+            noMoveStart: true,
+            noMoveEnd: true
+        });
+    } else {
+        // Walking speed or DR inactive: smooth pan is fine.
+        map.panTo([centerLat, centerLng], {
+            animate:       true,
+            duration:      panDuration,
+            easeLinearity: easeLinearity,
+            noMoveStart:   true
+        });
+    }
 
     if (window.DEBUG_PANNING) {
         console.debug('[Centered] Pan to center: speed=' + safeSpeed.toFixed(1) +
@@ -5434,23 +5668,32 @@ function _enforceCenteredMode(markerPos, map, marker) {
         correctedCenter = markerPos;
     }
 
-    // Use panTo with a short duration rather than setView(animate:false).
-    // setView snaps instantly which looks like a jump; panTo interpolates.
-    var panDuration = speedMPS > 2 ? 0.08 : 0.15;
+    // At high speed with dead reckoning active, use instant setView.
+    // The DR loop handles smoothness; we just correct the center.
+    var speedMPH = speedMPS * 2.23694;
 
-    window._centeredPanInProgress = true;
-    map.panTo([correctedCenter.lat, correctedCenter.lng], {
-        animate: true,
-        duration: panDuration,
-        easeLinearity: 0.3,
-        noMoveStart: true
-    });
+    if (speedMPH >= 15 && window.deadReckoning && window.deadReckoning.isActive()) {
+        map.setView([correctedCenter.lat, correctedCenter.lng], map.getZoom(), {
+            animate: false,
+            noMoveStart: true,
+            noMoveEnd: true
+        });
+    } else {
+        var panDuration = speedMPS > 2 ? 0.08 : 0.15;
 
-    // Clear flag after animation completes
-    setTimeout(function() {
-        window._centeredPanInProgress = false;
-    }, panDuration * 1000 + 50);
-}
+        window._centeredPanInProgress = true;
+        map.panTo([correctedCenter.lat, correctedCenter.lng], {
+            animate: true,
+            duration: panDuration,
+            easeLinearity: 0.3,
+            noMoveStart: true
+        });
+
+        setTimeout(function() {
+            window._centeredPanInProgress = false;
+        }, panDuration * 1000 + 50);
+    }
+        }
         
 /**
  * ROAMING MODE: Keep marker inside viewport with speed-scaled safety margin.
