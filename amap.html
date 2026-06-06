@@ -2071,6 +2071,19 @@ window.sensorFusion = new SensorFusionManager().init();
             return;
         }
 
+        // ── Yield to GPS-driven centered pan ──
+        // When _executeCenteredModePan or _enforceCenteredMode just
+        // called setView with a fresh GPS fix, skip this DR frame.
+        // The GPS data is more authoritative (real satellite fix +
+        // Kalman update), and we'll pick up the new position and
+        // velocity on the next frame naturally.
+        if (window._gpsCenteredPanJustOccurred) {
+            window._gpsCenteredPanJustOccurred = false;
+            _lastFrameTime = now;
+            _rafId = requestAnimationFrame(frame);
+            return;
+        }
+
         const dtMs = now - _lastFrameTime;
         if (dtMs < MIN_DT_MS) {
             _rafId = requestAnimationFrame(frame);
@@ -2175,7 +2188,7 @@ window.sensorFusion = new SensorFusionManager().init();
         isActive() { return _active; }
     };
 })();
-
+        
 /* ──────────────────────────────────────────────
    ZOOM CONTROLLER
    ────────────────────────────────────────────── */
@@ -3151,10 +3164,6 @@ function getWatchOptions() {
 /* ──────────────────────────────────────────────
    POSITION UPDATES — GPS watch + power manager
    ────────────────────────────────────────────── */
-/* ──────────────────────────────────────────────
-   GPS POWER MANAGER — fixed version
-   No more watchPosition restarts.
-   ────────────────────────────────────────────── */
 function startPositionUpdates() {
     try {
         // Clean up existing watch — only ONCE
@@ -3163,7 +3172,7 @@ function startPositionUpdates() {
             window.positionWatchId = null;
         }
 
-        // Single persistent watch with maximumAge=0 for best accuracy
+        // Single persistent watch with maximumAge=0 for best accuracy.
         // The GPS chip maintains its own internal fix strategy;
         // restarting it is always counterproductive.
         window.positionWatchId = navigator.geolocation.watchPosition(
@@ -3172,47 +3181,7 @@ function startPositionUpdates() {
             { enableHighAccuracy: true, timeout: 30000, maximumAge: 0 }
         );
 
-        // ── Dynamic maximumAge adjustment WITHOUT restarting the watch ──
-        // The watch always delivers fresh fixes. We throttle consumption
-        // in handlePositionUpdate based on speed state instead.
-        if (window._gpsPowerInterval) {
-            clearInterval(window._gpsPowerInterval);
-            window._gpsPowerInterval = null;
-        }
-
-        // This interval NO LONGER restarts the watch.
-        // It just updates the consumption throttle window._gpsConsumeInterval.
-        window._gpsConsumeInterval = 1000; // ms between accepted fixes (default: 1s)
-        
-        window._gpsPowerInterval = setInterval(() => {
-            if (!navigator.onLine) return;
-            const speedMPH = (window.lastPosition?.speedMPS ?? 0) * 2.23694;
-            
-            if (window.isStationary || speedMPH < 0.5) {
-                window._gpsConsumeInterval = 3000;  // Stationary: every 3s
-            } else if (speedMPH < 3) {
-                window._gpsConsumeInterval = 1000;  // Slow walk: every 1s
-            } else if (speedMPH < 8) {
-                window._gpsConsumeInterval = 700;   // Walk/jog: every 700ms
-            } else if (speedMPH < 15) {
-                window._gpsConsumeInterval = 400;   // Cycling: every 400ms
-            } else if (speedMPH < 45) {
-                window._gpsConsumeInterval = 200;   // City driving: every 200ms
-            } else {
-                window._gpsConsumeInterval = 100;   // Highway: every 100ms (accept all)
-            }
-        }, 5000);
-
-        if (memoryManager?.registerCleanupTask) {
-            memoryManager.registerCleanupTask(() => {
-                if (window._gpsPowerInterval) {
-                    clearInterval(window._gpsPowerInterval);
-                    window._gpsPowerInterval = null;
-                }
-            });
-        }
-
-        // ── Network listeners (same as before, no watch restart) ──
+        // ── Network listeners ──
         if (!window._positionUpdatesListenersSetup) {
             window._positionUpdatesListenersSetup = true;
 
@@ -3237,8 +3206,7 @@ function startPositionUpdates() {
                     window.onlineRestartTimeout = null;
                 }
                 // Don't kill the watch on offline — fixes may still arrive
-                // from cached satellite data. Only clear if we explicitly
-                // need to stop.
+                // from cached satellite data.
             };
 
             window.addEventListener('online', onlineHandler);
@@ -4747,7 +4715,27 @@ function updateUserLocation(position, forceUpdate = false) {
     };
 
     // Large jump
-    if (distance > 50 || forceUpdate) {
+    // Scale the jump threshold with speed so legitimate highway fixes
+    // aren't mistaken for GPS glitches or background-teleport events.
+    //
+    // At walking speed (1.5 m/s): max(50, 4.5)   = 50m   (unchanged)
+    // At cycling    (8 m/s):      max(50, 24)     = 50m   (unchanged)
+    // At city drive (18 m/s):     max(50, 54)     = 54m
+    // At highway    (29 m/s):     max(50, 87)     = 87m   ← fixes the bug
+    // At 80 MPH    (35.8 m/s):   max(50, 107.4)  = 107m
+    //
+    // The 3× multiplier provides headroom for:
+    //   • GPS reporting intervals up to ~3 seconds between fixes
+    //   • Normal GPS noise (~10–20m) on top of true displacement
+    //   • Speed EMA lagging slightly behind instantaneous speed
+    //
+    // Fixes that are truly impossible (e.g. 500m in 1 second) are
+    // still caught by the speed-rejection gate below this block:
+    //   if (distance / timeDelta > speedTier.maxSpeedThreshold)
+    
+    const dynamicJumpThreshold = Math.max(50, speedMPS * 3);
+    
+    if (distance > dynamicJumpThreshold || forceUpdate) {
         _handleLargeDistanceJump(newPosition, currentTime);
         window.lastUpdateTime = currentTime;
         if (typeof updateDistanceBox === 'function')
@@ -5173,6 +5161,9 @@ function _panMapToCenter(target, speedTier, directionChangeFactor, eastWestMovem
 /**
  * CENTERED MODE: Always keep the marker at the exact center with look-ahead.
  */
+/**
+ * CENTERED MODE: Always keep the marker at the exact center with look-ahead.
+ */
 function _executeCenteredModePan(target, speedTier, directionChangeFactor, eastWestMovement, speedMPH, lookAheadFactor) {
     /* ── Guard: map instance ── */
     if (!map) return;
@@ -5238,18 +5229,19 @@ function _executeCenteredModePan(target, speedTier, directionChangeFactor, eastW
 
     easeLinearity = Math.max(0.1, Math.min(0.5, easeLinearity));
 
-        /* ── Execute pan ── */
+    /* ── Execute pan ── */
     // At high speed, use setView(animate:false) to avoid animation queueing.
     // panTo animations stack up at high fix rates, causing visible jitter.
     // setView snaps the center instantly, which looks smoother because
     // the dead reckoning loop is already providing 60fps interpolation.
 
-    // Reuse the safeSpeed variable declared earlier in this function
-
     if (safeSpeed >= 15 && window.deadReckoning?.isActive()) {
         // High speed + dead reckoning active: snap center directly.
         // The DR loop provides visual smoothness; we just need the
         // map center to be at the right position.
+        // Set flag so the DR loop yields this frame — avoids a
+        // double setView where GPS and DR fight over the center.
+        window._gpsCenteredPanJustOccurred = true;
         map.setView([centerLat, centerLng], map.getZoom(), {
             animate: false,
             noMoveStart: true,
@@ -5627,7 +5619,7 @@ function _enforceViewportSafety(speedMPH, currentMarkerPos) {
 }
         
 /**
- * CENTERED MODE: Keep marker within 3px of exact center.
+ * CENTERED MODE: Keep marker within tolerance of exact center.
  * Uses setView (not panTo) for sub-frame correction at high speed.
  */
 function _enforceCenteredMode(markerPos, map, marker) {
@@ -5673,6 +5665,10 @@ function _enforceCenteredMode(markerPos, map, marker) {
     var speedMPH = speedMPS * 2.23694;
 
     if (speedMPH >= 15 && window.deadReckoning && window.deadReckoning.isActive()) {
+        // Tell dead reckoning to yield this frame — avoids a double
+        // setView where GPS enforcement and DR fight over the center.
+        window._gpsCenteredPanJustOccurred = true;
+        
         map.setView([correctedCenter.lat, correctedCenter.lng], map.getZoom(), {
             animate: false,
             noMoveStart: true,
@@ -5689,11 +5685,13 @@ function _enforceCenteredMode(markerPos, map, marker) {
             noMoveStart: true
         });
 
-        setTimeout(function() {
+        // Use tracked timeout so memory manager can clean it up if
+        // the page unloads or backgrounds during the pan.
+        createTrackedTimeout(function() {
             window._centeredPanInProgress = false;
         }, panDuration * 1000 + 50);
     }
-        }
+}
         
 /**
  * ROAMING MODE: Keep marker inside viewport with speed-scaled safety margin.
