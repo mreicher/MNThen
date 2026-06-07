@@ -3071,7 +3071,9 @@ function initializeUserLocation(position) {
         const initialZoom = 17;
         map.setView([lat, lng], initialZoom, { animate: false });
 
-        // Seed the position buffer for smoothing
+        // Seed the position buffer for smoothing — one entry only
+        // so the Kalman filter gets a clean baseline without a
+        // false zero-velocity prior from multiple identical copies.
         if (typeof seedPositionBuffer === 'function') {
             seedPositionBuffer({
                 lat, lng, accuracy,
@@ -3100,16 +3102,16 @@ function initializeUserLocation(position) {
         window._lastSuccessfulInit = Date.now();
         window._initRecoveryAttempts = 0;
 
-        // Start position updates on next tick
-        createTrackedTimeout(() => {
-            const watchId = startPositionUpdates();
-            if (watchId === null) {
-                // Retry once after 3 seconds
-                createTrackedTimeout(() => {
-                    if (!window.positionWatchId) startPositionUpdates();
-                }, 3000);
-            }
-        }, 0);
+        // Start the GPS watch synchronously — no deferral.
+        // A 0ms timeout still pushes watch registration to the next
+        // task queue cycle (after paint), adding one full frame of lag
+        // before any position events can fire.
+        const watchId = startPositionUpdates();
+        if (watchId === null) {
+            createTrackedTimeout(() => {
+                if (!window.positionWatchId) startPositionUpdates();
+            }, 3000);
+        }
 
         // Apply any position that arrived while we were initializing
         if (window._pendingInitPosition) {
@@ -3191,13 +3193,44 @@ function startPositionUpdates() {
             window.positionWatchId = null;
         }
 
-        // Single persistent watch with maximumAge=0 for best accuracy.
-        // The GPS chip maintains its own internal fix strategy;
-        // restarting it is always counterproductive.
+        // ── Fast-start: deliver a cached fix immediately if one exists,
+        //    then transparently upgrade to fresh high-accuracy fixes.
+        //
+        //    maximumAge:0 forces the chip to produce a brand-new fix before
+        //    firing the first callback — on cold start that stall is 1–5 s,
+        //    which is the primary remaining startup lag.
+        //
+        //    Strategy:
+        //      • First watch: maximumAge=5000 — fires instantly from cache,
+        //        places the marker with no perceptible delay.
+        //      • After the first callback arrives, swap to maximumAge=0 so
+        //        all subsequent fixes are fresh off the chip.
+        //
+        //    The swap is transparent to the rest of the app because both
+        //    watches call the same handlePositionUpdate handler.
+
+        let fastStartDone = false;
+
+        const fastStartHandler = (position) => {
+            handlePositionUpdate(position);
+
+            if (!fastStartDone) {
+                fastStartDone = true;
+
+                // Upgrade to zero-age watch for all subsequent fixes
+                navigator.geolocation.clearWatch(window.positionWatchId);
+                window.positionWatchId = navigator.geolocation.watchPosition(
+                    handlePositionUpdate,
+                    handleLocationError,
+                    { enableHighAccuracy: true, timeout: 30000, maximumAge: 0 }
+                );
+            }
+        };
+
         window.positionWatchId = navigator.geolocation.watchPosition(
-            handlePositionUpdate,
+            fastStartHandler,
             handleLocationError,
-            { enableHighAccuracy: true, timeout: 30000, maximumAge: 0 }
+            { enableHighAccuracy: true, timeout: 30000, maximumAge: 5000 }
         );
 
         // ── Network listeners ──
@@ -3638,23 +3671,23 @@ function updatePositionBuffer(position) {
 function seedPositionBuffer(seedPosition, count) {
     if (!seedPosition || typeof seedPosition.lat !== 'number' || typeof seedPosition.lng !== 'number') return;
 
-    const safeCount = Math.max(1, Math.min(count || CONFIG.MAX_BUFFER_SIZE, CONFIG.MAX_BUFFER_SIZE || 5));
     const buffer = window.positionBuffer;
-
     buffer.length = 0;
 
-    const template = {
+    // Always seed exactly one entry. Multiple identical copies give the
+    // Kalman filter a false zero-velocity prior — the filter averages
+    // them and sees no movement, so several real GPS fixes must arrive
+    // before velocity builds up. That delay is the visible startup lag
+    // and catch-up jump. One seed gives a clean baseline while letting
+    // the very first real fix immediately establish velocity.
+    buffer.push({
         lat: seedPosition.lat,
         lng: seedPosition.lng,
         accuracy: seedPosition.accuracy,
         timestamp: seedPosition.timestamp,
         heading: seedPosition.heading,
         speedMPS: seedPosition.speedMPS
-    };
-
-    for (let i = 0; i < safeCount; i++) {
-        buffer.push({ ...template });
-    }
+    });
 }
 
 /* ──────────────────────────────────────────────
@@ -5480,14 +5513,14 @@ function _resetMapToPosition(newPosition, options) {
         if (typeof setupMapInteractionHandlers === 'function') {
             setupMapInteractionHandlers();
         }
-    
+
         if (typeof seedPositionBuffer === 'function') {
             seedPositionBuffer(newPosition);
         } else {
             window.positionBuffer = [];
             window.positionBuffer.push(newPosition);
         }
-    
+
         window.stationaryStartTime      = currentTime;
         window.isMapInteracting         = false;
         window.lastInteractionTime      = currentTime;
@@ -5554,14 +5587,18 @@ function _resetMapToPosition(newPosition, options) {
         userMarker.setLatLng([newPosition.lat, newPosition.lng]);
     }
 
-    // Restore transition after delay
-    var restoreDelay = (resetType === 'init') ? 50 : 16;
-    setTimeout(function () {
-        // document.body.contains is the ES5-safe equivalent of node.isConnected
-        if (document.body && document.body.contains(mapContainer)) {
-            mapContainer.style.transition = originalTransition;
-        }
-    }, restoreDelay);
+    // Restore transition after the browser has composited the frame
+    // in which transition was suppressed. Two nested rAFs guarantee
+    // we are past that paint before re-enabling transitions — replacing
+    // the old setTimeout(50) which blocked compositing for an arbitrary
+    // wall-clock delay unrelated to the actual render pipeline.
+    requestAnimationFrame(function () {
+        requestAnimationFrame(function () {
+            if (document.body && document.body.contains(mapContainer)) {
+                mapContainer.style.transition = originalTransition;
+            }
+        });
+    });
 
     /* ── Post-reset actions ────────────────────────────────────────── */
     if (resetType === 'init') {
