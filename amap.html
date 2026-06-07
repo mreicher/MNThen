@@ -3855,13 +3855,17 @@ function setupMapInteractionHandlers() {
 
     // Interaction start — lock map & cancel snap-back timer
     const onInteractionStart = () => {
-    window.isMapInteracting = true;
-    _clearInactivityTimer();
-    if (typeof window._currentProximityZoomCleanup === 'function') {
-        window._currentProximityZoomCleanup();
-        window._currentProximityZoomCleanup = null;
-    }
-};
+        window.isMapInteracting = true;
+        _clearInactivityTimer();
+        
+        // FIX: Only cancel proximity zoom if the USER initiated the interaction.
+        // Our own flyTo also fires movestart/zoomstart — cancelling those
+        // would immediately kill the zoom-in animation.
+        if (typeof window._currentProximityZoomCleanup === 'function' && !window._isProximityZoomAnimating) {
+            window._currentProximityZoomCleanup();
+            window._currentProximityZoomCleanup = null;
+        }
+    };
 
     map.on('movestart', onInteractionStart);
     map.on('zoomstart', onInteractionStart);
@@ -5064,7 +5068,10 @@ function updateUserLocation(position, forceUpdate = false) {
                     window.lastMapUpdateTime = currentTime;
                 }
             } else if (!isInCenteredMode && map && !window.isMapInteracting && window.followUser) {
-                if (shouldUpdateMap) {
+                // Don't issue a panTo while a proximity zoom flyTo is running.
+                // panTo and flyTo share Leaflet's internal animation queue and will
+                // interrupt each other, causing visible jitter around POIs.
+                if (!window._isProximityZoomAnimating && shouldUpdateMap) {
                     map.panTo([lookAheadPos.lat, lookAheadPos.lng], {
                         animate: true,
                         duration: Math.max(0.08, speedTier.panDuration),
@@ -5128,10 +5135,6 @@ function updateUserLocation(position, forceUpdate = false) {
    PROXIMITY ZOOM LOGIC
    Handles zoom-in when approaching a POI and zoom-out when leaving.
    ────────────────────────────────────────────── */
-/* ──────────────────────────────────────────────
-   PROXIMITY ZOOM LOGIC
-   Handles zoom-in when approaching a POI and zoom-out when leaving.
-   ────────────────────────────────────────────── */
 function _handleProximityZoomLogic(speedMPH, eastWestMove) {
     const PROX_NEAR_M = 15.24;
     const PROX_FAR_M = 22.86;
@@ -5147,9 +5150,9 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
         return;
     }
 
-    // ── Guard: interaction ──
+    // ── Guard: map interaction ──
     // If the USER is manually interacting (not our own flyTo), clean up and bail.
-    // If our own flyTo caused isMapInteracting, just skip this tick — don't kill the animation.
+    // If our own flyTo set isMapInteracting, just skip this tick — don't kill the animation.
     if (window.isMapInteracting) {
         if (!window._isProximityZoomAnimating) {
             _cleanupProximityZoomAnimation();
@@ -5167,10 +5170,9 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
         return;
     }
 
-    // ── If a proximity zoom animation is already in progress, DON'T start a new one.
-    // Let the current one finish. The completion handler will clear the flag,
-    // and the next GPS tick will evaluate if further adjustment is needed.
-    // Starting a second flyTo while one is running causes severe jitter.
+    // ── Guard: animation already in progress ──
+    // Don't start a new flyTo while the previous one is still running.
+    // A second flyTo interrupts the first, causing violent map jitter.
     if (window._isProximityZoomAnimating) {
         return;
     }
@@ -5201,7 +5203,8 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
     const currentZoom = map.getZoom();
     const zoomDelta = Math.abs(targetZoom - currentZoom);
     const nowMs = Date.now();
-    const throttleOk = !window._lastProxZoomRequest || (nowMs - window._lastProxZoomRequest) >= PROX_THROTTLE_MS;
+    const throttleOk = !window._lastProxZoomRequest ||
+        (nowMs - window._lastProxZoomRequest) >= PROX_THROTTLE_MS;
 
     // Update proximity zone state with proper hysteresis
     if (distM <= PROX_NEAR_M) {
@@ -5209,6 +5212,7 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
     } else if (distM > PROX_FAR_M) {
         window._inProximityZone = false;
     }
+    // Between NEAR and FAR: maintain current state
 
     // --- 3. ANIMATION EXECUTION ---
     if (zoomDelta >= 0.15 && throttleOk) {
@@ -5219,27 +5223,21 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
         const userLL = userMarker?.getLatLng?.();
 
         if (userLL) {
-            const easeLinearity = targetZoom < currentZoom 
-                ? (eastWestMove ? 0.13 : 0.15) 
+            const easeLinearity = targetZoom < currentZoom
+                ? (eastWestMove ? 0.13 : 0.15)
                 : 0.25;
 
-            // Stop any lingering pan animation from the previous GPS tick.
-            if (typeof map.stop === 'function') {
-                try { map.stop(); } catch (_) {}
-            }
-
-            map.flyTo(userLL, targetZoom, { 
-                duration: zoomDur, 
-                easeLinearity: easeLinearity 
+            map.flyTo(userLL, targetZoom, {
+                duration: zoomDur,
+                easeLinearity: easeLinearity
             });
         }
 
-        // Attach the completion handler
         _attachProximityZoomEndHandler(2500);
     }
 }
 
-/* ── Helper: Clean up running animation ── */
+/* ── Helper: Clean up a running proximity zoom animation ── */
 function _cleanupProximityZoomAnimation() {
     if (!window._isProximityZoomAnimating) return;
 
@@ -5256,14 +5254,16 @@ function _cleanupProximityZoomAnimation() {
     window._isProximityZoomAnimating = false;
 }
 
-/* ── Helper: Reset smoothing state ── */
+/* ── Helper: Reset EMA smoothing state ── */
 function _resetProximityZoomSmoothing() {
     window._proxSmoothDist = null;
     window._proxTargetZoom = null;
     window._inProximityZone = false;
 }
 
-/* ── Helper: Animation completion handler (prevents double-firing) ── */
+/* ── Helper: Animation completion handler ──
+   Prevents double-firing from zoomend + moveend.
+   Fallback timeout ensures the flag is always cleared. */
 function _attachProximityZoomEndHandler(fallbackMs) {
     let handled = false;
     let fallbackId = null;
@@ -5278,6 +5278,7 @@ function _attachProximityZoomEndHandler(fallbackMs) {
         }
 
         if (fallbackId) { clearTimeout(fallbackId); fallbackId = null; }
+
         window._isProximityZoomAnimating = false;
         window._currentProximityZoomCleanup = null;
 
