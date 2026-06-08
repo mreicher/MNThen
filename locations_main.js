@@ -37,7 +37,7 @@ const locations = [
         additionalInfo: "Eyedea's music often delved into philosophy, psychology, and social issues, reflecting his thoughtful and introspective nature.",
         difficulty: 2
     },
-
+/*
     {
         id: "1012",
         lat: 44.1680805962643,
@@ -56,7 +56,7 @@ const locations = [
         additionalInfo: "After the U.S.-Dakota War, 2,000 Dakota were captured; President Lincoln commuted the sentences of all but 39 of the 303 condemned to die.",
         difficulty: 1
     },
-
+*/
     {
         id: "1013",
         lat: 44.961337319371076,
