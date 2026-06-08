@@ -1539,20 +1539,41 @@ class SensorFusionManager {
      * Smooth a raw GPS position through the constant-velocity Kalman filter.
      * Returns { lat, lng, vNorth, vEast, speedMPS }.
      */
-    smoothPosition(rawLat, rawLng, accuracyMeters, timestampMs, gpsSpeedMPS, gpsHeadingDeg) {
+       smoothPosition(rawLat, rawLng, accuracyMeters, timestampMs, gpsSpeedMPS, gpsHeadingDeg) {
         if (!this._kalmanFilter) return { lat: rawLat, lng: rawLng, vNorth: 0, vEast: 0, speedMPS: 0 };
 
         const result = this._kalmanFilter.update(rawLat, rawLng, accuracyMeters, timestampMs);
 
-        // Seed velocity from GPS speed/heading after initialization
+        // Seed velocity after initialization (first fix after reset/fresh start)
         if (this._kalmanFilter._justInitialized) {
+            let seeded = false;
+
+            // Primary: seed from GPS speed/heading (most reliable)
             if (gpsSpeedMPS != null && gpsSpeedMPS > 0.3 &&
                 gpsHeadingDeg != null && isFinite(gpsHeadingDeg)) {
                 const headingRad = gpsHeadingDeg * Math.PI / 180;
                 const vNorth = gpsSpeedMPS * Math.cos(headingRad);
                 const vEast  = gpsSpeedMPS * Math.sin(headingRad);
                 this._kalmanFilter.seedVelocity(vNorth, vEast, 10.0);
+                seeded = true;
             }
+
+            // CHANGED (Fix #3): Fallback — seed from displacement-derived velocity.
+            // GPS speed/heading are frequently null at walking speed or after
+            // background recovery. Without this fallback, the filter has zero
+            // velocity and takes 2–3 fixes to converge after any reset or
+            // reinitialization, causing visible marker lag.
+            if (!seeded && window._pendingKalmanSeedVelocity) {
+                const pending = window._pendingKalmanSeedVelocity;
+                if (isFinite(pending.vNorth) && isFinite(pending.vEast)) {
+                    this._kalmanFilter.seedVelocity(pending.vNorth, pending.vEast, 50.0);
+                    // Higher variance (50 vs 10) = less trust than GPS speed,
+                    // but infinitely better than zero velocity.
+                }
+                window._pendingKalmanSeedVelocity = null;
+                seeded = true;
+            }
+
             this._kalmanFilter._justInitialized = false;
         }
 
@@ -3354,15 +3375,30 @@ function handlePositionUpdate(position) {
     let isMoving = rawSpeedMPS > 0.5;
 
     if (window.sensorFusion) {
-    const smoothed = window.sensorFusion.smoothPosition(
-        rawLat, rawLng, rawAccuracy, positionTimestamp,
-        rawSpeedMPS, rawHeading   
-    );
-    fusedLat = smoothed.lat;
-    fusedLng = smoothed.lng;
-    fusedHeading = window.sensorFusion.getHeading(rawHeading, rawSpeedMPS);
-    isMoving = window.sensorFusion.isDeviceMoving(rawSpeedMPS);
-}
+        // CHANGED (Fix #2): Pre-boost Kalman velocity variance if the device
+        // just started moving from a stationary state. Without this,
+        // smoothPosition() processes the fix with low velocity variance
+        // (from the stationary period), causing the filter to resist
+        // tracking the new movement for an entire GPS cycle (~1s).
+        if (window.isStationary && window.sensorFusion.isDeviceMoving(rawSpeedMPS)) {
+            const kf = window.sensorFusion._kalmanFilter;
+            if (kf && kf.P && kf.x) {
+                kf.P[2][2] = 225;
+                kf.P[3][3] = 225;
+                kf.P[0][2] = 0; kf.P[2][0] = 0;
+                kf.P[1][3] = 0; kf.P[3][1] = 0;
+            }
+        }
+
+        const smoothed = window.sensorFusion.smoothPosition(
+            rawLat, rawLng, rawAccuracy, positionTimestamp,
+            rawSpeedMPS, rawSpeedMPS >= 0.5 ? rawHeading : null
+        );
+        fusedLat = smoothed.lat;
+        fusedLng = smoothed.lng;
+        fusedHeading = window.sensorFusion.getHeading(rawHeading, rawSpeedMPS);
+        isMoving = window.sensorFusion.isDeviceMoving(rawSpeedMPS);
+    }
 
     window.lastPositionAccuracy = rawAccuracy;
     window.lastValidPosition = {
@@ -4660,13 +4696,25 @@ function updateUserLocation(position, forceUpdate = false) {
     const rawAccuracy = coords.accuracy || 20;
     const rawHeading = coords.heading ?? null;
     const rawSpeedMPS = Math.max(0, coords.speed || 0);
-    const currentTime = Date.now();
+
+    // CHANGED (Fix #1): Derive currentTime from the GPS timestamp so the
+    // dead-reckoning loop extrapolates from the correct origin.  When the
+    // GPS chip produces a fix at T=1.0 s but delivery / processing delays
+    // mean we see it at T=1.5 s, the DR loop must extrapolate the full
+    // 500 ms — not the few ms it would compute if lastUpdateTimestamp
+    // were set to Date.now().  Falls back to Date.now() for synthetic
+    // positions (background recovery, _restoreFullTracking) where
+    // position.timestamp may be absent or stale.
+    const currentTime = (position.timestamp && isFinite(position.timestamp))
+        ? position.timestamp
+        : Date.now();
+
     const lastPos = window.lastPosition;
     const timeDelta = (lastPos && window.lastUpdateTime)
         ? (currentTime - window.lastUpdateTime) / 1000
         : 0;
 
-    // Long gap — reset Kalman and compute displacement velocity instead of zeroing.
+       // Long gap — reset Kalman and compute displacement velocity instead of zeroing.
     // Zeroing forces a 5+ second convergence delay before the marker tracks movement.
     if (timeDelta > 10) {
         if (window.sensorFusion) window.sensorFusion._kalmanFilter?.reset();
@@ -4676,6 +4724,19 @@ function updateUserLocation(position, forceUpdate = false) {
                 lat: (lat - lastPos.lat) / timeDelta,
                 lng: (lng - lastPos.lng) / timeDelta
             };
+
+            // CHANGED (Fix #3c): Seed displacement velocity for the same reason
+            // as _resetMapToPosition. Without this, the filter starts with zero
+            // velocity after a long-gap reset and takes 2–3 GPS fixes to
+            // re-converge — causing visible marker lag.
+            var sv = window.smoothedVelocity;
+            if (Math.abs(sv.lat) > 1e-8 || Math.abs(sv.lng) > 1e-8) {
+                var cosLat = Math.cos(lat * Math.PI / 180);
+                window._pendingKalmanSeedVelocity = {
+                    vNorth: sv.lat * 111111,
+                    vEast:  sv.lng * 111111 * cosLat
+                };
+            }
         } else {
             window.smoothedVelocity = { lat: 0, lng: 0 };
         }
@@ -4922,7 +4983,7 @@ function updateUserLocation(position, forceUpdate = false) {
             // Update immediately so the next tick doesn't see a false large jump
             window.lastPosition = newPosition;
             window.lastUpdateTime = currentTime;
-            window.lastUpdateTimestamp = currentTime; // Fix timestamp inconsistency
+            window.lastUpdateTimestamp = currentTime;
 
             // Evict stale buffer entries from the stationary period
             const buffer = window.positionBuffer;
@@ -5157,15 +5218,6 @@ function updateUserLocation(position, forceUpdate = false) {
         updateDistanceBox(forceUpdate, newPosition, closestLocation, closestDistance);
     }
 }
-        
-/* ──────────────────────────────────────────────
-   PROXIMITY ZOOM LOGIC
-   Handles zoom-in when approaching a POI and zoom-out when leaving.
-   ────────────────────────────────────────────── */
-/* ──────────────────────────────────────────────
-   PROXIMITY ZOOM LOGIC
-   Handles zoom-in when approaching a POI and zoom-out when leaving.
-   ────────────────────────────────────────────── */
 /* ──────────────────────────────────────────────
    PROXIMITY ZOOM LOGIC
    Handles zoom-in when approaching a POI and zoom-out when leaving.
@@ -5618,6 +5670,22 @@ function _resetMapToPosition(newPosition, options) {
     // Ensures smoothPosition() reinitializes cleanly and seeds velocity.
     if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
         window.sensorFusion._kalmanFilter.reset();
+
+        // CHANGED (Fix #3): Seed displacement velocity into the filter after reset.
+        // Without this, the filter starts with zero velocity and must wait
+        // 2–3 GPS fixes to re-converge — causing visible marker lag after
+        // background recovery or large jumps.  The displacement velocity
+        // was computed above and stored in window.smoothedVelocity (deg/s).
+        // We convert it to m/s and stash it so that smoothPosition() can
+        // inject it as the initial velocity state when it reinitializes
+        // the filter on the next GPS tick.
+        var sv = window.smoothedVelocity;
+        if (sv && (Math.abs(sv.lat) > 1e-8 || Math.abs(sv.lng) > 1e-8)) {
+            var cosLat = Math.cos((newPosition.lat || 0) * Math.PI / 180);
+            var vNorth = sv.lat * 111111;            // deg/s → m/s (north)
+            var vEast  = sv.lng * 111111 * cosLat;    // deg/s → m/s (east)
+            window._pendingKalmanSeedVelocity = { vNorth: vNorth, vEast: vEast };
+        }
     }
 
     window.isStationary             = false;
