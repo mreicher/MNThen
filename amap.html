@@ -5089,28 +5089,29 @@ function updateUserLocation(position, forceUpdate = false) {
         ? (currentTime - window.lastUpdateTime) / 1000
         : 0;
 
-    // Long gap — reset Kalman and compute displacement velocity instead of zeroing.
-    if (timeDelta > 10) {
-        if (window.sensorFusion) window.sensorFusion._kalmanFilter?.reset();
+    // Long gap — soft re-init: preserve heading, seed velocity from displacement.
+    // Do NOT hard-reset the Kalman; let its own dt logic handle the gap.
+    if (timeDelta > 10 && timeDelta < 300 && lastPos) {
+        window.smoothedVelocity = {
+            lat: (lat - lastPos.lat) / timeDelta,
+            lng: (lng - lastPos.lng) / timeDelta
+        };
 
-        if (lastPos && timeDelta > 0 && timeDelta < 300) {
-            window.smoothedVelocity = {
-                lat: (lat - lastPos.lat) / timeDelta,
-                lng: (lng - lastPos.lng) / timeDelta
+        const sv = window.smoothedVelocity;
+        if (Math.abs(sv.lat) > 1e-8 || Math.abs(sv.lng) > 1e-8) {
+            const cosLat = Math.cos(lat * Math.PI / 180);
+            window._pendingKalmanSeedVelocity = {
+                vNorth: sv.lat * 111111,
+                vEast:  sv.lng * 111111 * cosLat
             };
-
-            var sv = window.smoothedVelocity;
-            if (Math.abs(sv.lat) > 1e-8 || Math.abs(sv.lng) > 1e-8) {
-                var cosLat = Math.cos(lat * Math.PI / 180);
-                window._pendingKalmanSeedVelocity = {
-                    vNorth: sv.lat * 111111,
-                    vEast:  sv.lng * 111111 * cosLat
-                };
-            }
-        } else {
-            window.smoothedVelocity = { lat: 0, lng: 0 };
         }
 
+        window.isStationary = false;
+        window.stationaryStartTime = null;
+        window.stationaryLockPosition = null;
+    } else if (timeDelta >= 300 || !lastPos) {
+        if (window.sensorFusion) window.sensorFusion._kalmanFilter?.reset();
+        window.smoothedVelocity = { lat: 0, lng: 0 };
         window.isStationary = false;
         window.stationaryStartTime = null;
         window.stationaryLockPosition = null;
@@ -5124,14 +5125,12 @@ function updateUserLocation(position, forceUpdate = false) {
         speedMPS: rawSpeedMPS
     };
 
-    // Blend GPS speed with calculated speed
+    // Trust GPS doppler speed; only fall back to calculated speed when GPS reports null/very low.
     let reliableSpeedMPS = rawSpeedMPS;
-    if (lastPos && timeDelta > 0.15 && timeDelta < 5.0) {
+    if ((!rawSpeedMPS || rawSpeedMPS < 0.3) && lastPos && timeDelta > 0.15 && timeDelta < 5.0) {
         const dist = calculateDistance(lastPos, newPosition);
         if (isFinite(dist) && !(dist > 20 && timeDelta < 1.0)) {
-            const calcSpeed = Math.min(dist / timeDelta, 15);
-            if (reliableSpeedMPS < 0.5 && calcSpeed > 1.0) reliableSpeedMPS = calcSpeed;
-            else if (calcSpeed > reliableSpeedMPS * 1.5 && calcSpeed > 2.0) reliableSpeedMPS = calcSpeed;
+            reliableSpeedMPS = Math.min(dist / timeDelta, 15);
         }
     }
 
@@ -5180,8 +5179,6 @@ function updateUserLocation(position, forceUpdate = false) {
     let closestDistance = Infinity, closestLocation = null;
     const locationsWithDistance = [];
 
-    // Always recalculate proximity — the loop is O(N) with an early spatial cull
-    // and far cheaper than a stale proximity state causing zoom failures.
     closestDistance = Infinity;
     closestLocation = null;
 
@@ -5242,13 +5239,21 @@ function updateUserLocation(position, forceUpdate = false) {
         ? window.sensorFusion.getHeading(rawHeading, speedMPS)
         : rawHeading;
 
+    // Heading validation: only suppress changes when actually stationary per accelerometer
     let validatedHeading = fusedHeading;
     const lastHeading = lastPos.heading ?? null;
+    const isMoving = window.sensorFusion
+        ? window.sensorFusion.isDeviceMoving(rawSpeedMPS)
+        : (speedMPS > 0.5);
+
     if (lastHeading != null && fusedHeading != null) {
         let diff = Math.abs(fusedHeading - lastHeading);
         if (diff > 180) diff = 360 - diff;
-        if (speedMPS < 2.0 && diff > 90) validatedHeading = lastHeading;
+        if (!isMoving && speedMPS < 1.0 && diff > 90) {
+            validatedHeading = lastHeading;
+        }
     }
+
     let displayHeading = validatedHeading;
     if (lastHeading != null && validatedHeading != null &&
         Math.abs(validatedHeading - lastHeading) > 180) {
@@ -5306,10 +5311,10 @@ function updateUserLocation(position, forceUpdate = false) {
     }
 
     // ── Stationary detection — Raised thresholds ──
-    const STAT_THRESHOLD = 3.5;        // Raised from 1.5m
-    const STAT_CONFIRM_MS = 4000;      // Raised from 3000ms
-    const FAST_EXIT_DIST = 3.0;        // Raised from 2.5m
-    const FAST_EXIT_SPEED = 1.0;       // Raised from 1.2 m/s
+    const STAT_THRESHOLD = 3.5;
+    const STAT_CONFIRM_MS = 4000;
+    const FAST_EXIT_DIST = 3.0;
+    const FAST_EXIT_SPEED = 1.0;
 
     const isStationaryLocked = window.isStationary && window.stationaryLockPosition;
     const isDeviceMoving = window.lastValidPosition?.isMoving ?? null;
@@ -5337,13 +5342,19 @@ function updateUserLocation(position, forceUpdate = false) {
             window.stationaryStartTime = null;
             window._stationaryNudgeAnchor = null;
 
+            // Seed Kalman with breakout velocity instead of resetting to ignorance
             if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
                 const kf = window.sensorFusion._kalmanFilter;
-                if (kf.P && kf.x) {
-                    kf.P[2][2] = 225;
-                    kf.P[3][3] = 225;
-                    kf.P[0][2] = 0; kf.P[2][0] = 0;
-                    kf.P[1][3] = 0; kf.P[3][1] = 0;
+                const breakoutSpeed = timeDelta > 0 ? distance / timeDelta : 0;
+                if (breakoutSpeed > 0.3 && validatedHeading != null) {
+                    const rad = validatedHeading * Math.PI / 180;
+                    kf.seedVelocity(
+                        breakoutSpeed * Math.cos(rad),
+                        breakoutSpeed * Math.sin(rad),
+                        15.0
+                    );
+                } else {
+                    kf.reset();
                 }
                 kf._justInitialized = true;
             }
@@ -5367,7 +5378,6 @@ function updateUserLocation(position, forceUpdate = false) {
                 }
             }
 
-            // Restart dead reckoning immediately
             if (window.deadReckoning && typeof window.deadReckoning.onMovementResumed === 'function') {
                 window.deadReckoning.onMovementResumed();
             }
@@ -5429,7 +5439,7 @@ function updateUserLocation(position, forceUpdate = false) {
     window.isStationary = false;
     window.stationaryLockPosition = null;
 
-    // Second restart call after stationary state is cleared
+    // Restart dead reckoning
     if (!window.isStationary && speedMPS >= 0.15 && window.deadReckoning &&
         !window.deadReckoning.isActive()) {
         window.deadReckoning.start();
@@ -5454,7 +5464,15 @@ function updateUserLocation(position, forceUpdate = false) {
         }
     }
 
-    const smoothedPosition = {
+    // ── Kalman smoothing and shared prediction publication ──
+    let kalmanResult = null;
+    if (window.sensorFusion) {
+        kalmanResult = window.sensorFusion.smoothPosition(
+            lat, lng, rawAccuracy, currentTime, rawSpeedMPS, validatedHeading
+        );
+    }
+
+    const smoothedPosition = kalmanResult || {
         lat, lng,
         accuracy: rawAccuracy,
         heading: validatedHeading,
@@ -5462,9 +5480,14 @@ function updateUserLocation(position, forceUpdate = false) {
         speedMPS
     };
 
+    // Publish the Kalman-smoothed position as the canonical prediction
+    // for the dead reckoning loop to extrapolate from.
+    window._predictedPosition = { lat: smoothedPosition.lat, lng: smoothedPosition.lng };
+    window._predictedPositionTime = currentTime;
+
     const kalmanVelocity = window.sensorFusion
         ? window.sensorFusion.getSmoothedVelocityDegPerSec()
-        : { lat: 0, lng: 0 };
+        : (window.smoothedVelocity || { lat: 0, lng: 0 });
     window.smoothedVelocity = kalmanVelocity;
 
     const animDur = Math.max(0.05, speedTier.panDuration * directionChangeFactor);
@@ -5475,9 +5498,13 @@ function updateUserLocation(position, forceUpdate = false) {
                              speedMPH < 45 ? 1.0 + (speedMPH - 15) * 0.027 :
                                             Math.min(2.5, 1.81 + (speedMPH - 45) * 0.02);
 
-    const lookAheadPos = { lat: smoothedPosition.lat, lng: smoothedPosition.lng };
+    const lookAheadPos = {
+        lat: smoothedPosition.lat + kalmanVelocity.lat * lookAheadSeconds,
+        lng: smoothedPosition.lng + kalmanVelocity.lng * lookAheadSeconds
+    };
 
-    // Synchronous marker update, deferred map pan only
+    // Synchronous marker update follows shared prediction
+    const displayPos = window._predictedPosition || smoothedPosition;
     if (userMarker) {
         const markerEl = userMarker.getElement ? userMarker.getElement() : null;
         if (markerEl) {
@@ -5486,7 +5513,7 @@ function updateUserLocation(position, forceUpdate = false) {
             if (iconEl) iconEl.style.transition = 'none';
         }
         try {
-            userMarker.setLatLng([smoothedPosition.lat, smoothedPosition.lng]);
+            userMarker.setLatLng([displayPos.lat, displayPos.lng]);
         } catch (err) {
             console.warn('[MarkerUpdate] setLatLng failed:', err);
         }
@@ -5501,17 +5528,19 @@ function updateUserLocation(position, forceUpdate = false) {
     window._nextLocationUpdateRAF = requestAnimationFrame(() => {
         window._nextLocationUpdateRAF = null;
         if (window._isProximityZoomAnimating) return;
-        
+
         const shouldUpdateMap = (Date.now() - (window.lastMapUpdateTime || 0)) > speedTier.mapUpdateInterval ||
             isInCenteredMode || modeChanged;
 
         if (!map || window.isMapInteracting || !window.followUser) return;
 
+        const panPos = window._predictedPosition || lookAheadPos;
+
         if (isInCenteredMode) {
-            _panMapToCenter(lookAheadPos, speedTier, directionChangeFactor,
+            _panMapToCenter(panPos, speedTier, directionChangeFactor,
                 eastWestMove, speedMPH, lookAheadSeconds);
         } else if (shouldUpdateMap) {
-            map.panTo([lookAheadPos.lat, lookAheadPos.lng], {
+            map.panTo([panPos.lat, panPos.lng], {
                 animate: true,
                 duration: Math.max(0.08, speedTier.panDuration),
                 easeLinearity: speedTier.easeLinearity,
@@ -5544,6 +5573,9 @@ function updateUserLocation(position, forceUpdate = false) {
         
 /* ──────────────────────────────────────────────
    PROXIMITY ZOOM LOGIC
+   Smooth, predictive, continuous zoom with speed-adaptive hysteresis.
+   Ensures BOTH user marker and location marker remain visible.
+   Backwards compatible: user marker stays in center 60% of viewport.
    ────────────────────────────────────────────── */
 function _handleProximityZoomLogic(speedMPH, eastWestMove) {
     const PROX_NEAR_M = 15.24;
@@ -5551,18 +5583,32 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
     const PROX_ZOOM_IN = 19;
     const PROX_ZOOM_OUT = 17;
     const MAX_PROX_SPEED_MPH = 10;
-    const PROX_COOLDOWN_MS = 800;
+    const PROX_COOLDOWN_MS = 400;
+
+    if (window._proxZoomTargetLevel == null) window._proxZoomTargetLevel = PROX_ZOOM_OUT;
+    if (window._proxZoomCurrentLevel == null) window._proxZoomCurrentLevel = PROX_ZOOM_OUT;
+
+    window._proxSpeedEMA = window._proxSpeedEMA ?? speedMPH;
+    window._proxSpeedEMA = 0.6 * speedMPH + 0.4 * window._proxSpeedEMA;
+    const smoothedSpeedMPH = window._proxSpeedEMA;
+
+    const approachSpeed = _estimateApproachSpeedMPS();
+    const distM = window.proximityState?.distanceMeters ?? Infinity;
+    const timeToNearSec = (approachSpeed > 0.3 && isFinite(distM))
+        ? (distM - PROX_NEAR_M) / approachSpeed
+        : Infinity;
 
     if (!window.proximityState || !map) {
         _cleanupProximityZoomAnimation();
         _resetProximityZoomSmoothing();
+        window._proxZoomTargetLevel = PROX_ZOOM_OUT;
         return;
     }
 
-    // Guard removed: isMapInteracting is already checked in the RAF callback.
-    // Keeping it here caused deadlocks when the flag was stuck true.
+    const speedGateBreached = smoothedSpeedMPH > MAX_PROX_SPEED_MPH + 3;
 
-    if (speedMPH > MAX_PROX_SPEED_MPH) {
+    if (speedGateBreached) {
+        window._proxZoomTargetLevel = PROX_ZOOM_OUT;
         if (window._proxZoomState === 'ZOOMED_IN') {
             _executeProximityZoom(PROX_ZOOM_OUT, 'IDLE', eastWestMove);
         } else {
@@ -5575,11 +5621,13 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
     if (window._isProximityZoomAnimating) return;
 
     const now = Date.now();
-    if (window._lastProxZoomTime && (now - window._lastProxZoomTime < PROX_COOLDOWN_MS)) return;
 
-    const distM = window.proximityState.distanceMeters;
+    const cooldownKey = window._proxZoomTargetLevel > window._proxZoomCurrentLevel ? 'IN' : 'OUT';
+    const lastTimeForDir = window._lastProxZoomTimeByDir?.[cooldownKey] || 0;
+    if (now - lastTimeForDir < PROX_COOLDOWN_MS) return;
 
     if (!isFinite(distM) || distM === Infinity) {
+        window._proxZoomTargetLevel = PROX_ZOOM_OUT;
         if (window._proxZoomState === 'ZOOMED_IN') {
             _executeProximityZoom(PROX_ZOOM_OUT, 'IDLE', eastWestMove);
         } else {
@@ -5592,17 +5640,112 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
         window._proxZoomState = 'IDLE';
     }
 
-    if (window._proxZoomState === 'IDLE') {
-        if (distM <= PROX_NEAR_M) {
-            _executeProximityZoom(PROX_ZOOM_IN, 'ZOOMED_IN', eastWestMove);
-        }
-    } else if (window._proxZoomState === 'ZOOMED_IN') {
-        if (distM > PROX_FAR_M) {
-            _executeProximityZoom(PROX_ZOOM_OUT, 'IDLE', eastWestMove);
-        } else if (map.getZoom() < PROX_ZOOM_IN - 1.5) {
-            _executeProximityZoom(PROX_ZOOM_IN, 'ZOOMED_IN', eastWestMove);
+    let targetZoom = PROX_ZOOM_OUT;
+
+    if (distM <= PROX_NEAR_M && smoothedSpeedMPH <= MAX_PROX_SPEED_MPH) {
+        targetZoom = PROX_ZOOM_IN;
+    } else if (distM < PROX_FAR_M && smoothedSpeedMPH <= MAX_PROX_SPEED_MPH) {
+        const t = (PROX_FAR_M - distM) / (PROX_FAR_M - PROX_NEAR_M);
+        const easedT = t * t * (3 - 2 * t);
+        targetZoom = PROX_ZOOM_OUT + (PROX_ZOOM_IN - PROX_ZOOM_OUT) * easedT;
+    } else if (timeToNearSec < 3.0 && timeToNearSec > 0 && smoothedSpeedMPH <= MAX_PROX_SPEED_MPH) {
+        targetZoom = PROX_ZOOM_OUT + 0.5;
+    }
+
+    window._proxZoomTargetLevel = targetZoom;
+
+    const currentZoom = map.getZoom();
+    const zoomDiff = Math.abs(targetZoom - currentZoom);
+
+    if (zoomDiff < 0.1) {
+        window._proxZoomCurrentLevel = targetZoom;
+        window._proxZoomState = (Math.abs(targetZoom - PROX_ZOOM_IN) < 0.3) ? 'ZOOMED_IN' : 'IDLE';
+        return;
+    }
+
+    if (zoomDiff >= 0.4) {
+        const discreteTarget = targetZoom > (PROX_ZOOM_IN + PROX_ZOOM_OUT) / 2
+            ? PROX_ZOOM_IN
+            : PROX_ZOOM_OUT;
+
+        const newState = discreteTarget === PROX_ZOOM_IN ? 'ZOOMED_IN' : 'IDLE';
+
+        if (newState !== window._proxZoomState || zoomDiff > 1.0) {
+            window._proxZoomState = newState;
+            if (!window._lastProxZoomTimeByDir) window._lastProxZoomTimeByDir = {};
+            window._lastProxZoomTimeByDir[cooldownKey] = now;
+            _executeProximityZoom(discreteTarget, newState, eastWestMove);
         }
     }
+}
+
+function _estimateApproachSpeedMPS() {
+    if (!window.proximityState || !window.lastVelocity) return 0;
+
+    const closest = window.proximityState.closestLocation;
+    if (!closest || !closest.lat || !closest.lng) return 0;
+
+    const userPos = window.lastPosition;
+    if (!userPos) return 0;
+
+    const dLat = closest.lat - userPos.lat;
+    const dLng = closest.lng - userPos.lng;
+    const bearingToLoc = Math.atan2(dLng * Math.cos(userPos.lat * Math.PI / 180), dLat);
+
+    const vNorth = window.lastVelocity.lat * 111111;
+    const vEast = window.lastVelocity.lng * 111111 *
+                  Math.cos(userPos.lat * Math.PI / 180);
+    const userBearing = Math.atan2(vEast, vNorth);
+
+    const speed = Math.sqrt(vNorth * vNorth + vEast * vEast);
+    let angleDiff = Math.abs(userBearing - bearingToLoc);
+    if (angleDiff > Math.PI) angleDiff = 2 * Math.PI - angleDiff;
+
+    if (angleDiff > Math.PI / 2) return 0;
+    return speed * Math.cos(angleDiff);
+}
+
+/* ──────────────────────────────────────────────
+   Compute map center that keeps user in center 60%
+   and location visible. Returns { lat, lng }.
+   If location is already visible, returns userLL unchanged.
+   ────────────────────────────────────────────── */
+function _computeFramingCenter(userLL, locationLL, zoom) {
+    if (!userLL || !locationLL) return userLL;
+
+    // Check if location is already visible at current zoom
+    const bounds = map.getBounds();
+    if (bounds.contains(locationLL)) return userLL;
+
+    // Location is off-screen. Compute minimal shift to bring it in
+    // while keeping user in center 60% of viewport.
+    const size = map.getSize();
+    const userPx = map.project(userLL, zoom);
+    const locPx = map.project(locationLL, zoom);
+
+    // Center 60% box: ±30% from center in each dimension
+    const maxOffsetX = size.x * 0.30;
+    const maxOffsetY = size.y * 0.30;
+
+    const centerPx = map.project(map.getCenter(), zoom);
+    const dx = locPx.x - centerPx.x;
+    const dy = locPx.y - centerPx.y;
+
+    // How much do we need to shift center so location is at edge of 60% box?
+    let shiftX = 0, shiftY = 0;
+
+    if (Math.abs(dx) > maxOffsetX) {
+        shiftX = dx > 0 ? dx - maxOffsetX : dx + maxOffsetX;
+    }
+    if (Math.abs(dy) > maxOffsetY) {
+        shiftY = dy > 0 ? dy - maxOffsetY : dy + maxOffsetY;
+    }
+
+    // If shift is tiny, don't bother
+    if (Math.abs(shiftX) < 5 && Math.abs(shiftY) < 5) return userLL;
+
+    const newCenterPx = L.point(centerPx.x + shiftX, centerPx.y + shiftY);
+    return map.unproject(newCenterPx, zoom);
 }
 
 function _executeProximityZoom(targetZoom, nextState, eastWestMove) {
@@ -5611,6 +5754,7 @@ function _executeProximityZoom(targetZoom, nextState, eastWestMove) {
 
     if (zoomDelta < 0.15) {
         window._proxZoomState = nextState;
+        window._proxZoomCurrentLevel = targetZoom;
         return;
     }
 
@@ -5618,7 +5762,7 @@ function _executeProximityZoom(targetZoom, nextState, eastWestMove) {
     window._proxZoomState = nextState;
     window._isProximityZoomAnimating = true;
 
-    const zoomDur = Math.min(1.0, Math.max(0.3, zoomDelta * 0.3));
+    const zoomDur = Math.min(0.6, Math.max(0.2, zoomDelta * 0.2));
     const userLL = userMarker?.getLatLng?.();
 
     if (!userLL) {
@@ -5626,21 +5770,29 @@ function _executeProximityZoom(targetZoom, nextState, eastWestMove) {
         return;
     }
 
-    // Set flag inside rAF so it's consumed by the correct event cycle
     requestAnimationFrame(() => {
         if (!window._isProximityZoomAnimating) return;
 
-        const easeLinearity = targetZoom < currentZoom
-            ? (eastWestMove ? 0.13 : 0.15)
-            : 0.25;
-
         window._programmaticFlyInProgress = true;
-        map.flyTo(userLL, targetZoom, {
+
+        const closestLoc = window.proximityState?.closestLocation;
+        const locationLL = closestLoc ? L.latLng(closestLoc.lat, closestLoc.lng) : null;
+
+        // ── Only shift center if location is actually off-screen.
+        // If visible, center stays exactly on user (original behavior).
+        // If off-screen, shift minimally to bring it in while keeping
+        // user in center 60% of viewport.
+        const targetCenter = (targetZoom >= 18 && locationLL)
+            ? _computeFramingCenter(userLL, locationLL, targetZoom)
+            : userLL;
+
+        map.setView(targetCenter, targetZoom, {
+            animate: true,
             duration: zoomDur,
-            easeLinearity: easeLinearity
+            easeLinearity: 0.25
         });
 
-        _attachProximityZoomEndHandler(zoomDur * 1000 + 1500);
+        _attachProximityZoomEndHandler(zoomDur * 1000 + 1000);
     });
 }
 
@@ -5664,6 +5816,13 @@ function _resetProximityZoomSmoothing() {
     window._proxZoomState = 'IDLE';
     window._lastProxZoomTime = 0;
     window._inProximityZone = false;
+    window._proxZoomTargetLevel = 17;
+    window._proxZoomCurrentLevel = 17;
+    window._proxSpeedEMA = null;
+    if (window._lastProxZoomTimeByDir) {
+        window._lastProxZoomTimeByDir.IN = 0;
+        window._lastProxZoomTimeByDir.OUT = 0;
+    }
 }
 
 function _attachProximityZoomEndHandler(fallbackMs) {
@@ -5676,14 +5835,13 @@ function _attachProximityZoomEndHandler(fallbackMs) {
 
         if (map) {
             map.off('moveend', onDone);
+            map.off('zoomend', onDone);
         }
 
         if (fallbackId) { clearTimeout(fallbackId); fallbackId = null; }
 
         window._isProximityZoomAnimating = false;
         window._currentProximityZoomCleanup = null;
-
-        // Defensive clear — if onInteractionStart's old bug stuck this true, reset it
         window.isMapInteracting = false;
 
         if (map && typeof map.invalidateSize === 'function') {
@@ -5693,12 +5851,16 @@ function _attachProximityZoomEndHandler(fallbackMs) {
 
     if (map) {
         map.on('moveend', onDone);
+        map.on('zoomend', onDone);
     }
 
     window._currentProximityZoomCleanup = () => {
         if (!handled) {
             handled = true;
-            if (map) map.off('moveend', onDone);
+            if (map) {
+                map.off('moveend', onDone);
+                map.off('zoomend', onDone);
+            }
             if (fallbackId) { clearTimeout(fallbackId); fallbackId = null; }
             window._isProximityZoomAnimating = false;
             window.isMapInteracting = false;
@@ -5765,7 +5927,8 @@ function _executeCenteredModePan(target, speedTier, directionChangeFactor, eastW
         const svLat = window.smoothedVelocity.lat;
         const svLng = window.smoothedVelocity.lng;
         if (svLat != null && svLng != null && isFinite(svLat) && isFinite(svLng)) {
-            const lngMultiplier = eastWestMovement ? 0.90 : 1.0;
+            // ── CHANGED: Compensate for Mercator east-west compression instead of penalizing ──
+            const lngMultiplier = eastWestMovement ? 1.12 : 1.0;
             centerLat += svLat * laSec;
             centerLng += svLng * laSec * lngMultiplier;
         }
@@ -5781,26 +5944,21 @@ function _executeCenteredModePan(target, speedTier, directionChangeFactor, eastW
     const baseDuration = (speedTier && speedTier.panDuration != null) ? speedTier.panDuration : 0.2;
     const factor = (directionChangeFactor != null) ? directionChangeFactor : 1.0;
 
-    // ── MODE TRANSITION: Smooth easing from roaming → centered ──
-    // When first entering centered mode, the marker may be far from
-    // center (roaming allows it). A short 120ms pan for a 200px
-    // offset looks like a jump. This transition gradually shortens
-    // the pan duration over 800ms, starting long (0.8s) and easing
-    // down to the normal tracking duration.
     const transitionProgress = (typeof ModeManager !== 'undefined' &&
                                 typeof ModeManager.getTransitionProgress === 'function')
         ? ModeManager.getTransitionProgress()
         : 1;
 
+    // ── CHANGED: Smoothstep for perceptual settling ──
+    const smoothProgress = transitionProgress * transitionProgress * (3 - 2 * transitionProgress);
+
     let panDuration;
     if (transitionProgress < 1) {
-        // Interpolate: 0.8s at progress=0 → normal duration at progress=1
         const transitionDuration = 0.8;
-        panDuration = transitionDuration + (baseDuration * factor - transitionDuration) * transitionProgress;
+        panDuration = transitionDuration + (baseDuration * factor - transitionDuration) * smoothProgress;
     } else {
         panDuration = baseDuration * factor;
 
-        // Normal speed-based multipliers (only after transition completes)
         if (safeSpeed >= 30)      panDuration *= 0.70;
         else if (safeSpeed >= 20) panDuration *= 0.80;
         else if (safeSpeed >= highSpeedThreshold) panDuration *= 0.90;
@@ -5813,27 +5971,37 @@ function _executeCenteredModePan(target, speedTier, directionChangeFactor, eastW
     /* ── Resolve effective easing ── */
     let easeLinearity;
     if (transitionProgress < 1) {
-        // During transition: gentle easing for smooth capture
-        easeLinearity = 0.10 + 0.05 * transitionProgress;
-    } else {
+        // ── CHANGED: Blend from gentle start to speed-appropriate base ──
         const baseEase = (speedTier && speedTier.easeLinearity != null) ? speedTier.easeLinearity : 0.15;
-        easeLinearity = baseEase;
+        easeLinearity = 0.08 + (baseEase - 0.08) * smoothProgress;
+    } else {
+        easeLinearity = (speedTier && speedTier.easeLinearity != null) ? speedTier.easeLinearity : 0.15;
         if (safeSpeed >= 20)            easeLinearity = Math.min(0.25, easeLinearity * 1.4);
         else if (safeSpeed >= highSpeedThreshold) easeLinearity = Math.min(0.20, easeLinearity * 1.2);
     }
     easeLinearity = Math.max(0.1, Math.min(0.5, easeLinearity));
 
-    /* ── Execute pan ── */
-    if (safeSpeed >= 15 && window.deadReckoning?.isActive() && transitionProgress >= 1) {
-        // High speed + DR active + transition complete: snap center.
+    /* ── CHANGED: Gradual snap blend instead of binary threshold ── */
+    const snapBlend = Math.min(1, Math.max(0, (safeSpeed - 12) / 6));
+
+    if (snapBlend > 0.5 && window.deadReckoning?.isActive() && transitionProgress >= 1) {
         window._gpsCenteredPanJustOccurred = true;
+        // Clear flag after microtask so DR loop can see it
+        Promise.resolve().then(() => { window._gpsCenteredPanJustOccurred = false; });
+
         map.setView([centerLat, centerLng], map.getZoom(), {
             animate: false,
             noMoveStart: true,
             noMoveEnd: true
         });
+    } else if (snapBlend > 0) {
+        map.panTo([centerLat, centerLng], {
+            animate: true,
+            duration: panDuration * (1 - snapBlend * 0.7),
+            easeLinearity: easeLinearity + snapBlend * 0.15,
+            noMoveStart: true
+        });
     } else {
-        // Walking speed, transition period, or DR inactive: smooth pan.
         map.panTo([centerLat, centerLng], {
             animate: true,
             duration: panDuration,
@@ -5845,7 +6013,8 @@ function _executeCenteredModePan(target, speedTier, directionChangeFactor, eastW
     if (window.DEBUG_PANNING) {
         console.debug('[Centered] Pan: speed=' + safeSpeed.toFixed(1) +
             'mph, duration=' + (panDuration * 1000).toFixed(0) +
-            'ms, transition=' + (transitionProgress * 100).toFixed(0) + '%');
+            'ms, transition=' + (transitionProgress * 100).toFixed(0) + '%' +
+            ', snapBlend=' + snapBlend.toFixed(2));
     }
 }
         
@@ -5908,12 +6077,9 @@ function _resetMapToPosition(newPosition, options) {
     var forceUpdate      = !!options.forceUpdate;
     var clearStationary  = options.clearStationary !== false;
 
-    // Save previous position/timestamp before they're overwritten
-    // so we can compute displacement velocity for the Kalman filter.
     var prevPos  = window.lastPosition || null;
     var prevTime = window.lastUpdateTime || null;
 
-    // State reset (type-specific)
     if (resetType === 'init') {
         if (typeof setupMapInteractionHandlers === 'function') {
             setupMapInteractionHandlers();
@@ -5943,23 +6109,32 @@ function _resetMapToPosition(newPosition, options) {
         window.stationaryStartTime  = null;
     }
 
-    // Shared state updates
     window.lastPosition             = newPosition;
     window.lastUpdateTime           = currentTime;
     window.lastUpdateTimestamp      = currentTime;
 
-    // Compute velocity from displacement instead of zeroing.
-    // Zeroing forces the marker to freeze until Kalman re-converges (5+ seconds).
     if (prevPos && prevTime && currentTime) {
         var dtSec = (currentTime - prevTime) / 1000;
-        if (dtSec > 0 && dtSec < 120 &&
-            Math.abs(newPosition.lat - prevPos.lat) < 0.01 &&
-            Math.abs(newPosition.lng - prevPos.lng) < 0.01) {
-            window.lastVelocity = {
-                lat: (newPosition.lat - prevPos.lat) / dtSec,
-                lng: (newPosition.lng - prevPos.lng) / dtSec
-            };
-            window.smoothedVelocity = { lat: window.lastVelocity.lat, lng: window.lastVelocity.lng };
+        if (dtSec > 0 && dtSec < 120) {
+            var latVel = (newPosition.lat - prevPos.lat) / dtSec;
+            var lngVel = (newPosition.lng - prevPos.lng) / dtSec;
+
+            // ── Sanity check on computed velocity, not displacement ──
+            // Reject physically impossible velocities (>100 m/s = 224 MPH).
+            // The original 0.01° cap rejected legitimate large displacements
+            // (e.g. 5km drive with 10min background gap). This checks the
+            // resulting velocity instead, which is what actually matters.
+            var speedDegPerSec = Math.sqrt(latVel * latVel + lngVel * lngVel);
+            var speedMetersPerSec = speedDegPerSec * 111111 *
+                Math.cos((newPosition.lat || 0) * Math.PI / 180);
+
+            if (speedMetersPerSec < 100) {
+                window.lastVelocity = { lat: latVel, lng: lngVel };
+                window.smoothedVelocity = { lat: latVel, lng: lngVel };
+            } else {
+                window.lastVelocity     = { lat: 0, lng: 0 };
+                window.smoothedVelocity = { lat: 0, lng: 0 };
+            }
         } else {
             window.lastVelocity     = { lat: 0, lng: 0 };
             window.smoothedVelocity = { lat: 0, lng: 0 };
@@ -5969,24 +6144,14 @@ function _resetMapToPosition(newPosition, options) {
         window.smoothedVelocity = { lat: 0, lng: 0 };
     }
 
-    // Reset Kalman filter on large jumps/initialization.
-    // Ensures smoothPosition() reinitializes cleanly and seeds velocity.
     if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
         window.sensorFusion._kalmanFilter.reset();
 
-        // Seed displacement velocity into the filter after reset.
-        // Without this, the filter starts with zero velocity and must wait
-        // 2–3 GPS fixes to re-converge — causing visible marker lag after
-        // background recovery or large jumps.  The displacement velocity
-        // was computed above and stored in window.smoothedVelocity (deg/s).
-        // We convert it to m/s and stash it so that smoothPosition() can
-        // inject it as the initial velocity state when it reinitializes
-        // the filter on the next GPS tick.
         var sv = window.smoothedVelocity;
         if (sv && (Math.abs(sv.lat) > 1e-8 || Math.abs(sv.lng) > 1e-8)) {
             var cosLat = Math.cos((newPosition.lat || 0) * Math.PI / 180);
-            var vNorth = sv.lat * 111111;            // deg/s → m/s (north)
-            var vEast  = sv.lng * 111111 * cosLat;    // deg/s → m/s (east)
+            var vNorth = sv.lat * 111111;
+            var vEast  = sv.lng * 111111 * cosLat;
             window._pendingKalmanSeedVelocity = { vNorth: vNorth, vEast: vEast };
         }
     }
@@ -5995,7 +6160,6 @@ function _resetMapToPosition(newPosition, options) {
     window.stationaryLockPosition   = null;
     window.followUser               = true;
 
-    // Shared map operations
     var mapContainer       = map.getContainer();
     var originalTransition = mapContainer.style.transition;
     mapContainer.style.transition = 'none';
@@ -6031,8 +6195,6 @@ function _resetMapToPosition(newPosition, options) {
         userMarker.setLatLng([newPosition.lat, newPosition.lng]);
     }
 
-    // Restore transition after two rAFs to guarantee the suppressed
-    // transition frame has been composited.
     requestAnimationFrame(function () {
         requestAnimationFrame(function () {
             if (document.body && document.body.contains(mapContainer)) {
@@ -6041,7 +6203,6 @@ function _resetMapToPosition(newPosition, options) {
         });
     });
 
-    // Post-reset actions
     if (resetType === 'init') {
         if (typeof updateDistanceBox === 'function') {
             updateDistanceBox(forceUpdate);
@@ -6058,7 +6219,6 @@ function _resetMapToPosition(newPosition, options) {
         }
     }
 
-    // Viewport safety
     var speedMPS = (newPosition && isFinite(newPosition.speedMPS)) ? newPosition.speedMPS : 0;
     var speedMPH = speedMPS * 2.23694;
 
@@ -6099,10 +6259,9 @@ function _confirmStationary(newPosition, currentTime) {
     window.isStationary = true;
     window.stationaryLockPosition = { lat: newPosition.lat, lng: newPosition.lng };
 
-    /* ── Marker repositioning ── */
     if (userMarker && newPosition) {
         var currentLatLng = userMarker.getLatLng();
-        var finalDistance  = 0;
+        var finalDistance = Infinity; // Default to animated path
 
         if (currentLatLng && typeof currentLatLng.distanceTo === 'function' &&
             typeof L !== 'undefined' && typeof L.latLng === 'function') {
@@ -6117,11 +6276,15 @@ function _confirmStationary(newPosition, currentTime) {
                 easeLinearity: 0.06
             });
         } else {
-            scheduleMarkerUpdate(newPosition.lat, newPosition.lng);
+            // Micro-animation for perceptual smoothness even on tiny drift
+            scheduleMarkerUpdate(newPosition.lat, newPosition.lng, {
+                animate: true,
+                duration: 0.25,
+                easeLinearity: 0.06
+            });
         }
     }
 
-    /* ── Shared state updates ──────────────────────────────────────── */
     window.lastPosition   = newPosition;
     window.positionBuffer = [newPosition];
     window.lastUpdateTime = currentTime;
@@ -6138,16 +6301,37 @@ function _confirmStationary(newPosition, currentTime) {
  */
 function _resetProximityZoom() {
     try {
+        var hadControl = false;
         if (window._pzState && window._pzState.controlGranted && window.zoomController) {
             var currentState = window.zoomController.getState();
             if (currentState && currentState.currentSource === 'proximity') {
                 window.zoomController.release('proximity');
+                hadControl = true;
             }
         }
 
         window._proximityZoomActive = false;
 
-        // Re-initialize state object
+        // Only full reset if we actually had control or state is stale
+        if (hadControl || !window._pzState || window._pzState.currentLocationId != null) {
+            window._pzState = {
+                currentLocationId: null,
+                isZoomedIn: false,
+                lastTransitionTime: Date.now(),
+                lastZoomInTime: 0,
+                lastZoomOutTime: 0,
+                controlGranted: false
+            };
+        }
+
+        window.zoomedInState = false;
+        window.isNearLocation = false;
+        window.blockSpeedZoom = false;
+        window._proxZoomState = 'IDLE';
+        window._lastProxZoomTime = 0;
+
+    } catch (error) {
+        console.error('[PZ] Reset error:', error);
         window._pzState = {
             currentLocationId: null,
             isZoomedIn: false,
@@ -6156,26 +6340,12 @@ function _resetProximityZoom() {
             lastZoomOutTime: 0,
             controlGranted: false
         };
-
-        // Reset global proximity flags
-        window.zoomedInState = false;
-        window.isNearLocation = false;
-        window.blockSpeedZoom = false;
-        
-        // Reset new state machine variables
-        window._proxZoomState = 'IDLE';
-        window._lastProxZoomTime = 0;
-
-    } catch (error) {
-        console.error('[PZ] Reset error:', error);
-        window._pzState = null;
         window._proximityZoomActive = false;
     }
 }
 
 /**
  * Cleanup function (backward compatibility wrapper).
- * Delegates to the core reset logic.
  */
 function _cleanupProximityZoomState() {
     _resetProximityZoom();
@@ -6185,15 +6355,20 @@ function _cleanupProximityZoomState() {
 if (typeof window !== 'undefined') {
     window.addEventListener('beforeunload', function() {
         try {
+            if (window.sensorFusion && typeof window.sensorFusion.destroy === 'function') {
+                window.sensorFusion.destroy();
+            }
+            if (window.deadReckoning && typeof window.deadReckoning.stop === 'function') {
+                window.deadReckoning.stop();
+            }
             _resetProximityZoom();
-            delete window._pzState;
-            delete window.lastProximityCheck;
+            window.lastProximityCheck = null;
         } catch (error) {
             // Silent fail on cleanup
         }
 
         if (window._sharedAudioContext && window._sharedAudioContext.state !== 'closed') {
-            window._sharedAudioContext.close().catch(function() {});
+            try { window._sharedAudioContext.close(); } catch (_) {}
         }
     });
 }
@@ -6407,10 +6582,7 @@ function _enforceRoamingMode(markerPos, map, marker, speedMPH) {
         
 function updateDistanceBox(forceUpdate = false, precalcUserPos = null, precalcClosestLocation = null, precalcClosestDistance = Infinity) {
     const distanceBox = cachedElements.distanceBox || document.getElementById('distanceBox');
-    if (!distanceBox) {
-        console.warn('Distance box element not found');
-        return;
-    }
+    if (!distanceBox) return;
     if (document.hidden) return;
 
     if (!userMarker || !gameLocations || gameLocations.length === 0) {
@@ -6424,18 +6596,16 @@ function updateDistanceBox(forceUpdate = false, precalcUserPos = null, precalcCl
     let userPos;
 
     if (precalcUserPos && precalcClosestLocation && isFinite(precalcClosestDistance)) {
-        // Skip the loop — values already calculated this GPS tick.
         userPos = precalcUserPos;
         closestDistance = precalcClosestDistance;
         closestLocation = precalcClosestLocation;
-       } else {
+    } else {
         const latestPos = window.lastPosition;
         const userLatLng = latestPos
             ? { lat: latestPos.lat, lng: latestPos.lng }
             : (userMarker ? userMarker.getLatLng() : null);
 
         if (!userLatLng || !isFinite(userLatLng.lat) || !isFinite(userLatLng.lng)) {
-            console.warn('Invalid user coordinates:', userLatLng);
             distanceBox.textContent = 'Initializing...';
             resetDistanceBoxStyling(distanceBox);
             return;
@@ -6456,7 +6626,6 @@ function updateDistanceBox(forceUpdate = false, precalcUserPos = null, precalcCl
 
         for (const location of gameLocations) {
             if (!location || typeof location.lat !== 'number' || typeof location.lng !== 'number') {
-                console.warn('Invalid location data:', location);
                 continue;
             }
             const locationPos = { lat: location.lat, lng: location.lng };
@@ -6468,7 +6637,6 @@ function updateDistanceBox(forceUpdate = false, precalcUserPos = null, precalcCl
         }
 
         if (!isFinite(closestDistance) || closestDistance === Infinity || !closestLocation) {
-            console.warn('No valid distances calculated - locations may not be ready');
             distanceBox.textContent = 'Initializing...';
             resetDistanceBoxStyling(distanceBox);
             return;
@@ -6497,8 +6665,6 @@ function updateDistanceBox(forceUpdate = false, precalcUserPos = null, precalcCl
         isOnCooldown = !!cooldownStatus?.isOnCooldown;
     }
 
-    // rafId is stored on window so _stopCountdown can cancel it even when called
-    // from outside the closure that started the countdown.
     function _stopCountdown() {
         if (window._countdownRafId) {
             cancelAnimationFrame(window._countdownRafId);
@@ -6552,7 +6718,6 @@ function updateDistanceBox(forceUpdate = false, precalcUserPos = null, precalcCl
                         return;
                     }
 
-                    // Re-read from window to avoid stale closure value.
                     const currentClosest = window.lastClosestLocation;
                     if (!currentClosest?.id || !window.cooldownManager) {
                         _stopCountdown();
@@ -6601,8 +6766,6 @@ function updateDistanceBox(forceUpdate = false, precalcUserPos = null, precalcCl
                     scheduleNext();
                 };
 
-                // true keeps existing `if (window.distanceBoxCountdownInterval)` checks
-                // working without storing a numeric interval ID.
                 window.distanceBoxCountdownInterval = true;
                 tick();
 
@@ -6638,7 +6801,6 @@ function updateDistanceBox(forceUpdate = false, precalcUserPos = null, precalcCl
                             );
                             if ((dist * 3.28084) <= PROXIMITY_THRESHOLD &&
                                 typeof window._openLocationPage === 'function') {
-                                console.log('[Cooldown] Guaranteed expiry timeout fired — opening location', locId);
                                 window._openLocationPage(loc);
                             }
                         }
@@ -6677,11 +6839,9 @@ function updateDistanceBox(forceUpdate = false, precalcUserPos = null, precalcCl
         }
     }
 
-    applyBorderStyling(distanceBox, closestLocation, distanceFeet, isArrived);
-
     window.currentlyArrived = isArrived && !isOnCooldown;
 }
-        
+
 function resetDistanceBoxStyling(element) {
     element.style.background = 'white';
     element.style.color = 'var(--dark-blue)';
@@ -6699,26 +6859,6 @@ function applyDefaultStyling(element) {
     element.style.background = 'white';
     element.style.color = 'var(--dark-blue)';
     element.style.fontWeight = 'normal';
-}
-
-function applyBorderStyling(element, closestLocation, distanceFeet, isArrived) {
-    if (isArrived) {
-        // When arrived, use dark red border
-        element.style.border = '3px solid darkred';
-    } else if (closestLocation && closestLocation.markerColor) {
-        // When not arrived, use location-based border
-        let borderStyle = '';
-        if (distanceFeet <= 100) {
-            borderStyle = `3px solid ${closestLocation.markerColor}`;
-        } else if (distanceFeet <= 500) {
-            borderStyle = `2px solid ${closestLocation.markerColor}`;
-        } else {
-            borderStyle = `1px solid ${closestLocation.markerColor}`;
-        }
-        element.style.border = borderStyle;
-    } else {
-        element.style.border = '3px solid var(--dark-blue)';
-    }
 }
         
 function calculateDistance(pos1OrLat, pos2OrLng, lat2, lng2) {
@@ -6786,12 +6926,13 @@ function calculateDistance(pos1OrLat, pos2OrLng, lat2, lng2) {
 
 function getGeolocationOptions(speedMPS = 0) {
     const isStationary = speedMPS < 0.5;
-    const isMoving = speedMPS >= 2;
+    const isWalking = speedMPS >= 0.5 && speedMPS < 3;
+    const isMoving = speedMPS >= 3;
     
     return {
-        enableHighAccuracy: true, 
-        timeout: isMoving ? 15000 : isStationary ? 30000 : 20000,
-        maximumAge: isStationary ? 15000 : isMoving ? 2000 : 5000
+        enableHighAccuracy: true,
+        timeout: isMoving ? 10000 : isWalking ? 15000 : 30000,
+        maximumAge: isMoving ? 1000 : isWalking ? 3000 : 15000
     };
 }
 
@@ -6870,12 +7011,10 @@ function handleLocationError(error) {
 
 function showPopup(title, message, type = "info", callback = null) {
     console.log("showPopup called with:", title, message);
-    
+
     const existingPopups = document.querySelectorAll(".popup-overlay");
-    existingPopups.forEach(popup => {
-        popup.remove();
-    });
-    
+    existingPopups.forEach(popup => popup.remove());
+
     const overlay = document.createElement("div");
     overlay.className = "popup-overlay";
     overlay.setAttribute("role", "dialog");
@@ -6888,86 +7027,106 @@ function showPopup(title, message, type = "info", callback = null) {
     overlay.style.height = "100%";
     overlay.style.backgroundColor = "rgba(0, 0, 0, 0.7)";
     overlay.style.zIndex = "9999";
-    
+    overlay.style.display = "flex";
+    overlay.style.alignItems = "center";
+    overlay.style.justifyContent = "center";
+
     const typeColors = {
         info: "#2c5282",
         success: "#276749",
         warning: "#c05621",
         error: "#c53030"
     };
-    
+
     const popupContainer = document.createElement("div");
     popupContainer.className = "popup-container";
-    popupContainer.style.position = "absolute";
-    popupContainer.style.left = "50%";
-    popupContainer.style.top = "50%";
-    popupContainer.style.transform = "translate(-50%, -50%)";
     popupContainer.style.backgroundColor = "white";
-    popupContainer.style.borderRadius = "8px";
-    popupContainer.style.padding = "20px";
-    popupContainer.style.width = "300px";
-    popupContainer.style.maxWidth = "90%";
-    popupContainer.style.boxShadow = "0 4px 15px rgba(0, 0, 0, 0.2)";
-    
+    popupContainer.style.borderRadius = "12px";
+    popupContainer.style.padding = "24px";
+    popupContainer.style.width = "280px";
+    popupContainer.style.maxWidth = "85%";
+    popupContainer.style.boxShadow = "0 8px 32px rgba(0, 0, 0, 0.3)";
+
     const titleElement = document.createElement("h3");
     titleElement.textContent = title;
-    titleElement.style.margin = "0 0 15px 0";
+    titleElement.style.margin = "0 0 12px 0";
     titleElement.style.textAlign = "center";
-    titleElement.style.color = "#333";
-    
+    titleElement.style.color = "#1a1a1a";
+    titleElement.style.fontSize = "18px";
+    titleElement.style.fontWeight = "600";
+
     const messageElement = document.createElement("p");
     messageElement.textContent = message;
     messageElement.style.margin = "0 0 20px 0";
     messageElement.style.textAlign = "center";
     messageElement.style.color = "#555";
-    
-    const button = document.createElement("button");
-    button.textContent = "OK";
-    button.style.display = "block";
-    button.style.margin = "0 auto";
-    button.style.padding = "8px 20px";
-    button.style.backgroundColor = typeColors[type] || typeColors.info;
-    button.style.color = "white";
-    button.style.border = "none";
-    button.style.borderRadius = "4px";
-    button.style.cursor = "pointer";
-    button.style.touchAction = "manipulation"; // Prevents 300ms delay and double-tap zoom
-    
+    messageElement.style.fontSize = "15px";
+    messageElement.style.lineHeight = "1.5";
+
+    const closeButton = document.createElement("button");
+    closeButton.textContent = "Close";
+    closeButton.style.display = "block";
+    closeButton.style.width = "100%";
+    closeButton.style.margin = "0";
+    closeButton.style.padding = "14px 0";
+    closeButton.style.backgroundColor = typeColors[type] || typeColors.info;
+    closeButton.style.color = "white";
+    closeButton.style.border = "none";
+    closeButton.style.borderRadius = "8px";
+    closeButton.style.cursor = "pointer";
+    closeButton.style.fontSize = "16px";
+    closeButton.style.fontWeight = "500";
+    closeButton.style.touchAction = "manipulation";
+    closeButton.style.webkitTapHighlightColor = "transparent";
+
     function closePopup() {
-        overlay.remove();
-        document.body.style.overflow = ""; // Restore background scrolling
-        if (callback && typeof callback === 'function') {
-            callback();
-        }
+        overlay.style.opacity = "0";
+        setTimeout(() => {
+            overlay.remove();
+            if (window._popupOriginalOverflow !== undefined) {
+                document.body.style.overflow = window._popupOriginalOverflow;
+                window._popupOriginalOverflow = undefined;
+            }
+            if (callback && typeof callback === 'function') {
+                callback();
+            }
+        }, 150);
     }
-    
-    button.addEventListener("click", closePopup);
-    
+
+    closeButton.addEventListener("click", closePopup);
+
     overlay.addEventListener("click", function(e) {
         if (e.target === overlay) {
             closePopup();
         }
     });
-    
-    // Lock background scrolling when popup is open
+
+    if (window._popupOriginalOverflow === undefined) {
+        window._popupOriginalOverflow = document.body.style.overflow || "";
+    }
     document.body.style.overflow = "hidden";
-    
+
     popupContainer.appendChild(titleElement);
     popupContainer.appendChild(messageElement);
-    popupContainer.appendChild(button);
+    popupContainer.appendChild(closeButton);
     overlay.appendChild(popupContainer);
     document.body.appendChild(overlay);
-    
-    button.focus();
+
+    // Trigger fade-in
+    overlay.style.opacity = "0";
+    overlay.style.transition = "opacity 150ms ease-out";
+    requestAnimationFrame(() => {
+        overlay.style.opacity = "1";
+    });
 }
         
-let recenterTimer;            
+let recenterTimer;
 
 function recenterMap() {
     const btn = cachedElements?.recenterButton ?? document.getElementById('recenterButton');
     if (!btn || !userMarker?.getLatLng()) return;
 
-    btn.disabled = true;                 // block spam
+    btn.disabled = true;
     btn.style.backgroundColor = 'var(--primary-color)';
     btn.style.color = 'white';
 
@@ -6980,6 +7139,7 @@ function recenterMap() {
     });
 
     followUser = true;
+    window.followUser = true;
     announceToScreenReader('Map re-centred on your location');
 
     clearTimeout(recenterTimer);
@@ -6987,6 +7147,7 @@ function recenterMap() {
         btn.style.backgroundColor = 'white';
         btn.style.color = 'var(--primary-color)';
         btn.disabled = false;
+        recenterTimer = null;
     }, 500);
 }
 
@@ -6996,7 +7157,7 @@ const STORAGE_KEY = 'locationCooldowns';
 const DEBOUNCE_TIME_MS = ('ontouchstart' in window || navigator.maxTouchPoints > 0) ? 500 : 300;
 const CLEANUP_INTERVAL_MS = 60 * 1000;
 const MAP_RESET_CHECK_INTERVAL_MS = 5000;
-const EXIT_DELAY_MS = 500; // Kept because patchCloseFunctions/polling might rely on constants existing, though unused by UI now
+const EXIT_DELAY_MS = 500;
 
 class LocationCooldownManager {
   constructor() {
@@ -7022,9 +7183,6 @@ class LocationCooldownManager {
     this.mapResetInterval = null;
     this.toastInterval = null;
     this.activeToast = null;
-
-    // REMOVED: All state related to centered popups, corner badges, dismissals, and exit delays
-    // REMOVED: _centeredPopupTimeout, _exitTimeout, _badgeDismissed, _currentDisplayMode
 
     this.cleanupExpiredCooldowns();
     this.startPeriodicCleanup();
@@ -7199,7 +7357,8 @@ class LocationCooldownManager {
           latitude: window.lastPosition.lat,
           longitude: window.lastPosition.lng,
           accuracy: window.lastPosition.accuracy || 20,
-          speed: (window.currentSpeed || 0) / 2.23694,
+          // ── CHANGED: Use existing m/s value instead of converting from MPH ──
+          speed: window.lastPosition?.speedMPS || 0,
           heading: window.lastPosition.heading || null
         },
         timestamp: Date.now()
@@ -7325,11 +7484,14 @@ class LocationCooldownManager {
         return false;
       }
 
-      const distanceFeet = calculateDistance(userPos.lat, userPos.lng, lat, lng);
-      if (!isFinite(distanceFeet) || distanceFeet < 0) {
+      // ── CalculateDistance returns meters, convert to feet before comparing ──
+      const distanceMeters = calculateDistance(userPos.lat, userPos.lng, lat, lng);
+      if (!isFinite(distanceMeters) || distanceMeters < 0) {
         this._setProximityCache(cacheKey, false);
         return false;
       }
+
+      const distanceFeet = distanceMeters * 3.28084;
 
       const threshold = (typeof CONFIG?.DISTANCE_THRESHOLD === 'number')
         ? CONFIG.DISTANCE_THRESHOLD
@@ -7345,9 +7507,6 @@ class LocationCooldownManager {
     }
   }
 
-  // Stripped out all dead UI rendering logic. The interval 
-  // remains because it is necessary to detect the exact second the 
-  // cooldown expires to trigger the auto-open functionality.
   notifyUserWithCountdown(locationId, remainingSeconds) {
     if (this._monitoringLocationId === locationId) {
         return;
@@ -7373,9 +7532,6 @@ class LocationCooldownManager {
             this._handleCooldownExpired(locationId, isNearby);
             return;
         }
-        
-        // The upper right distance box handles its own UI updates via its own mechanisms.
-        // No custom UI rendering needed here anymore.
     };
 
     updateCheck();
@@ -7399,8 +7555,6 @@ class LocationCooldownManager {
     }
   }
 
-  // No more complex state transitions, 
-  // DOM elements, or timeouts to manage.
   clearToast() {
     this.clearToastInterval();
     this._monitoringLocationId = null;
@@ -7540,6 +7694,9 @@ class LocationCooldownManager {
     this._monitoringLocationId = null;
     this._announcedLocations.clear();
     this._prefsChecked.clear();
+
+    // ── Null the global reference so external code knows it's gone ──
+    window.cooldownManager = null;
   }
 
   resetSessionPreferences() { this.clearSessionPrefs(); }
@@ -7594,7 +7751,9 @@ window._openLocationPage = function(location) {
     
     if (window.cooldownManager.currentLocationId === String(location.id)) {
       const lochuntContainer = document.querySelector('.lochunt-container');
-      const pageIsActuallyOpen = lochuntContainer && lochuntContainer.style.display !== 'none';
+      // ── Use computed style instead of inline style ──
+      const pageIsActuallyOpen = lochuntContainer && 
+          getComputedStyle(lochuntContainer).display !== 'none';
       if (!pageIsActuallyOpen) {
         window.cooldownManager.currentLocationId = null;
       }
@@ -7605,10 +7764,6 @@ window._openLocationPage = function(location) {
   }
   
   if (typeof window.showLocationHunt === 'function') {
-    // Pass source:'proximity' so showLocationHunt skips its debounce.
-    // The proximity system (_handleTriggerZone) already has its own
-    // per-location debounce — the global debounce in showLocationHunt
-    // is only needed for manual (tap) interactions.
     window.showLocationHunt(location, { source: 'proximity' });
   }
 };
@@ -8706,25 +8861,17 @@ function handleContinueClick() {
     window.isLocationHuntVisible = false;
     clearStationaryState();
 
-    // ── Reset all proximity state ──
     window.zoomedInState = false;
     window.isNearLocation = false;
     window.blockSpeedZoom = false;
     window.currentProximityLocationId = null;
 
-    // Reset proximity zoom state machine
     window._proxZoomState = 'IDLE';
-    // Use a short cooldown so the user doesn't immediately re-open
-    // the same location, but don't lock them out for 2 full seconds
     window._lastProxZoomTime = Date.now();
-
-    // Do NOT force _currentProximityZone to 'OUTSIDE'
-    // window._currentProximityZone = 'OUTSIDE';  // REMOVED
 
     window._inProximityZone = false;
     window._proximityZoomActive = false;
 
-    // Cancel any in-progress proximity zoom animation
     if (window._isProximityZoomAnimating && map) {
         if (typeof map.stop === 'function') map.stop();
         window._isProximityZoomAnimating = false;
@@ -8735,7 +8882,6 @@ function handleContinueClick() {
         }
     }
 
-    // Clean up countdown visibility handler
     if (window._countdownVisibilityHandler) {
         document.removeEventListener('visibilitychange', window._countdownVisibilityHandler);
         window._countdownVisibilityHandler = null;
@@ -8767,13 +8913,18 @@ function handleContinueClick() {
         }
     }
 
-    if (map && window.lastPosition) {
+    const userLL = userMarker?.getLatLng?.();
+    const centerLatLng = userLL || (window.lastPosition ?
+        { lat: window.lastPosition.lat, lng: window.lastPosition.lng } :
+        null);
+
+    if (map && centerLatLng) {
         window.isMapInteracting = false;
         window.followUser = true;
         window._blockAutoMapUpdates = true;
 
         map.setView(
-            [window.lastPosition.lat, window.lastPosition.lng],
+            [centerLatLng.lat, centerLatLng.lng],
             map.getZoom(),
             { animate: true, duration: 0.6, easeLinearity: 0.18 }
         );
@@ -8812,8 +8963,24 @@ function clearStationaryState() {
 }
         
 function ensureGPSActive() {
-    if (window.positionWatchId === undefined || window.positionWatchId === null) {
+    const GPS_HEARTBEAT_MS = 15000; // 15 seconds without a fix = dead
+
+    if (window.positionWatchId == null) {
         console.log("GPS watch inactive - restarting");
+        startPositionUpdates();
+        return;
+    }
+
+    const lastFixAge = window.lastUpdateTimestamp
+        ? (Date.now() - window.lastUpdateTimestamp)
+        : Infinity;
+
+    if (lastFixAge > GPS_HEARTBEAT_MS) {
+        console.log(`GPS watch stale (${Math.round(lastFixAge / 1000)}s) - restarting`);
+        if (window.positionWatchId != null) {
+            navigator.geolocation.clearWatch(window.positionWatchId);
+            window.positionWatchId = null;
+        }
         startPositionUpdates();
     } else {
         console.log("GPS watch active - awaiting fresh updates");
@@ -8939,7 +9106,6 @@ function _restoreFullTracking() {
 function showLocationSummary(locationId) {
   const location = (window.gameLocations || locations).find(loc => String(loc.id) === String(locationId));
   if (!location || !location.summary) {
-    console.log("Location or summary not found. Location ID:", locationId);
     showPopup("Error", "Summary not available for this location.");
     return;
   }
@@ -9212,16 +9378,15 @@ function startHunt() {
     window.gameLocations = gameLocations;
     lastVisitedLocationId = null;
     loadAllLocations();
-    startIdleProximityCheck(); 
 
-    // iOS PWA Recovery
+    // iOS PWA Recovery — do this before starting proximity checks
+    var recovered = false;
     try {
         const activeLocationId = localStorage.getItem('activeLocationId');
         if (activeLocationId) {
-            console.log('[Recovery] Found active location, restoring:', activeLocationId);
             const location = gameLocations.find(loc => String(loc.id) === String(activeLocationId));
-            
             if (location) {
+                recovered = true;
                 requestAnimationFrame(() => {
                     if (typeof showLocationHunt === 'function') {
                         showLocationHunt(location);
@@ -9235,10 +9400,15 @@ function startHunt() {
     } catch (e) {
         console.warn('[Recovery] Failed to restore session:', e);
     }
+
+    // Only start proximity checks if not recovering into a location
+    if (!recovered) {
+        startIdleProximityCheck();
+    }
 }
         
 function getMarkerColor(tours) {
-    if (!tours) return '#0f2bab';
+    if (typeof tours !== 'string') return '#0f2bab';
     
     switch (tours.toLowerCase()) {
         case 'person':
@@ -9255,11 +9425,20 @@ function getMarkerColor(tours) {
 }
 
 function showAppMessage(appName, redirectUrl) {
-    // Escape dynamic text to prevent XSS
     const esc = (str) => typeof str === 'string' 
         ? str.replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])) 
         : '';
     const safeName = esc(appName);
+
+    let safeUrl = '';
+    if (redirectUrl) {
+        try {
+            const url = new URL(redirectUrl, window.location.href);
+            if (url.protocol === 'http:' || url.protocol === 'https:') {
+                safeUrl = url.href;
+            }
+        } catch (e) {}
+    }
 
     const messageEl = document.createElement('div');
     messageEl.style.cssText = `
@@ -9279,10 +9458,11 @@ function showAppMessage(appName, redirectUrl) {
     
     document.body.appendChild(messageEl);
     
-    // Tracked so memory manager can clean it up on page unload
     createTrackedTimeout(() => {
         messageEl.remove();
-        window.location.href = redirectUrl;
+        if (safeUrl) {
+            window.location.href = safeUrl;
+        }
     }, 3000);
 }
 
@@ -9326,17 +9506,15 @@ function createMarkersOnly() {
         const markerColor = getMarkerColor(location.tours);
         location.markerColor = markerColor;
         
-        // Sanitize dynamic data to prevent XSS in popup HTML
         const safeName = esc(String(location.name));
         const safeId = esc(String(location.id));
         const safeImage = esc(String(location.image));
         
-        // Validate URL to prevent javascript: protocol injection
         let safeLink = '';
         if (location.link) {
             try {
-                const url = new URL(location.link);
-                if (url.protocol === "http:" || url.protocol === "https:") safeLink = url.href;
+                const url = new URL(location.link, window.location.href);
+                if (url.protocol === 'http:' || url.protocol === 'https:') safeLink = url.href;
             } catch (e) {}
         }
 
@@ -9353,7 +9531,7 @@ function createMarkersOnly() {
         
         const popupContent = `
             <div class="popup-content">
-                <img loading="lazy" src="${safeImage}" alt="${safeName}" class="location-image">
+                <img loading="eager" src="${safeImage}" alt="${safeName}" class="location-image">
                 <h4 class="location-name">
                     ${safeLink ? `<a href="${safeLink}" target="_blank" rel="noopener noreferrer" style="text-decoration: none; color: inherit;">${safeName}</a>` : safeName}
                 </h4>
