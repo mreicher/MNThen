@@ -5385,9 +5385,17 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
     const PROX_ZOOM_OUT = 17;
     const MAX_PROX_SPEED_MPH = 10;
     const PROX_COOLDOWN_MS = 400;
+    const ANIMATION_STUCK_TIMEOUT_MS = 3000;
 
     if (window._proxZoomTargetLevel == null) window._proxZoomTargetLevel = PROX_ZOOM_OUT;
-    if (window._proxZoomCurrentLevel == null) window._proxZoomCurrentLevel = PROX_ZOOM_OUT;
+
+    // Sync current level from the real map zoom so stale state
+    // left over after a location page close doesn't poison calculations.
+    if (map) {
+        window._proxZoomCurrentLevel = map.getZoom();
+    } else if (window._proxZoomCurrentLevel == null) {
+        window._proxZoomCurrentLevel = PROX_ZOOM_OUT;
+    }
 
     window._proxSpeedEMA = window._proxSpeedEMA ?? speedMPH;
     window._proxSpeedEMA = 0.6 * speedMPH + 0.4 * window._proxSpeedEMA;
@@ -5419,7 +5427,24 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
         return;
     }
 
-    if (window._isProximityZoomAnimating) return;
+    // Escape hatch — if the animating flag has been stuck for longer
+    // than ANIMATION_STUCK_TIMEOUT_MS, Leaflet never fired the completion
+    // events. Clear it so the proximity system can recover.
+    if (window._isProximityZoomAnimating) {
+        const flagAge = Date.now() - (window._proxZoomAnimationStartTime || 0);
+        if (flagAge > ANIMATION_STUCK_TIMEOUT_MS) {
+            console.warn('[ProximityZoom] Animation flag stuck for', flagAge, 'ms — clearing');
+            // Call the cleanup function properly instead of just clearing the flag
+            if (typeof window._currentProximityZoomCleanup === 'function') {
+                window._currentProximityZoomCleanup();
+            } else {
+                window._isProximityZoomAnimating = false;
+                window.isMapInteracting = false;
+            }
+        } else {
+            return;
+        }
+    }
 
     const now = Date.now();
 
@@ -5562,12 +5587,14 @@ function _executeProximityZoom(targetZoom, nextState, eastWestMove) {
     window._lastProxZoomTime = Date.now();
     window._proxZoomState = nextState;
     window._isProximityZoomAnimating = true;
+    window._proxZoomAnimationStartTime = Date.now(); // timestamp for stuck detection
 
     const zoomDur = Math.min(0.6, Math.max(0.2, zoomDelta * 0.2));
     const userLL = userMarker?.getLatLng?.();
 
     if (!userLL) {
         window._isProximityZoomAnimating = false;
+        window._proxZoomAnimationStartTime = null;
         return;
     }
 
@@ -5579,10 +5606,6 @@ function _executeProximityZoom(targetZoom, nextState, eastWestMove) {
         const closestLoc = window.proximityState?.closestLocation;
         const locationLL = closestLoc ? L.latLng(closestLoc.lat, closestLoc.lng) : null;
 
-        // ── Only shift center if location is actually off-screen.
-        // If visible, center stays exactly on user (original behavior).
-        // If off-screen, shift minimally to bring it in while keeping
-        // user in center 60% of viewport.
         const targetCenter = (targetZoom >= 18 && locationLL)
             ? _computeFramingCenter(userLL, locationLL, targetZoom)
             : userLL;
@@ -5593,7 +5616,9 @@ function _executeProximityZoom(targetZoom, nextState, eastWestMove) {
             easeLinearity: 0.25
         });
 
-        _attachProximityZoomEndHandler(zoomDur * 1000 + 1000);
+        // Shorter fallback — zoomDur is at most 600ms, so 600ms + 500ms
+        // = 1100ms total is plenty. The original 1600ms created a long dead window.
+        _attachProximityZoomEndHandler((zoomDur * 1000) + 500);
     });
 }
 
@@ -5604,13 +5629,26 @@ function _cleanupProximityZoomAnimation() {
         try { map.stop(); } catch (_) {}
     }
 
-    if (window._currentProximityZoomCleanup && map) {
-        map.off('moveend', window._currentProximityZoomCleanup);
-        map.off('zoomend', window._currentProximityZoomCleanup);
-        window._currentProximityZoomCleanup = null;
+    // Remove the ACTUAL onDone listener, not the cleanup wrapper.
+    // The old code did map.off('moveend', window._currentProximityZoomCleanup)
+    // which removed nothing because _currentProximityZoomCleanup was never
+    // registered as a listener — onDone was.
+    if (window._proxZoomOnDone && map) {
+        map.off('moveend', window._proxZoomOnDone);
+        map.off('zoomend', window._proxZoomOnDone);
+        window._proxZoomOnDone = null;
     }
 
-    window._isProximityZoomAnimating = false;
+    // Call the cleanup function to properly handle the fallback timeout
+    // and handled flag, instead of just clearing the flag manually.
+    if (typeof window._currentProximityZoomCleanup === 'function') {
+        window._currentProximityZoomCleanup();
+    } else {
+        // Fallback if cleanup function is missing
+        window._isProximityZoomAnimating = false;
+        window._proxZoomAnimationStartTime = null;
+        window.isMapInteracting = false;
+    }
 }
 
 function _resetProximityZoomSmoothing() {
@@ -5620,6 +5658,8 @@ function _resetProximityZoomSmoothing() {
     window._proxZoomTargetLevel = 17;
     window._proxZoomCurrentLevel = 17;
     window._proxSpeedEMA = null;
+    window._proxZoomAnimationStartTime = null; 
+    window._proxZoomOnDone = null; clear stored listener reference
     if (window._lastProxZoomTimeByDir) {
         window._lastProxZoomTimeByDir.IN = 0;
         window._lastProxZoomTimeByDir.OUT = 0;
@@ -5630,6 +5670,8 @@ function _attachProximityZoomEndHandler(fallbackMs) {
     let handled = false;
     let fallbackId = null;
 
+    // Store onDone reference on window so _cleanupProximityZoomAnimation
+    // can remove the ACTUAL listener, not the cleanup function.
     const onDone = () => {
         if (handled) return;
         handled = true;
@@ -5642,13 +5684,20 @@ function _attachProximityZoomEndHandler(fallbackMs) {
         if (fallbackId) { clearTimeout(fallbackId); fallbackId = null; }
 
         window._isProximityZoomAnimating = false;
+        window._proxZoomAnimationStartTime = null; // FIX
         window._currentProximityZoomCleanup = null;
+        window._proxZoomOnDone = null; // FIX: clear the stored reference
         window.isMapInteracting = false;
 
         if (map && typeof map.invalidateSize === 'function') {
             map.invalidateSize({ animate: false, debounceMoveend: true });
         }
     };
+
+    // Store onDone so _cleanupProximityZoomAnimation can remove the
+    // actual listener instead of trying to remove _currentProximityZoomCleanup
+    // (which was never registered as a listener — it's the cleanup wrapper).
+    window._proxZoomOnDone = onDone;
 
     if (map) {
         map.on('moveend', onDone);
@@ -5664,8 +5713,10 @@ function _attachProximityZoomEndHandler(fallbackMs) {
             }
             if (fallbackId) { clearTimeout(fallbackId); fallbackId = null; }
             window._isProximityZoomAnimating = false;
-            window.isMapInteracting = false;
+            window._proxZoomAnimationStartTime = null;
             window._currentProximityZoomCleanup = null;
+            window._proxZoomOnDone = null;
+            window.isMapInteracting = false;
         }
     };
 
@@ -6102,6 +6153,11 @@ function _confirmStationary(newPosition, currentTime) {
  */
 function _resetProximityZoom() {
     try {
+        If an animation is running, clean it up properly
+        if (window._isProximityZoomAnimating) {
+            _cleanupProximityZoomAnimation();
+        }
+
         var hadControl = false;
         if (window._pzState && window._pzState.controlGranted && window.zoomController) {
             var currentState = window.zoomController.getState();
@@ -6113,7 +6169,6 @@ function _resetProximityZoom() {
 
         window._proximityZoomActive = false;
 
-        // Only full reset if we actually had control or state is stale
         if (hadControl || !window._pzState || window._pzState.currentLocationId != null) {
             window._pzState = {
                 currentLocationId: null,
@@ -6130,6 +6185,7 @@ function _resetProximityZoom() {
         window.blockSpeedZoom = false;
         window._proxZoomState = 'IDLE';
         window._lastProxZoomTime = 0;
+        window._proxZoomAnimationStartTime = null; // FIX
 
     } catch (error) {
         console.error('[PZ] Reset error:', error);
@@ -6142,6 +6198,8 @@ function _resetProximityZoom() {
             controlGranted: false
         };
         window._proximityZoomActive = false;
+        window._isProximityZoomAnimating = false; // FIX
+        window._proxZoomAnimationStartTime = null; // FIX
     }
 }
 
@@ -8669,18 +8727,37 @@ function handleContinueClick() {
 
     window._proxZoomState = 'IDLE';
     window._lastProxZoomTime = Date.now();
+    
+    // Reset the proximity zoom level and animation tracking state
+    // so the next approach doesn't get blocked by stale values left over
+    // from the location page that just closed.
+    window._proxZoomCurrentLevel = map ? map.getZoom() : 17;
+    window._proxZoomAnimationStartTime = null;
+    window._proxZoomOnDone = null;
 
     window._inProximityZone = false;
     window._proximityZoomActive = false;
 
+    // Properly clean up any running proximity zoom animation.
+    // The old code tried to remove _currentProximityZoomCleanup as a map listener,
+    // but it was never registered as one (the internal onDone was). This left
+    // onDone dangling and the fallback timeout running.
     if (window._isProximityZoomAnimating && map) {
-        if (typeof map.stop === 'function') map.stop();
-        window._isProximityZoomAnimating = false;
-        if (window._currentProximityZoomCleanup) {
-            map.off('moveend', window._currentProximityZoomCleanup);
-            map.off('zoomend', window._currentProximityZoomCleanup);
-            window._currentProximityZoomCleanup = null;
+        if (typeof window._currentProximityZoomCleanup === 'function') {
+            window._currentProximityZoomCleanup();
+        } else {
+            // Fallback if the cleanup wrapper is missing
+            if (typeof map.stop === 'function') map.stop();
+            
+            // Remove the ACTUAL listener that was registered
+            if (window._proxZoomOnDone) {
+                map.off('moveend', window._proxZoomOnDone);
+                map.off('zoomend', window._proxZoomOnDone);
+                window._proxZoomOnDone = null;
+            }
+            window._isProximityZoomAnimating = false;
         }
+        window._proxZoomAnimationStartTime = null;
     }
 
     if (window._countdownVisibilityHandler) {
