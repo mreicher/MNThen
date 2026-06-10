@@ -1367,6 +1367,21 @@ class EnterpriseBackgroundSync {
 
 /* ──────────────────────────────────────────────
    SENSOR FUSION — Device Orientation for heading
+   Merged v1 + v2. Walking-optimized.
+   All public APIs identical to v1. Drop-in replacement.
+
+   Changes vs v1:
+   - getHeading(): smooth speed-blended GPS/compass fusion
+     instead of hard switch at 2 m/s
+   - Compass EMA pre-filter before glitch rejection
+     (reduces phantom heading jumps from magnetic interference)
+   - PositionKalmanFilter: soft re-init on long GPS gaps (>30s)
+     preserves heading + speed instead of wiping state
+   - PositionKalmanFilter: pedestrian noise curve (lower accel
+     noise at walking speed for tighter position tracking)
+   - PositionKalmanFilter: predictToTime() for optional use
+   - OneEuroFilter added (used only for heading display)
+   - Dead reckoning loop: unchanged from v1 (it works)
    ────────────────────────────────────────────── */
 class SensorFusionManager {
     constructor() {
@@ -1389,6 +1404,15 @@ class SensorFusionManager {
         this._lastMovementTime = 0;
         this._accelGestureHandler = null;
         this._accelPendingPermission = false;
+
+        // One-Euro filter for heading display smoothness
+        // Low beta keeps it tight; minCutoff 0.8 is gentle enough for walking turns
+        this._headingFilter = new OneEuroFilter({ minCutoff: 0.8, beta: 0.02 });
+
+        // EMA pre-filter for raw compass — absorbs magnetic interference spikes
+        // before the glitch-rejection threshold sees them
+        this._rawCompassHeading = null;
+        this._compassAlpha = 0.15; // lower = smoother but more lag; 0.15 is good for walking
     }
 
     init() {
@@ -1400,8 +1424,9 @@ class SensorFusionManager {
 
     _initKalmanFilter() {
         this._kalmanFilter = new PositionKalmanFilter({
-            accelNoise: 1.0,
-            measurementNoise: 15,
+            accelNoise: 1.0,            // v1 default preserved
+            measurementNoise: 15,       // v1 default preserved
+            noiseCurve: 'pedestrian',   // walking-optimized noise schedule
         });
     }
 
@@ -1452,16 +1477,42 @@ class SensorFusionManager {
             const accuracy = e.webkitCompassAccuracy ?? null;
 
             if (heading != null && isFinite(heading) && heading >= 0 && heading < 360) {
-                if (this.deviceHeading != null) {
-                    let diff = Math.abs(heading - this.deviceHeading);
-                    if (diff > 180) diff = 360 - diff;
 
-                    // Reject sensor glitches (>150°) and poor-accuracy jumps (>45°)
-                    if (diff > 150) return;
-                    if (diff > 45 && (accuracy == null || accuracy > 25)) return;
+                // EMA pre-filter: absorbs small jitter and magnetic interference.
+                // Large changes (>30°) pass through immediately so genuine turns
+                // aren't delayed. This runs before glitch rejection so the
+                // rejection threshold operates on already-smoothed data.
+                if (this._rawCompassHeading == null) {
+                    this._rawCompassHeading = heading;
+                } else {
+                    let diff = Math.abs(heading - this._rawCompassHeading);
+                    if (diff > 180) diff = 360 - diff;
+                    if (diff < 30) {
+                        // Circular EMA — handles 359°→1° wraparound correctly
+                        let delta = heading - this._rawCompassHeading;
+                        if (delta > 180) delta -= 360;
+                        if (delta < -180) delta += 360;
+                        this._rawCompassHeading = (this._rawCompassHeading + this._compassAlpha * delta + 360) % 360;
+                    } else {
+                        // Large change — pass through, may be a real fast turn
+                        this._rawCompassHeading = heading;
+                    }
                 }
 
-                this.deviceHeading = heading;
+                const filteredHeading = this._rawCompassHeading;
+
+                if (this.deviceHeading != null) {
+                    let diff = Math.abs(filteredHeading - this.deviceHeading);
+                    if (diff > 180) diff = 360 - diff;
+
+                    // Glitch rejection on the pre-filtered value.
+                    // Thresholds slightly relaxed vs v1 because EMA already
+                    // absorbed minor jitter before we get here.
+                    if (diff > 150) return;
+                    if (diff > 60 && (accuracy == null || accuracy > 25)) return;
+                }
+
+                this.deviceHeading = filteredHeading;
                 this.headingAccuracy = accuracy;
             }
         };
@@ -1641,6 +1692,14 @@ class SensorFusionManager {
         return result;
     }
 
+    // New: predict position at an arbitrary future timestamp.
+    // Optional — dead reckoning loop still uses getSmoothedVelocityDegPerSec()
+    // so callers that don't use this get identical behaviour to v1.
+    predictPosition(atTimestampMs) {
+        if (!this._kalmanFilter) return null;
+        return this._kalmanFilter.predictToTime(atTimestampMs);
+    }
+
     getSmoothedVelocityDegPerSec() {
         if (!this._kalmanFilter) return { lat: 0, lng: 0 };
         return this._kalmanFilter.getVelocityDegPerSec();
@@ -1662,14 +1721,51 @@ class SensorFusionManager {
         return (gpsSpeedMPS || 0) > 0.5;
     }
 
+    // CHANGED vs v1: smooth speed-blended GPS/compass fusion.
+    //
+    // v1 had a hard switch: GPS heading if speed > 2 m/s, compass otherwise.
+    // At walking pace GPS heading is noisy and unreliable — it computes heading
+    // from consecutive position fixes which are only ~1-2m apart and dominated
+    // by GPS error. The compass is almost always better below ~3 m/s.
+    //
+    // This version:
+    //   < 1.5 m/s  → compass only (or GPS if no compass)
+    //   1.5–3 m/s  → linear blend, weighted toward GPS as speed rises
+    //   > 3 m/s    → GPS only (cycling/driving where GPS heading is reliable)
+    //
+    // Final value is passed through a One-Euro filter so the displayed heading
+    // doesn't jitter when blending between the two sources.
     getHeading(gpsHeading, speedMPS) {
-        if (gpsHeading != null && isFinite(gpsHeading) && speedMPS > 2) {
-            return gpsHeading;
+        const now = performance.now();
+        let source = null;
+
+        if (gpsHeading != null && isFinite(gpsHeading)) {
+            if (speedMPS > 3) {
+                // Fast movement — GPS heading is reliable
+                source = gpsHeading;
+            } else if (speedMPS > 1.5 && this.deviceHeading != null) {
+                // Blend zone: linear interpolation on the shortest arc
+                let diff = gpsHeading - this.deviceHeading;
+                while (diff > 180)  diff -= 360;
+                while (diff < -180) diff += 360;
+                const blend = (speedMPS - 1.5) / 1.5; // 0 at 1.5 m/s, 1 at 3 m/s
+                source = (this.deviceHeading + diff * blend + 360) % 360;
+            } else if (this.deviceHeading != null) {
+                // Slow/walking — trust compass
+                source = this.deviceHeading;
+            } else {
+                // No compass available — fall back to GPS heading
+                source = gpsHeading;
+            }
+        } else if (this.deviceHeading != null) {
+            source = this.deviceHeading;
         }
-        if (this.deviceHeading != null) {
-            return this.deviceHeading;
-        }
-        return gpsHeading;
+
+        if (source == null) return gpsHeading;
+
+        // One-Euro filter smooths display without adding perceptible lag.
+        // The filter is stateful so it runs every call — don't skip it.
+        return this._headingFilter.filter(source, now);
     }
 
     destroy() {
@@ -1704,13 +1800,87 @@ class SensorFusionManager {
 }
 
 /* ──────────────────────────────────────────────
+   ONE-EURO FILTER
+   Adaptive low-pass filter. Zero lag for constant
+   velocity signals, smooths jitter at rest.
+   Only used for heading display in this codebase.
+   Reference: Casiez et al., CHI 2012.
+   ────────────────────────────────────────────── */
+class OneEuroFilter {
+    constructor({ minCutoff = 1.0, beta = 0.0, dCutoff = 1.0 }) {
+        this.minCutoff = minCutoff;
+        this.beta = beta;
+        this.dCutoff = dCutoff;
+        this.xPrev = null;
+        this.dxPrev = null;
+        this.tPrev = null;
+    }
+
+    _alpha(cutoff, dt) {
+        const tau = 1.0 / (2 * Math.PI * cutoff);
+        return 1.0 / (1.0 + tau / dt);
+    }
+
+    filter(x, t) {
+        if (this.xPrev == null) {
+            this.xPrev = x;
+            this.dxPrev = 0;
+            this.tPrev = t;
+            return x;
+        }
+
+        const dt = (t - this.tPrev) / 1000;
+        if (dt <= 0) return this.xPrev;
+
+        // Handle circular values (heading wraps 0-360)
+        let rawDx = (x - this.xPrev) / dt;
+        // Unwrap derivative for heading
+        if (rawDx > 180 / dt)  rawDx -= 360 / dt;
+        if (rawDx < -180 / dt) rawDx += 360 / dt;
+
+        const aD   = this._alpha(this.dCutoff, dt);
+        const dxHat = aD * rawDx + (1 - aD) * this.dxPrev;
+
+        const cutoff = this.minCutoff + this.beta * Math.abs(dxHat);
+        const a      = this._alpha(cutoff, dt);
+
+        // Circular blend on the value itself
+        let diff = x - this.xPrev;
+        if (diff > 180)  diff -= 360;
+        if (diff < -180) diff += 360;
+        const xHat = (this.xPrev + a * diff + 360) % 360;
+
+        this.xPrev  = xHat;
+        this.dxPrev = dxHat;
+        this.tPrev  = t;
+
+        return xHat;
+    }
+
+    reset() {
+        this.xPrev  = null;
+        this.dxPrev = null;
+        this.tPrev  = null;
+    }
+}
+
+/* ──────────────────────────────────────────────
    POSITION KALMAN FILTER
+   Changes vs v1:
+   - Soft re-init on long GPS gaps (>30s): preserves
+     heading and speed instead of wiping state cold
+   - Pedestrian noise curve: lower accel noise at
+     walking speed (1–4 m/s) for tighter tracking
+   - predictToTime(): extrapolate to arbitrary future
+     timestamp, useful for dead reckoning callers
+   - All other maths identical to v1
    ────────────────────────────────────────────── */
 class PositionKalmanFilter {
     constructor(options = {}) {
         this.accelNoise = options.accelNoise ?? 1.0;
         this.measurementNoise = options.measurementNoise ?? 15;
         this._maxRefShiftMeters = options.maxRefShiftMeters ?? 2000;
+        this._noiseCurve = options.noiseCurve ?? 'default';
 
         this._baseAccelNoise = this.accelNoise;
         this._currentSpeedMPS = 0;
@@ -1721,7 +1891,10 @@ class PositionKalmanFilter {
         this.refLat = null;
         this.refLng = null;
 
-        // Zero-GC scratchpads
+        // For predictToTime()
+        this._lastUpdateTimestampMs = null;
+
+        // Zero-GC scratchpads (identical to v1)
         this._P2 = [[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]];
         this._Q  = [[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]];
         this._K  = [[0,0],[0,0],[0,0],[0,0]];
@@ -1740,9 +1913,34 @@ class PositionKalmanFilter {
         }
 
         const dt = (timestampMs - this.lastTimestamp) / 1000;
-        this.lastTimestamp = timestampMs;
 
-        if (dt <= 0 || dt > 10) {
+        if (dt <= 0) {
+            this._initialize(lat, lng, R, timestampMs);
+            return this._makeResult(lat, lng);
+        }
+
+        if (dt > 30) {
+            // Soft re-init: preserve heading and speed across the gap.
+            // v1 hard-reset here, losing the velocity state entirely.
+            // With a long GPS gap you likely just went through a tunnel
+            // or building — heading is still valid, velocity roughly so.
+            const oldHeading = this.getHeading();
+            const oldSpeed   = this.getSpeedMPS();
+            this._initialize(lat, lng, R, timestampMs);
+            if (oldHeading != null && oldSpeed > 0.3) {
+                const rad = oldHeading * Math.PI / 180;
+                // High variance (50) since we don't really know current speed
+                this.seedVelocity(
+                    oldSpeed * Math.cos(rad),
+                    oldSpeed * Math.sin(rad),
+                    50.0
+                );
+            }
+            return this._makeResult(lat, lng);
+        }
+
+        // Normal update path — identical to v1
+        if (dt > 10) {
             this._initialize(lat, lng, R, timestampMs);
             return this._makeResult(lat, lng);
         }
@@ -1753,14 +1951,44 @@ class PositionKalmanFilter {
         const local = this._toLocal(lat, lng);
         this._update(local.north, local.east, R);
 
-        // Shift local reference when approaching numeric limits
         const maxRef = this._maxRefShiftMeters;
         if (Math.abs(this.x[0]) > maxRef || Math.abs(this.x[1]) > maxRef) {
             this._shiftReference();
         }
 
         const pos = this._toGlobal(this.x[0], this.x[1]);
+        this._lastUpdateTimestampMs = timestampMs;
+
         return this._makeResult(pos.lat, pos.lng);
+    }
+
+    // Extrapolate position to an arbitrary future timestamp using current
+    // velocity state. Capped at 2s ahead to prevent runaway predictions.
+    // Returns null if filter not yet initialized.
+    predictToTime(atTimestampMs) {
+        if (!this.x || this._lastUpdateTimestampMs == null) return null;
+
+        const dt = (atTimestampMs - this._lastUpdateTimestampMs) / 1000;
+        if (dt <= 0) {
+            const pos = this._toGlobal(this.x[0], this.x[1]);
+            return this._makeResult(pos.lat, pos.lng);
+        }
+
+        const MAX_S = 2.0;
+        const clampedDt = Math.min(dt, MAX_S);
+
+        const north = this.x[0] + this.x[2] * clampedDt;
+        const east  = this.x[1] + this.x[3] * clampedDt;
+        const pos   = this._toGlobal(north, east);
+
+        return {
+            lat: pos.lat,
+            lng: pos.lng,
+            vNorth: this.x[2],
+            vEast:  this.x[3],
+            speedMPS: Math.sqrt(this.x[2] * this.x[2] + this.x[3] * this.x[3]),
+            isExtrapolated: dt > MAX_S
+        };
     }
 
     getVelocity() {
@@ -1797,6 +2025,7 @@ class PositionKalmanFilter {
         this.refLng = null;
         this.accelNoise = this._baseAccelNoise;
         this._currentSpeedMPS = 0;
+        this._lastUpdateTimestampMs = null;
     }
 
     seedVelocity(vNorth, vEast, variance) {
@@ -1807,7 +2036,6 @@ class PositionKalmanFilter {
             const v = variance || 10.0;
             this.P[2][2] = v;
             this.P[3][3] = v;
-            // Zero cross-correlation after seed; _predict rebuilds via F·P·Fᵀ
             this.P[0][2] = 0; this.P[2][0] = 0;
             this.P[1][3] = 0; this.P[3][1] = 0;
         }
@@ -1822,7 +2050,7 @@ class PositionKalmanFilter {
         this._currentSpeedMPS = 0;
 
         const R2 = R * R;
-        const v0 = 225.0;
+        const v0 = 225.0; // v1 value preserved
         this.P = [
             [R2, 0,  0,  0 ],
             [0,  R2, 0,  0 ],
@@ -1831,6 +2059,7 @@ class PositionKalmanFilter {
         ];
         this.lastTimestamp = timestampMs;
         this._justInitialized = true;
+        this._lastUpdateTimestampMs = timestampMs;
     }
 
     _updateAccelNoise() {
@@ -1839,17 +2068,36 @@ class PositionKalmanFilter {
         const speed = Math.sqrt(this.x[2] * this.x[2] + this.x[3] * this.x[3]);
         this._currentSpeedMPS = speed;
 
-        // Piecewise linear: 0.15 stationary → 5.0 at speed
-        if (speed >= 15) {
-            this.accelNoise = 5.0;
-        } else if (speed >= 8) {
-            this.accelNoise = 1.5 + (speed - 8) * (3.5 / 7);
-        } else if (speed >= 2) {
-            this.accelNoise = 0.5 + (speed - 2) * (1.0 / 6);
-        } else if (speed >= 0.3) {
-            this.accelNoise = 0.15 + (speed - 0.3) * (0.35 / 1.7);
+        if (this._noiseCurve === 'pedestrian') {
+            // Tuned for walking (0–2 m/s) and light jogging (2–4 m/s).
+            // Lower noise at walking speed = filter trusts velocity model more
+            // = smoother marker, less GPS scatter pulling it off course.
+            // Higher noise when stationary = filter trusts GPS corrections more
+            // = snaps to true position quickly when you stop.
+            if (speed >= 8) {
+                this.accelNoise = 3.0;
+            } else if (speed >= 4) {
+                this.accelNoise = 0.8 + (speed - 4) * (2.2 / 4);
+            } else if (speed >= 1.5) {
+                this.accelNoise = 0.2 + (speed - 1.5) * (0.6 / 2.5);
+            } else if (speed >= 0.3) {
+                this.accelNoise = 0.08 + (speed - 0.3) * (0.12 / 1.2);
+            } else {
+                this.accelNoise = 0.08;
+            }
         } else {
-            this.accelNoise = 0.15;
+            // Original v1 curve — preserved for non-pedestrian use cases
+            if (speed >= 15) {
+                this.accelNoise = 5.0;
+            } else if (speed >= 8) {
+                this.accelNoise = 1.5 + (speed - 8) * (3.5 / 7);
+            } else if (speed >= 2) {
+                this.accelNoise = 0.5 + (speed - 2) * (1.0 / 6);
+            } else if (speed >= 0.3) {
+                this.accelNoise = 0.15 + (speed - 0.3) * (0.35 / 1.7);
+            } else {
+                this.accelNoise = 0.15;
+            }
         }
     }
 
@@ -1866,10 +2114,10 @@ class PositionKalmanFilter {
         const dt3 = dt2 * dt;
         const dt4 = dt3 * dt;
 
-        Q[0][0] = q * dt4 / 4; Q[0][1] = 0;         Q[0][2] = q * dt3 / 2; Q[0][3] = 0;
-        Q[1][0] = 0;           Q[1][1] = q * dt4 / 4; Q[1][2] = 0;         Q[1][3] = q * dt3 / 2;
-        Q[2][0] = q * dt3 / 2; Q[2][1] = 0;         Q[2][2] = q * dt2;    Q[2][3] = 0;
-        Q[3][0] = 0;           Q[3][1] = q * dt3 / 2; Q[3][2] = 0;         Q[3][3] = q * dt2;
+        Q[0][0] = q * dt4 / 4; Q[0][1] = 0;           Q[0][2] = q * dt3 / 2; Q[0][3] = 0;
+        Q[1][0] = 0;           Q[1][1] = q * dt4 / 4;  Q[1][2] = 0;           Q[1][3] = q * dt3 / 2;
+        Q[2][0] = q * dt3 / 2; Q[2][1] = 0;            Q[2][2] = q * dt2;     Q[2][3] = 0;
+        Q[3][0] = 0;           Q[3][1] = q * dt3 / 2;  Q[3][2] = 0;           Q[3][3] = q * dt2;
 
         const P2 = this._P2;
 
@@ -1883,9 +2131,9 @@ class PositionKalmanFilter {
         P2[1][0] = FP10 + dt * FP12 + Q[1][0]; P2[1][1] = FP11 + dt * FP13 + Q[1][1];
         P2[1][2] = FP12 + Q[1][2];             P2[1][3] = FP13 + Q[1][3];
         P2[2][0] = P[2][0] + dt * P[2][2] + Q[2][0]; P2[2][1] = P[2][1] + dt * P[2][3] + Q[2][1];
-        P2[2][2] = P[2][2] + Q[2][2];                  P2[2][3] = P[2][3] + Q[2][3];
+        P2[2][2] = P[2][2] + Q[2][2];                 P2[2][3] = P[2][3] + Q[2][3];
         P2[3][0] = P[3][0] + dt * P[3][2] + Q[3][0]; P2[3][1] = P[3][1] + dt * P[3][3] + Q[3][1];
-        P2[3][2] = P[3][2] + Q[3][2];                  P2[3][3] = P[3][3] + Q[3][3];
+        P2[3][2] = P[3][2] + Q[3][2];                 P2[3][3] = P[3][3] + Q[3][3];
 
         this.P = P2;
         this._P2 = P;
@@ -1905,7 +2153,6 @@ class PositionKalmanFilter {
 
         const detS = S00 * S11 - S01 * S01;
 
-        // Guard negative determinant from floating-point drift
         if (detS <= 1e-15) {
             K[0][0] = P[0][0] / S00; K[0][1] = 0;
             K[1][0] = 0;             K[1][1] = P[1][1] / S11;
@@ -1977,16 +2224,15 @@ class PositionKalmanFilter {
         return { lat, lng, vNorth, vEast, speedMPS: speed };
     }
 }
-        
+
 // ── Global instance ──
 window.sensorFusion = new SensorFusionManager().init();
 
 /* ──────────────────────────────────────────────
    DEAD RECKONING LOOP
-   Interpolates marker position between GPS fixes
-   using the Kalman filter's velocity state.
-   Without this, the marker freezes for 1+ seconds
-   between fixes at high speed.
+   Identical to v1. Interpolates marker position
+   between GPS fixes using the Kalman filter's
+   velocity state.
    ────────────────────────────────────────────── */
 
 (function initDeadReckoning() {
@@ -1995,8 +2241,8 @@ window.sensorFusion = new SensorFusionManager().init();
     let _active = false;
 
     const MIN_DT_MS = 16;
-    const MIN_SPEED_MPS = 0.15;        
-    const MAX_PREDICT_AHEAD_S = 2.0;   
+    const MIN_SPEED_MPS = 0.15;
+    const MAX_PREDICT_AHEAD_S = 2.0;
     const MIN_CENTER_DRIFT_PX = 3;
 
     function frame(now) {
@@ -2009,8 +2255,6 @@ window.sensorFusion = new SensorFusionManager().init();
             return;
         }
 
-        // Don't stop DR just because isStationary — let speed decide
-        // isStationary is unreliable due to GPS jitter
         if (window.isStationary) {
             const speedMPS = window.sensorFusion
                 ? window.sensorFusion.getFilteredSpeedMPS()
@@ -2073,7 +2317,6 @@ window.sensorFusion = new SensorFusionManager().init();
         const predictedLat = lastPos.lat + vel.lat * predictDtSec;
         const predictedLng = lastPos.lng + vel.lng * predictDtSec;
 
-        // Sanity: predicted position shouldn't be more than 150m from last fix
         const jumpLat = Math.abs(predictedLat - lastPos.lat) * 111111;
         const jumpLng = Math.abs(predictedLng - lastPos.lng) * 111111 *
                         Math.cos(lastPos.lat * Math.PI / 180);
@@ -2107,32 +2350,22 @@ window.sensorFusion = new SensorFusionManager().init();
         _rafId = requestAnimationFrame(frame);
     }
 
-    // Auto-start — don't wait for first GPS fix
     _active = true;
     _rafId = requestAnimationFrame(frame);
 
     function _restartIfMoving() {
         if (_active) return;
         if (window.isLocationHuntVisible) return;
-        // Do NOT gate on isStationary here — the stationary lock breaker
-        // inside updateUserLocation handles clearing it. If speed says we're
-        // moving, trust speed over the stale stationary flag.
         const speedMPS = window.sensorFusion
             ? window.sensorFusion.getFilteredSpeedMPS()
             : (window.lastPosition?.speedMPS || 0);
         if (speedMPS < MIN_SPEED_MPS) return;
-        // Only restart if the stationary lock has been cleared by GPS evidence
         if (window.isStationary && speedMPS < 0.8) return;
         _active = true;
         _lastFrameTime = performance.now();
         _rafId = requestAnimationFrame(frame);
     }
 
-    // -------------------------------------------------------------------------
-    // MemoryManager may be in TDZ (let/const declared later in same scope).
-    // typeof on a TDZ binding throws ReferenceError. We use try/catch and
-    // a deferred registration path so the IIFE never crashes on load.
-    // -------------------------------------------------------------------------
     function _registerCleanup() {
         try {
             if (typeof memoryManager !== 'undefined' && memoryManager.registerCleanupTask) {
@@ -2145,16 +2378,11 @@ window.sensorFusion = new SensorFusionManager().init();
                 });
                 return true;
             }
-        } catch (e) {
-            // TDZ hit — memoryManager exists but isn't initialized yet
-        }
+        } catch (e) {}
         return false;
     }
 
-    // Attempt immediate registration (works if memoryManager is already ready)
     if (!_registerCleanup()) {
-        // Defer: expose a hook so your app init can call this after
-        // memoryManager is constructed, OR poll briefly.
         window.deadReckoning = {
             stop() {
                 if (_rafId != null) {
@@ -2166,10 +2394,9 @@ window.sensorFusion = new SensorFusionManager().init();
             start() { _restartIfMoving(); },
             isActive() { return _active; },
             onMovementResumed: _restartIfMoving,
-            _registerCleanup: _registerCleanup  // call once after memoryManager init
+            _registerCleanup: _registerCleanup
         };
     } else {
-        // Already registered — expose the normal API
         window.deadReckoning = {
             stop() {
                 if (_rafId != null) {
