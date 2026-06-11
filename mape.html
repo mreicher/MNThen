@@ -1610,6 +1610,12 @@ class SensorFusionManager {
             return { lat: rawLat || 0, lng: rawLng || 0, vNorth: 0, vEast: 0, speedMPS: 0 };
         }
 
+        // ── CHANGE 1 of 4: Store GPS speed before update() ──
+        // Breaks feedback loop: low Kalman speed → low accelNoise → more lag → lower speed
+        if (this._kalmanFilter && isFinite(gpsSpeedMPS) && gpsSpeedMPS >= 0) {
+            this._kalmanFilter._lastGPSSpeedMPS = gpsSpeedMPS;
+        }
+
         const result = this._kalmanFilter.update(rawLat, rawLng, accuracyMeters, timestampMs);
 
         if (this._kalmanFilter._justInitialized) {
@@ -1803,6 +1809,7 @@ class PositionKalmanFilter {
         this.refLng = null;
         this.accelNoise = this._baseAccelNoise;
         this._currentSpeedMPS = 0;
+        this._lastGPSSpeedMPS = 0;  // ── CHANGE 2 of 4 ──
     }
 
     seedVelocity(vNorth, vEast, variance) {
@@ -1849,20 +1856,34 @@ _initialize(lat, lng, R, timestampMs) {
     _updateAccelNoise() {
         if (!this.x) return;
 
-        const speed = Math.sqrt(this.x[2] * this.x[2] + this.x[3] * this.x[3]);
+        const kalmanSpeed = Math.sqrt(this.x[2] * this.x[2] + this.x[3] * this.x[3]);
+
+        // ── CHANGE 3 of 4: GPS speed floor ──
+        // Use GPS speed as floor to prevent the lag feedback loop:
+        // Low Kalman speed → low accelNoise → more lag → even lower Kalman speed
+        const gpsSpeed = this._lastGPSSpeedMPS || 0;
+        const speed = Math.max(kalmanSpeed, gpsSpeed * 0.8);
+
         this._currentSpeedMPS = speed;
 
-        // Piecewise linear: 0.15 stationary → 5.0 at speed
+        // RAISED values at walking speeds.
+        // Old: walking (1.4 m/s) got accelNoise ≈ 0.38 (σ_a ≈ 0.61 m/s²)
+        //      Actual walking acceleration: 1-2 m/s² → filter was 3x too sluggish
+        // New: walking (1.4 m/s) gets accelNoise ≈ 1.08 (σ_a ≈ 1.04 m/s²)
+        //      Matches real walking acceleration → responsive without jitter
         if (speed >= 15) {
             this.accelNoise = 5.0;
         } else if (speed >= 8) {
             this.accelNoise = 1.5 + (speed - 8) * (3.5 / 7);
         } else if (speed >= 2) {
-            this.accelNoise = 0.5 + (speed - 2) * (1.0 / 6);
+            // Was: 0.5 + (speed - 2) * (1.0 / 6) → range 0.5 to 1.5
+            this.accelNoise = 1.5 + (speed - 2) * (0.0 / 6);   // Flat 1.5 through jogging
         } else if (speed >= 0.3) {
-            this.accelNoise = 0.15 + (speed - 0.3) * (0.35 / 1.7);
+            // Was: 0.15 + (speed - 0.3) * (0.35 / 1.7) → range 0.15 to 0.50
+            this.accelNoise = 0.3 + (speed - 0.3) * (1.2 / 1.7); // range 0.3 to 1.5
         } else {
-            this.accelNoise = 0.15;
+            // Was: 0.15
+            this.accelNoise = 0.3;  // Slightly higher to reduce stationary-to-walking lag
         }
     }
 
@@ -2092,22 +2113,51 @@ window.sensorFusion = new SensorFusionManager().init();
         if (userMarker) {
             const el = userMarker.getElement();
             if (el) el.style.transition = 'none';
-            userMarker.setLatLng([predictedLat, predictedLng]);
-        }
 
-        const isCentered = typeof ModeManager !== 'undefined' && ModeManager.isCentered();
-        if (!window._isProximityZoomAnimating && isCentered && window.followUser && map) {
-            const currentCenter = map.getCenter();
-            const predictedPx = map.latLngToContainerPoint([predictedLat, predictedLng]);
-            const centerPx = map.latLngToContainerPoint(currentCenter);
-            const driftPx = Math.hypot(predictedPx.x - centerPx.x, predictedPx.y - centerPx.y);
+            // Speed-clamp marker movement to prevent visible snaps
+            // when GPS updates cause lastPos to jump
+            const currentPos = userMarker.getLatLng();
+            const dLat = predictedLat - currentPos.lat;
+            const dLng = predictedLng - currentPos.lng;
+            const cosLat = Math.cos((currentPos.lat || 0) * Math.PI / 180);
+            const moveDistM = Math.sqrt(
+                Math.pow(dLat * 111111, 2) +
+                Math.pow(dLng * 111111 * cosLat, 2)
+            );
 
-            if (driftPx > MIN_CENTER_DRIFT_PX) {
-                map.setView([predictedLat, predictedLng], map.getZoom(), {
-                    animate: false,
-                    noMoveStart: true,
-                    noMoveEnd: true
-                });
+            const dtSec = dtMs / 1000;
+            // Allow up to 3x expected per-frame distance.
+            // At walking (1.4 m/s, 60fps): expected 0.023m/frame, max 0.07m/frame
+            // A 1m GPS correction smooths over ~14 frames (~233ms) — imperceptible
+            const maxMoveM = Math.max(0.3, speedMPS * dtSec * 3);
+
+            let targetLat, targetLng;
+            if (moveDistM > maxMoveM && moveDistM > 0) {
+                const scale = maxMoveM / moveDistM;
+                targetLat = currentPos.lat + dLat * scale;
+                targetLng = currentPos.lng + dLng * scale;
+            } else {
+                targetLat = predictedLat;
+                targetLng = predictedLng;
+            }
+
+            userMarker.setLatLng([targetLat, targetLng]);
+
+            // Center map on the clamped position (not the raw prediction)
+            const isCentered = typeof ModeManager !== 'undefined' && ModeManager.isCentered();
+            if (!window._isProximityZoomAnimating && isCentered && window.followUser && map) {
+                const currentCenter = map.getCenter();
+                const targetPx = map.latLngToContainerPoint([targetLat, targetLng]);
+                const centerPx = map.latLngToContainerPoint(currentCenter);
+                const driftPx = Math.hypot(targetPx.x - centerPx.x, targetPx.y - centerPx.y);
+
+                if (driftPx > MIN_CENTER_DRIFT_PX) {
+                    map.setView([targetLat, targetLng], map.getZoom(), {
+                        animate: false,
+                        noMoveStart: true,
+                        noMoveEnd: true
+                    });
+                }
             }
         }
 
@@ -2454,9 +2504,6 @@ function isValidPosition(pos) {
     return pos && typeof pos.lat === 'number' && typeof pos.lng === 'number' && !isNaN(pos.lat) && !isNaN(pos.lng);
 }
 
-/* ──────────────────────────────────────────────
-   MEMORY MANAGEMENT
-   ────────────────────────────────────────────── */
 /* ──────────────────────────────────────────────
    MEMORY MANAGEMENT — v2
    Explicit lifecycle, fail-fast cleanup, no silent failures.
