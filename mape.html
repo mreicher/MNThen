@@ -2096,7 +2096,7 @@ window.sensorFusion = new SensorFusionManager().init();
         }
 
         const isCentered = typeof ModeManager !== 'undefined' && ModeManager.isCentered();
-        if (isCentered && window.followUser && map) {
+        if (!window._isProximityZoomAnimating && isCentered && window.followUser && map) {
             const currentCenter = map.getCenter();
             const predictedPx = map.latLngToContainerPoint([predictedLat, predictedLng]);
             const centerPx = map.latLngToContainerPoint(currentCenter);
@@ -5139,6 +5139,15 @@ function updateUserLocation(position, forceUpdate) {
         mapUpdateDistance = 2.0; maxAccuracy = 32; minDistThreshold = 0.25; maxSpeedThreshold = 3;
     }
 
+    // Orange accuracy (20–50m): scale thresholds to match noise level.
+    // Without this, 2m/0.25m thresholds are exceeded by GPS jitter alone,
+    // causing the map to chase noise — jump, skip, jump, skip.
+    if (rawAccuracy >= 20 && rawAccuracy < 50) {
+        var _noiseScale = Math.min(2.0, 1.0 + (rawAccuracy - 20) / 30);
+        mapUpdateDistance *= _noiseScale;
+        minDistThreshold  *= _noiseScale;
+    }
+
     var speedTier = {
         panDuration: panDuration,
         easeLinearity: easeLinearity,
@@ -5364,12 +5373,14 @@ function updateUserLocation(position, forceUpdate) {
 
     // Synchronous marker update follows shared prediction
     var displayPos = window._predictedPosition || smoothedPosition;
-    if (userMarker) {
+        if (userMarker) {
         var markerEl = userMarker.getElement ? userMarker.getElement() : null;
         if (markerEl) {
-            markerEl.style.transition = 'none';
+            var _orangeAccuracy = rawAccuracy >= 20 && rawAccuracy < 50;
+            var _transitionVal = _orangeAccuracy ? 'transform 200ms ease-out' : 'none';
+            markerEl.style.transition = _transitionVal;
             var iconEl = markerEl.querySelector('.user-marker-icon');
-            if (iconEl) iconEl.style.transition = 'none';
+            if (iconEl) iconEl.style.transition = _transitionVal;
         }
         try {
             userMarker.setLatLng([displayPos.lat, displayPos.lng]);
@@ -5449,666 +5460,129 @@ function updateUserLocation(position, forceUpdate) {
 }
         
 /* ──────────────────────────────────────────────
-   updateUserLocation — Core position processing
-   (Refactored: modular, same behavior, same globals)
+   PROXIMITY ZOOM LOGIC
    ────────────────────────────────────────────── */
-function updateUserLocation(position, forceUpdate) {
-    if (forceUpdate === undefined) forceUpdate = false;
+function _handleProximityZoomLogic(speedMPH, eastWestMove) {
+    const PROX_NEAR_M = 15.24;
+    const PROX_FAR_M = 25.0;
+    const PROX_ZOOM_IN = 19;
+    const PROX_ZOOM_OUT = 17;
+    const MAX_PROX_SPEED_MPH = 10;
+    const PROX_COOLDOWN_MS = 400;
+    const ANIMATION_STUCK_TIMEOUT_MS = 3000;
 
-    var now = performance.now();
+    if (window._proxZoomTargetLevel == null) window._proxZoomTargetLevel = PROX_ZOOM_OUT;
 
-    if (map && !window._interactionHandlersSetup) setupMapInteractionHandlers();
-
-    var coords = (position || {}).coords;
-    if (!coords || !Number.isFinite(coords.latitude) || !Number.isFinite(coords.longitude)) return;
-
-    var gpsAge = (Date.now() - (position.timestamp || 0)) / 1000;
-    if (!forceUpdate && gpsAge > 4.0) return;
-
-    // ── Debounce & generation management ──
-    if (window._debounceTimeoutId) {
-        clearTimeout(window._debounceTimeoutId);
-        window._debounceTimeoutId = null;
-    }
-    window._locationUpdateGeneration = (window._locationUpdateGeneration || 0) + 1;
-    if (window._nextLocationUpdateRAF) {
-        cancelAnimationFrame(window._nextLocationUpdateRAF);
-        window._nextLocationUpdateRAF = null;
+    // Sync from live map zoom — prevents stale state after location page closes
+    if (map) {
+        window._proxZoomCurrentLevel = map.getZoom();
+    } else if (window._proxZoomCurrentLevel == null) {
+        window._proxZoomCurrentLevel = PROX_ZOOM_OUT;
     }
 
-    // GPS timeout watchdog
-    if (window._gpsTimeoutTimer) clearTimeout(window._gpsTimeoutTimer);
-    window._gpsTimeoutTimer = createTrackedTimeout(function() {
-        if (!window.isGPSSearching) {
-            window.isGPSSearching = true;
-            if (typeof showGPSSearchingState === 'function') showGPSSearchingState();
-        }
-    }, 30000);
+    window._proxSpeedEMA = window._proxSpeedEMA ?? speedMPH;
+    window._proxSpeedEMA = 0.6 * speedMPH + 0.4 * window._proxSpeedEMA;
+    const smoothedSpeedMPH = window._proxSpeedEMA;
 
-    // ── Extract and normalize raw GPS data ──
-    var rawData = _extractRawGPSData(position, coords);
-    var currentTime = rawData.currentTime;
-    var lat = rawData.lat;
-    var lng = rawData.lng;
-    var rawAccuracy = rawData.rawAccuracy;
-    var rawHeading = rawData.rawHeading;
-    var rawSpeedMPS = rawData.rawSpeedMPS;
+    const approachSpeed = _estimateApproachSpeedMPS();
+    const distM = window.proximityState?.distanceMeters ?? Infinity;
+    const timeToNearSec = (approachSpeed > 0.3 && isFinite(distM))
+        ? (distM - PROX_NEAR_M) / approachSpeed
+        : Infinity;
 
-    // ── Handle gap / re-initialization logic ──
-    _handleGPSGapLogic(currentTime, lat, lng);
-
-    var newPosition = {
-        lat: lat, lng: lng,
-        accuracy: rawAccuracy,
-        heading: rawHeading,
-        timestamp: currentTime,
-        speedMPS: rawSpeedMPS
-    };
-
-    // ── Speed computation with EMA smoothing ──
-    var speedBundle = _computeSmoothedSpeed(rawSpeedMPS, newPosition, currentTime);
-    var reliableSpeedMPS = speedBundle.reliableSpeedMPS;
-    var modeSpeedMPH = speedBundle.modeSpeedMPH;
-    var speedMPH = speedBundle.speedMPH;
-    var speedMPS = speedBundle.speedMPS;
-
-    var modeChanged = ModeManager.update(modeSpeedMPH);
-    var isInCenteredMode = ModeManager.isCentered();
-
-    if (speedMPH >= 1.0) _clearInactivityTimer();
-    else _startInactivityTimer();
-
-    // ── GPS recovery state machine ──
-    _handleGPSRecovery(newPosition, currentTime, lat, lng, timeDelta);
-
-    // ── Proximity calculations — Always recalculate ──
-    var proximityBundle = _computeProximity(newPosition, lat, lng, speedMPH, currentTime);
-    var closestDistance = proximityBundle.closestDistance;
-    var closestLocation = proximityBundle.closestLocation;
-
-    // ── First fix short-circuit ──
-    var lastPos = window.lastPosition;
-    if (!lastPos) {
-        _initializeUserLocationState(newPosition, currentTime, forceUpdate);
+    if (!window.proximityState || !map) {
+        _cleanupProximityZoomAnimation();
+        _resetProximityZoomSmoothing();
+        window._proxZoomTargetLevel = PROX_ZOOM_OUT;
         return;
     }
 
-    var distance = calculateDistance(lastPos, newPosition);
-    var latMeters = Math.abs(lat - lastPos.lat) * 111111;
-    var lngMeters = Math.abs(lng - lastPos.lng) * 111111 * Math.cos(lat * Math.PI / 180);
-    var eastWestMove = lngMeters > latMeters * 1.2;
+    const speedGateBreached = smoothedSpeedMPH > MAX_PROX_SPEED_MPH + 3;
 
-    // ── Reject impossible acceleration ──
-    var timeDelta = (window.lastUpdateTime) ? (currentTime - window.lastUpdateTime) / 1000 : 0;
-    if (_shouldRejectAcceleration(speedMPH, lastPos, timeDelta)) {
-        window.lastUpdateTime = currentTime;
+    if (speedGateBreached) {
+        window._proxZoomTargetLevel = PROX_ZOOM_OUT;
+        if (window._proxZoomState === 'ZOOMED_IN') {
+            _executeProximityZoom(PROX_ZOOM_OUT, 'IDLE', eastWestMove);
+        } else {
+            _cleanupProximityZoomAnimation();
+            _resetProximityZoomSmoothing();
+        }
         return;
     }
 
-    // ── Heading fusion and validation ──
-    var validatedHeading = _fuseAndValidateHeading(rawHeading, speedMPS, lastPos);
-
-    var displayHeading = validatedHeading;
-    if (lastPos.heading !== null && validatedHeading !== null &&
-        Math.abs(validatedHeading - lastPos.heading) > 180) {
-        displayHeading = validatedHeading < lastPos.heading
-            ? validatedHeading + 360
-            : validatedHeading - 360;
-    }
-
-    var headingBundle = _computeHeadingFactor(lastPos, validatedHeading);
-    var headingDiff = headingBundle.headingDiff;
-    var directionChangeFactor = headingBundle.directionChangeFactor;
-
-    // ── Speed tier selection ──
-    var speedTier = _selectSpeedTier(speedMPH, eastWestMove);
-
-    // ── Large jump handling ──
-    var dynamicJumpThreshold = Math.max(50, speedMPS * 3);
-    if (distance > dynamicJumpThreshold || forceUpdate) {
-        _handleLargeDistanceJump(newPosition, currentTime);
-        window.lastUpdateTime = currentTime;
-        if (typeof updateDistanceBox === 'function')
-            updateDistanceBox(forceUpdate, newPosition, closestLocation, closestDistance);
+    // Escape hatch: if animating flag is stuck > 3s, force cleanup
+    if (window._isProximityZoomAnimating) {
+        const flagAge = Date.now() - (window._proxZoomAnimationStartTime || 0);
+        if (flagAge > ANIMATION_STUCK_TIMEOUT_MS) {
+            console.warn('[ProximityZoom] Animation flag stuck for', flagAge, 'ms — clearing');
+            if (typeof window._currentProximityZoomCleanup === 'function') {
+                window._currentProximityZoomCleanup();
+            } else {
+                window._isProximityZoomAnimating = false;
+                window._proxZoomAnimationStartTime = null;
+                window.isMapInteracting = false;
+            }
+        }
         return;
     }
 
-    // ── Stationary detection and lock management ──
-    var stationaryResult = _manageStationaryState(
-        newPosition, currentTime, distance, timeDelta,
-        validatedHeading, lat, lng,
-        forceUpdate, closestLocation, closestDistance
-    );
-    if (stationaryResult.handled) return;
+    const now = Date.now();
 
-    // ── Actively moving: clear stationary, restart DR ──
-    window.stationaryStartTime = null;
-    window.isStationary = false;
-    window.stationaryLockPosition = null;
+    const cooldownKey = window._proxZoomTargetLevel > window._proxZoomCurrentLevel ? 'IN' : 'OUT';
+    const lastTimeForDir = window._lastProxZoomTimeByDir?.[cooldownKey] || 0;
+    if (now - lastTimeForDir < PROX_COOLDOWN_MS) return;
 
-    if (!window.isStationary && speedMPS >= 0.15 && window.deadReckoning &&
-        typeof window.deadReckoning.start === 'function' &&
-        !window.deadReckoning.isActive()) {
-        window.deadReckoning.start();
-    }
-
-    // ── Quality gates ──
-    if (!forceUpdate) {
-        if (newPosition.accuracy > speedTier.maxAccuracy * 3) {
-            window.lastUpdateTime = currentTime;
-            return;
-        }
-        if (distance < speedTier.minDistanceThreshold) {
-            window.lastPosition = newPosition;
-            window.lastUpdateTime = currentTime;
-            if (typeof updateDistanceBox === 'function')
-                updateDistanceBox(forceUpdate, newPosition, closestLocation, closestDistance);
-            return;
-        }
-        if (timeDelta > 0 && distance / timeDelta > speedTier.maxSpeedThreshold) {
-            window.lastUpdateTime = currentTime;
-            return;
-        }
-    }
-
-    // ── Kalman smoothing and prediction publication ──
-    var kalmanResult = null;
-    if (window.sensorFusion) {
-        kalmanResult = window.sensorFusion.smoothPosition(
-            lat, lng, rawAccuracy, currentTime, rawSpeedMPS, validatedHeading
-        );
-    }
-
-    var smoothedPosition = kalmanResult || {
-        lat: lat, lng: lng,
-        accuracy: rawAccuracy,
-        heading: validatedHeading,
-        timestamp: currentTime,
-        speedMPS: speedMPS
-    };
-
-    window._predictedPosition = { lat: smoothedPosition.lat, lng: smoothedPosition.lng };
-    window._predictedPositionTime = currentTime;
-
-    var kalmanVelocity = window.sensorFusion
-        ? window.sensorFusion.getSmoothedVelocityDegPerSec()
-        : (window.smoothedVelocity || { lat: 0, lng: 0 });
-    window.smoothedVelocity = kalmanVelocity;
-
-    // ── Look-ahead position for panning ──
-    var lookAheadSeconds = speedMPH < 3  ? 0.3 :
-                           speedMPH < 15 ? 0.3 + (speedMPH - 3) * 0.06 :
-                           speedMPH < 45 ? 1.0 + (speedMPH - 15) * 0.027 :
-                                          Math.min(2.5, 1.81 + (speedMPH - 45) * 0.02);
-
-    var lookAheadPos = {
-        lat: smoothedPosition.lat + kalmanVelocity.lat * lookAheadSeconds,
-        lng: smoothedPosition.lng + kalmanVelocity.lng * lookAheadSeconds
-    };
-
-    // ── Synchronous marker update ──
-    _updateUserMarker(window._predictedPosition || smoothedPosition);
-
-    if (typeof _ensureWillChange === 'function') _ensureWillChange();
-    if (typeof _scheduleWillChangeReset === 'function') _scheduleWillChangeReset();
-
-    // ── RAF block: proximity zoom + map panning ──
-    _scheduleMapUpdateRAF(
-        modeSpeedMPH, eastWestMove, speedTier, directionChangeFactor,
-        speedMPH, lookAheadSeconds, isInCenteredMode, modeChanged
-    );
-
-    // ── Update state synchronously ──
-    window.lastPosition = newPosition;
-    window.lastVelocity = window.smoothedVelocity;
-    window.lastUpdateTime = currentTime;
-    window.lastUpdateTimestamp = currentTime;
-
-    // Final DR restart check
-    if (!window.isLocationHuntVisible &&
-        speedMPS >= 0.15 &&
-        window.deadReckoning &&
-        typeof window.deadReckoning.start === 'function' &&
-        !window.deadReckoning.isActive()) {
-        window.deadReckoning.start();
-    }
-
-    if (typeof updateDistanceBox === 'function') {
-        updateDistanceBox(forceUpdate, newPosition, closestLocation, closestDistance);
-    }
-}
-
-/* ══════════════════════════════════════════════
-   REFACTORED HELPER FUNCTIONS (same globals)
-   ══════════════════════════════════════════════ */
-
-function _extractRawGPSData(position, coords) {
-    return {
-        lat: coords.latitude,
-        lng: coords.longitude,
-        rawAccuracy: coords.accuracy || 20,
-        rawHeading: coords.heading !== undefined && coords.heading !== null ? coords.heading : null,
-        rawSpeedMPS: Math.max(0, coords.speed || 0),
-        currentTime: (position.timestamp && isFinite(position.timestamp))
-            ? position.timestamp
-            : Date.now()
-    };
-}
-
-function _handleGPSGapLogic(currentTime, lat, lng) {
-    var lastPos = window.lastPosition;
-    var timeDelta = (lastPos && window.lastUpdateTime)
-        ? (currentTime - window.lastUpdateTime) / 1000
-        : 0;
-
-    // Long gap — soft re-init: preserve heading, seed velocity from displacement.
-    if (timeDelta > 10 && timeDelta < 300 && lastPos) {
-        window.smoothedVelocity = {
-            lat: (lat - lastPos.lat) / timeDelta,
-            lng: (lng - lastPos.lng) / timeDelta
-        };
-
-        var sv = window.smoothedVelocity;
-        if (Math.abs(sv.lat) > 1e-8 || Math.abs(sv.lng) > 1e-8) {
-            var cosLat = Math.cos(lat * Math.PI / 180);
-            window._pendingKalmanSeedVelocity = {
-                vNorth: sv.lat * 111111,
-                vEast:  sv.lng * 111111 * cosLat
-            };
-        }
-
-        window.isStationary = false;
-        window.stationaryStartTime = null;
-        window.stationaryLockPosition = null;
-    } else if (timeDelta >= 300 || !lastPos) {
-        if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
-            window.sensorFusion._kalmanFilter.reset();
-        }
-        window.smoothedVelocity = { lat: 0, lng: 0 };
-        window.isStationary = false;
-        window.stationaryStartTime = null;
-        window.stationaryLockPosition = null;
-    }
-}
-
-function _computeSmoothedSpeed(rawSpeedMPS, newPosition, currentTime) {
-    var lastPos = window.lastPosition;
-    var timeDelta = (lastPos && window.lastUpdateTime)
-        ? (currentTime - window.lastUpdateTime) / 1000
-        : 0;
-
-    var reliableSpeedMPS = rawSpeedMPS;
-    if ((!rawSpeedMPS || rawSpeedMPS < 0.3) && lastPos && timeDelta > 0.15 && timeDelta < 5.0) {
-        var dist = calculateDistance(lastPos, newPosition);
-        if (isFinite(dist) && !(dist > 20 && timeDelta < 1.0)) {
-            reliableSpeedMPS = Math.min(dist / timeDelta, 15);
-        }
-    }
-
-    window._modeSpeedEMA = window._modeSpeedEMA !== undefined ? window._modeSpeedEMA : reliableSpeedMPS;
-    window._modeSpeedEMA = 0.7 * reliableSpeedMPS + 0.3 * window._modeSpeedEMA;
-    var modeSpeedMPH = Math.min(window._modeSpeedEMA * 2.23694, 120);
-
-    window._visualSpeedEMA = window._visualSpeedEMA !== undefined ? window._visualSpeedEMA : reliableSpeedMPS;
-    window._visualSpeedEMA = 0.5 * reliableSpeedMPS + 0.5 * window._visualSpeedEMA;
-    var speedMPH = Math.min(window._visualSpeedEMA * 2.23694, 120);
-
-    return {
-        reliableSpeedMPS: reliableSpeedMPS,
-        modeSpeedMPH: modeSpeedMPH,
-        speedMPH: speedMPH,
-        speedMPS: window._visualSpeedEMA
-    };
-}
-
-function _handleGPSRecovery(newPosition, currentTime, lat, lng, timeDelta) {
-    if (!window.isGPSSearching) return;
-
-    window.isGPSSearching = false;
-    window.isStationary = false;
-    window.stationaryStartTime = null;
-    window.stationaryLockPosition = null;
-
-    var lastPos = window.lastPosition;
-    if (lastPos && timeDelta > 0.5 && timeDelta < 120) {
-        var gapDist = calculateDistance(lastPos, newPosition);
-        if (isFinite(gapDist) && gapDist < 200) {
-            var velLat = (lat - lastPos.lat) / timeDelta;
-            var velLng = (lng - lastPos.lng) / timeDelta;
-            window.lastVelocity = { lat: velLat, lng: velLng };
-            window.smoothedVelocity = { lat: velLat, lng: velLng };
+    if (!isFinite(distM) || distM === Infinity) {
+        window._proxZoomTargetLevel = PROX_ZOOM_OUT;
+        if (window._proxZoomState === 'ZOOMED_IN') {
+            _executeProximityZoom(PROX_ZOOM_OUT, 'IDLE', eastWestMove);
         } else {
-            window.lastVelocity = { lat: 0, lng: 0 };
-            window.smoothedVelocity = { lat: 0, lng: 0 };
+            _resetProximityZoomSmoothing();
         }
-    } else {
-        window.lastVelocity = { lat: 0, lng: 0 };
-        window.smoothedVelocity = { lat: 0, lng: 0 };
+        return;
     }
 
-    if (typeof hideGPSSearchingState === 'function') hideGPSSearchingState();
-}
-
-function _computeProximity(newPosition, lat, lng, speedMPH, currentTime) {
-    var closestDistance = Infinity;
-    var closestLocation = null;
-    var locationsWithDistance = [];
-
-    if (Array.isArray(window.gameLocations) && window.gameLocations.length) {
-        var speedFactor = Math.min(speedMPH / 15, 4);
-        var R = 0.015 + 0.01 * speedFactor;
-        for (var i = 0; i < window.gameLocations.length; i++) {
-            var loc = window.gameLocations[i];
-            if (!loc || !loc.lat || loc.lat < lat - R || loc.lat > lat + R ||
-                loc.lng < lng - R || loc.lng > lng + R) continue;
-            var dist2 = calculateDistance(newPosition, loc);
-            locationsWithDistance.push({ location: loc, distance: dist2 });
-            if (dist2 < closestDistance) { closestDistance = dist2; closestLocation = loc; }
-        }
+    if (!window._proxZoomState) {
+        window._proxZoomState = 'IDLE';
     }
 
-    window._lastClosestDistance = closestDistance;
-    window._lastClosestLocation = closestLocation;
+    let targetZoom = PROX_ZOOM_OUT;
 
-    window.proximityState = (closestLocation && closestDistance !== Infinity)
-        ? { closestLocation: closestLocation, distanceMeters: closestDistance } : null;
-
-    if (locationsWithDistance.length &&
-        (!window._lastCacheUpdate || (currentTime - window._lastCacheUpdate) > 5000)) {
-        var cacheFn = window.enterpriseCacheManager && window.enterpriseCacheManager.cacheLocationData;
-        if (cacheFn) {
-            for (var j = 0; j < locationsWithDistance.length; j++) {
-                if (locationsWithDistance[j].distance <= 100) {
-                    cacheFn(locationsWithDistance[j].location, newPosition);
-                }
-            }
-        }
-        window._lastCacheUpdate = currentTime;
+    if (distM <= PROX_NEAR_M && smoothedSpeedMPH <= MAX_PROX_SPEED_MPH) {
+        targetZoom = PROX_ZOOM_IN;
+    } else if (distM < PROX_FAR_M && smoothedSpeedMPH <= MAX_PROX_SPEED_MPH) {
+        const t = (PROX_FAR_M - distM) / (PROX_FAR_M - PROX_NEAR_M);
+        const easedT = t * t * (3 - 2 * t);
+        targetZoom = PROX_ZOOM_OUT + (PROX_ZOOM_IN - PROX_ZOOM_OUT) * easedT;
+    } else if (timeToNearSec < 3.0 && timeToNearSec > 0 && smoothedSpeedMPH <= MAX_PROX_SPEED_MPH) {
+        targetZoom = PROX_ZOOM_OUT + 0.5;
     }
 
-    return { closestDistance: closestDistance, closestLocation: closestLocation };
-}
+    window._proxZoomTargetLevel = targetZoom;
 
-function _shouldRejectAcceleration(speedMPH, lastPos, timeDelta) {
-    if (!(timeDelta > 0 && timeDelta < 5)) return false;
-    var lastSpeedMPH = (lastPos.speedMPS || 0) * 2.23694;
-    var accel = Math.abs(speedMPH - lastSpeedMPH) / timeDelta;
-    if ((speedMPH < 3 && accel > 25) ||
-        (speedMPH < 8 && accel > 22) ||
-        (speedMPH < 15 && accel > 18)) {
-        return true;
-    }
-    return false;
-}
+    const currentZoom = map.getZoom();
+    const zoomDiff = Math.abs(targetZoom - currentZoom);
 
-function _fuseAndValidateHeading(rawHeading, speedMPS, lastPos) {
-    var fusedHeading = window.sensorFusion
-        ? window.sensorFusion.getHeading(rawHeading, speedMPS)
-        : rawHeading;
-
-    var validatedHeading = fusedHeading;
-    var lastHeading = lastPos.heading !== undefined && lastPos.heading !== null ? lastPos.heading : null;
-    var isMoving = window.sensorFusion
-        ? window.sensorFusion.isDeviceMoving(speedMPS)
-        : (speedMPS > 0.5);
-
-    if (lastHeading !== null && fusedHeading !== null) {
-        var diff = Math.abs(fusedHeading - lastHeading);
-        if (diff > 180) diff = 360 - diff;
-        if (!isMoving && speedMPS < 1.0 && diff > 90) {
-            validatedHeading = lastHeading;
-        }
+    if (zoomDiff < 0.1) {
+        window._proxZoomCurrentLevel = targetZoom;
+        window._proxZoomState = (Math.abs(targetZoom - PROX_ZOOM_IN) < 0.3) ? 'ZOOMED_IN' : 'IDLE';
+        return;
     }
 
-    return validatedHeading;
-}
+    if (zoomDiff >= 0.4) {
+        const discreteTarget = targetZoom > (PROX_ZOOM_IN + PROX_ZOOM_OUT) / 2
+            ? PROX_ZOOM_IN
+            : PROX_ZOOM_OUT;
 
-function _computeHeadingFactor(lastPos, validatedHeading) {
-    var headingDiff = 0;
-    var directionChangeFactor = 1.0;
-    var lastHeading = lastPos.heading !== undefined && lastPos.heading !== null ? lastPos.heading : null;
+        const newState = discreteTarget === PROX_ZOOM_IN ? 'ZOOMED_IN' : 'IDLE';
 
-    if (lastHeading !== null && validatedHeading !== null) {
-        headingDiff = Math.abs(validatedHeading - lastHeading);
-        if (headingDiff > 180) headingDiff = 360 - headingDiff;
-        if (headingDiff > 12) {
-            directionChangeFactor = Math.min(1.3, 1.0 + headingDiff / 200);
+        if (newState !== window._proxZoomState || zoomDiff > 1.0) {
+            window._proxZoomState = newState;
+            if (!window._lastProxZoomTimeByDir) window._lastProxZoomTimeByDir = {};
+            window._lastProxZoomTimeByDir[cooldownKey] = now;
+            _executeProximityZoom(discreteTarget, newState, eastWestMove);
         }
     }
-
-    return { headingDiff: headingDiff, directionChangeFactor: directionChangeFactor };
-}
-
-function _selectSpeedTier(speedMPH, eastWestMove) {
-    var panDuration, easeLinearity, mapUpdateInterval, mapUpdateDistance,
-        maxAccuracy, minDistThreshold, maxSpeedThreshold;
-
-    if (speedMPH >= 15) {
-        panDuration = 0.12; easeLinearity = 0.22; mapUpdateInterval = 150;
-        mapUpdateDistance = 6.5; maxAccuracy = 20; minDistThreshold = 0.85; maxSpeedThreshold = 80;
-    } else if (speedMPH >= 8) {
-        panDuration = 0.25; easeLinearity = 0.18; mapUpdateInterval = 400;
-        mapUpdateDistance = 4.0; maxAccuracy = 25; minDistThreshold = 0.5; maxSpeedThreshold = 15;
-    } else if (speedMPH >= 3) {
-        panDuration = 0.35; easeLinearity = 0.15; mapUpdateInterval = 800;
-        mapUpdateDistance = 3.0; maxAccuracy = 28; minDistThreshold = 0.35; maxSpeedThreshold = 8;
-    } else {
-        panDuration = 0.60; easeLinearity = 0.12; mapUpdateInterval = 1000;
-        mapUpdateDistance = 2.0; maxAccuracy = 32; minDistThreshold = 0.25; maxSpeedThreshold = 3;
-    }
-
-    var speedTier = {
-        panDuration: panDuration,
-        easeLinearity: easeLinearity,
-        mapUpdateInterval: Math.max(33, mapUpdateInterval),
-        mapUpdateDistance: mapUpdateDistance,
-        maxAccuracy: maxAccuracy,
-        minDistanceThreshold: minDistThreshold,
-        maxSpeedThreshold: maxSpeedThreshold
-    };
-
-    if (eastWestMove) {
-        speedTier.panDuration *= 0.88;
-        speedTier.easeLinearity *= 0.92;
-        speedTier.mapUpdateInterval = Math.max(33, speedTier.mapUpdateInterval * 0.88);
-        speedTier.minDistanceThreshold *= 0.92;
-    }
-
-    return speedTier;
-}
-
-function _manageStationaryState(newPosition, currentTime, distance, timeDelta,
-                                 validatedHeading, lat, lng,
-                                 forceUpdate, closestLocation, closestDistance) {
-    var STAT_THRESHOLD = 3.5;
-    var STAT_CONFIRM_MS = 4000;
-    var FAST_EXIT_DIST = 3.0;
-    var FAST_EXIT_SPEED = 1.0;
-
-    var isStationaryLocked = window.isStationary && window.stationaryLockPosition;
-    var isDeviceMoving = window.lastValidPosition && window.lastValidPosition.isMoving !== undefined
-        ? window.lastValidPosition.isMoving
-        : null;
-
-    if (isStationaryLocked) {
-        var shouldBreakLock = false;
-
-        if (isDeviceMoving === true && distance >= 1.0) {
-            shouldBreakLock = true;
-        } else if (isDeviceMoving === null) {
-            var calcSpeed = timeDelta > 0 ? distance / timeDelta : 0;
-            if (distance >= FAST_EXIT_DIST && calcSpeed >= FAST_EXIT_SPEED) {
-                shouldBreakLock = true;
-            }
-        } else if (isDeviceMoving === false) {
-            var calcSpeed2 = timeDelta > 0 ? distance / timeDelta : 0;
-            if (distance >= FAST_EXIT_DIST * 2 && calcSpeed2 >= FAST_EXIT_SPEED * 1.25) {
-                shouldBreakLock = true;
-            }
-        }
-
-        if (shouldBreakLock) {
-            _breakStationaryLock(newPosition, currentTime, timeDelta, validatedHeading, lat, lng);
-            return { handled: true };
-        } else {
-            _maintainStationaryLock(newPosition, currentTime, lat, lng, forceUpdate, closestLocation, closestDistance);
-            return { handled: true };
-        }
-    }
-
-    // Check if the user has become stationary
-    var isEffectivelyStill = isDeviceMoving === false
-        ? (distance < STAT_THRESHOLD * 2)
-        : (distance < STAT_THRESHOLD);
-
-    if (isEffectivelyStill) {
-        if (!window.stationaryStartTime) window.stationaryStartTime = currentTime;
-        var confirmTime = (isDeviceMoving === false) ? 800 : STAT_CONFIRM_MS;
-
-        if (currentTime - window.stationaryStartTime >= confirmTime) {
-            _confirmStationary(newPosition, currentTime);
-            if (typeof _cleanupMarkerStyles === 'function') _cleanupMarkerStyles();
-            window.lastUpdateTime = currentTime;
-            return { handled: true };
-        }
-
-        if (distance > 0.3) {
-            scheduleMarkerUpdate(lat, lng, { animate: true, duration: 0.5, easeLinearity: 0.06 });
-        }
-
-        window.lastPosition = newPosition;
-        window.lastUpdateTime = currentTime;
-        if (typeof updateDistanceBox === 'function')
-            updateDistanceBox(forceUpdate, newPosition, closestLocation, closestDistance);
-        return { handled: true };
-    }
-
-    return { handled: false };
-}
-
-function _breakStationaryLock(newPosition, currentTime, timeDelta, validatedHeading, lat, lng) {
-    window.isStationary = false;
-    window.stationaryLockPosition = null;
-    window.stationaryStartTime = null;
-    window._stationaryNudgeAnchor = null;
-
-    if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
-        var kf = window.sensorFusion._kalmanFilter;
-        var breakoutSpeed = timeDelta > 0 ? distance / timeDelta : 0;
-        if (breakoutSpeed > 0.3 && validatedHeading !== null) {
-            var rad = validatedHeading * Math.PI / 180;
-            kf.seedVelocity(
-                breakoutSpeed * Math.cos(rad),
-                breakoutSpeed * Math.sin(rad),
-                15.0
-            );
-        } else {
-            kf.reset();
-        }
-        kf._justInitialized = true;
-    }
-
-    window.smoothedVelocity = timeDelta > 0
-        ? { lat: (lat - window.lastPosition.lat) / timeDelta, lng: (lng - window.lastPosition.lng) / timeDelta }
-        : { lat: 0, lng: 0 };
-
-    window.lastPosition = newPosition;
-    window.lastUpdateTime = currentTime;
-    window.lastUpdateTimestamp = currentTime;
-
-    var buffer = window.positionBuffer;
-    if (buffer && buffer.length > 0) {
-        var staleCutoff = currentTime - 10000;
-        while (buffer.length > 0 && (buffer[0].timestamp || 0) < staleCutoff) {
-            buffer.shift();
-        }
-        if (buffer.length === 0 && typeof seedPositionBuffer === 'function') {
-            seedPositionBuffer(newPosition, 2);
-        }
-    }
-
-    if (window.deadReckoning && typeof window.deadReckoning.onMovementResumed === 'function') {
-        window.deadReckoning.onMovementResumed();
-    }
-}
-
-function _maintainStationaryLock(newPosition, currentTime, lat, lng, forceUpdate, closestLocation, closestDistance) {
-    var distFromLock = calculateDistance(window.stationaryLockPosition, newPosition);
-    if (distFromLock < 2.0 && newPosition.accuracy < window.lastPosition.accuracy * 0.7) {
-        scheduleMarkerUpdate(lat, lng, { animate: true, duration: 0.4, easeLinearity: 0.06 });
-
-        if (!window._stationaryNudgeAnchor) {
-            window._stationaryNudgeAnchor = {
-                lat: window.stationaryLockPosition.lat,
-                lng: window.stationaryLockPosition.lng
-            };
-        }
-        var distFromAnchor = calculateDistance(window._stationaryNudgeAnchor, newPosition);
-        if (distFromAnchor < 1.0) {
-            window.stationaryLockPosition = { lat: lat, lng: lng };
-        }
-    }
-    window.lastPosition = newPosition;
-    window.lastUpdateTime = currentTime;
-    window.lastUpdateTimestamp = currentTime;
-    if (typeof updateDistanceBox === 'function')
-        updateDistanceBox(forceUpdate, newPosition, closestLocation, closestDistance);
-}
-
-function _updateUserMarker(displayPos) {
-    if (!userMarker) return;
-    var markerEl = userMarker.getElement ? userMarker.getElement() : null;
-    if (markerEl) {
-        markerEl.style.transition = 'none';
-        var iconEl = markerEl.querySelector('.user-marker-icon');
-        if (iconEl) iconEl.style.transition = 'none';
-    }
-    try {
-        userMarker.setLatLng([displayPos.lat, displayPos.lng]);
-    } catch (err) {
-        if (typeof console !== 'undefined' && console.warn) {
-            console.warn('[MarkerUpdate] setLatLng failed:', err);
-        }
-    }
-}
-
-function _scheduleMapUpdateRAF(modeSpeedMPH, eastWestMove, speedTier, directionChangeFactor,
-                                speedMPH, lookAheadSeconds, isInCenteredMode, modeChanged) {
-    if (window._nextLocationUpdateRAF) {
-        cancelAnimationFrame(window._nextLocationUpdateRAF);
-    }
-
-    window._nextLocationUpdateRAF = requestAnimationFrame(function() {
-        window._nextLocationUpdateRAF = null;
-
-        // Always run proximity zoom logic first — stuck-flag escape hatch
-        if (typeof _handleProximityZoomLogic === 'function') {
-            _handleProximityZoomLogic(modeSpeedMPH, eastWestMove);
-        }
-
-        // Skip map panning while proximity zoom animation is in progress
-        if (window._isProximityZoomAnimating) return;
-
-        var shouldUpdateMap = (Date.now() - (window.lastMapUpdateTime || 0)) > speedTier.mapUpdateInterval ||
-            isInCenteredMode || modeChanged;
-
-        if (!map || window.isMapInteracting || !window.followUser) return;
-
-        var panPos = window._predictedPosition;
-
-        if (isInCenteredMode) {
-            _panMapToCenter(panPos, speedTier, directionChangeFactor,
-                eastWestMove, speedMPH, lookAheadSeconds);
-        } else if (shouldUpdateMap) {
-            map.panTo([panPos.lat, panPos.lng], {
-                animate: true,
-                duration: Math.max(0.08, speedTier.panDuration),
-                easeLinearity: speedTier.easeLinearity,
-                noMoveStart: true
-            });
-        }
-        window.lastMapUpdateTime = Date.now();
-    });
 }
 
 function _estimateApproachSpeedMPS() {
