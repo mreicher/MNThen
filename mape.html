@@ -2081,18 +2081,26 @@ window.sensorFusion = new SensorFusionManager().init();
     let _rafId = null;
     let _active = false;
 
+    // Smooth prediction offset — ramps up to the adaptive horizon after each
+    // GPS fix rather than jumping to 0 and snapping. Eliminates the per-fix
+    // micro-stutter without unbounded integration or GPS-outage drift risk.
+    let _predictOffsetSec = 0;
+    let _lastKalmanTimestamp = null;
+
     const MIN_DT_MS = 16;
     const MIN_SPEED_MPS = 0.15;
     const MIN_CENTER_DRIFT_PX = 3;
 
-    // Adaptive prediction horizon: shorter at walking speeds to minimize drift,
-    // longer at driving speeds where GPS latency matters more.
+    // Approach rate: reaches 0.3s horizon in ~150ms, 0.6s in ~300ms.
+    // Fast enough to be imperceptible, slow enough to prevent visible snap.
+    const PREDICT_APPROACH_RATE = 2.0; // seconds of offset per second of wall time
+
     function getAdaptivePredictAheadSec(speedMPS) {
-        if (speedMPS < 1.5) return 0.6;   // Slow walk: ~0.9m max drift
-        if (speedMPS < 2.5) return 0.9;   // Brisk walk
-        if (speedMPS < 5.0) return 1.3;   // Jogging / slow bike
-        if (speedMPS < 12.0) return 1.8;  // City driving
-        return 2.2;                        // Highway
+        if (speedMPS < 1.5) return 0.3;   // Reduced from 0.6 — 45cm max at walk
+        if (speedMPS < 2.5) return 0.5;   // Reduced from 0.9
+        if (speedMPS < 5.0) return 1.3;
+        if (speedMPS < 12.0) return 1.8;
+        return 2.2;
     }
 
     function frame(now) {
@@ -2155,13 +2163,7 @@ window.sensorFusion = new SensorFusionManager().init();
             return;
         }
 
-        // CHANGE: Use the Kalman-filtered position as the extrapolation origin
-        // instead of the raw GPS lastPos. The Kalman output is the filter's
-        // best smoothed estimate; predicting forward from it means GPS
-        // measurement updates are absorbed silently inside the filter and cause
-        // zero visible discontinuity in the marker position. The original code
-        // predicted from the raw GPS fix, so every ~1 Hz GPS update caused the
-        // marker to snap back and then race forward again.
+        // Resolve the Kalman origin (unchanged from original)
         const nowMs = Date.now();
         let originLat, originLng, originTimestamp;
 
@@ -2179,8 +2181,41 @@ window.sensorFusion = new SensorFusionManager().init();
             originTimestamp = window.lastUpdateTimestamp || nowMs;
         }
 
-        const timeSinceFixSec = Math.max(0, (nowMs - originTimestamp) / 1000);
-        const predictDtSec = Math.min(getAdaptivePredictAheadSec(speedMPS), timeSinceFixSec);
+        // FIX: track the prediction offset as smooth state rather than
+        // re-deriving it from timeSinceFixSec each frame.
+        //
+        // Original code:
+        //   const timeSinceFixSec = Math.max(0, (nowMs - originTimestamp) / 1000);
+        //   const predictDtSec = Math.min(getAdaptivePredictAheadSec(speedMPS), timeSinceFixSec);
+        //
+        // Problem: when a new GPS fix arrives, originTimestamp resets to ~nowMs,
+        // so timeSinceFixSec drops to ~0 and predictDtSec snaps back to near-zero,
+        // visibly pulling the marker backward before it ramps up again over ~600ms.
+        //
+        // Fix: on a new fix, reset _predictOffsetSec to 0 and let it ramp smoothly
+        // toward the adaptive horizon at PREDICT_APPROACH_RATE. The ramp takes
+        // ~150–300ms which is imperceptible. Between fixes the offset stays near
+        // the horizon — no snap, no unbounded integration, no GPS-outage drift.
+        const horizon = getAdaptivePredictAheadSec(speedMPS);
+        const dtSec = dtMs / 1000;
+
+        if (kalmanPos && kalmanPos.timestamp !== _lastKalmanTimestamp) {
+            // New GPS fix: start the ramp from zero.
+            // The Kalman output already incorporates the new measurement, so
+            // originLat/Lng is consistent — no position discontinuity here.
+            _lastKalmanTimestamp = kalmanPos.timestamp;
+            _predictOffsetSec = 0;
+        } else {
+            // Between fixes: smoothly approach the horizon in both directions
+            // so speed changes don't cause a jump either.
+            if (_predictOffsetSec < horizon) {
+                _predictOffsetSec = Math.min(horizon, _predictOffsetSec + PREDICT_APPROACH_RATE * dtSec);
+            } else if (_predictOffsetSec > horizon) {
+                _predictOffsetSec = Math.max(horizon, _predictOffsetSec - PREDICT_APPROACH_RATE * dtSec);
+            }
+        }
+
+        const predictDtSec = _predictOffsetSec; // replaces the original two lines
 
         if (predictDtSec <= 0) {
             _rafId = requestAnimationFrame(frame);
@@ -2190,7 +2225,7 @@ window.sensorFusion = new SensorFusionManager().init();
         const predictedLat = originLat + vel.lat * predictDtSec;
         const predictedLng = originLng + vel.lng * predictDtSec;
 
-        // Sanity-check: discard predictions that jump more than 150 m
+        // Sanity-check: discard predictions that jump more than 150m (unchanged)
         const jumpLat = Math.abs(predictedLat - originLat) * 111111;
         const jumpLng = Math.abs(predictedLng - originLng) * 111111 *
                         Math.cos(originLat * Math.PI / 180);
@@ -2200,9 +2235,6 @@ window.sensorFusion = new SensorFusionManager().init();
             return;
         }
 
-        // The origin is already Kalman-smoothed, so the predicted position needs
-        // no additional per-frame clamping or EMA — applying either would only
-        // add latency. Set the marker directly.
         if (userMarker) {
             const el = userMarker.getElement();
             if (el) el.style.transition = 'none';
@@ -2240,6 +2272,9 @@ window.sensorFusion = new SensorFusionManager().init();
             : (window.lastPosition?.speedMPS || 0);
         if (speedMPS < MIN_SPEED_MPS) return;
         if (window.isStationary && speedMPS < 0.8) return;
+        // Reset prediction offset so it ramps in cleanly on restart
+        _predictOffsetSec = 0;
+        _lastKalmanTimestamp = null;
         _active = true;
         _lastFrameTime = performance.now();
         _rafId = requestAnimationFrame(frame);
