@@ -2081,23 +2081,17 @@ window.sensorFusion = new SensorFusionManager().init();
     let _rafId = null;
     let _active = false;
 
-    // Smooth prediction offset — ramps up to the adaptive horizon after each
-    // GPS fix rather than jumping to 0 and snapping. Eliminates the per-fix
-    // micro-stutter without unbounded integration or GPS-outage drift risk.
     let _predictOffsetSec = 0;
     let _lastKalmanTimestamp = null;
 
     const MIN_DT_MS = 16;
     const MIN_SPEED_MPS = 0.15;
     const MIN_CENTER_DRIFT_PX = 3;
-
-    // Approach rate: reaches 0.3s horizon in ~150ms, 0.6s in ~300ms.
-    // Fast enough to be imperceptible, slow enough to prevent visible snap.
-    const PREDICT_APPROACH_RATE = 2.0; // seconds of offset per second of wall time
+    const PREDICT_APPROACH_RATE = 2.0;
 
     function getAdaptivePredictAheadSec(speedMPS) {
-        if (speedMPS < 1.5) return 0.3;   // Reduced from 0.6 — 45cm max at walk
-        if (speedMPS < 2.5) return 0.5;   // Reduced from 0.9
+        if (speedMPS < 1.5) return 0.3;
+        if (speedMPS < 2.5) return 0.5;
         if (speedMPS < 5.0) return 1.3;
         if (speedMPS < 12.0) return 1.8;
         return 2.2;
@@ -2123,6 +2117,8 @@ window.sensorFusion = new SensorFusionManager().init();
             }
         }
 
+        // While the user is interacting, keep the loop alive but don't move
+        // anything — we'll resume predicting the moment they lift off.
         if (window.isMapInteracting) {
             _lastFrameTime = now;
             _rafId = requestAnimationFrame(frame);
@@ -2163,9 +2159,9 @@ window.sensorFusion = new SensorFusionManager().init();
             return;
         }
 
-        // Resolve the Kalman origin (unchanged from original)
+        // ── Resolve Kalman origin ──────────────────────────────────────────
         const nowMs = Date.now();
-        let originLat, originLng, originTimestamp;
+        let originLat, originLng;
 
         const kalmanPos = window.sensorFusion
             ? window.sensorFusion.getLastKalmanPosition()
@@ -2174,40 +2170,25 @@ window.sensorFusion = new SensorFusionManager().init();
         if (kalmanPos && kalmanPos.timestamp != null) {
             originLat = kalmanPos.lat;
             originLng = kalmanPos.lng;
-            originTimestamp = kalmanPos.timestamp;
         } else {
             originLat = lastPos.lat;
             originLng = lastPos.lng;
-            originTimestamp = window.lastUpdateTimestamp || nowMs;
         }
 
-        // FIX: track the prediction offset as smooth state rather than
-        // re-deriving it from timeSinceFixSec each frame.
-        //
-        // Original code:
-        //   const timeSinceFixSec = Math.max(0, (nowMs - originTimestamp) / 1000);
-        //   const predictDtSec = Math.min(getAdaptivePredictAheadSec(speedMPS), timeSinceFixSec);
-        //
-        // Problem: when a new GPS fix arrives, originTimestamp resets to ~nowMs,
-        // so timeSinceFixSec drops to ~0 and predictDtSec snaps back to near-zero,
-        // visibly pulling the marker backward before it ramps up again over ~600ms.
-        //
-        // Fix: on a new fix, reset _predictOffsetSec to 0 and let it ramp smoothly
-        // toward the adaptive horizon at PREDICT_APPROACH_RATE. The ramp takes
-        // ~150–300ms which is imperceptible. Between fixes the offset stays near
-        // the horizon — no snap, no unbounded integration, no GPS-outage drift.
+        // ── Smooth prediction offset ───────────────────────────────────────
+        // Ramps from 0 to the adaptive horizon after each GPS fix, rather than
+        // snapping to 0 and jerking the marker back on every 1Hz update.
         const horizon = getAdaptivePredictAheadSec(speedMPS);
         const dtSec = dtMs / 1000;
 
         if (kalmanPos && kalmanPos.timestamp !== _lastKalmanTimestamp) {
-            // New GPS fix: start the ramp from zero.
-            // The Kalman output already incorporates the new measurement, so
-            // originLat/Lng is consistent — no position discontinuity here.
+            // New GPS fix: the Kalman position has been updated — start the
+            // ramp from zero so we predict forward smoothly from the new origin.
             _lastKalmanTimestamp = kalmanPos.timestamp;
             _predictOffsetSec = 0;
         } else {
-            // Between fixes: smoothly approach the horizon in both directions
-            // so speed changes don't cause a jump either.
+            // Between fixes: glide toward the current horizon.
+            // Also handles speed changes without jumping.
             if (_predictOffsetSec < horizon) {
                 _predictOffsetSec = Math.min(horizon, _predictOffsetSec + PREDICT_APPROACH_RATE * dtSec);
             } else if (_predictOffsetSec > horizon) {
@@ -2215,17 +2196,15 @@ window.sensorFusion = new SensorFusionManager().init();
             }
         }
 
-        const predictDtSec = _predictOffsetSec; // replaces the original two lines
-
-        if (predictDtSec <= 0) {
+        if (_predictOffsetSec <= 0) {
             _rafId = requestAnimationFrame(frame);
             return;
         }
 
-        const predictedLat = originLat + vel.lat * predictDtSec;
-        const predictedLng = originLng + vel.lng * predictDtSec;
+        const predictedLat = originLat + vel.lat * _predictOffsetSec;
+        const predictedLng = originLng + vel.lng * _predictOffsetSec;
 
-        // Sanity-check: discard predictions that jump more than 150m (unchanged)
+        // Sanity-check: discard anything that jumps more than 150m
         const jumpLat = Math.abs(predictedLat - originLat) * 111111;
         const jumpLng = Math.abs(predictedLng - originLng) * 111111 *
                         Math.cos(originLat * Math.PI / 180);
@@ -2235,6 +2214,7 @@ window.sensorFusion = new SensorFusionManager().init();
             return;
         }
 
+        // ── Update marker and map center ───────────────────────────────────
         if (userMarker) {
             const el = userMarker.getElement();
             if (el) el.style.transition = 'none';
@@ -2249,11 +2229,17 @@ window.sensorFusion = new SensorFusionManager().init();
                 const driftPx = Math.hypot(targetPx.x - centerPx.x, targetPx.y - centerPx.y);
 
                 if (driftPx > MIN_CENTER_DRIFT_PX) {
+                    // FLAG: tell the interaction handlers this moveend is ours,
+                    // not a user gesture. Without this, the 60fps moveend events
+                    // we fire here beat zoomend after a pinch and release
+                    // isMapInteracting prematurely — the root cause Kimi found.
+                    window._programmaticMapMove = true;
                     map.setView([predictedLat, predictedLng], map.getZoom(), {
                         animate: false,
                         noMoveStart: true,
                         noMoveEnd: true
                     });
+                    window._programmaticMapMove = false;
                 }
             }
         }
@@ -2272,7 +2258,6 @@ window.sensorFusion = new SensorFusionManager().init();
             : (window.lastPosition?.speedMPS || 0);
         if (speedMPS < MIN_SPEED_MPS) return;
         if (window.isStationary && speedMPS < 0.8) return;
-        // Reset prediction offset so it ramps in cleanly on restart
         _predictOffsetSec = 0;
         _lastKalmanTimestamp = null;
         _active = true;
@@ -2299,10 +2284,7 @@ window.sensorFusion = new SensorFusionManager().init();
     if (!_registerCleanup()) {
         window.deadReckoning = {
             stop() {
-                if (_rafId != null) {
-                    cancelAnimationFrame(_rafId);
-                    _rafId = null;
-                }
+                if (_rafId != null) { cancelAnimationFrame(_rafId); _rafId = null; }
                 _active = false;
             },
             start() { _restartIfMoving(); },
@@ -2313,10 +2295,7 @@ window.sensorFusion = new SensorFusionManager().init();
     } else {
         window.deadReckoning = {
             stop() {
-                if (_rafId != null) {
-                    cancelAnimationFrame(_rafId);
-                    _rafId = null;
-                }
+                if (_rafId != null) { cancelAnimationFrame(_rafId); _rafId = null; }
                 _active = false;
             },
             start() { _restartIfMoving(); },
@@ -4419,14 +4398,12 @@ function setupMapInteractionHandlers() {
     }
 
     let activeTouchCount = 0;
-    // NEW: tracks whether the most recent gesture included a pinch (2+ fingers).
-    // touchend clears activeTouchCount before zoomend fires, so we need this
-    // flag to tell onInteractionEnd "a zoom just happened — start the timer,
-    // don't bail out early."
     let _pinchOccurred = false;
 
     const onInteractionStart = () => {
-        if (window._programmaticFlyInProgress) {
+        // Ignore movestart/zoomstart fired by the DR loop's setView or
+        // programmatic fly — neither represents a user gesture.
+        if (window._programmaticMapMove || window._programmaticFlyInProgress) {
             window._programmaticFlyInProgress = false;
             return;
         }
@@ -4441,9 +4418,12 @@ function setupMapInteractionHandlers() {
     };
 
     const onInteractionEnd = () => {
-        // GUARD: Don't release if fingers are still on screen (pinch in progress).
-        // Also allow through if a pinch just completed — fingers lifted but
-        // zoomend fires after the animation, so activeTouchCount is already 0.
+        // Ignore moveend fired by the DR loop's 60fps setView calls.
+        // Without this guard the DR loop beats zoomend to the punch and
+        // releases interaction state while fingers are still on the screen.
+        if (window._programmaticMapMove) return;
+
+        // Don't release while fingers are still down (mid-pinch).
         if (activeTouchCount > 0) return;
 
         window.isMapInteracting = false;
@@ -4453,20 +4433,14 @@ function setupMapInteractionHandlers() {
             : 0;
 
         if (speedMPH < 1.0) {
-            // FIX: always start the 30s timer after any gesture ends —
-            // whether it was a pan or a completed pinch-zoom.
-            // Previously, when zoomend fired after a pinch, activeTouchCount
-            // was already 0 (fingers lifted) so the guard passed and this
-            // path ran — but _pinchOccurred lets us be explicit about intent.
             _startInactivityTimer();
         }
 
-        _pinchOccurred = false; // reset for the next gesture
+        _pinchOccurred = false;
     };
 
     map.on('movestart', onInteractionStart);
     map.on('zoomstart', onInteractionStart);
-
     map.on('moveend', onInteractionEnd);
     map.on('zoomend', onInteractionEnd);
 
@@ -4475,24 +4449,26 @@ function setupMapInteractionHandlers() {
 
     const touchStartHandler = (e) => {
         activeTouchCount = e.touches.length;
-        // NEW: flag a pinch the moment a second finger touches down.
+
         if (e.touches.length >= 2) {
             _pinchOccurred = true;
         }
+
+        // Clear inactivity timer immediately on any touch — don't wait for
+        // movestart/zoomstart, which can lag behind the first touch event.
+        _clearInactivityTimer();
     };
 
     const touchEndHandler = (e) => {
         activeTouchCount = e.touches.length;
 
-        // If all fingers lifted and this was NOT a pinch, fire end immediately.
-        // If it WAS a pinch, leave isMapInteracting=true so the map stays
-        // "held" until zoomend fires and onInteractionEnd runs naturally.
         if (activeTouchCount === 0 && window.isMapInteracting) {
             if (!_pinchOccurred) {
+                // Pan: fire end immediately — no zoom animation to wait for.
                 onInteractionEnd();
             }
-            // If _pinchOccurred, zoomend will call onInteractionEnd once
-            // the zoom animation completes — no action needed here.
+            // Pinch: leave isMapInteracting = true; zoomend fires after the
+            // zoom animation completes and calls onInteractionEnd naturally.
         }
     };
 
@@ -4523,8 +4499,6 @@ function _clearInactivityTimer() {
 function _startInactivityTimer() {
     if (window.inactivityTimer) return;
 
-    // Use createTrackedTimeout so the memory manager cleans this up
-    // on page unload instead of leaving a dangling timer
     window.inactivityTimer = createTrackedTimeout(() => {
         _handleInactivityReset();
     }, 30000);
@@ -4535,20 +4509,17 @@ function _handleInactivityReset() {
     const speed = pos ? (pos.speedMPS * 2.23694) : 0;
 
     if (pos && speed < 0.5 && map && userMarker) {
-        // Re-enable following BEFORE panning so the GPS update
-        // loop picks up the change on the next tick.
         window.followUser = true;
         window.isMapInteracting = false;
 
         map.panTo([pos.lat, pos.lng], {
             animate: true,
-            duration: 1.0,            // Slower, smoother return
-            easeLinearity: 0.15,      // Gentler easing (lower = more acceleration/deceleration)
+            duration: 1.0,
+            easeLinearity: 0.15,
             noMoveStart: true
         });
         userMarker.setLatLng([pos.lat, pos.lng]);
 
-        // Reset stationary state so the next GPS update starts fresh
         window.stationaryStartTime = Date.now();
     }
 
