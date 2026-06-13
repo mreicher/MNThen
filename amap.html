@@ -5428,6 +5428,9 @@ function updateUserLocation(position, forceUpdate = false) {
         
 /* ──────────────────────────────────────────────
    PROXIMITY ZOOM LOGIC
+   Smooth, predictive, continuous zoom with speed-adaptive hysteresis.
+   Ensures BOTH user marker and location marker remain visible.
+   Backwards compatible: user marker stays in center 60% of viewport.
    ────────────────────────────────────────────── */
 function _handleProximityZoomLogic(speedMPH, eastWestMove) {
     const PROX_NEAR_M = 15.24;
@@ -5436,16 +5439,9 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
     const PROX_ZOOM_OUT = 17;
     const MAX_PROX_SPEED_MPH = 10;
     const PROX_COOLDOWN_MS = 400;
-    const ANIMATION_STUCK_TIMEOUT_MS = 3000;
 
     if (window._proxZoomTargetLevel == null) window._proxZoomTargetLevel = PROX_ZOOM_OUT;
-
-    // Sync from live map zoom — prevents stale state after location page closes
-    if (map) {
-        window._proxZoomCurrentLevel = map.getZoom();
-    } else if (window._proxZoomCurrentLevel == null) {
-        window._proxZoomCurrentLevel = PROX_ZOOM_OUT;
-    }
+    if (window._proxZoomCurrentLevel == null) window._proxZoomCurrentLevel = PROX_ZOOM_OUT;
 
     window._proxSpeedEMA = window._proxSpeedEMA ?? speedMPH;
     window._proxSpeedEMA = 0.6 * speedMPH + 0.4 * window._proxSpeedEMA;
@@ -5477,21 +5473,7 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
         return;
     }
 
-    // Escape hatch: if animating flag is stuck > 3s, force cleanup
-    if (window._isProximityZoomAnimating) {
-        const flagAge = Date.now() - (window._proxZoomAnimationStartTime || 0);
-        if (flagAge > ANIMATION_STUCK_TIMEOUT_MS) {
-            console.warn('[ProximityZoom] Animation flag stuck for', flagAge, 'ms — clearing');
-            if (typeof window._currentProximityZoomCleanup === 'function') {
-                window._currentProximityZoomCleanup();
-            } else {
-                window._isProximityZoomAnimating = false;
-                window._proxZoomAnimationStartTime = null;
-                window.isMapInteracting = false;
-            }
-        }
-        return;
-    }
+    if (window._isProximityZoomAnimating) return;
 
     const now = Date.now();
 
@@ -5634,27 +5616,27 @@ function _executeProximityZoom(targetZoom, nextState, eastWestMove) {
     window._lastProxZoomTime = Date.now();
     window._proxZoomState = nextState;
     window._isProximityZoomAnimating = true;
-    window._proxZoomAnimationStartTime = Date.now();
 
     const zoomDur = Math.min(0.6, Math.max(0.2, zoomDelta * 0.2));
     const userLL = userMarker?.getLatLng?.();
 
     if (!userLL) {
         window._isProximityZoomAnimating = false;
-        window._proxZoomAnimationStartTime = null;
         return;
     }
-
-    // Set flag BEFORE the rAF so interaction handlers see it immediately
-    // when Leaflet fires movestart/zoomstart on setView.
-    window._programmaticFlyInProgress = true;
 
     requestAnimationFrame(() => {
         if (!window._isProximityZoomAnimating) return;
 
+        window._programmaticFlyInProgress = true;
+
         const closestLoc = window.proximityState?.closestLocation;
         const locationLL = closestLoc ? L.latLng(closestLoc.lat, closestLoc.lng) : null;
 
+        // ── Only shift center if location is actually off-screen.
+        // If visible, center stays exactly on user (original behavior).
+        // If off-screen, shift minimally to bring it in while keeping
+        // user in center 60% of viewport.
         const targetCenter = (targetZoom >= 18 && locationLL)
             ? _computeFramingCenter(userLL, locationLL, targetZoom)
             : userLL;
@@ -5665,7 +5647,7 @@ function _executeProximityZoom(targetZoom, nextState, eastWestMove) {
             easeLinearity: 0.25
         });
 
-        _attachProximityZoomEndHandler((zoomDur * 1000) + 600);
+        _attachProximityZoomEndHandler(zoomDur * 1000 + 1000);
     });
 }
 
@@ -5676,26 +5658,13 @@ function _cleanupProximityZoomAnimation() {
         try { map.stop(); } catch (_) {}
     }
 
-    // Remove the ACTUAL onDone listener, not the cleanup wrapper.
-    // The old code did map.off('moveend', window._currentProximityZoomCleanup)
-    // which removed nothing because _currentProximityZoomCleanup was never
-    // registered as a listener — onDone was.
-    if (window._proxZoomOnDone && map) {
-        map.off('moveend', window._proxZoomOnDone);
-        map.off('zoomend', window._proxZoomOnDone);
-        window._proxZoomOnDone = null;
+    if (window._currentProximityZoomCleanup && map) {
+        map.off('moveend', window._currentProximityZoomCleanup);
+        map.off('zoomend', window._currentProximityZoomCleanup);
+        window._currentProximityZoomCleanup = null;
     }
 
-    // Call the cleanup function to properly handle the fallback timeout
-    // and handled flag, instead of just clearing the flag manually.
-    if (typeof window._currentProximityZoomCleanup === 'function') {
-        window._currentProximityZoomCleanup();
-    } else {
-        // Fallback if cleanup function is missing
-        window._isProximityZoomAnimating = false;
-        window._proxZoomAnimationStartTime = null;
-        window.isMapInteracting = false;
-    }
+    window._isProximityZoomAnimating = false;
 }
 
 function _resetProximityZoomSmoothing() {
@@ -5705,8 +5674,6 @@ function _resetProximityZoomSmoothing() {
     window._proxZoomTargetLevel = 17;
     window._proxZoomCurrentLevel = 17;
     window._proxSpeedEMA = null;
-    window._proxZoomAnimationStartTime = null;
-    window._proxZoomOnDone = null;
     if (window._lastProxZoomTimeByDir) {
         window._lastProxZoomTimeByDir.IN = 0;
         window._lastProxZoomTimeByDir.OUT = 0;
@@ -5714,75 +5681,52 @@ function _resetProximityZoomSmoothing() {
 }
 
 function _attachProximityZoomEndHandler(fallbackMs) {
-    var handled = false;
-    var fallbackId = null;
+    let handled = false;
+    let fallbackId = null;
 
-    var onDone = function() {
+    const onDone = () => {
         if (handled) return;
         handled = true;
 
-        if (map && typeof map.off === 'function') {
+        if (map) {
             map.off('moveend', onDone);
             map.off('zoomend', onDone);
         }
 
-        if (fallbackId !== null) {
-            clearTimeout(fallbackId);
-            fallbackId = null;
-        }
+        if (fallbackId) { clearTimeout(fallbackId); fallbackId = null; }
 
         window._isProximityZoomAnimating = false;
-        window._proxZoomAnimationStartTime = null;
         window._currentProximityZoomCleanup = null;
-        window._proxZoomOnDone = null;
         window.isMapInteracting = false;
-
-        if (map && typeof map.getZoom === 'function') {
-            window._proxZoomCurrentLevel = map.getZoom();
-        }
 
         if (map && typeof map.invalidateSize === 'function') {
             map.invalidateSize({ animate: false, debounceMoveend: true });
         }
     };
 
-    window._proxZoomOnDone = onDone;
-
-    if (map && typeof map.on === 'function') {
+    if (map) {
         map.on('moveend', onDone);
         map.on('zoomend', onDone);
-        // NO zoomanim listener — it fires at animation START, not END,
-        // causing premature cleanup before the zoom completes.
     }
 
-    window._currentProximityZoomCleanup = function() {
+    window._currentProximityZoomCleanup = () => {
         if (!handled) {
             handled = true;
-            if (map && typeof map.off === 'function') {
+            if (map) {
                 map.off('moveend', onDone);
                 map.off('zoomend', onDone);
             }
-            if (fallbackId !== null) {
-                clearTimeout(fallbackId);
-                fallbackId = null;
-            }
+            if (fallbackId) { clearTimeout(fallbackId); fallbackId = null; }
             window._isProximityZoomAnimating = false;
-            window._proxZoomAnimationStartTime = null;
-            window._currentProximityZoomCleanup = null;
-            window._proxZoomOnDone = null;
             window.isMapInteracting = false;
+            window._currentProximityZoomCleanup = null;
         }
     };
 
-    fallbackId = typeof createTrackedTimeout === 'function'
-        ? createTrackedTimeout(function() {
-            fallbackId = null;
-            if (!handled) onDone();
-        }, fallbackMs)
-        : setTimeout(function() {
-            fallbackId = null;
-            if (!handled) onDone();
-        }, fallbackMs);
+    fallbackId = createTrackedTimeout(() => {
+        fallbackId = null;
+        if (!handled) onDone();
+    }, fallbackMs);
 }
         
 /*  Pans the map to keep the user centered — **centered mode only**. */
