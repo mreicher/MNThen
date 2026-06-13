@@ -236,7 +236,7 @@
       touch-action: none;
       -webkit-user-select: none;
       user-select: none;
-     /* contain: layout paint; */
+      contain: layout paint;
     }
 
     @supports (-webkit-touch-callout: none) {
@@ -591,11 +591,11 @@
       transition: background-color 0.3s ease;
       contain: layout paint;
     }
-/*
+
     .map-tiles {
     will-change: transform;
     }
-*/
+
     /* 11. KEYFRAMES */
     @keyframes pulse {
       0%, 100% { opacity: 0.8; }
@@ -2081,20 +2081,18 @@ window.sensorFusion = new SensorFusionManager().init();
     let _rafId = null;
     let _active = false;
 
-    let _predictOffsetSec = 0;
-    let _lastKalmanTimestamp = null;
-
     const MIN_DT_MS = 16;
     const MIN_SPEED_MPS = 0.15;
     const MIN_CENTER_DRIFT_PX = 3;
-    const PREDICT_APPROACH_RATE = 2.0;
 
+    // Adaptive prediction horizon: shorter at walking speeds to minimize drift,
+    // longer at driving speeds where GPS latency matters more.
     function getAdaptivePredictAheadSec(speedMPS) {
-        if (speedMPS < 1.5) return 0.3;
-        if (speedMPS < 2.5) return 0.5;
-        if (speedMPS < 5.0) return 1.3;
-        if (speedMPS < 12.0) return 1.8;
-        return 2.2;
+        if (speedMPS < 1.5) return 0.6;   // Slow walk: ~0.9m max drift
+        if (speedMPS < 2.5) return 0.9;   // Brisk walk
+        if (speedMPS < 5.0) return 1.3;   // Jogging / slow bike
+        if (speedMPS < 12.0) return 1.8;  // City driving
+        return 2.2;                        // Highway
     }
 
     function frame(now) {
@@ -2117,8 +2115,6 @@ window.sensorFusion = new SensorFusionManager().init();
             }
         }
 
-        // While the user is interacting, keep the loop alive but don't move
-        // anything — we'll resume predicting the moment they lift off.
         if (window.isMapInteracting) {
             _lastFrameTime = now;
             _rafId = requestAnimationFrame(frame);
@@ -2159,9 +2155,15 @@ window.sensorFusion = new SensorFusionManager().init();
             return;
         }
 
-        // ── Resolve Kalman origin ──────────────────────────────────────────
+        // CHANGE: Use the Kalman-filtered position as the extrapolation origin
+        // instead of the raw GPS lastPos. The Kalman output is the filter's
+        // best smoothed estimate; predicting forward from it means GPS
+        // measurement updates are absorbed silently inside the filter and cause
+        // zero visible discontinuity in the marker position. The original code
+        // predicted from the raw GPS fix, so every ~1 Hz GPS update caused the
+        // marker to snap back and then race forward again.
         const nowMs = Date.now();
-        let originLat, originLng;
+        let originLat, originLng, originTimestamp;
 
         const kalmanPos = window.sensorFusion
             ? window.sensorFusion.getLastKalmanPosition()
@@ -2170,41 +2172,25 @@ window.sensorFusion = new SensorFusionManager().init();
         if (kalmanPos && kalmanPos.timestamp != null) {
             originLat = kalmanPos.lat;
             originLng = kalmanPos.lng;
+            originTimestamp = kalmanPos.timestamp;
         } else {
             originLat = lastPos.lat;
             originLng = lastPos.lng;
+            originTimestamp = window.lastUpdateTimestamp || nowMs;
         }
 
-        // ── Smooth prediction offset ───────────────────────────────────────
-        // Ramps from 0 to the adaptive horizon after each GPS fix, rather than
-        // snapping to 0 and jerking the marker back on every 1Hz update.
-        const horizon = getAdaptivePredictAheadSec(speedMPS);
-        const dtSec = dtMs / 1000;
+        const timeSinceFixSec = Math.max(0, (nowMs - originTimestamp) / 1000);
+        const predictDtSec = Math.min(getAdaptivePredictAheadSec(speedMPS), timeSinceFixSec);
 
-        if (kalmanPos && kalmanPos.timestamp !== _lastKalmanTimestamp) {
-            // New GPS fix: the Kalman position has been updated — start the
-            // ramp from zero so we predict forward smoothly from the new origin.
-            _lastKalmanTimestamp = kalmanPos.timestamp;
-            _predictOffsetSec = 0;
-        } else {
-            // Between fixes: glide toward the current horizon.
-            // Also handles speed changes without jumping.
-            if (_predictOffsetSec < horizon) {
-                _predictOffsetSec = Math.min(horizon, _predictOffsetSec + PREDICT_APPROACH_RATE * dtSec);
-            } else if (_predictOffsetSec > horizon) {
-                _predictOffsetSec = Math.max(horizon, _predictOffsetSec - PREDICT_APPROACH_RATE * dtSec);
-            }
-        }
-
-        if (_predictOffsetSec <= 0) {
+        if (predictDtSec <= 0) {
             _rafId = requestAnimationFrame(frame);
             return;
         }
 
-        const predictedLat = originLat + vel.lat * _predictOffsetSec;
-        const predictedLng = originLng + vel.lng * _predictOffsetSec;
+        const predictedLat = originLat + vel.lat * predictDtSec;
+        const predictedLng = originLng + vel.lng * predictDtSec;
 
-        // Sanity-check: discard anything that jumps more than 150m
+        // Sanity-check: discard predictions that jump more than 150 m
         const jumpLat = Math.abs(predictedLat - originLat) * 111111;
         const jumpLng = Math.abs(predictedLng - originLng) * 111111 *
                         Math.cos(originLat * Math.PI / 180);
@@ -2214,7 +2200,9 @@ window.sensorFusion = new SensorFusionManager().init();
             return;
         }
 
-        // ── Update marker and map center ───────────────────────────────────
+        // The origin is already Kalman-smoothed, so the predicted position needs
+        // no additional per-frame clamping or EMA — applying either would only
+        // add latency. Set the marker directly.
         if (userMarker) {
             const el = userMarker.getElement();
             if (el) el.style.transition = 'none';
@@ -2229,17 +2217,11 @@ window.sensorFusion = new SensorFusionManager().init();
                 const driftPx = Math.hypot(targetPx.x - centerPx.x, targetPx.y - centerPx.y);
 
                 if (driftPx > MIN_CENTER_DRIFT_PX) {
-                    // FLAG: tell the interaction handlers this moveend is ours,
-                    // not a user gesture. Without this, the 60fps moveend events
-                    // we fire here beat zoomend after a pinch and release
-                    // isMapInteracting prematurely — the root cause Kimi found.
-                    window._programmaticMapMove = true;
                     map.setView([predictedLat, predictedLng], map.getZoom(), {
                         animate: false,
                         noMoveStart: true,
                         noMoveEnd: true
                     });
-                    window._programmaticMapMove = false;
                 }
             }
         }
@@ -2258,8 +2240,6 @@ window.sensorFusion = new SensorFusionManager().init();
             : (window.lastPosition?.speedMPS || 0);
         if (speedMPS < MIN_SPEED_MPS) return;
         if (window.isStationary && speedMPS < 0.8) return;
-        _predictOffsetSec = 0;
-        _lastKalmanTimestamp = null;
         _active = true;
         _lastFrameTime = performance.now();
         _rafId = requestAnimationFrame(frame);
@@ -2284,7 +2264,10 @@ window.sensorFusion = new SensorFusionManager().init();
     if (!_registerCleanup()) {
         window.deadReckoning = {
             stop() {
-                if (_rafId != null) { cancelAnimationFrame(_rafId); _rafId = null; }
+                if (_rafId != null) {
+                    cancelAnimationFrame(_rafId);
+                    _rafId = null;
+                }
                 _active = false;
             },
             start() { _restartIfMoving(); },
@@ -2295,7 +2278,10 @@ window.sensorFusion = new SensorFusionManager().init();
     } else {
         window.deadReckoning = {
             stop() {
-                if (_rafId != null) { cancelAnimationFrame(_rafId); _rafId = null; }
+                if (_rafId != null) {
+                    cancelAnimationFrame(_rafId);
+                    _rafId = null;
+                }
                 _active = false;
             },
             start() { _restartIfMoving(); },
@@ -2303,52 +2289,6 @@ window.sensorFusion = new SensorFusionManager().init();
             onMovementResumed: _restartIfMoving
         };
     }
-})();
-
-// Temporary diagnostics — paste this right before your DOMContentLoaded init block
-(function diagnosePinchBug() {
-    const _orig = window._handleInactivityReset;
-
-    // Trace every inactivity timer start
-    const origStart = window._startInactivityTimer;
-    window._startInactivityTimerDEBUG = function() {
-        console.trace('[DEBUG] _startInactivityTimer called');
-    };
-
-    // Monkey-patch the map once it exists
-    const waitForMap = setInterval(() => {
-        if (typeof map === 'undefined' || !map) return;
-        clearInterval(waitForMap);
-
-        console.log('[DEBUG] setupMapInteractionHandlers called?', !!window._interactionHandlersSetup);
-
-        // Log every moveend/zoomend and who isMapInteracting is at that moment
-        map.on('moveend', () => console.log('[DEBUG] moveend — isMapInteracting:', window.isMapInteracting, '_programmaticMapMove:', window._programmaticMapMove));
-        map.on('zoomend', () => console.log('[DEBUG] zoomend — isMapInteracting:', window.isMapInteracting));
-        map.on('zoomstart', () => console.log('[DEBUG] zoomstart — isMapInteracting:', window.isMapInteracting));
-
-        // Log every write to isMapInteracting
-        let _val = window.isMapInteracting;
-        Object.defineProperty(window, 'isMapInteracting', {
-            get() { return _val; },
-            set(v) {
-                console.trace('[DEBUG] isMapInteracting set to', v);
-                _val = v;
-            },
-            configurable: true
-        });
-
-        // Log inactivity timer creation
-        const origCreateTrackedTimeout = window.createTrackedTimeout;
-        if (origCreateTrackedTimeout) {
-            window.createTrackedTimeout = function(fn, delay) {
-                if (delay === 30000) {
-                    console.trace('[DEBUG] 30s inactivity timer started');
-                }
-                return origCreateTrackedTimeout(fn, delay);
-            };
-        }
-    }, 100);
 })();
         
 /* ──────────────────────────────────────────────
@@ -2902,86 +2842,38 @@ const memoryManager = setupMemoryManagement();
    MAP INITIALIZATION
    ────────────────────────────────────────────── */
 function initMap() {
-    if (window._mapInitInProgress) {
-        console.warn('[Map] initMap() called while initialization already in progress — skipping');
-        return;
-    }
-    window._mapInitInProgress = true;
-
+    // ── Guard: full Leaflet teardown if re-initializing ──
     if (typeof disposeMapLoop === 'function') disposeMapLoop();
-
-    const mapContainer = document.getElementById('map');
-    if (mapContainer) {
-        while (mapContainer.firstChild) {
-            mapContainer.removeChild(mapContainer.firstChild);
-        }
-        mapContainer.className = '';
-        mapContainer.removeAttribute('style');
-        mapContainer.removeAttribute('data-leaflet-id');
-    }
-
     if (map) {
-        try {
-            map.remove();
-        } catch (e) {
-            console.warn('[Map] Leaflet remove() failed:', e.message);
-            if (mapContainer) {
-                const leafletElements = mapContainer.querySelectorAll('.leaflet-container, .leaflet-map-pane, .leaflet-tile, .leaflet-layer');
-                leafletElements.forEach(el => el.remove());
-            }
-        }
+        try { map.remove(); } catch (e) { console.warn('[Map] Remove failed:', e.message); }
         map = null;
     }
-
-    window._interactionHandlersSetup = false;
-
     if (markerClusterGroup) {
-        try {
-            markerClusterGroup.clearLayers();
-        } catch (e) {
-            console.warn('[Map] Marker cluster cleanup failed:', e.message);
-        }
+        try { markerClusterGroup.clearLayers(); } catch (e) {}
         markerClusterGroup = null;
     }
 
+    // ── Storage cleanup ──
     ['lastKnownPos', 'routeHistory'].forEach(k => {
         try { localStorage.removeItem(k); sessionStorage.removeItem(k); } catch (_) {}
     });
 
-    if (!mapContainer) {
-        console.error('[Map] Map container #map not found in DOM');
-        window._mapInitInProgress = false;
-        showPopup('Initialization Error', 'Map container not found. Please refresh the page.');
-        return;
-    }
+    // ── Map creation ──
+    map = L.map('map', {
+        zoomControl: false,
+        attributionControl: false,
+        zoomSnap: 0.1,
+        zoomDelta: 0.5,
+        wheelDebounceTime: 100,
+        tapTolerance: 15,
+        bounceAtZoomLimits: false,
+        renderer: L.canvas(),
+        fadeAnimation: false,
+        zoomAnimationThreshold: 4,
+        markerZoomAnimation: false
+    }).setView([46.392410, -94.636230], 9);
 
-    try {
-        map = L.map('map', {
-            zoomControl: false,
-            attributionControl: false,
-            zoomSnap: 0.1,
-            zoomDelta: 0.5,
-            wheelDebounceTime: 100,
-            tapTolerance: 15,
-            bounceAtZoomLimits: false,
-            renderer: L.canvas(),
-            fadeAnimation: false,
-            zoomAnimationThreshold: 4,
-            markerZoomAnimation: false
-        }).setView([46.392410, -94.636230], 9);
-    } catch (e) {
-        console.error('[Map] Leaflet map creation failed:', e);
-        window._mapInitInProgress = false;
-        showPopup('Initialization Error', 'Unable to initialize map. Please refresh the page.');
-        return;
-    }
-
-    // Call immediately after map creation so interaction handlers are
-    // registered before any GPS update, touch, or zoom event fires.
-    if (typeof setupMapInteractionHandlers === 'function') {
-        setupMapInteractionHandlers();
-    }
-
+    // ── Tile layer with required OSM attribution ──
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         minZoom: 7,
         maxZoom: 19,
@@ -2992,6 +2884,7 @@ function initMap() {
         className: 'map-tiles'
     }).addTo(map);
 
+    // ── Marker cluster ──
     markerClusterGroup = L.markerClusterGroup({
         showCoverageOnHover: false,
         zoomToBoundsOnClick: true,
@@ -3007,6 +2900,7 @@ function initMap() {
         })
     }).addTo(map);
 
+    // ── User marker ──
     userMarker = L.marker([0, 0], {
         icon: L.divIcon({
             className: 'user-marker',
@@ -3019,14 +2913,17 @@ function initMap() {
 
     showLoadingMessage();
 
+    // ── Geolocation with escalated fallback ──
     if ('geolocation' in navigator) {
         const opts = { enableHighAccuracy: true, timeout: 45000, maximumAge: 0 };
-
+        
         const onFirstError = (err) => {
+            // iOS often denies first prompt due to timing; retry with relaxed constraints
             const isTimeout = err?.code === 3;
             const retryOpts = isTimeout
                 ? { enableHighAccuracy: true, timeout: 60000, maximumAge: 10000 }
                 : opts;
+            
             navigator.geolocation.getCurrentPosition(
                 initializeUserLocation,
                 handleLocationError,
@@ -3040,13 +2937,12 @@ function initMap() {
             opts
         );
     } else {
-        showPopup('Geolocation Error', 'Geolocation is not supported by your browser.');
+        showPopup('Geolocation Error', 'Geolocation is not supported');
         map.setView([44.9778, -93.2650], 17, { animate: false });
         hideLoadingMessage();
-        window._mapInitInProgress = false;
     }
 }
-        
+
 /* ──────────────────────────────────────────────
    GPS SEARCHING STATE — CSS-driven
    ────────────────────────────────────────────── */
@@ -3494,16 +3390,12 @@ function updateAccuracyIndicator(accuracy) {
    USER LOCATION INITIALIZATION
    ────────────────────────────────────────────── */
 function initializeUserLocation(position) {
-    if (!position || !position.coords) {
+    if (!position?.coords) {
         handleLocationError(new Error('Invalid initial position'));
         return;
     }
 
-    var lat = position.coords.latitude;
-    var lng = position.coords.longitude;
-    var accuracy = position.coords.accuracy;
-    var heading = position.coords.heading;
-    var speed = position.coords.speed;
+    const { latitude: lat, longitude: lng, accuracy, heading, speed } = position.coords;
 
     if (isNaN(lat) || isNaN(lng)) {
         handleLocationError(new Error('Invalid initial coordinates'));
@@ -3515,44 +3407,45 @@ function initializeUserLocation(position) {
         return;
     }
 
+    // Already initialized — just update the marker
     if (window._initializationComplete) {
         if (userMarker) userMarker.setLatLng([lat, lng]);
-        if (map) {
-            window._programmaticMapMove = true;
-            map.panTo([lat, lng], { animate: false });
-            window._programmaticMapMove = false;
-        }
+        if (map) map.panTo([lat, lng], { animate: false });
         return;
     }
 
+    // Guard against concurrent initialization
     if (window._initializationInProgress) {
         window._pendingInitPosition = position;
         return;
     }
     window._initializationInProgress = true;
 
+    // Announce accuracy
     if (typeof announceToScreenReader === 'function') {
         if (accuracy > 100) {
-            announceToScreenReader('Location acquired with ' + Math.round(accuracy) + ' meter accuracy. Map loading.');
+            announceToScreenReader(`Location acquired with ${accuracy.toFixed(0)} meter accuracy. Map loading.`);
         } else {
             announceToScreenReader('Location acquired. Map ready for navigation.');
         }
     }
 
     try {
+        // Retry if userMarker isn't ready yet
         if (!userMarker) {
             window._markerRetryCount = (window._markerRetryCount || 0) + 1;
 
             if (window._markerRetryCount <= 3) {
                 window._initializationInProgress = false;
-                createTrackedTimeout(function() {
-                    var latestPosition = window._pendingInitPosition || position;
+                createTrackedTimeout(() => {
+                    const latestPosition = window._pendingInitPosition || position;
                     window._pendingInitPosition = null;
                     initializeUserLocation(latestPosition);
                 }, 100 * window._markerRetryCount);
                 return;
             }
 
+            // Exhausted retries
             window._initializationInProgress = false;
             window._markerRetryCount = 0;
             handleLocationError(new Error('Map marker initialization failed'));
@@ -3564,36 +3457,33 @@ function initializeUserLocation(position) {
 
         if (!map) throw new Error('Map not initialized');
 
-        window._programmaticMapMove = true;
-        map.setView([lat, lng], 17, { animate: false });
-        window._programmaticMapMove = false;
+        const initialZoom = 17;
+        map.setView([lat, lng], initialZoom, { animate: false });
 
+        // Seed the position buffer for smoothing — one entry only
+        // so the Kalman filter gets a clean baseline without a
+        // false zero-velocity prior from multiple identical copies.
         if (typeof seedPositionBuffer === 'function') {
             seedPositionBuffer({
-                lat: lat,
-                lng: lng,
-                accuracy: accuracy,
+                lat, lng, accuracy,
                 timestamp: position.timestamp || Date.now(),
-                heading: heading !== undefined && heading !== null ? heading : null,
+                heading: heading ?? null,
                 speedMPS: speed || 0
             });
         }
 
         if (typeof hideLoadingMessage === 'function') hideLoadingMessage();
 
+        // Start the hunt
         if (typeof startHunt === 'function' && !window._huntStarted) {
             window._huntStarted = true;
             startHunt();
         }
 
+        // Start idle proximity check
         if (typeof startIdleProximityCheck === 'function' && !window._proximityCheckStarted) {
             window._proximityCheckStarted = true;
             startIdleProximityCheck();
-        }
-
-        if (typeof startIdleProximityZoomCheck === 'function' && !window._proxZoomCheckStarted) {
-            window._proxZoomCheckStarted = true;
-            startIdleProximityZoomCheck();
         }
 
         window._initializationComplete = true;
@@ -3601,28 +3491,30 @@ function initializeUserLocation(position) {
         window._lastSuccessfulInit = Date.now();
         window._initRecoveryAttempts = 0;
 
-        var watchId = startPositionUpdates();
+        // Start the GPS watch synchronously — no deferral.
+        // A 0ms timeout still pushes watch registration to the next
+        // task queue cycle (after paint), adding one full frame of lag
+        // before any position events can fire.
+        const watchId = startPositionUpdates();
         if (watchId === null) {
-            createTrackedTimeout(function() {
+            createTrackedTimeout(() => {
                 if (!window.positionWatchId) startPositionUpdates();
             }, 3000);
         }
 
+        // Apply any position that arrived while we were initializing
         if (window._pendingInitPosition) {
-            var pending = window._pendingInitPosition;
+            const pending = window._pendingInitPosition;
             window._pendingInitPosition = null;
-            var pLat = pending && pending.coords ? pending.coords.latitude : null;
-            var pLng = pending && pending.coords ? pending.coords.longitude : null;
-            if (userMarker && pLat !== null && pLng !== null && !isNaN(pLat) && !isNaN(pLng)) {
+            const pLat = pending?.coords?.latitude;
+            const pLng = pending?.coords?.longitude;
+            if (userMarker && pLat != null && pLng != null && !isNaN(pLat) && !isNaN(pLng)) {
                 userMarker.setLatLng([pLat, pLng]);
             }
         }
 
     } catch (err) {
-        window._programmaticMapMove = false;
-        if (typeof console !== 'undefined' && console.error) {
-            console.error('Error during location initialization:', err);
-        }
+        console.error('Error during location initialization:', err);
         window._initializationInProgress = false;
 
         if (!window._initializationComplete) {
@@ -3635,8 +3527,8 @@ function initializeUserLocation(position) {
         window._initRecoveryAttempts = (window._initRecoveryAttempts || 0) + 1;
 
         if (window._initRecoveryAttempts <= 3) {
-            var backoffMs = Math.min(15000, Math.pow(2, window._initRecoveryAttempts) * 1000);
-            createTrackedTimeout(function() {
+            const backoffMs = Math.min(15000, Math.pow(2, window._initRecoveryAttempts) * 1000);
+            createTrackedTimeout(() => {
                 if (navigator.geolocation && !window._initializationComplete) {
                     navigator.geolocation.getCurrentPosition(
                         initializeUserLocation,
@@ -3858,31 +3750,42 @@ function handlePositionUpdate(position) {
    ────────────────────────────────────────────── */
 function handleVisibilityChange() {
     if (document.hidden) {
+        // Tab/app going to background
         window.lastHiddenTime = Date.now();
         lastKnownPosition = userMarker?.getLatLng() ?? null;
         resetInactivityTimer(false);
+
         disposeMapLoop();
         window.isReWaking = false;
+
         if (window.visibilityDebounceTimer) {
             clearTimeout(window.visibilityDebounceTimer);
             window.visibilityDebounceTimer = null;
         }
     } else {
+        // Tab/app returning to foreground
         const awayMs = Date.now() - (window.lastHiddenTime || 0);
         const threshold = CONFIG?.BACKGROUND_THRESHOLD ?? 30_000;
 
+        // Cancel any pending debounce
         if (window.visibilityDebounceTimer) {
             clearTimeout(window.visibilityDebounceTimer);
             window.visibilityDebounceTimer = null;
         }
 
         if (awayMs > threshold) {
+            // Debounce to handle rapid tab switches
             window.visibilityDebounceTimer = createTrackedTimeout(() => {
                 window.visibilityDebounceTimer = null;
+
+                // Recalculate time away to ensure freshness
                 const currentAwayMs = Date.now() - (window.lastHiddenTime || 0);
                 if (currentAwayMs <= threshold) return;
+
                 if (window.isReWaking) return;
+
                 window.isReWaking = true;
+
                 Promise.resolve(updateLocationAfterBackground())
                     .catch((error) => {
                         console.error("Background location update failed:", error);
@@ -3892,18 +3795,13 @@ function handleVisibilityChange() {
                     });
             }, 500);
         } else {
-            // Short absence — restore map geometry and marker position only.
+            // Short absence → immediate refresh
             if (map && lastKnownPosition) {
                 map.invalidateSize({ pan: false });
                 userMarker?.setLatLng(lastKnownPosition);
             }
         }
-
-        // Pass false — returning from background is not a user gesture.
-        // setupMapInteractionHandlers owns isMapInteracting and the 30s timer.
-        // Calling with true here was immediately overwriting isMapInteracting = false
-        // and starting the timer even if the user had fingers on the screen.
-        resetInactivityTimer(false);
+        resetInactivityTimer(true);
     }
 }
 
@@ -3927,17 +3825,11 @@ function updateLocationAfterBackground() {
         return;
     }
 
-    // ── Re-entrancy guard ──
-    if (window._isLocationUpdateInProgress) {
-        console.log('[BackgroundUpdate] Already in progress, skipping duplicate call');
-        return;
-    }
-    window._isLocationUpdateInProgress = true;
+    if (window._isLocationUpdateInProgress) return;
 
-    if (!("geolocation" in navigator)) {
-        window._isLocationUpdateInProgress = false;
-        return;
-    }
+    if (!("geolocation" in navigator)) return;
+
+    window._isLocationUpdateInProgress = true;
 
     // Only dispose map loop if away longer than 30s
     const awayMs = Date.now() - (window.lastHiddenTime || 0);
@@ -3955,45 +3847,13 @@ function updateLocationAfterBackground() {
         }
     }
 
-    // ── Shared cleanup state (closure-scoped, not global) ──
-    let _bgWatchId = null;
-    let _bgTimeoutId = null;
-    let _isCleanedUp = false;
-
-    const cleanup = () => {
-        if (_isCleanedUp) return;
-        _isCleanedUp = true;
-
-        geolocationRequestPending = false;
-
-        // ALWAYS clear the actual watch using the closure variable
-        if (_bgWatchId !== null) {
-            navigator.geolocation.clearWatch(_bgWatchId);
-            _bgWatchId = null;
-        }
-        // Also clear the global fallback (defense in depth)
-        if (warmupWatchId !== null) {
-            navigator.geolocation.clearWatch(warmupWatchId);
-            warmupWatchId = null;
-        }
-
-        if (_bgTimeoutId !== null) {
-            clearTimeout(_bgTimeoutId);
-            _bgTimeoutId = null;
-        }
-        if (_backgroundUpdateTimeout) {
-            clearTimeout(_backgroundUpdateTimeout);
-            _backgroundUpdateTimeout = null;
-        }
-
-        window._isLocationUpdateInProgress = false;
-    };
-
-    // ── Pre-emptive cleanup of any stale state from previous runs ──
+    // Clean up any existing watch
     if (warmupWatchId !== null) {
         navigator.geolocation.clearWatch(warmupWatchId);
         warmupWatchId = null;
     }
+
+    // Clear any existing timeout
     if (_backgroundUpdateTimeout) {
         clearTimeout(_backgroundUpdateTimeout);
         _backgroundUpdateTimeout = null;
@@ -4002,6 +3862,19 @@ function updateLocationAfterBackground() {
     geolocationRequestPending = true;
     const startTime = Date.now();
     const MAX_DURATION = 30000;
+
+    const cleanup = () => {
+        geolocationRequestPending = false;
+        if (warmupWatchId !== null) {
+            navigator.geolocation.clearWatch(warmupWatchId);
+            warmupWatchId = null;
+        }
+        if (_backgroundUpdateTimeout) {
+            clearTimeout(_backgroundUpdateTimeout);
+            _backgroundUpdateTimeout = null;
+        }
+        window._isLocationUpdateInProgress = false;
+    };
 
     // ── Retry Modal (CSS-driven) ──
     const showRetryModal = () => {
@@ -4030,25 +3903,16 @@ function updateLocationAfterBackground() {
         retryBtn.textContent = '↻ Try Again';
         retryBtn.addEventListener('click', () => {
             overlay.remove();
-            // CRITICAL: cleanup BEFORE re-entering to prevent watch leak
-            cleanup();
-            // Small delay to let cleanup settle before re-initializing
-            requestAnimationFrame(() => updateLocationAfterBackground());
+            updateLocationAfterBackground();
         });
 
         const closeBtn = document.createElement('button');
         closeBtn.className = 'geo-retry-cancel';
         closeBtn.textContent = 'Cancel';
-        closeBtn.addEventListener('click', () => {
-            overlay.remove();
-            cleanup();
-        });
+        closeBtn.addEventListener('click', () => { overlay.remove(); });
 
         overlay.addEventListener('click', (e) => {
-            if (e.target === overlay) {
-                overlay.remove();
-                cleanup();
-            }
+            if (e.target === overlay) overlay.remove();
         });
 
         card.appendChild(title);
@@ -4064,7 +3928,7 @@ function updateLocationAfterBackground() {
         return speedMPH < 5;
     };
 
-    // ── Handle successful position acquisition ──
+    // ── Handle successful position acquisition
     const onPositionSuccess = (position) => {
         const coords = position?.coords;
         if (!coords ||
@@ -4077,7 +3941,7 @@ function updateLocationAfterBackground() {
 
         if (Date.now() - position.timestamp > 30000) return;
 
-        // Cleanup immediately on success — guaranteed to clear the actual watch
+        // Cleanup immediately on success — this clears the timeout too
         cleanup();
 
         window._lastBackgroundUpdate = Date.now();
@@ -4131,15 +3995,11 @@ function updateLocationAfterBackground() {
 
     const onPositionError = (error) => {
         console.warn("Geolocation error:", error.message, "Code:", error.code);
-        // Don't cleanup here — let the timeout handle it for persistent errors,
-        // but cleanup on fatal errors to avoid hanging the state machine
-        if (error.code === 1) { // Permission denied
-            cleanup();
-        }
+        // Don't cleanup here — let the timeout handle it
     };
 
-    // Start watching for position — store in closure variable
-    _bgWatchId = navigator.geolocation.watchPosition(
+    // Start watching for position
+    warmupWatchId = navigator.geolocation.watchPosition(
         onPositionSuccess,
         onPositionError,
         {
@@ -4148,11 +4008,9 @@ function updateLocationAfterBackground() {
             maximumAge: 10000
         }
     );
-    // Also update global for any legacy code that references it
-    warmupWatchId = _bgWatchId;
 
-    // Timeout handler — use closure variable for reliable cleanup
-    _bgTimeoutId = createTrackedTimeout(() => {
+    // Timeout handler — tracked so it's cleaned up on page unload
+    _backgroundUpdateTimeout = createTrackedTimeout(() => {
         if (geolocationRequestPending) {
             cleanup();
             if (safeToShowModal()) {
@@ -4160,8 +4018,6 @@ function updateLocationAfterBackground() {
             }
         }
     }, MAX_DURATION);
-    // Also update global for legacy cleanup paths
-    _backgroundUpdateTimeout = _bgTimeoutId;
 }
 
 /* ──────────────────────────────────────────────
@@ -4218,7 +4074,7 @@ function updatePositionBuffer(position) {
     }
 }
 
-function seedPositionBuffer(seedPosition, /* deprecated, kept for backward compatibility */ count) {
+function seedPositionBuffer(seedPosition, count) {
     if (!seedPosition || typeof seedPosition.lat !== 'number' || typeof seedPosition.lng !== 'number') return;
 
     const kalmanPos = window.sensorFusion
@@ -4227,13 +4083,7 @@ function seedPositionBuffer(seedPosition, /* deprecated, kept for backward compa
 
     const bufferTimestamp = seedPosition.timestamp || Date.now();
 
-    // ── Use Kalman-smoothed position if available and valid ──
-    // Fallback to raw GPS only if Kalman output is stale (>5s) or missing
-    const useKalman = kalmanPos && 
-                      kalmanPos.timestamp != null && 
-                      (bufferTimestamp - kalmanPos.timestamp) < 5000;
-
-    const seed = useKalman ? {
+    const seed = kalmanPos ? {
         lat: kalmanPos.lat,
         lng: kalmanPos.lng,
         accuracy: seedPosition.accuracy,
@@ -4252,7 +4102,7 @@ function seedPositionBuffer(seedPosition, /* deprecated, kept for backward compa
     window.positionBuffer.length = 0;
     window.positionBuffer.push(seed);
 }
-        
+
 /* ──────────────────────────────────────────────
    THROTTLE — tracked trailing edge
    ────────────────────────────────────────────── */
@@ -4416,13 +4266,12 @@ function setupMapInteractionHandlers() {
         window.isMapInteracting = false;
     }
 
-    let activeTouchCount = 0;
-    let _pinchOccurred = false;
-
+    // Interaction start — lock map & cancel snap-back timer
     const onInteractionStart = () => {
-        // Ignore movestart/zoomstart fired by the DR loop's setView or
-        // programmatic fly — neither represents a user gesture.
-        if (window._programmaticMapMove || window._programmaticFlyInProgress) {
+        // Check programmatic flag BEFORE touching isMapInteracting.
+        // If flyTo triggered this event, don't mark the map as user-interacting.
+        // The flag is consumed here so onInteractionEnd won't start the timer.
+        if (window._programmaticFlyInProgress) {
             window._programmaticFlyInProgress = false;
             return;
         }
@@ -4430,82 +4279,36 @@ function setupMapInteractionHandlers() {
         window.isMapInteracting = true;
         _clearInactivityTimer();
 
+        // User is overriding a running proximity zoom — cancel it
         if (typeof window._currentProximityZoomCleanup === 'function') {
             window._currentProximityZoomCleanup();
             window._currentProximityZoomCleanup = null;
         }
     };
 
+    map.on('movestart', onInteractionStart);
+    map.on('zoomstart', onInteractionStart);
+
+    // Interaction end — unlock instantly, then decide about timer
+    const STATIONARY_SPEED_MPH = 1.0;
+
     const onInteractionEnd = () => {
-        // Ignore moveend fired by the DR loop's 60fps setView calls.
-        // Without this guard the DR loop beats zoomend to the punch and
-        // releases interaction state while fingers are still on the screen.
-        if (window._programmaticMapMove) return;
-
-        // Don't release while fingers are still down (mid-pinch).
-        if (activeTouchCount > 0) return;
-
+        // Immediate unlock
         window.isMapInteracting = false;
 
+        // Determine current speed (fallback to 0 if no fix yet)
         const speedMPH = window.lastPosition?.speedMPS
             ? window.lastPosition.speedMPS * 2.23694
             : 0;
 
-        if (speedMPH < 1.0) {
+        if (speedMPH < STATIONARY_SPEED_MPH) {
             _startInactivityTimer();
         }
-
-        _pinchOccurred = false;
+        // Driving → keep following GPS, do not start the timer
     };
 
-    map.on('movestart', onInteractionStart);
-    map.on('zoomstart', onInteractionStart);
     map.on('moveend', onInteractionEnd);
     map.on('zoomend', onInteractionEnd);
-
-    // ── Touch tracking on map container ──
-    const mapContainer = map.getContainer();
-
-    const touchStartHandler = (e) => {
-        activeTouchCount = e.touches.length;
-
-        if (e.touches.length >= 2) {
-            _pinchOccurred = true;
-        }
-
-        // Clear inactivity timer immediately on any touch — don't wait for
-        // movestart/zoomstart, which can lag behind the first touch event.
-        _clearInactivityTimer();
-    };
-
-    const touchEndHandler = (e) => {
-        activeTouchCount = e.touches.length;
-
-        if (activeTouchCount === 0 && window.isMapInteracting) {
-            if (!_pinchOccurred) {
-                // Pan: fire end immediately — no zoom animation to wait for.
-                onInteractionEnd();
-            }
-            // Pinch: leave isMapInteracting = true; zoomend fires after the
-            // zoom animation completes and calls onInteractionEnd naturally.
-        }
-    };
-
-    mapContainer.addEventListener('touchstart', touchStartHandler, { passive: true });
-    mapContainer.addEventListener('touchend', touchEndHandler, { passive: true });
-
-    // Cleanup
-    if (typeof memoryManager !== 'undefined' && memoryManager?.registerCleanupTask) {
-        memoryManager.registerCleanupTask(() => {
-            mapContainer.removeEventListener('touchstart', touchStartHandler);
-            mapContainer.removeEventListener('touchend', touchEndHandler);
-            map.off('movestart', onInteractionStart);
-            map.off('zoomstart', onInteractionStart);
-            map.off('moveend', onInteractionEnd);
-            map.off('zoomend', onInteractionEnd);
-            window._interactionHandlersSetup = false;
-        });
-    }
 }
 
 function _clearInactivityTimer() {
@@ -4518,6 +4321,8 @@ function _clearInactivityTimer() {
 function _startInactivityTimer() {
     if (window.inactivityTimer) return;
 
+    // Use createTrackedTimeout so the memory manager cleans this up
+    // on page unload instead of leaving a dangling timer
     window.inactivityTimer = createTrackedTimeout(() => {
         _handleInactivityReset();
     }, 30000);
@@ -4528,17 +4333,20 @@ function _handleInactivityReset() {
     const speed = pos ? (pos.speedMPS * 2.23694) : 0;
 
     if (pos && speed < 0.5 && map && userMarker) {
+        // Re-enable following BEFORE panning so the GPS update
+        // loop picks up the change on the next tick.
         window.followUser = true;
         window.isMapInteracting = false;
 
         map.panTo([pos.lat, pos.lng], {
             animate: true,
-            duration: 1.0,
-            easeLinearity: 0.15,
+            duration: 1.0,            // Slower, smoother return
+            easeLinearity: 0.15,      // Gentler easing (lower = more acceleration/deceleration)
             noMoveStart: true
         });
         userMarker.setLatLng([pos.lat, pos.lng]);
 
+        // Reset stationary state so the next GPS update starts fresh
         window.stationaryStartTime = Date.now();
     }
 
@@ -5294,6 +5102,7 @@ function updateUserLocation(position, forceUpdate) {
     var isInCenteredMode = ModeManager.isCentered();
 
     if (speedMPH >= 1.0) _clearInactivityTimer();
+    else _startInactivityTimer();
 
     // GPS recovery
     if (window.isGPSSearching) {
@@ -5725,14 +5534,12 @@ function updateUserLocation(position, forceUpdate) {
             _panMapToCenter(panPos, speedTier, directionChangeFactor,
                 eastWestMove, speedMPH, lookAheadSeconds);
         } else if (shouldUpdateMap) {
-            window._programmaticMapMove = true;
             map.panTo([panPos.lat, panPos.lng], {
                 animate: true,
                 duration: Math.max(0.08, speedTier.panDuration),
                 easeLinearity: speedTier.easeLinearity,
                 noMoveStart: true
             });
-            window._programmaticMapMove = false;
         }
         window.lastMapUpdateTime = Date.now();
     });
@@ -6052,24 +5859,27 @@ function _attachProximityZoomEndHandler(fallbackMs) {
     var onDone = function() {
         if (handled) return;
         handled = true;
+
         if (map && typeof map.off === 'function') {
             map.off('moveend', onDone);
             map.off('zoomend', onDone);
         }
+
         if (fallbackId !== null) {
             clearTimeout(fallbackId);
             fallbackId = null;
         }
+
         window._isProximityZoomAnimating = false;
         window._proxZoomAnimationStartTime = null;
         window._currentProximityZoomCleanup = null;
         window._proxZoomOnDone = null;
-        // REMOVED: window.isMapInteracting = false
-        // setupMapInteractionHandlers owns this flag. Proximity zoom is
-        // programmatic — it must never release interaction state.
+        window.isMapInteracting = false;
+
         if (map && typeof map.getZoom === 'function') {
             window._proxZoomCurrentLevel = map.getZoom();
         }
+
         if (map && typeof map.invalidateSize === 'function') {
             map.invalidateSize({ animate: false, debounceMoveend: true });
         }
@@ -6080,6 +5890,8 @@ function _attachProximityZoomEndHandler(fallbackMs) {
     if (map && typeof map.on === 'function') {
         map.on('moveend', onDone);
         map.on('zoomend', onDone);
+        // NO zoomanim listener — it fires at animation START, not END,
+        // causing premature cleanup before the zoom completes.
     }
 
     window._currentProximityZoomCleanup = function() {
@@ -6097,9 +5909,7 @@ function _attachProximityZoomEndHandler(fallbackMs) {
             window._proxZoomAnimationStartTime = null;
             window._currentProximityZoomCleanup = null;
             window._proxZoomOnDone = null;
-            // REMOVED: window.isMapInteracting = false
-            // Called from onInteractionStart when a real gesture begins.
-            // isMapInteracting was just set to true — don't stomp it.
+            window.isMapInteracting = false;
         }
     };
 
@@ -6312,10 +6122,10 @@ function _resetMapToPosition(newPosition, options) {
 
     if (!map || !userMarker || !newPosition) return;
 
-    var currentTime     = options.currentTime != null ? options.currentTime : Date.now();
-    var resetType       = options.resetType || 'jump';
-    var forceUpdate     = !!options.forceUpdate;
-    var clearStationary = options.clearStationary !== false;
+    var currentTime      = options.currentTime != null ? options.currentTime : Date.now();
+    var resetType        = options.resetType || 'jump';
+    var forceUpdate      = !!options.forceUpdate;
+    var clearStationary  = options.clearStationary !== false;
 
     var prevPos  = window.lastPosition || null;
     var prevTime = window.lastUpdateTime || null;
@@ -6328,29 +6138,30 @@ function _resetMapToPosition(newPosition, options) {
         if (typeof seedPositionBuffer === 'function') {
             seedPositionBuffer(newPosition);
         } else {
-            window.positionBuffer = [newPosition];
+            window.positionBuffer = [];
+            window.positionBuffer.push(newPosition);
         }
 
-        window.stationaryStartTime     = currentTime;
-        window.isMapInteracting        = false;
-        window.lastInteractionTime     = currentTime;
-        window.blockSpeedZoom          = false;
-        window.zoomedInState           = false;
-        window._lastCenteredMode       = false;
-        window._viewportSafetyEnforced = false;
+        window.stationaryStartTime      = currentTime;
+        window.isMapInteracting         = false;
+        window.lastInteractionTime      = currentTime;
+        window.blockSpeedZoom           = false;
+        window.zoomedInState            = false;
+        window._lastCenteredMode        = false;
+        window._viewportSafetyEnforced  = false;
     } else {
         if (clearStationary && window.stationaryCheckTimeout != null) {
             clearTimeout(window.stationaryCheckTimeout);
             window.stationaryCheckTimeout = null;
         }
 
-        window.positionBuffer      = [newPosition];
-        window.stationaryStartTime = null;
+        window.positionBuffer       = [newPosition];
+        window.stationaryStartTime  = null;
     }
 
-    window.lastPosition        = newPosition;
-    window.lastUpdateTime      = currentTime;
-    window.lastUpdateTimestamp = currentTime;
+    window.lastPosition             = newPosition;
+    window.lastUpdateTime           = currentTime;
+    window.lastUpdateTimestamp      = currentTime;
 
     if (prevPos && prevTime && currentTime) {
         var dtSec = (currentTime - prevTime) / 1000;
@@ -6358,12 +6169,17 @@ function _resetMapToPosition(newPosition, options) {
             var latVel = (newPosition.lat - prevPos.lat) / dtSec;
             var lngVel = (newPosition.lng - prevPos.lng) / dtSec;
 
-            var speedDegPerSec   = Math.sqrt(latVel * latVel + lngVel * lngVel);
+            // ── Sanity check on computed velocity, not displacement ──
+            // Reject physically impossible velocities (>100 m/s = 224 MPH).
+            // The original 0.01° cap rejected legitimate large displacements
+            // (e.g. 5km drive with 10min background gap). This checks the
+            // resulting velocity instead, which is what actually matters.
+            var speedDegPerSec = Math.sqrt(latVel * latVel + lngVel * lngVel);
             var speedMetersPerSec = speedDegPerSec * 111111 *
                 Math.cos((newPosition.lat || 0) * Math.PI / 180);
 
             if (speedMetersPerSec < 100) {
-                window.lastVelocity     = { lat: latVel, lng: lngVel };
+                window.lastVelocity = { lat: latVel, lng: lngVel };
                 window.smoothedVelocity = { lat: latVel, lng: lngVel };
             } else {
                 window.lastVelocity     = { lat: 0, lng: 0 };
@@ -6384,49 +6200,48 @@ function _resetMapToPosition(newPosition, options) {
         var sv = window.smoothedVelocity;
         if (sv && (Math.abs(sv.lat) > 1e-8 || Math.abs(sv.lng) > 1e-8)) {
             var cosLat = Math.cos((newPosition.lat || 0) * Math.PI / 180);
-            window._pendingKalmanSeedVelocity = {
-                vNorth: sv.lat * 111111,
-                vEast:  sv.lng * 111111 * cosLat
-            };
+            var vNorth = sv.lat * 111111;
+            var vEast  = sv.lng * 111111 * cosLat;
+            window._pendingKalmanSeedVelocity = { vNorth: vNorth, vEast: vEast };
         }
     }
 
-    window.isStationary           = false;
-    window.stationaryLockPosition = null;
-    window.followUser             = true;
+    window.isStationary             = false;
+    window.stationaryLockPosition   = null;
+    window.followUser               = true;
 
     var mapContainer       = map.getContainer();
     var originalTransition = mapContainer.style.transition;
     mapContainer.style.transition = 'none';
 
-    var currentZoom     = map.getZoom();
+    var currentZoom = map.getZoom();
     var intelligentZoom = (typeof getSpeedBasedZoom === 'function')
         ? getSpeedBasedZoom(newPosition.speedMPS)
         : -1;
 
-    var targetZoom = (typeof intelligentZoom === 'number' && intelligentZoom > 0)
-        ? intelligentZoom
-        : (resetType === 'init' ? 17 : currentZoom);
+    var targetZoom;
+    if (resetType === 'init') {
+        targetZoom = (typeof intelligentZoom === 'number' && intelligentZoom > 0)
+            ? intelligentZoom
+            : 17;
+    } else {
+        targetZoom = (typeof intelligentZoom === 'number' && intelligentZoom > 0)
+            ? intelligentZoom
+            : currentZoom;
+    }
 
-    // FLAG: mark these setView calls as programmatic so the moveend they fire
-    // doesn't leak into setupMapInteractionHandlers and release gesture state.
     try {
         userMarker.setLatLng([newPosition.lat, newPosition.lng]);
-        window._programmaticMapMove = true;
         map.setView([newPosition.lat, newPosition.lng], targetZoom, {
             animate: false,
             noMoveStart: true,
             noMoveEnd: true
         });
-        window._programmaticMapMove = false;
     } catch (error) {
-        window._programmaticMapMove = false;
         console.error(resetType + ' centering failed:', error);
 
         var fallbackZoom = (resetType === 'init') ? 17 : currentZoom;
-        window._programmaticMapMove = true;
         map.setView([newPosition.lat, newPosition.lng], fallbackZoom, { animate: false });
-        window._programmaticMapMove = false;
         userMarker.setLatLng([newPosition.lat, newPosition.lng]);
     }
 
@@ -6439,12 +6254,14 @@ function _resetMapToPosition(newPosition, options) {
     });
 
     if (resetType === 'init') {
-        if (typeof updateDistanceBox === 'function') updateDistanceBox(forceUpdate);
-        if (typeof updateAccuracyIndicator === 'function') updateAccuracyIndicator(newPosition.accuracy);
+        if (typeof updateDistanceBox === 'function') {
+            updateDistanceBox(forceUpdate);
+        }
+
+        if (typeof updateAccuracyIndicator === 'function') {
+            updateAccuracyIndicator(newPosition.accuracy);
+        }
     } else {
-        // Pass false — this is a GPS/movement update, not a user gesture.
-        // resetInactivityTimer must not start the timer or touch isMapInteracting
-        // unless called from an actual user interaction.
         if (typeof isSignificantMovement === 'function' &&
             isSignificantMovement(newPosition) &&
             typeof resetInactivityTimer === 'function') {
@@ -6452,7 +6269,9 @@ function _resetMapToPosition(newPosition, options) {
         }
     }
 
-    var speedMPH = (isFinite(newPosition.speedMPS) ? newPosition.speedMPS : 0) * 2.23694;
+    var speedMPS = (newPosition && isFinite(newPosition.speedMPS)) ? newPosition.speedMPS : 0;
+    var speedMPH = speedMPS * 2.23694;
+
     if (typeof _enforceViewportSafety === 'function') {
         _enforceViewportSafety(speedMPH, userMarker.getLatLng());
     }
@@ -7177,78 +6996,57 @@ function getGeolocationOptions(speedMPS = 0) {
 function handleLocationError(error) {
     console.warn("Error getting user location:", error);
 
-    // ── Deduplication: prevent duplicate popups from rapid error callbacks ──
-    if (window._locationErrorPopupOpen) {
-        console.log('[LocationError] Popup already open, suppressing duplicate');
-        return;
-    }
-
-    // ── Permission Denied (Code 1): permanent session block ──
-    // Browsers remember a "Deny" click. Retrying is futile and wastes
-    // timeout cycles. Show the message immediately and block further retries.
+    // Early exit for Permission Denied (Code 1).
+    // Browsers remember a "Deny" click. Retrying is completely futile and
+    // just wastes 3 timeout cycles before finally showing the user the
+    // "Please allow access" message. Show it immediately instead.
     if (error?.code === 1) {
         retryCount = 0;
-        window._locationPermissionDenied = true;  // Block all future retry attempts
         hideLoadingMessage();
-        
-        window._locationErrorPopupOpen = true;
-        showPopup("Location Error", "Please allow access to your location to use this feature.", "error", () => {
-            window._locationErrorPopupOpen = false;
-        });
-        
+        showPopup("Location Error", "Please allow access to your location to use this feature.");
         if (typeof onLocationFailure === 'function') {
-            try { onLocationFailure(error); } catch (e) { console.warn('onLocationFailure failed:', e); }
+            onLocationFailure(error);
         }
         return;
     }
 
-    // ── Block retries if permission was previously denied in this session ──
-    if (window._locationPermissionDenied) {
-        console.log('[LocationError] Permission previously denied, skipping retry');
-        return;
-    }
-
-    // ── Retry on recoverable errors (including iOS 17's code 0), up to MAX_RETRIES ──
+    // Retry on recoverable errors (including iOS 17's code 0), up to MAX_RETRIES
     if (retryCount < CONFIG.MAX_RETRIES) {
         retryCount++;
         
-        // Exponential backoff: 1s, 2s, 4s. Capped at 10 seconds.
+        // Exponential backoff instead of linear.
+        // 1s, 2s, 4s. Capped at 10 seconds. Much kinder to the battery/CPU
+        // than hammering the GPS chip with rapid retries.
         const backoffMs = Math.min(10000, CONFIG.RETRY_DELAY * Math.pow(2, retryCount - 1));
         
         console.log(`Retrying to get location (Attempt ${retryCount} of ${CONFIG.MAX_RETRIES} in ${backoffMs}ms)`);
 
-        // Track the timeout ID so we can cancel it if the user manually recovers
-        // Use createTrackedTimeout for automatic cleanup on page unload
-        window._locationRetryTimeoutId = createTrackedTimeout(() => {
-            window._locationRetryTimeoutId = null;
-            
-            // Double-check permission wasn't denied while we were waiting
-            if (window._locationPermissionDenied) {
-                console.log('[LocationError] Permission denied during retry backoff, aborting');
-                return;
-            }
-            
+        setTimeout(() => {
             navigator.geolocation.getCurrentPosition(
                 (position) => {
                     console.log("Location retrieved successfully after retry");
-                    retryCount = 0;
                     hideLoadingMessage();
                     updateUserLocation(position, true);
+                    retryCount = 0;
                 },
                 handleLocationError,
-                getGeolocationOptions(0)
+
+                getGeolocationOptions(0) 
             );
         }, backoffMs);
         return;
     }
 
-    // ── Max retries reached ──
+    // Max retries reached
     retryCount = 0;
     hideLoadingMessage();
 
     let errorMessage = "An error occurred while getting your location.";
     if (error?.code !== undefined) {
         switch (error.code) {
+            case 1:
+                errorMessage = "Please allow access to your location to use this feature.";
+                break;
             case 2:
                 errorMessage = "Your location is currently unavailable. Please try again later.";
                 break;
@@ -7259,50 +7057,20 @@ function handleLocationError(error) {
                 // iOS 17 Safari sometimes returns non-standard code 0
                 errorMessage = "Unable to determine your location. Please check your device settings and try again.";
                 break;
-            default:
-                errorMessage = "An unexpected location error occurred. Please try again.";
-                break;
         }
     }
 
-    window._locationErrorPopupOpen = true;
-    showPopup("Location Error", errorMessage, "error", () => {
-        window._locationErrorPopupOpen = false;
-    });
-    
+    showPopup("Location Error", errorMessage);
     if (typeof onLocationFailure === 'function') {
-        try { onLocationFailure(error); } catch (e) { console.warn('onLocationFailure failed:', e); }
+        onLocationFailure(error);
     }
 }
 
 function showPopup(title, message, type = "info", callback = null) {
     console.log("showPopup called with:", title, message);
 
-    // ── Unified modal stack guard ──
-    // Remove ALL known modal types, not just .popup-overlay, to prevent stacking
-    const modalSelectors = [
-        ".popup-overlay",
-        ".modal",
-        ".navigation-tips-overlay",
-        ".source-info-content",
-        ".geo-retry-overlay",
-        ".reminder-modal",
-        "#summaryModal",
-        "#sourceInfoPopup",
-        "#geolocation-retry-modal"
-    ];
-    modalSelectors.forEach(selector => {
-        document.querySelectorAll(selector).forEach(el => {
-            // Don't remove if it's currently animating out (has fade-out class)
-            if (!el.classList.contains('fade-out')) {
-                el.remove();
-            }
-        });
-    });
-
-    // Also clear any tracked modal-open flags from other subsystems
-    if (window._locationErrorPopupOpen) window._locationErrorPopupOpen = false;
-    if (window.navigationTipsOpen) window.navigationTipsOpen = false;
+    const existingPopups = document.querySelectorAll(".popup-overlay");
+    existingPopups.forEach(popup => popup.remove());
 
     const overlay = document.createElement("div");
     overlay.className = "popup-overlay";
@@ -7370,15 +7138,14 @@ function showPopup(title, message, type = "info", callback = null) {
 
     function closePopup() {
         overlay.style.opacity = "0";
-        // Use createTrackedTimeout for consistency with app patterns
-        createTrackedTimeout(() => {
+        setTimeout(() => {
             overlay.remove();
             if (window._popupOriginalOverflow !== undefined) {
                 document.body.style.overflow = window._popupOriginalOverflow;
                 window._popupOriginalOverflow = undefined;
             }
             if (callback && typeof callback === 'function') {
-                try { callback(); } catch (e) { console.warn('Popup callback failed:', e); }
+                callback();
             }
         }, 150);
     }
@@ -7390,15 +7157,6 @@ function showPopup(title, message, type = "info", callback = null) {
             closePopup();
         }
     });
-
-    // ── Escape key handler ──
-    const escapeHandler = (e) => {
-        if (e.key === 'Escape') {
-            document.removeEventListener('keydown', escapeHandler);
-            closePopup();
-        }
-    };
-    document.addEventListener('keydown', escapeHandler);
 
     if (window._popupOriginalOverflow === undefined) {
         window._popupOriginalOverflow = document.body.style.overflow || "";
@@ -7416,8 +7174,6 @@ function showPopup(title, message, type = "info", callback = null) {
     overlay.style.transition = "opacity 150ms ease-out";
     requestAnimationFrame(() => {
         overlay.style.opacity = "1";
-        // Focus the close button for keyboard accessibility
-        closeButton.focus();
     });
 }
         
@@ -9807,15 +9563,13 @@ let activePopups = new Set();
 function recenterOnUser() {
     if (userMarker && map) {
         map.closePopup();
-        window.followUser = true;
-        window.isMapInteracting = false;
-        window._programmaticMapMove = true;
         map.panTo(userMarker.getLatLng(), {
             animate: true,
             duration: 0.5,
             noZoom: true
         });
-        window._programmaticMapMove = false;
+        window.followUser = true;
+        window.isMapInteracting = false;
     }
 }
         
@@ -10237,12 +9991,11 @@ function loadAllLocations() {
         showPopup("Error", "No locations available. Please try reloading the page.");
         return;
     }
+
     window.gameLocations = gameLocations;
     createMarkersOnly();
     updateDistanceBox();
-    // Pass false — this is startup/data loading, not a user gesture.
-    // The 30s timer must not start here; setupMapInteractionHandlers owns that.
-    resetInactivityTimer(false);
+    resetInactivityTimer();
 }
 
 let visibilityTimeout;
@@ -10251,6 +10004,7 @@ document.addEventListener('visibilitychange', function() {
         clearTimeout(visibilityTimeout);
         visibilityTimeout = setTimeout(() => {
             recenterOnUser();
+            // Safety net for iOS PWA recovery where DOM gets wiped
             if (markerClusterGroup && markerClusterGroup.getLayers().length === 0) {
                 createMarkersOnly();
             }
@@ -10516,43 +10270,32 @@ function isSignificantMovement(newPosition) {
 }
 
 function resetInactivityTimer(isExplicitInteraction = true) {
-    // REMOVED: the old isExplicitInteraction branch that set
-    // window.isMapInteracting = false unconditionally. That was the root cause —
-    // called on every GPS update and significant movement, it was overwriting
-    // interaction state set by setupMapInteractionHandlers regardless of whether
-    // fingers were on the screen.
-    //
-    // isMapInteracting is now owned exclusively by setupMapInteractionHandlers.
-    // Nothing else should write to it.
-
-    // Don't touch the timer while the user is actively interacting.
-    // setupMapInteractionHandlers will call _startInactivityTimer itself
-    // when the gesture ends.
-    if (window.isMapInteracting) return;
-
     if (inactivityTimer) {
         clearTimeout(inactivityTimer);
         inactivityTimer = null;
     }
-
-    // Only start the 30s return timer when explicitly triggered by a real
-    // user interaction ending — not on every GPS update or movement event.
-    // Callers that aren't user gestures should pass false.
-    if (!isExplicitInteraction) return;
-
+    
     inactivityTimer = createTrackedTimeout(() => {
         if (!map || !userMarker) return;
-        if (window.isMapInteracting) return; // re-check at fire time
-
+        
         map.closePopup();
-        window.followUser = true;
-
-        const userPos = userMarker.getLatLng();
-        if (userPos && isFinite(userPos.lat) && isFinite(userPos.lng)) {
-            map.panTo(userPos, { animate: true, duration: 0.5, noZoom: true });
+        if (!window.isMapInteracting) {  
+            window.followUser = true;                  
+            window.isMapInteracting = false; // Ensure state is fully released
+            
+            const userPos = userMarker.getLatLng();
+            // isFinite prevents failure at exact 0 lat/lng coordinates
+            if (userPos && isFinite(userPos.lat) && isFinite(userPos.lng)) {
+                map.panTo(userPos, { animate: true, duration: 0.5, noZoom: true });
+            }
         }
     }, CONFIG.INACTIVITY_TIMEOUT);
+    
+    if (isExplicitInteraction) {
+        window.isMapInteracting = false;  
+    }
 }
+
 function optimizeImages(root = document) {
   if (!root || !root.querySelectorAll) {
     console.warn('optimizeImages: Invalid root element provided');
@@ -10730,19 +10473,17 @@ if (document.readyState === 'loading') {
   setupImageOptimizationObserver();
 }
 
-const _leafletListenerRegistry = [];
-
+/* EVENT LISTENER SETUP */
 function setupEventListeners() {
-    if (setupEventListeners._initialized) {
-        console.debug('[Events] Already initialized — skipping duplicate setup');
-        return;
-    }
-    Object.defineProperty(setupEventListeners, '_initialized', {
-        value: true,
-        writable: true,
-        enumerable: false,
-        configurable: true
-    });
+    const handleInteractionStart = () => {
+        window.followUser = false;
+        window.isMapInteracting = true;
+    };
+
+    const handleInteractionEnd = () => {
+        window.isMapInteracting = false;
+        resetInactivityTimer();
+    };
 
     const setupMapEvents = () => {
         if (!map) {
@@ -10751,34 +10492,9 @@ function setupEventListeners() {
         }
 
         try {
-            _leafletListenerRegistry.forEach(entry => {
-                try { map.off(entry.event, entry.handler); } catch (_) {}
-            });
-            _leafletListenerRegistry.length = 0;
-
-            // ── IMPORTANT: Do NOT wire dragstart/zoomstart/dragend/zoomend/moveend
-            // here. setupMapInteractionHandlers() owns all interaction and
-            // inactivity state. Duplicating those listeners here caused:
-            //   1. handleInteractionEnd firing on every DR-loop moveend (60fps),
-            //      overwriting isMapInteracting = false and resetting the inactivity
-            //      timer regardless of _programmaticMapMove or _pinchOccurred.
-            //   2. Two competing state machines for the same flags.
-            // If you need to react to map interaction, read window.isMapInteracting
-            // (set authoritatively by setupMapInteractionHandlers) rather than
-            // adding new Leaflet event listeners here.
-            // ──────────────────────────────────────────────────────────────────
-
-            if (typeof memoryManager !== 'undefined' && memoryManager?.registerCleanupTask) {
-                memoryManager.registerCleanupTask(() => {
-                    _leafletListenerRegistry.forEach(entry => {
-                        try {
-                            if (map) map.off(entry.event, entry.handler);
-                        } catch (_) {}
-                    });
-                    _leafletListenerRegistry.length = 0;
-                    setupEventListeners._initialized = false;
-                });
-            }
+            // Rely entirely on Leaflet's native, highly-optimized touch/drag handlers.
+            map.on('dragstart zoomstart', handleInteractionStart);
+            map.on('dragend zoomend moveend', handleInteractionEnd);
         } catch (error) {
             console.error('Error setting up map events:', error);
         }
@@ -10795,7 +10511,6 @@ function setupEventListeners() {
             try {
                 const element = document.getElementById(config.id);
                 if (element) {
-                    element.removeEventListener('click', config.handler);
                     element.addEventListener('click', config.handler);
                 } else if (config.required) {
                     console.error(`Required button element not found: ${config.id}`);
@@ -10806,40 +10521,26 @@ function setupEventListeners() {
         });
     };
 
-    const setupAccessibilityEvents = () => {
-        // Reserved for future ARIA live region management
-    };
+       const setupAccessibilityEvents = () => {};
 
     const setupSystemEvents = () => {
         try {
-            const visibilityHandler = () => {
+            document.addEventListener('visibilitychange', () => {
                 try {
                     if (typeof handleVisibilityChange === 'function') handleVisibilityChange();
                 } catch (error) {
                     console.error('Visibility change handler error:', error);
                 }
-            };
-            document.removeEventListener('visibilitychange', visibilityHandler);
-            document.addEventListener('visibilitychange', visibilityHandler);
+            });
 
             let resizeTimeout;
-            const resizeHandler = () => {
+            window.addEventListener('resize', () => {
                 clearTimeout(resizeTimeout);
                 resizeTimeout = setTimeout(() => {
                     if (map) map.invalidateSize();
                     if (typeof updateDistanceBox === 'function') updateDistanceBox();
                 }, 250);
-            };
-            window.removeEventListener('resize', resizeHandler);
-            window.addEventListener('resize', resizeHandler);
-
-            if (typeof memoryManager !== 'undefined' && memoryManager?.registerCleanupTask) {
-                memoryManager.registerCleanupTask(() => {
-                    document.removeEventListener('visibilitychange', visibilityHandler);
-                    window.removeEventListener('resize', resizeHandler);
-                    clearTimeout(resizeTimeout);
-                });
-            }
+            });
         } catch (error) {
             console.error('Error setting up system events:', error);
         }
@@ -10852,32 +10553,20 @@ function setupEventListeners() {
         setupSystemEvents();
     } catch (error) {
         console.error('Critical error in setupEventListeners:', error);
-        setupEventListeners._initialized = false;
     }
 }
 
-setupEventListeners.reset = function() {
-    _leafletListenerRegistry.forEach(entry => {
-        try {
-            if (typeof map !== 'undefined' && map) map.off(entry.event, entry.handler);
-        } catch (_) {}
-    });
-    _leafletListenerRegistry.length = 0;
-    this._initialized = false;
-    console.debug('[Events] Reset complete — ready for re-initialization');
-};
-
 document.addEventListener('DOMContentLoaded', () => {
     const initSteps = [
-        { name: 'Cache Elements',        fn: cacheElements },
-        { name: 'Initialize Map',        fn: initMap },
+        { name: 'Cache Elements', fn: cacheElements },
+        { name: 'Initialize Map', fn: initMap },
         { name: 'Setup Event Listeners', fn: setupEventListeners },
-        { name: 'Optimize Images',       fn: optimizeImages },
-        { name: 'Initialize UI',         fn: initializeUI }
+        { name: 'Optimize Images', fn: optimizeImages },
+        { name: 'Initialize UI', fn: initializeUI }
     ];
 
     let successCount = 0;
-
+    
     initSteps.forEach(step => {
         try {
             if (typeof step.fn === 'function') {
