@@ -2296,7 +2296,7 @@ window.sensorFusion = new SensorFusionManager().init();
    Manages map zoom authority using a priority system.
    ────────────────────────────────────────────── */
 (function() {
-  const DEFAULT_ZOOM = 17;
+  const DEFAULT_ZOOM = 18;
   const DEFAULT_LOCK_DURATION_MS = 2000;
 
   class ZoomController {
@@ -2877,7 +2877,7 @@ function initMap() {
     // ── Tile layer with required OSM attribution ──
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         minZoom: 7,
-        maxZoom: 19,
+        maxZoom: 18,
         attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>',
         updateWhenIdle: true,
         updateWhenZooming: false,
@@ -3464,7 +3464,7 @@ function initializeUserLocation(position) {
 
         if (!map) throw new Error('Map not initialized');
 
-        const initialZoom = 17;
+        const initialZoom = 18;
         map.setView([lat, lng], initialZoom, { animate: false });
 
         // Seed the position buffer for smoothing — one entry only
@@ -4525,8 +4525,174 @@ function handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, c
 }
 
 /* ──────────────────────────────────────────────
+   PREFETCH ZONE HANDLER (80ft → 20ft)
+   ────────────────────────────────────────────── */
+function _handleProximityZoomLogic(speedMPH, eastWestMove) {
+    const PROX_NEAR_M = 15.24;
+    const PROX_FAR_M = 25.0;
+    const PROX_ZOOM_IN = 18;
+    const PROX_ZOOM_OUT = 18;
+    const MAX_PROX_SPEED_MPH = 10;
+    const PROX_COOLDOWN_MS = 400;
+    const ANIMATION_STUCK_TIMEOUT_MS = 3000;
+
+    // Don't interfere with user map interaction (pinch/zoom/pan)
+    if (window.isMapInteracting) return;
+
+    if (window._proxZoomTargetLevel == null) window._proxZoomTargetLevel = PROX_ZOOM_OUT;
+
+    // Sync from live map zoom — prevents stale state after location page closes
+    if (map) {
+        window._proxZoomCurrentLevel = map.getZoom();
+    } else if (window._proxZoomCurrentLevel == null) {
+        window._proxZoomCurrentLevel = PROX_ZOOM_OUT;
+    }
+
+    window._proxSpeedEMA = window._proxSpeedEMA ?? speedMPH;
+    window._proxSpeedEMA = 0.6 * speedMPH + 0.4 * window._proxSpeedEMA;
+    const smoothedSpeedMPH = window._proxSpeedEMA;
+
+    const approachSpeed = _estimateApproachSpeedMPS();
+    const distM = window.proximityState?.distanceMeters ?? Infinity;
+    const timeToNearSec = (approachSpeed > 0.3 && isFinite(distM))
+        ? (distM - PROX_NEAR_M) / approachSpeed
+        : Infinity;
+
+    if (!window.proximityState || !map) {
+        _cleanupProximityZoomAnimation();
+        _resetProximityZoomSmoothing();
+        window._proxZoomTargetLevel = PROX_ZOOM_OUT;
+        return;
+    }
+
+    const speedGateBreached = smoothedSpeedMPH > MAX_PROX_SPEED_MPH + 3;
+
+    if (speedGateBreached) {
+        window._proxZoomTargetLevel = PROX_ZOOM_OUT;
+        if (window._proxZoomState === 'ZOOMED_IN') {
+            _executeProximityZoom(PROX_ZOOM_OUT, 'IDLE', eastWestMove);
+        } else {
+            _cleanupProximityZoomAnimation();
+            _resetProximityZoomSmoothing();
+        }
+        return;
+    }
+
+    // Escape hatch: if animating flag is stuck > 3s, force cleanup
+    if (window._isProximityZoomAnimating) {
+        const flagAge = Date.now() - (window._proxZoomAnimationStartTime || 0);
+        if (flagAge > ANIMATION_STUCK_TIMEOUT_MS) {
+            console.warn('[ProximityZoom] Animation flag stuck for', flagAge, 'ms — clearing');
+            if (typeof window._currentProximityZoomCleanup === 'function') {
+                window._currentProximityZoomCleanup();
+            } else {
+                window._isProximityZoomAnimating = false;
+                window._proxZoomAnimationStartTime = null;
+                window.isMapInteracting = false;
+            }
+        }
+        return;
+    }
+
+    const now = Date.now();
+
+    const cooldownKey = window._proxZoomTargetLevel > window._proxZoomCurrentLevel ? 'IN' : 'OUT';
+    const lastTimeForDir = window._lastProxZoomTimeByDir?.[cooldownKey] || 0;
+    if (now - lastTimeForDir < PROX_COOLDOWN_MS) return;
+
+    if (!isFinite(distM) || distM === Infinity) {
+        window._proxZoomTargetLevel = PROX_ZOOM_OUT;
+        if (window._proxZoomState === 'ZOOMED_IN') {
+            _executeProximityZoom(PROX_ZOOM_OUT, 'IDLE', eastWestMove);
+        } else {
+            _resetProximityZoomSmoothing();
+        }
+        return;
+    }
+
+    if (!window._proxZoomState) {
+        window._proxZoomState = 'IDLE';
+    }
+
+    let targetZoom = PROX_ZOOM_OUT;
+
+    if (distM <= PROX_NEAR_M && smoothedSpeedMPH <= MAX_PROX_SPEED_MPH) {
+        targetZoom = PROX_ZOOM_IN;
+    } else if (distM < PROX_FAR_M && smoothedSpeedMPH <= MAX_PROX_SPEED_MPH) {
+        const t = (PROX_FAR_M - distM) / (PROX_FAR_M - PROX_NEAR_M);
+        const easedT = t * t * (3 - 2 * t);
+        targetZoom = PROX_ZOOM_OUT + (PROX_ZOOM_IN - PROX_ZOOM_OUT) * easedT;
+    } else if (timeToNearSec < 3.0 && timeToNearSec > 0 && smoothedSpeedMPH <= MAX_PROX_SPEED_MPH) {
+        targetZoom = PROX_ZOOM_OUT + 0.5;
+    }
+
+    window._proxZoomTargetLevel = targetZoom;
+
+    const currentZoom = map.getZoom();
+    const zoomDiff = Math.abs(targetZoom - currentZoom);
+
+    if (zoomDiff < 0.1) {
+        window._proxZoomCurrentLevel = targetZoom;
+        window._proxZoomState = (Math.abs(targetZoom - PROX_ZOOM_IN) < 0.3) ? 'ZOOMED_IN' : 'IDLE';
+        return;
+    }
+
+    if (zoomDiff >= 0.4) {
+        const discreteTarget = targetZoom > (PROX_ZOOM_IN + PROX_ZOOM_OUT) / 2
+            ? PROX_ZOOM_IN
+            : PROX_ZOOM_OUT;
+
+        const newState = discreteTarget === PROX_ZOOM_IN ? 'ZOOMED_IN' : 'IDLE';
+
+        if (newState !== window._proxZoomState || zoomDiff > 1.0) {
+            window._proxZoomState = newState;
+            if (!window._lastProxZoomTimeByDir) window._lastProxZoomTimeByDir = {};
+            window._lastProxZoomTimeByDir[cooldownKey] = now;
+            _executeProximityZoom(discreteTarget, newState, eastWestMove);
+        }
+    }
+}
+
+/* ──────────────────────────────────────────────
    TRIGGER ZONE HANDLER (≤20ft)
    ────────────────────────────────────────────── */
+function _handlePrefetchZone(location, distanceFeet, now) {
+    if (!location || !location.id) return;
+
+    // Initialize prefetch state tracking if needed
+    if (!window._prefetchState) window._prefetchState = {};
+
+    const locationId = location.id;
+
+    // Record when we first entered the prefetch zone for this location
+    if (!window._prefetchState[locationId]) {
+        window._prefetchState[locationId] = {
+            startTime: now,
+            startDistance: distanceFeet
+        };
+    }
+
+    // Preload the location image if not already done
+    if (!window.preloadedLocation || window.preloadedLocation.id !== locationId) {
+        window.preloadedLocation = location;
+        if (typeof preloadLocationData === 'function') {
+            try {
+                preloadLocationData(location);
+            } catch (err) {
+                console.warn('[Prefetch] preloadLocationData failed:', err);
+            }
+        }
+    }
+
+    // Prefetch map tiles at zoom 19 for smooth proximity zoom
+    if (typeof _prefetchMapTiles === 'function') {
+        _prefetchMapTiles(location, now);
+    }
+}
+
+// Add this function definition. It was called but never defined,
+// causing a ReferenceError that silently broke distance updates
+// whenever the user entered the 80ft prefetch zone.
 function _handlePrefetchZone(location, distanceFeet, now) {
     if (!location || !location.id) return;
 
@@ -4717,7 +4883,7 @@ function _prefetchMapTiles(location, now) {
             throw new Error('Invalid map center');
         }
 
-        const targetZoom = 19;
+        const targetZoom = 18;
         const tileUrlTemplate = window.currentTileLayer?._url
             || 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
 
@@ -5541,32 +5707,41 @@ function updateUserLocation(position, forceUpdate) {
 function _handleProximityZoomLogic(speedMPH, eastWestMove) {
     const PROX_NEAR_M = 15.24;
     const PROX_FAR_M = 25.0;
-    const PROX_ZOOM_IN = 19;
-    const PROX_ZOOM_OUT = 17;
+    const PROX_ZOOM_IN = 18;
+    const PROX_ZOOM_OUT = 18;
     const MAX_PROX_SPEED_MPH = 10;
     const PROX_COOLDOWN_MS = 400;
     const ANIMATION_STUCK_TIMEOUT_MS = 3000;
 
-    if (window.isMapInteracting) return;
-    if (!window.proximityState || !map) {
-        _cleanupProximityZoomAnimation();
-        _resetProximityZoomSmoothing();
-        return;
-    }
-
-    // If the user has manually zoomed below our standard level, respect it.
-    const currentZoom = map.getZoom();
-    if (currentZoom < PROX_ZOOM_OUT - 0.5) return;
-
     if (window._proxZoomTargetLevel == null) window._proxZoomTargetLevel = PROX_ZOOM_OUT;
-    window._proxZoomCurrentLevel = currentZoom;
+
+    // Sync from live map zoom — prevents stale state after location page closes
+    if (map) {
+        window._proxZoomCurrentLevel = map.getZoom();
+    } else if (window._proxZoomCurrentLevel == null) {
+        window._proxZoomCurrentLevel = PROX_ZOOM_OUT;
+    }
 
     window._proxSpeedEMA = window._proxSpeedEMA ?? speedMPH;
     window._proxSpeedEMA = 0.6 * speedMPH + 0.4 * window._proxSpeedEMA;
     const smoothedSpeedMPH = window._proxSpeedEMA;
 
-    // Speed gate
-    if (smoothedSpeedMPH > MAX_PROX_SPEED_MPH + 3) {
+    const approachSpeed = _estimateApproachSpeedMPS();
+    const distM = window.proximityState?.distanceMeters ?? Infinity;
+    const timeToNearSec = (approachSpeed > 0.3 && isFinite(distM))
+        ? (distM - PROX_NEAR_M) / approachSpeed
+        : Infinity;
+
+    if (!window.proximityState || !map) {
+        _cleanupProximityZoomAnimation();
+        _resetProximityZoomSmoothing();
+        window._proxZoomTargetLevel = PROX_ZOOM_OUT;
+        return;
+    }
+
+    const speedGateBreached = smoothedSpeedMPH > MAX_PROX_SPEED_MPH + 3;
+
+    if (speedGateBreached) {
         window._proxZoomTargetLevel = PROX_ZOOM_OUT;
         if (window._proxZoomState === 'ZOOMED_IN') {
             _executeProximityZoom(PROX_ZOOM_OUT, 'IDLE', eastWestMove);
@@ -5577,7 +5752,7 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
         return;
     }
 
-    // Escape hatch: stuck animation flag
+    // Escape hatch: if animating flag is stuck > 3s, force cleanup
     if (window._isProximityZoomAnimating) {
         const flagAge = Date.now() - (window._proxZoomAnimationStartTime || 0);
         if (flagAge > ANIMATION_STUCK_TIMEOUT_MS) {
@@ -5594,46 +5769,62 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
     }
 
     const now = Date.now();
-    if (!window._proxZoomState) window._proxZoomState = 'IDLE';
 
-    const distM = window.proximityState?.distanceMeters ?? Infinity;
+    const cooldownKey = window._proxZoomTargetLevel > window._proxZoomCurrentLevel ? 'IN' : 'OUT';
+    const lastTimeForDir = window._lastProxZoomTimeByDir?.[cooldownKey] || 0;
+    if (now - lastTimeForDir < PROX_COOLDOWN_MS) return;
 
-    if (!isFinite(distM)) {
+    if (!isFinite(distM) || distM === Infinity) {
+        window._proxZoomTargetLevel = PROX_ZOOM_OUT;
         if (window._proxZoomState === 'ZOOMED_IN') {
-            window._proxZoomTargetLevel = PROX_ZOOM_OUT;
             _executeProximityZoom(PROX_ZOOM_OUT, 'IDLE', eastWestMove);
+        } else {
+            _resetProximityZoomSmoothing();
         }
         return;
     }
 
-    // Determine target
+    if (!window._proxZoomState) {
+        window._proxZoomState = 'IDLE';
+    }
+
     let targetZoom = PROX_ZOOM_OUT;
+
     if (distM <= PROX_NEAR_M && smoothedSpeedMPH <= MAX_PROX_SPEED_MPH) {
         targetZoom = PROX_ZOOM_IN;
     } else if (distM < PROX_FAR_M && smoothedSpeedMPH <= MAX_PROX_SPEED_MPH) {
         const t = (PROX_FAR_M - distM) / (PROX_FAR_M - PROX_NEAR_M);
         const easedT = t * t * (3 - 2 * t);
         targetZoom = PROX_ZOOM_OUT + (PROX_ZOOM_IN - PROX_ZOOM_OUT) * easedT;
+    } else if (timeToNearSec < 3.0 && timeToNearSec > 0 && smoothedSpeedMPH <= MAX_PROX_SPEED_MPH) {
+        targetZoom = PROX_ZOOM_OUT + 0.5;
     }
 
     window._proxZoomTargetLevel = targetZoom;
 
-    const discreteTarget = targetZoom > (PROX_ZOOM_IN + PROX_ZOOM_OUT) / 2
-        ? PROX_ZOOM_IN
-        : PROX_ZOOM_OUT;
-    const newState = discreteTarget === PROX_ZOOM_IN ? 'ZOOMED_IN' : 'IDLE';
-    
-    const mapNeedsCorrection = Math.abs(currentZoom - discreteTarget) >= 0.5;
-    if (newState === window._proxZoomState && !mapNeedsCorrection) return;
+    const currentZoom = map.getZoom();
+    const zoomDiff = Math.abs(targetZoom - currentZoom);
 
-    const cooldownKey = discreteTarget > currentZoom ? 'IN' : 'OUT';
-    const lastTimeForDir = window._lastProxZoomTimeByDir?.[cooldownKey] || 0;
-    if (now - lastTimeForDir < PROX_COOLDOWN_MS) return;
+    if (zoomDiff < 0.1) {
+        window._proxZoomCurrentLevel = targetZoom;
+        window._proxZoomState = (Math.abs(targetZoom - PROX_ZOOM_IN) < 0.3) ? 'ZOOMED_IN' : 'IDLE';
+        return;
+    }
 
-    window._proxZoomState = newState;
-    if (!window._lastProxZoomTimeByDir) window._lastProxZoomTimeByDir = {};
-    window._lastProxZoomTimeByDir[cooldownKey] = now;
-    _executeProximityZoom(discreteTarget, newState, eastWestMove);
+    if (zoomDiff >= 0.4) {
+        const discreteTarget = targetZoom > (PROX_ZOOM_IN + PROX_ZOOM_OUT) / 2
+            ? PROX_ZOOM_IN
+            : PROX_ZOOM_OUT;
+
+        const newState = discreteTarget === PROX_ZOOM_IN ? 'ZOOMED_IN' : 'IDLE';
+
+        if (newState !== window._proxZoomState || zoomDiff > 1.0) {
+            window._proxZoomState = newState;
+            if (!window._lastProxZoomTimeByDir) window._lastProxZoomTimeByDir = {};
+            window._lastProxZoomTimeByDir[cooldownKey] = now;
+            _executeProximityZoom(discreteTarget, newState, eastWestMove);
+        }
+    }
 }
 
 function _estimateApproachSpeedMPS() {
@@ -5670,22 +5861,35 @@ function _estimateApproachSpeedMPS() {
 function _computeFramingCenter(userLL, locationLL, zoom) {
     if (!userLL || !locationLL) return userLL;
 
+    // Check if location is already visible at current zoom
     const bounds = map.getBounds();
     if (bounds.contains(locationLL)) return userLL;
 
+    // Location is off-screen. Compute minimal shift to bring it in
+    // while keeping user in center 60% of viewport.
     const size = map.getSize();
+    const userPx = map.project(userLL, zoom);
+    const locPx = map.project(locationLL, zoom);
+
+    // Center 60% box: ±30% from center in each dimension
     const maxOffsetX = size.x * 0.30;
     const maxOffsetY = size.y * 0.30;
 
     const centerPx = map.project(map.getCenter(), zoom);
-    const locPx = map.project(locationLL, zoom);
-
     const dx = locPx.x - centerPx.x;
     const dy = locPx.y - centerPx.y;
 
+    // How much do we need to shift center so location is at edge of 60% box?
     let shiftX = 0, shiftY = 0;
-    if (Math.abs(dx) > maxOffsetX) shiftX = dx > 0 ? dx - maxOffsetX : dx + maxOffsetX;
-    if (Math.abs(dy) > maxOffsetY) shiftY = dy > 0 ? dy - maxOffsetY : dy + maxOffsetY;
+
+    if (Math.abs(dx) > maxOffsetX) {
+        shiftX = dx > 0 ? dx - maxOffsetX : dx + maxOffsetX;
+    }
+    if (Math.abs(dy) > maxOffsetY) {
+        shiftY = dy > 0 ? dy - maxOffsetY : dy + maxOffsetY;
+    }
+
+    // If shift is tiny, don't bother
     if (Math.abs(shiftX) < 5 && Math.abs(shiftY) < 5) return userLL;
 
     const newCenterPx = L.point(centerPx.x + shiftX, centerPx.y + shiftY);
@@ -5716,12 +5920,15 @@ function _executeProximityZoom(targetZoom, nextState, eastWestMove) {
         return;
     }
 
+    // Flag this as a programmatic interaction so movestart/zoomstart
+    // handlers don't treat it as a user gesture
     window._programmaticFlyInProgress = true;
     window._proxZoomCausedInteraction = true;
 
     requestAnimationFrame(() => {
         if (!window._isProximityZoomAnimating) return;
 
+        // Abort if user started a gesture while we were waiting for rAF
         if (window.isMapInteracting && !window._proxZoomCausedInteraction) {
             window._isProximityZoomAnimating = false;
             window._proxZoomAnimationStartTime = null;
@@ -5731,6 +5938,7 @@ function _executeProximityZoom(targetZoom, nextState, eastWestMove) {
 
         const closestLoc = window.proximityState?.closestLocation;
         const locationLL = closestLoc ? L.latLng(closestLoc.lat, closestLoc.lng) : null;
+
         const targetCenter = (targetZoom >= 18 && locationLL)
             ? _computeFramingCenter(userLL, locationLL, targetZoom)
             : userLL;
@@ -5752,15 +5960,22 @@ function _cleanupProximityZoomAnimation() {
         try { map.stop(); } catch (_) {}
     }
 
+    // Remove the ACTUAL onDone listener, not the cleanup wrapper.
+    // The old code did map.off('moveend', window._currentProximityZoomCleanup)
+    // which removed nothing because _currentProximityZoomCleanup was never
+    // registered as a listener — onDone was.
     if (window._proxZoomOnDone && map) {
         map.off('moveend', window._proxZoomOnDone);
         map.off('zoomend', window._proxZoomOnDone);
         window._proxZoomOnDone = null;
     }
 
+    // Call the cleanup function to properly handle the fallback timeout
+    // and handled flag, instead of just clearing the flag manually.
     if (typeof window._currentProximityZoomCleanup === 'function') {
         window._currentProximityZoomCleanup();
     } else {
+        // Fallback if cleanup function is missing
         window._isProximityZoomAnimating = false;
         window._proxZoomAnimationStartTime = null;
         window.isMapInteracting = false;
@@ -5771,18 +5986,15 @@ function _resetProximityZoomSmoothing() {
     window._proxZoomState = 'IDLE';
     window._lastProxZoomTime = 0;
     window._inProximityZone = false;
+    window._proxZoomTargetLevel = 18;
+    window._proxZoomCurrentLevel = 18;
     window._proxSpeedEMA = null;
     window._proxZoomAnimationStartTime = null;
     window._proxZoomOnDone = null;
-    window._isProximityZoomAnimating = false;
-    window._programmaticFlyInProgress = false;
-    window._proxZoomCausedInteraction = false;
     if (window._lastProxZoomTimeByDir) {
         window._lastProxZoomTimeByDir.IN = 0;
         window._lastProxZoomTimeByDir.OUT = 0;
     }
-    // DO NOT reset _proxZoomTargetLevel or _proxZoomCurrentLevel —
-    // they must reflect live map state, not a hardcoded default.
 }
 
 function _attachProximityZoomEndHandler(fallbackMs) {
@@ -5807,8 +6019,9 @@ function _attachProximityZoomEndHandler(fallbackMs) {
         window._proxZoomAnimationStartTime = null;
         window._currentProximityZoomCleanup = null;
         window._proxZoomOnDone = null;
-        window._programmaticFlyInProgress = false;
 
+        // Only reset isMapInteracting if the proximity zoom caused it,
+        // not if the user started a gesture during the animation
         if (window._proxZoomCausedInteraction) {
             window.isMapInteracting = false;
             window._proxZoomCausedInteraction = false;
@@ -5828,6 +6041,8 @@ function _attachProximityZoomEndHandler(fallbackMs) {
     if (map && typeof map.on === 'function') {
         map.on('moveend', onDone);
         map.on('zoomend', onDone);
+        // NO zoomanim listener — it fires at animation START, not END,
+        // causing premature cleanup before the zoom completes.
     }
 
     window._currentProximityZoomCleanup = function() {
@@ -5848,8 +6063,9 @@ function _attachProximityZoomEndHandler(fallbackMs) {
             window._proxZoomAnimationStartTime = null;
             window._currentProximityZoomCleanup = null;
             window._proxZoomOnDone = null;
-            window._programmaticFlyInProgress = false;
 
+            // Only reset isMapInteracting if the proximity zoom caused it,
+            // not if the user started a gesture during the animation
             if (window._proxZoomCausedInteraction) {
                 window.isMapInteracting = false;
                 window._proxZoomCausedInteraction = false;
@@ -6167,7 +6383,7 @@ function _resetMapToPosition(newPosition, options) {
     if (resetType === 'init') {
         targetZoom = (typeof intelligentZoom === 'number' && intelligentZoom > 0)
             ? intelligentZoom
-            : 17;
+            : 18;
     } else {
         targetZoom = (typeof intelligentZoom === 'number' && intelligentZoom > 0)
             ? intelligentZoom
@@ -8910,7 +9126,7 @@ function handleContinueClick() {
     // Reset the proximity zoom level and animation tracking state
     // so the next approach doesn't get blocked by stale values left over
     // from the location page that just closed.
-    window._proxZoomCurrentLevel = map ? map.getZoom() : 17;
+    window._proxZoomCurrentLevel = map ? map.getZoom() : 18;
     window._proxZoomAnimationStartTime = null;
 
     window._inProximityZone = false;
