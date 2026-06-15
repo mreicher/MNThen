@@ -4275,18 +4275,13 @@ function setupMapInteractionHandlers() {
 
     // Interaction start — lock map & cancel snap-back timer
     const onInteractionStart = () => {
-        // Check programmatic flag BEFORE touching isMapInteracting.
-        // If flyTo triggered this event, don't mark the map as user-interacting.
-        // The flag is consumed here so onInteractionEnd won't start the timer.
-        if (window._programmaticFlyInProgress) {
-            window._programmaticFlyInProgress = false;
+        if (window._programmaticFlyInProgress || window._proxZoomCausedInteraction) {
+            // Don't clear the flag here — let onDone/cleanup clear it after animation ends.
+            // Just suppress the interaction lock.
             return;
         }
-
         window.isMapInteracting = true;
         _clearInactivityTimer();
-
-        // User is overriding a running proximity zoom — cancel it
         if (typeof window._currentProximityZoomCleanup === 'function') {
             window._currentProximityZoomCleanup();
             window._currentProximityZoomCleanup = null;
@@ -8910,50 +8905,51 @@ function handleContinueClick() {
     window.isNearLocation = false;
     window.blockSpeedZoom = false;
     window.currentProximityLocationId = null;
-
-    window._proxZoomState = 'IDLE';
-    window._lastProxZoomTime = Date.now();
-    
-    // Reset the proximity zoom level and animation tracking state
-    // so the next approach doesn't get blocked by stale values left over
-    // from the location page that just closed.
-    window._proxZoomCurrentLevel = map ? map.getZoom() : 17;
-    window._proxZoomAnimationStartTime = null;
-
     window._inProximityZone = false;
     window._proximityZoomActive = false;
+    window._didPrefetch19 = false;
 
-    // Reset cooldown direction timers so the same location can re-trigger
-    // after cooldown expires without being blocked by stale timestamps.
-    if (!window._lastProxZoomTimeByDir) window._lastProxZoomTimeByDir = {};
-    window._lastProxZoomTimeByDir.IN = 0;
-    window._lastProxZoomTimeByDir.OUT = 0;
-
-    // Clean up any running proximity zoom animation BEFORE nulling _proxZoomOnDone.
-    // The old code nulled _proxZoomOnDone on line 33, then tried to use it on line 50
-    // — the fallback branch never executed because the reference was already gone.
+    // ── Full proximity zoom state reset ──────────────────────────────────
+    // Clean up any running animation BEFORE clearing the flag references,
+    // since the cleanup functions need those references to remove listeners.
     if (window._isProximityZoomAnimating && map) {
         if (typeof window._currentProximityZoomCleanup === 'function') {
             window._currentProximityZoomCleanup();
         } else {
-            // Fallback if the cleanup wrapper is missing
             if (typeof map.stop === 'function') map.stop();
-            
-            //  Also remove zoomanim listener (added in _attachProximityZoomEndHandler)
             if (window._proxZoomOnDone) {
                 map.off('moveend', window._proxZoomOnDone);
                 map.off('zoomend', window._proxZoomOnDone);
-                map.off('zoomanim', window._proxZoomOnDone); // ← ADDED
                 window._proxZoomOnDone = null;
             }
             window._isProximityZoomAnimating = false;
         }
-        window._proxZoomAnimationStartTime = null;
     }
 
-    // Now safe to clear the reference — cleanup above already used it
+    // Now safe to clear all zoom state — animation cleanup above already
+    // used any references it needed.
     window._proxZoomOnDone = null;
+    window._currentProximityZoomCleanup = null;
+    window._isProximityZoomAnimating = false;
+    window._proxZoomAnimationStartTime = null;
+    window._programmaticFlyInProgress = false;
+    window._proxZoomCausedInteraction = false;
+    window._proxZoomState = 'IDLE';
+    window._proxZoomTargetLevel = null;
+    window._proxZoomCurrentLevel = map ? map.getZoom() : 17;
+    window._lastProxZoomTime = 0;
+    window._proxSpeedEMA = null;
+    if (!window._lastProxZoomTimeByDir) window._lastProxZoomTimeByDir = {};
+    window._lastProxZoomTimeByDir.IN = 0;
+    window._lastProxZoomTimeByDir.OUT = 0;
 
+    // Unblock map interaction — the location page set isMapInteracting = true
+    // on open and it must be cleared here so the zoom logic can run again.
+    window.isMapInteracting = false;
+    window.followUser = true;
+    // ─────────────────────────────────────────────────────────────────────
+
+    // Countdown cleanup
     if (window._countdownVisibilityHandler) {
         document.removeEventListener('visibilitychange', window._countdownVisibilityHandler);
         window._countdownVisibilityHandler = null;
@@ -8976,7 +8972,6 @@ function handleContinueClick() {
     window.lastProximityZoomOutLocationId = lastVisitedLocationId;
     window.lastProximityZoomInTime = now - 2000;
     window.lastProximityZoomTime = now;
-    window._didPrefetch19 = false;
 
     if (window.zoomController) {
         const currentSource = window.zoomController.getState()?.currentSource;
@@ -8991,8 +8986,6 @@ function handleContinueClick() {
         null);
 
     if (map && centerLatLng) {
-        window.isMapInteracting = false;
-        window.followUser = true;
         window._blockAutoMapUpdates = true;
 
         map.setView(
@@ -9006,11 +8999,14 @@ function handleContinueClick() {
         }, 800);
     }
 
-    // Explicitly restart dead reckoning after closing location page.
-    // The proximity zoom may have left DR inactive with a stale _lastFrameTime.
-    // This is a no-op if DR is already running.
+    // Restart dead reckoning — proximity zoom may have left it inactive.
     if (window.deadReckoning && typeof window.deadReckoning.start === 'function') {
         window.deadReckoning.start();
+    }
+
+    // Restart idle zoom check in case it was never started or got cleared.
+    if (typeof startIdleProximityZoomCheck === 'function') {
+        startIdleProximityZoomCheck();
     }
 
     ensureGPSActive();
@@ -9483,6 +9479,7 @@ function startHunt() {
     // Only start proximity checks if not recovering into a location
     if (!recovered) {
         startIdleProximityCheck();
+        startIdleProximityZoomCheck();
     }
 }
         
@@ -10473,11 +10470,15 @@ function setupEventListeners() {
         resetInactivityTimer();
     };
 
-    const setupMapEvents = () => {
+      const setupMapEvents = () => {
+        // Map interaction handlers are fully managed by setupMapInteractionHandlers(),
+        // which is called from updateUserLocation on first GPS fix.
+        // Do NOT register duplicate handlers here — they fight the programmatic
+        // zoom flag logic and permanently lock isMapInteracting = true.
         if (!map) {
             console.error('Map not available for event setup');
-            return;
         }
+    };
 
         try {
             // Rely entirely on Leaflet's native, highly-optimized touch/drag handlers.
