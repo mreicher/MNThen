@@ -4156,51 +4156,34 @@ function setupMapInteractionHandlers() {
         window.isMapInteracting = false;
     }
 
-    // Interaction start — lock map & cancel snap-back timer
     const onInteractionStart = () => {
-        // Check programmatic flag BEFORE touching isMapInteracting.
-        // If flyTo triggered this event, don't mark the map as user-interacting.
-        // The flag is consumed here so onInteractionEnd won't start the timer.
         if (window._programmaticFlyInProgress) {
             window._programmaticFlyInProgress = false;
             return;
         }
-
         window.isMapInteracting = true;
         _clearInactivityTimer();
+        _cleanupProximityZoomAnimation();
+    };
 
-        // User is overriding a running proximity zoom — cancel it
-        if (typeof window._currentProximityZoomCleanup === 'function') {
-            window._currentProximityZoomCleanup();
-            window._currentProximityZoomCleanup = null;
+    const STATIONARY_SPEED_MPH = 1.0;
+
+    const onInteractionEnd = () => {
+        window.isMapInteracting = false;
+        const speedMPH = window.lastPosition?.speedMPS
+            ? window.lastPosition.speedMPS * 2.23694
+            : 0;
+        if (speedMPH < STATIONARY_SPEED_MPH) {
+            _startInactivityTimer();
         }
     };
 
     map.on('movestart', onInteractionStart);
     map.on('zoomstart', onInteractionStart);
-
-    // Interaction end — unlock instantly, then decide about timer
-    const STATIONARY_SPEED_MPH = 1.0;
-
-    const onInteractionEnd = () => {
-        // Immediate unlock
-        window.isMapInteracting = false;
-
-        // Determine current speed (fallback to 0 if no fix yet)
-        const speedMPH = window.lastPosition?.speedMPS
-            ? window.lastPosition.speedMPS * 2.23694
-            : 0;
-
-        if (speedMPH < STATIONARY_SPEED_MPH) {
-            _startInactivityTimer();
-        }
-        // Driving → keep following GPS, do not start the timer
-    };
-
     map.on('moveend', onInteractionEnd);
     map.on('zoomend', onInteractionEnd);
 }
-
+        
 function _clearInactivityTimer() {
     if (window.inactivityTimer) {
         clearTimeout(window.inactivityTimer);
@@ -5638,22 +5621,6 @@ function _executeProximityZoom(targetZoom, nextState, eastWestMove) {
     });
 }
 
-function _cleanupProximityZoomAnimation() {
-    if (!window._isProximityZoomAnimating) return;
-
-    if (map && typeof map.stop === 'function') {
-        try { map.stop(); } catch (_) {}
-    }
-
-    if (window._currentProximityZoomCleanup && map) {
-        map.off('moveend', window._currentProximityZoomCleanup);
-        map.off('zoomend', window._currentProximityZoomCleanup);
-        window._currentProximityZoomCleanup = null;
-    }
-
-    window._isProximityZoomAnimating = false;
-}
-
 function _resetProximityZoomSmoothing() {
     window._proxZoomState = 'IDLE';
     window._lastProxZoomTime = 0;
@@ -5667,12 +5634,20 @@ function _resetProximityZoomSmoothing() {
     }
 }
 
+// Monotonically increasing ID — each proximity zoom animation gets its own.
+// If a user gesture fires moveend/zoomend, the ID won't match, so onDone is a no-op.
+let _proxZoomAnimationId = 0;
+
 function _attachProximityZoomEndHandler(fallbackMs) {
+    // Stamp this animation with a unique ID
+    const myId = ++_proxZoomAnimationId;
     let handled = false;
     let fallbackId = null;
 
     const onDone = () => {
-        if (handled) return;
+        // If a newer proximity animation has started, or a user gesture fired
+        // these events, myId won't match the current ID — bail out.
+        if (handled || myId !== _proxZoomAnimationId) return;
         handled = true;
 
         if (map) {
@@ -5684,11 +5659,9 @@ function _attachProximityZoomEndHandler(fallbackMs) {
 
         window._isProximityZoomAnimating = false;
         window._currentProximityZoomCleanup = null;
-        window.isMapInteracting = false;
+        window._programmaticFlyInProgress = false;
 
-        if (map && typeof map.invalidateSize === 'function') {
-            map.invalidateSize({ animate: false, debounceMoveend: true });
-        }
+        // Do NOT touch window.isMapInteracting — that belongs to gesture handling
     };
 
     if (map) {
@@ -5696,24 +5669,45 @@ function _attachProximityZoomEndHandler(fallbackMs) {
         map.on('zoomend', onDone);
     }
 
+    // Exposed so _cleanupProximityZoomAnimation can cancel without map.stop()
     window._currentProximityZoomCleanup = () => {
-        if (!handled) {
-            handled = true;
-            if (map) {
-                map.off('moveend', onDone);
-                map.off('zoomend', onDone);
-            }
-            if (fallbackId) { clearTimeout(fallbackId); fallbackId = null; }
-            window._isProximityZoomAnimating = false;
-            window.isMapInteracting = false;
-            window._currentProximityZoomCleanup = null;
+        if (handled) return;
+        handled = true;
+        // Invalidate the ID so any pending onDone calls become no-ops
+        _proxZoomAnimationId++;
+
+        if (map) {
+            map.off('moveend', onDone);
+            map.off('zoomend', onDone);
         }
+
+        if (fallbackId) { clearTimeout(fallbackId); fallbackId = null; }
+
+        window._isProximityZoomAnimating = false;
+        window._programmaticFlyInProgress = false;
+        window._currentProximityZoomCleanup = null;
+        // Again: do NOT touch isMapInteracting
     };
 
     fallbackId = createTrackedTimeout(() => {
         fallbackId = null;
-        if (!handled) onDone();
+        if (!handled && myId === _proxZoomAnimationId) onDone();
     }, fallbackMs);
+}
+
+function _cleanupProximityZoomAnimation() {
+    if (!window._isProximityZoomAnimating) return;
+
+    // Do NOT call map.stop() — that interrupts user pinch gestures.
+    // Just run the cleanup handler which invalidates the animation ID.
+    if (window._currentProximityZoomCleanup) {
+        window._currentProximityZoomCleanup();
+    } else {
+        // Safety fallback if handler wasn't attached yet
+        _proxZoomAnimationId++;
+        window._isProximityZoomAnimating = false;
+        window._programmaticFlyInProgress = false;
+    }
 }
         
 /*  Pans the map to keep the user centered — **centered mode only**. */
@@ -10225,39 +10219,14 @@ if (document.readyState === 'loading') {
 }
 
 /* EVENT LISTENER SETUP */
+/* EVENT LISTENER SETUP */
 function setupEventListeners() {
-    const handleInteractionStart = () => {
-        window.followUser = false;
-        window.isMapInteracting = true;
-    };
-
-    const handleInteractionEnd = () => {
-        window.isMapInteracting = false;
-        resetInactivityTimer();
-    };
-
-    const setupMapEvents = () => {
-        if (!map) {
-            console.error('Map not available for event setup');
-            return;
-        }
-
-        try {
-            // Rely entirely on Leaflet's native, highly-optimized touch/drag handlers.
-            map.on('dragstart zoomstart', handleInteractionStart);
-            map.on('dragend zoomend moveend', handleInteractionEnd);
-        } catch (error) {
-            console.error('Error setting up map events:', error);
-        }
-    };
-
     const setupButtonEvents = () => {
         const buttonConfigs = [
             { id: 'recenterButton', handler: recenterMap, required: true },
             { id: 'returnButton', handler: returnToIndex, required: true },
             { id: 'tipsButton', handler: showNavigationTips, required: false }
         ];
-
         buttonConfigs.forEach(config => {
             try {
                 const element = document.getElementById(config.id);
@@ -10272,7 +10241,7 @@ function setupEventListeners() {
         });
     };
 
-       const setupAccessibilityEvents = () => {};
+    const setupAccessibilityEvents = () => {};
 
     const setupSystemEvents = () => {
         try {
@@ -10283,7 +10252,6 @@ function setupEventListeners() {
                     console.error('Visibility change handler error:', error);
                 }
             });
-
             let resizeTimeout;
             window.addEventListener('resize', () => {
                 clearTimeout(resizeTimeout);
@@ -10298,7 +10266,6 @@ function setupEventListeners() {
     };
 
     try {
-        setupMapEvents();
         setupButtonEvents();
         setupAccessibilityEvents();
         setupSystemEvents();
@@ -10312,12 +10279,12 @@ document.addEventListener('DOMContentLoaded', () => {
         { name: 'Cache Elements', fn: cacheElements },
         { name: 'Initialize Map', fn: initMap },
         { name: 'Setup Event Listeners', fn: setupEventListeners },
+        { name: 'Setup Map Interaction Handlers', fn: setupMapInteractionHandlers },
         { name: 'Optimize Images', fn: optimizeImages },
         { name: 'Initialize UI', fn: initializeUI }
     ];
-
     let successCount = 0;
-    
+
     initSteps.forEach(step => {
         try {
             if (typeof step.fn === 'function') {
@@ -10330,7 +10297,6 @@ document.addEventListener('DOMContentLoaded', () => {
             console.error(`${step.name} failed:`, error);
         }
     });
-
     console.log(`Application initialization: ${successCount}/${initSteps.length} steps completed`);
 });
 
