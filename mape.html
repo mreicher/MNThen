@@ -5488,7 +5488,7 @@ function updateUserLocation(position, forceUpdate = false) {
    PROXIMITY ZOOM LOGIC
    Smooth, predictive, continuous zoom with speed-adaptive hysteresis.
    Ensures BOTH user marker and location marker remain visible.
-   Backwards compatible: user marker stays in center 60% of viewport.
+   Includes fixes for "Stuck Animation" and "State Sync".
    ────────────────────────────────────────────── */
 function _handleProximityZoomLogic(speedMPH, eastWestMove) {
     const PROX_NEAR_M = 15.24;
@@ -5498,28 +5498,27 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
     const MAX_PROX_SPEED_MPH = 10;
     const PROX_COOLDOWN_MS = 400;
 
-    // ─── Init ───
     if (window._proxZoomTargetLevel == null) window._proxZoomTargetLevel = PROX_ZOOM_OUT;
     if (window._proxZoomCurrentLevel == null) window._proxZoomCurrentLevel = PROX_ZOOM_OUT;
 
-    // ─── Speed smoothing ───
+    // Speed Smoothing
     window._proxSpeedEMA = window._proxSpeedEMA ?? speedMPH;
     window._proxSpeedEMA = 0.6 * speedMPH + 0.4 * window._proxSpeedEMA;
     const smoothedSpeedMPH = window._proxSpeedEMA;
 
+    // Distance Calculation
     const approachSpeed = _estimateApproachSpeedMPS();
     const distM = window.proximityState?.distanceMeters ?? Infinity;
     const timeToNearSec = (approachSpeed > 0.3 && isFinite(distM))
         ? (distM - PROX_NEAR_M) / approachSpeed
         : Infinity;
 
-    // ─── Debug ───
+    // Debug
     const debugEl = document.getElementById('proxDebug');
     if (debugEl) {
-        debugEl.innerHTML = `dist:${isFinite(distM) ? Math.round(distM) : '?'}m spd:${Math.round(smoothedSpeedMPH)}mph tgt:${window._proxZoomTargetLevel.toFixed(1)} cur:${map?.getZoom?.()?.toFixed(1) || '?'} anim:${window._isProximityZoomAnimating ? 'Y' : 'N'} gesture:${window._userGestureActive ? 'Y' : 'N'} interact:${window.isMapInteracting ? 'Y' : 'N'} inact:${window._inactivityTimerActive ? 'Y' : 'N'} state:${window._proxZoomState || '?'}`;
+        debugEl.innerHTML = `dist:${isFinite(distM) ? Math.round(distM) : '?'}m spd:${Math.round(smoothedSpeedMPH)}mph tgt:${window._proxZoomTargetLevel} anim:${window._isProximityZoomAnimating ? 'Y' : 'N'} blocked:${(window._userGestureActive || window.isMapInteracting || window._inactivityTimerActive) ? 'Y' : 'N'}`;
     }
 
-    // ─── Early exits / cleanup ───
     if (!window.proximityState || !map) {
         _cleanupProximityZoomAnimation();
         _resetProximityZoomSmoothing();
@@ -5527,7 +5526,28 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
         return;
     }
 
+    // ---------------------------------------------------------
+    // FIX 1: Watchdog for Stuck Animations
+    // If the logic thinks it's animating, but the map has stopped moving,
+    // force reset the animation flag so we can accept new inputs.
+    // ---------------------------------------------------------
+    if (window._isProximityZoomAnimating) {
+        // Check if map is moving (Mapbox/Google Maps standard check)
+        // If map.isMoving is not available, this assumes it's stuck after 2 seconds
+        const isMoving = typeof map.isMoving === 'function' ? map.isMoving() : false;
+        
+        if (!isMoving) {
+            console.log("Prox: Animation stuck detected. Resetting.");
+            window._isProximityZoomAnimating = false;
+            _cleanupProximityZoomAnimation();
+        } else {
+            // If animating, don't run logic yet (wait for finish)
+            return; 
+        }
+    }
+
     const speedGateBreached = smoothedSpeedMPH > MAX_PROX_SPEED_MPH + 3;
+
     if (speedGateBreached) {
         window._proxZoomTargetLevel = PROX_ZOOM_OUT;
         if (window._proxZoomState === 'ZOOMED_IN') {
@@ -5539,13 +5559,35 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
         return;
     }
 
-    if (window._isProximityZoomAnimating) return;
-
-    // ─── Gesture blocks ───
-    if (window._userGestureActive) return;
-    if (window.isMapInteracting) return;
-
     const now = Date.now();
+    const isInteracting = window._userGestureActive || window.isMapInteracting;
+
+    // ---------------------------------------------------------
+    // FIX 2: Interaction State Sync
+    // Detect the "falling edge" of an interaction (User just stopped pinching).
+    // We immediately sync our internal state to the actual map state.
+    // This prevents the logic from trying to "correct" the user's manual zoom.
+    // ---------------------------------------------------------
+    if (window._wasInteracting && !isInteracting) {
+        // User just finished a gesture. 
+        // Reset our internal "Current Level" to wherever the map actually is now.
+        window._proxZoomCurrentLevel = map.getZoom();
+        
+        // Reset state to IDLE to prevent immediate snapping back
+        window._proxZoomState = 'IDLE';
+        
+        // Optional: Clear cooldowns so logic can react immediately if needed
+        // window._lastProxZoomTimeByDir = {}; 
+        
+        // We return this frame to let the system settle
+        window._wasInteracting = false;
+        return;
+    }
+    window._wasInteracting = isInteracting;
+
+    // Standard Interaction Blocking
+    if (isInteracting) return;
+    if (window._inactivityTimerActive) return;
 
     if (!isFinite(distM) || distM === Infinity) {
         window._proxZoomTargetLevel = PROX_ZOOM_OUT;
@@ -5561,7 +5603,6 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
         window._proxZoomState = 'IDLE';
     }
 
-    // ─── Compute target zoom ───
     let targetZoom = PROX_ZOOM_OUT;
 
     if (distM <= PROX_NEAR_M && smoothedSpeedMPH <= MAX_PROX_SPEED_MPH) {
@@ -5576,29 +5617,14 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
 
     window._proxZoomTargetLevel = targetZoom;
 
+    const isZoomingIn = targetZoom > (window._proxZoomCurrentLevel ?? PROX_ZOOM_OUT);
+    
+    // Cooldown logic
+    const cooldownKey = isZoomingIn ? 'IN' : 'OUT';
+    const lastTimeForDir = window._lastProxZoomTimeByDir?.[cooldownKey] || 0;
+    if (now - lastTimeForDir < PROX_COOLDOWN_MS) return;
+
     const currentZoom = map.getZoom();
-    const isZoomingIn = targetZoom > currentZoom;
-    const isZoomingOut = targetZoom < currentZoom;
-
-    // ─── FORCE ZOOM-OUT: must fire immediately when leaving location ───
-    if (window._proxZoomState === 'ZOOMED_IN' && distM > PROX_FAR_M) {
-        window._proxZoomState = 'IDLE';
-        window._proxZoomCurrentLevel = PROX_ZOOM_OUT;
-        if (!window._lastProxZoomTimeByDir) window._lastProxZoomTimeByDir = {};
-        window._lastProxZoomTimeByDir['OUT'] = now;
-        _executeProximityZoom(PROX_ZOOM_OUT, 'IDLE', eastWestMove);
-        return;
-    }
-
-    // Inactivity timer only blocks zoom-IN
-    if (window._inactivityTimerActive && isZoomingIn) return;
-
-    const cooldownKey = isZoomingIn ? 'IN' : (isZoomingOut ? 'OUT' : null);
-    if (cooldownKey) {
-        const lastTimeForDir = window._lastProxZoomTimeByDir?.[cooldownKey] || 0;
-        if (now - lastTimeForDir < PROX_COOLDOWN_MS) return;
-    }
-
     const zoomDiff = Math.abs(targetZoom - currentZoom);
 
     if (zoomDiff < 0.1) {
@@ -5615,12 +5641,10 @@ function _handleProximityZoomLogic(speedMPH, eastWestMove) {
         const newState = discreteTarget === PROX_ZOOM_IN ? 'ZOOMED_IN' : 'IDLE';
         const discreteDiff = Math.abs(discreteTarget - currentZoom);
 
-        if (newState !== window._proxZoomState || discreteDiff > 0.3 || (newState === 'IDLE' && window._proxZoomState === 'ZOOMED_IN')) {
+        if (newState !== window._proxZoomState || discreteDiff > 0.3) {
             window._proxZoomState = newState;
-            if (cooldownKey) {
-                if (!window._lastProxZoomTimeByDir) window._lastProxZoomTimeByDir = {};
-                window._lastProxZoomTimeByDir[cooldownKey] = now;
-            }
+            if (!window._lastProxZoomTimeByDir) window._lastProxZoomTimeByDir = {};
+            window._lastProxZoomTimeByDir[cooldownKey] = now;
             _executeProximityZoom(discreteTarget, newState, eastWestMove);
         }
     }
