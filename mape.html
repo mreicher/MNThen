@@ -1366,361 +1366,6 @@ class EnterpriseBackgroundSync {
 }
 
 /* ──────────────────────────────────────────────
-   SENSOR FUSION MANAGER 
-   Eliminated feedback loop, GPS floor applied early,
-   cleaner velocity seeding, proper Kalman position caching
-   ────────────────────────────────────────────── */
-class SensorFusionManager {
-    constructor() {
-        this.deviceHeading = null;
-        this.headingAccuracy = null;
-        this.hasCompass = false;
-        this.isAvailable = false;
-        this._listener = null;
-        this._kalmanFilter = null;
-        this._accelerometer = null;
-        this._accelAvailable = false;
-        this._isMoving = false;
-        this._lastAccelMagnitude = 0;
-        this._filteredSpeedMPS = 0;
-
-        this._orientationTestTimer = null;
-        this._graceTimerId = null;
-        this._lastMovementTime = 0;
-        this._accelGestureHandler = null;
-        this._accelPendingPermission = false;
-
-        this._lastKalmanLat = null;
-        this._lastKalmanLng = null;
-        this._lastKalmanTimestamp = null;
-    }
-
-    init() {
-        this._initDeviceOrientation();
-        this._initAccelerometer();
-        this._initKalmanFilter();
-        return this;
-    }
-
-    _initKalmanFilter() {
-        // TUNING: Higher accelNoise (2.5) and lower measurementNoise (10)
-        // for more responsive tracking at walking speeds
-        this._kalmanFilter = new PositionKalmanFilter({
-            accelNoise: 2.5,        // Was 1.0 — more responsive
-            measurementNoise: 10,   // Was 15 — trust measurements more
-        });
-    }
-
-    _initDeviceOrientation() {
-        const testHandler = (e) => {
-            const heading = e.webkitCompassHeading ??
-                (e.alpha != null && e.absolute === true
-                    ? (360 - e.alpha) % 360
-                    : null);
-
-            if (heading != null && isFinite(heading)) {
-                this.hasCompass = true;
-                this.isAvailable = true;
-                window.removeEventListener('deviceorientationabsolute', testHandler);
-                window.removeEventListener('deviceorientation', testHandler);
-                this._clearOrientationTestTimer();
-                this._attachOrientationListener();
-            }
-        };
-
-        window.addEventListener('deviceorientationabsolute', testHandler);
-        window.addEventListener('deviceorientation', testHandler);
-
-        this._orientationTestTimer = setTimeout(() => {
-            this._orientationTestTimer = null;
-            window.removeEventListener('deviceorientationabsolute', testHandler);
-            window.removeEventListener('deviceorientation', testHandler);
-        }, 3000);
-    }
-
-    _clearOrientationTestTimer() {
-        if (this._orientationTestTimer) {
-            clearTimeout(this._orientationTestTimer);
-            this._orientationTestTimer = null;
-        }
-    }
-
-    _attachOrientationListener() {
-        const eventName = 'ondeviceorientationabsolute' in window
-            ? 'deviceorientationabsolute'
-            : 'deviceorientation';
-
-        this._listener = (e) => {
-            const heading = e.webkitCompassHeading ??
-                (e.alpha != null && e.absolute === true
-                    ? (360 - e.alpha) % 360
-                    : null);
-
-            const accuracy = e.webkitCompassAccuracy ?? null;
-
-            if (heading != null && isFinite(heading) && heading >= 0 && heading < 360) {
-                if (this.deviceHeading != null) {
-                    let diff = Math.abs(heading - this.deviceHeading);
-                    if (diff > 180) diff = 360 - diff;
-                    if (diff > 150) return;
-                    if (diff > 45 && (accuracy == null || accuracy > 25)) return;
-                }
-                this.deviceHeading = heading;
-                this.headingAccuracy = accuracy;
-            }
-        };
-
-        window.addEventListener(eventName, this._listener, true);
-    }
-
-    _initAccelerometer() {
-        if (!('Accelerometer' in window)) return;
-
-        if (navigator.permissions && typeof navigator.permissions.query === 'function') {
-            navigator.permissions.query({ name: 'accelerometer' })
-                .then(result => {
-                    if (result.state === 'granted') {
-                        this._startAccelerometer();
-                    } else if (result.state === 'prompt') {
-                        this._accelPendingPermission = true;
-                        this._attachPermissionGestureHandler();
-                    }
-                    result.addEventListener('change', () => {
-                        if (result.state === 'granted' && !this._accelAvailable) {
-                            this._startAccelerometer();
-                            this._removePermissionGestureHandler();
-                        }
-                    });
-                })
-                .catch(() => this._startAccelerometer());
-        } else {
-            this._startAccelerometer();
-        }
-    }
-
-    _startAccelerometer() {
-        if (this._accelAvailable) return;
-        try {
-            this._accelerometer = new Accelerometer({ frequency: 10 });
-            const MOVEMENT_GRACE_MS = 800;
-
-            this._accelerometer.addEventListener('reading', () => {
-                const a = this._accelerometer;
-                if (a.x == null || a.y == null || a.z == null) return;
-
-                const magnitude = Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
-                const linearAccel = Math.abs(magnitude - 9.8);
-                this._lastAccelMagnitude = linearAccel;
-
-                if (linearAccel > 0.3) {
-                    this._isMoving = true;
-                    this._lastMovementTime = Date.now();
-                    if (this._graceTimerId != null) {
-                        clearTimeout(this._graceTimerId);
-                        this._graceTimerId = null;
-                    }
-                    this._graceTimerId = setTimeout(() => {
-                        this._graceTimerId = null;
-                        if (Date.now() - this._lastMovementTime >= MOVEMENT_GRACE_MS - 50) {
-                            this._isMoving = false;
-                        }
-                    }, MOVEMENT_GRACE_MS);
-                }
-            });
-
-            this._accelerometer.addEventListener('error', (e) => {
-                if (e.error?.name === 'NotAllowedError') {
-                    console.warn('[SensorFusion] Accelerometer permission denied');
-                }
-                this._accelAvailable = false;
-                this._accelPendingPermission = false;
-                this._isMoving = false;
-                if (this._graceTimerId != null) {
-                    clearTimeout(this._graceTimerId);
-                    this._graceTimerId = null;
-                }
-                if (this._accelerometer) {
-                    try { this._accelerometer.stop(); } catch (_) {}
-                    this._accelerometer = null;
-                }
-            });
-
-            this._accelerometer.start();
-            this._accelAvailable = true;
-            this._accelPendingPermission = false;
-        } catch (e) {
-            if (e.name === 'NotAllowedError') {
-                this._accelPendingPermission = true;
-                this._attachPermissionGestureHandler();
-            }
-            this._accelAvailable = false;
-        }
-    }
-
-    _attachPermissionGestureHandler() {
-        if (this._accelGestureHandler) return;
-        this._accelGestureHandler = async () => {
-            if (!this._accelPendingPermission) return;
-            try {
-                const result = await navigator.permissions.query({ name: 'accelerometer' });
-                if (result.state === 'granted') {
-                    this._startAccelerometer();
-                    this._removePermissionGestureHandler();
-                    return;
-                }
-            } catch (_) {}
-            this._startAccelerometer();
-            this._removePermissionGestureHandler();
-        };
-        document.addEventListener('click', this._accelGestureHandler, true);
-        document.addEventListener('touchend', this._accelGestureHandler, true);
-    }
-
-    _removePermissionGestureHandler() {
-        if (this._accelGestureHandler) {
-            document.removeEventListener('click', this._accelGestureHandler, true);
-            document.removeEventListener('touchend', this._accelGestureHandler, true);
-            this._accelGestureHandler = null;
-        }
-        this._accelPendingPermission = false;
-    }
-
-    /**
-     * GPS speed floor applied BEFORE Kalman update.
-     * Velocity seeding happens via scheduleVelocitySeed for background resume.
-     * No more feedback loop: we trust GPS speed as the authoritative floor.
-     */
-    smoothPosition(rawLat, rawLng, accuracyMeters, timestampMs, gpsSpeedMPS, gpsHeadingDeg) {
-        if (!isFinite(rawLat) || !isFinite(rawLng) || !this._kalmanFilter) {
-            return { lat: rawLat || 0, lng: rawLng || 0, vNorth: 0, vEast: 0, speedMPS: 0 };
-        }
-
-        const kf = this._kalmanFilter;
-
-        // Background resume: compute displacement velocity and schedule seed
-        if (kf.lastTimestamp != null && kf.x != null) {
-            const dtMs = timestampMs - kf.lastTimestamp;
-            if (dtMs > 10000 && window.lastPosition) {
-                const dtSec = dtMs / 1000;
-                const cosLat = Math.cos(rawLat * Math.PI / 180);
-                const vNorth = ((rawLat - window.lastPosition.lat) / dtSec) * 111111;
-                const vEast = ((rawLng - window.lastPosition.lng) / dtSec) * 111111 * cosLat;
-                kf.scheduleVelocitySeed(vNorth, vEast);
-            }
-        }
-
-        // Run Kalman update with GPS speed floor built in
-        const result = kf.update(rawLat, rawLng, accuracyMeters, timestampMs, gpsSpeedMPS);
-
-        // Handle post-initialization velocity seeding
-        if (kf._justInitialized) {
-            let seeded = false;
-
-            // GPS doppler speed + heading
-            if (gpsSpeedMPS != null && gpsSpeedMPS > 0.3 &&
-                gpsHeadingDeg != null && isFinite(gpsHeadingDeg)) {
-                const headingRad = gpsHeadingDeg * Math.PI / 180;
-                const vNorth = gpsSpeedMPS * Math.cos(headingRad);
-                const vEast = gpsSpeedMPS * Math.sin(headingRad);
-                kf.seedVelocity(vNorth, vEast, 10.0);
-                seeded = true;
-            }
-
-            // Displacement-derived velocity from scheduleVelocitySeed
-            if (!seeded && kf._pendingSeedVelocity) {
-                const pending = kf._pendingSeedVelocity;
-                if (isFinite(pending.vNorth) && isFinite(pending.vEast)) {
-                    kf.seedVelocity(pending.vNorth, pending.vEast, 50.0);
-                }
-                kf._pendingSeedVelocity = null;
-            }
-
-            kf._justInitialized = false;
-        }
-
-        // Read fresh speed from filter state (not stale result)
-        this._filteredSpeedMPS = kf.getSpeedMPS();
-
-        // Cache Kalman position for DR loop
-        this._lastKalmanLat = result.lat;
-        this._lastKalmanLng = result.lng;
-        this._lastKalmanTimestamp = timestampMs;
-
-        return result;
-    }
-
-    getSmoothedVelocityDegPerSec() {
-        if (!this._kalmanFilter) return { lat: 0, lng: 0 };
-        return this._kalmanFilter.getVelocityDegPerSec();
-    }
-
-    getFilteredSpeedMPS() {
-        return this._filteredSpeedMPS || 0;
-    }
-
-    getFilteredHeading() {
-        if (!this._kalmanFilter) return null;
-        return this._kalmanFilter.getHeading();
-    }
-
-    getLastKalmanPosition() {
-        if (this._lastKalmanLat == null) return null;
-        return {
-            lat: this._lastKalmanLat,
-            lng: this._lastKalmanLng,
-            timestamp: this._lastKalmanTimestamp
-        };
-    }
-
-    isDeviceMoving(gpsSpeedMPS) {
-        if (this._filteredSpeedMPS >= 0.8) return true;
-        if (this._accelAvailable && this._isMoving) return true;
-        if (this._filteredSpeedMPS >= 0.5) return true;
-        return (gpsSpeedMPS || 0) > 0.5;
-    }
-
-    getHeading(gpsHeading, speedMPS) {
-        if (gpsHeading != null && isFinite(gpsHeading) && speedMPS > 2) {
-            return gpsHeading;
-        }
-        if (this.deviceHeading != null) {
-            return this.deviceHeading;
-        }
-        return gpsHeading;
-    }
-
-    destroy() {
-        this._clearOrientationTestTimer();
-        if (this._graceTimerId) {
-            clearTimeout(this._graceTimerId);
-            this._graceTimerId = null;
-        }
-        if (this._listener) {
-            window.removeEventListener('deviceorientation', this._listener, true);
-            window.removeEventListener('deviceorientationabsolute', this._listener, true);
-            this._listener = null;
-        }
-        this._removePermissionGestureHandler();
-        if (this._accelerometer) {
-            try { this._accelerometer.stop(); } catch (_) {}
-            this._accelerometer = null;
-        }
-        if (this._kalmanFilter) {
-            this._kalmanFilter.reset();
-            this._kalmanFilter = null;
-        }
-        this.isAvailable = false;
-        this._accelAvailable = false;
-        this._lastKalmanLat = null;
-        this._lastKalmanLng = null;
-        this._lastKalmanTimestamp = null;
-    }
-}
-
-// Global instance
-window.sensorFusion = new SensorFusionManager().init();
-
-/* ──────────────────────────────────────────────
    POSITION KALMAN FILTER 
    accelNoise schedule, zero-copy predict, P swap bug
    ────────────────────────────────────────────── */
@@ -2090,6 +1735,361 @@ class PositionKalmanFilter {
 }
 
 // ── Global instance ──
+window.sensorFusion = new SensorFusionManager().init();
+
+/* ──────────────────────────────────────────────
+   SENSOR FUSION MANAGER 
+   Eliminated feedback loop, GPS floor applied early,
+   cleaner velocity seeding, proper Kalman position caching
+   ────────────────────────────────────────────── */
+class SensorFusionManager {
+    constructor() {
+        this.deviceHeading = null;
+        this.headingAccuracy = null;
+        this.hasCompass = false;
+        this.isAvailable = false;
+        this._listener = null;
+        this._kalmanFilter = null;
+        this._accelerometer = null;
+        this._accelAvailable = false;
+        this._isMoving = false;
+        this._lastAccelMagnitude = 0;
+        this._filteredSpeedMPS = 0;
+
+        this._orientationTestTimer = null;
+        this._graceTimerId = null;
+        this._lastMovementTime = 0;
+        this._accelGestureHandler = null;
+        this._accelPendingPermission = false;
+
+        this._lastKalmanLat = null;
+        this._lastKalmanLng = null;
+        this._lastKalmanTimestamp = null;
+    }
+
+    init() {
+        this._initDeviceOrientation();
+        this._initAccelerometer();
+        this._initKalmanFilter();
+        return this;
+    }
+
+    _initKalmanFilter() {
+        // TUNING: Higher accelNoise (2.5) and lower measurementNoise (10)
+        // for more responsive tracking at walking speeds
+        this._kalmanFilter = new PositionKalmanFilter({
+            accelNoise: 2.5,        // Was 1.0 — more responsive
+            measurementNoise: 10,   // Was 15 — trust measurements more
+        });
+    }
+
+    _initDeviceOrientation() {
+        const testHandler = (e) => {
+            const heading = e.webkitCompassHeading ??
+                (e.alpha != null && e.absolute === true
+                    ? (360 - e.alpha) % 360
+                    : null);
+
+            if (heading != null && isFinite(heading)) {
+                this.hasCompass = true;
+                this.isAvailable = true;
+                window.removeEventListener('deviceorientationabsolute', testHandler);
+                window.removeEventListener('deviceorientation', testHandler);
+                this._clearOrientationTestTimer();
+                this._attachOrientationListener();
+            }
+        };
+
+        window.addEventListener('deviceorientationabsolute', testHandler);
+        window.addEventListener('deviceorientation', testHandler);
+
+        this._orientationTestTimer = setTimeout(() => {
+            this._orientationTestTimer = null;
+            window.removeEventListener('deviceorientationabsolute', testHandler);
+            window.removeEventListener('deviceorientation', testHandler);
+        }, 3000);
+    }
+
+    _clearOrientationTestTimer() {
+        if (this._orientationTestTimer) {
+            clearTimeout(this._orientationTestTimer);
+            this._orientationTestTimer = null;
+        }
+    }
+
+    _attachOrientationListener() {
+        const eventName = 'ondeviceorientationabsolute' in window
+            ? 'deviceorientationabsolute'
+            : 'deviceorientation';
+
+        this._listener = (e) => {
+            const heading = e.webkitCompassHeading ??
+                (e.alpha != null && e.absolute === true
+                    ? (360 - e.alpha) % 360
+                    : null);
+
+            const accuracy = e.webkitCompassAccuracy ?? null;
+
+            if (heading != null && isFinite(heading) && heading >= 0 && heading < 360) {
+                if (this.deviceHeading != null) {
+                    let diff = Math.abs(heading - this.deviceHeading);
+                    if (diff > 180) diff = 360 - diff;
+                    if (diff > 150) return;
+                    if (diff > 45 && (accuracy == null || accuracy > 25)) return;
+                }
+                this.deviceHeading = heading;
+                this.headingAccuracy = accuracy;
+            }
+        };
+
+        window.addEventListener(eventName, this._listener, true);
+    }
+
+    _initAccelerometer() {
+        if (!('Accelerometer' in window)) return;
+
+        if (navigator.permissions && typeof navigator.permissions.query === 'function') {
+            navigator.permissions.query({ name: 'accelerometer' })
+                .then(result => {
+                    if (result.state === 'granted') {
+                        this._startAccelerometer();
+                    } else if (result.state === 'prompt') {
+                        this._accelPendingPermission = true;
+                        this._attachPermissionGestureHandler();
+                    }
+                    result.addEventListener('change', () => {
+                        if (result.state === 'granted' && !this._accelAvailable) {
+                            this._startAccelerometer();
+                            this._removePermissionGestureHandler();
+                        }
+                    });
+                })
+                .catch(() => this._startAccelerometer());
+        } else {
+            this._startAccelerometer();
+        }
+    }
+
+    _startAccelerometer() {
+        if (this._accelAvailable) return;
+        try {
+            this._accelerometer = new Accelerometer({ frequency: 10 });
+            const MOVEMENT_GRACE_MS = 800;
+
+            this._accelerometer.addEventListener('reading', () => {
+                const a = this._accelerometer;
+                if (a.x == null || a.y == null || a.z == null) return;
+
+                const magnitude = Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
+                const linearAccel = Math.abs(magnitude - 9.8);
+                this._lastAccelMagnitude = linearAccel;
+
+                if (linearAccel > 0.3) {
+                    this._isMoving = true;
+                    this._lastMovementTime = Date.now();
+                    if (this._graceTimerId != null) {
+                        clearTimeout(this._graceTimerId);
+                        this._graceTimerId = null;
+                    }
+                    this._graceTimerId = setTimeout(() => {
+                        this._graceTimerId = null;
+                        if (Date.now() - this._lastMovementTime >= MOVEMENT_GRACE_MS - 50) {
+                            this._isMoving = false;
+                        }
+                    }, MOVEMENT_GRACE_MS);
+                }
+            });
+
+            this._accelerometer.addEventListener('error', (e) => {
+                if (e.error?.name === 'NotAllowedError') {
+                    console.warn('[SensorFusion] Accelerometer permission denied');
+                }
+                this._accelAvailable = false;
+                this._accelPendingPermission = false;
+                this._isMoving = false;
+                if (this._graceTimerId != null) {
+                    clearTimeout(this._graceTimerId);
+                    this._graceTimerId = null;
+                }
+                if (this._accelerometer) {
+                    try { this._accelerometer.stop(); } catch (_) {}
+                    this._accelerometer = null;
+                }
+            });
+
+            this._accelerometer.start();
+            this._accelAvailable = true;
+            this._accelPendingPermission = false;
+        } catch (e) {
+            if (e.name === 'NotAllowedError') {
+                this._accelPendingPermission = true;
+                this._attachPermissionGestureHandler();
+            }
+            this._accelAvailable = false;
+        }
+    }
+
+    _attachPermissionGestureHandler() {
+        if (this._accelGestureHandler) return;
+        this._accelGestureHandler = async () => {
+            if (!this._accelPendingPermission) return;
+            try {
+                const result = await navigator.permissions.query({ name: 'accelerometer' });
+                if (result.state === 'granted') {
+                    this._startAccelerometer();
+                    this._removePermissionGestureHandler();
+                    return;
+                }
+            } catch (_) {}
+            this._startAccelerometer();
+            this._removePermissionGestureHandler();
+        };
+        document.addEventListener('click', this._accelGestureHandler, true);
+        document.addEventListener('touchend', this._accelGestureHandler, true);
+    }
+
+    _removePermissionGestureHandler() {
+        if (this._accelGestureHandler) {
+            document.removeEventListener('click', this._accelGestureHandler, true);
+            document.removeEventListener('touchend', this._accelGestureHandler, true);
+            this._accelGestureHandler = null;
+        }
+        this._accelPendingPermission = false;
+    }
+
+    /**
+     * GPS speed floor applied BEFORE Kalman update.
+     * Velocity seeding happens via scheduleVelocitySeed for background resume.
+     * No more feedback loop: we trust GPS speed as the authoritative floor.
+     */
+    smoothPosition(rawLat, rawLng, accuracyMeters, timestampMs, gpsSpeedMPS, gpsHeadingDeg) {
+        if (!isFinite(rawLat) || !isFinite(rawLng) || !this._kalmanFilter) {
+            return { lat: rawLat || 0, lng: rawLng || 0, vNorth: 0, vEast: 0, speedMPS: 0 };
+        }
+
+        const kf = this._kalmanFilter;
+
+        // Background resume: compute displacement velocity and schedule seed
+        if (kf.lastTimestamp != null && kf.x != null) {
+            const dtMs = timestampMs - kf.lastTimestamp;
+            if (dtMs > 10000 && window.lastPosition) {
+                const dtSec = dtMs / 1000;
+                const cosLat = Math.cos(rawLat * Math.PI / 180);
+                const vNorth = ((rawLat - window.lastPosition.lat) / dtSec) * 111111;
+                const vEast = ((rawLng - window.lastPosition.lng) / dtSec) * 111111 * cosLat;
+                kf.scheduleVelocitySeed(vNorth, vEast);
+            }
+        }
+
+        // Run Kalman update with GPS speed floor built in
+        const result = kf.update(rawLat, rawLng, accuracyMeters, timestampMs, gpsSpeedMPS);
+
+        // Handle post-initialization velocity seeding
+        if (kf._justInitialized) {
+            let seeded = false;
+
+            // GPS doppler speed + heading
+            if (gpsSpeedMPS != null && gpsSpeedMPS > 0.3 &&
+                gpsHeadingDeg != null && isFinite(gpsHeadingDeg)) {
+                const headingRad = gpsHeadingDeg * Math.PI / 180;
+                const vNorth = gpsSpeedMPS * Math.cos(headingRad);
+                const vEast = gpsSpeedMPS * Math.sin(headingRad);
+                kf.seedVelocity(vNorth, vEast, 10.0);
+                seeded = true;
+            }
+
+            // Displacement-derived velocity from scheduleVelocitySeed
+            if (!seeded && kf._pendingSeedVelocity) {
+                const pending = kf._pendingSeedVelocity;
+                if (isFinite(pending.vNorth) && isFinite(pending.vEast)) {
+                    kf.seedVelocity(pending.vNorth, pending.vEast, 50.0);
+                }
+                kf._pendingSeedVelocity = null;
+            }
+
+            kf._justInitialized = false;
+        }
+
+        // Read fresh speed from filter state (not stale result)
+        this._filteredSpeedMPS = kf.getSpeedMPS();
+
+        // Cache Kalman position for DR loop
+        this._lastKalmanLat = result.lat;
+        this._lastKalmanLng = result.lng;
+        this._lastKalmanTimestamp = timestampMs;
+
+        return result;
+    }
+
+    getSmoothedVelocityDegPerSec() {
+        if (!this._kalmanFilter) return { lat: 0, lng: 0 };
+        return this._kalmanFilter.getVelocityDegPerSec();
+    }
+
+    getFilteredSpeedMPS() {
+        return this._filteredSpeedMPS || 0;
+    }
+
+    getFilteredHeading() {
+        if (!this._kalmanFilter) return null;
+        return this._kalmanFilter.getHeading();
+    }
+
+    getLastKalmanPosition() {
+        if (this._lastKalmanLat == null) return null;
+        return {
+            lat: this._lastKalmanLat,
+            lng: this._lastKalmanLng,
+            timestamp: this._lastKalmanTimestamp
+        };
+    }
+
+    isDeviceMoving(gpsSpeedMPS) {
+        if (this._filteredSpeedMPS >= 0.8) return true;
+        if (this._accelAvailable && this._isMoving) return true;
+        if (this._filteredSpeedMPS >= 0.5) return true;
+        return (gpsSpeedMPS || 0) > 0.5;
+    }
+
+    getHeading(gpsHeading, speedMPS) {
+        if (gpsHeading != null && isFinite(gpsHeading) && speedMPS > 2) {
+            return gpsHeading;
+        }
+        if (this.deviceHeading != null) {
+            return this.deviceHeading;
+        }
+        return gpsHeading;
+    }
+
+    destroy() {
+        this._clearOrientationTestTimer();
+        if (this._graceTimerId) {
+            clearTimeout(this._graceTimerId);
+            this._graceTimerId = null;
+        }
+        if (this._listener) {
+            window.removeEventListener('deviceorientation', this._listener, true);
+            window.removeEventListener('deviceorientationabsolute', this._listener, true);
+            this._listener = null;
+        }
+        this._removePermissionGestureHandler();
+        if (this._accelerometer) {
+            try { this._accelerometer.stop(); } catch (_) {}
+            this._accelerometer = null;
+        }
+        if (this._kalmanFilter) {
+            this._kalmanFilter.reset();
+            this._kalmanFilter = null;
+        }
+        this.isAvailable = false;
+        this._accelAvailable = false;
+        this._lastKalmanLat = null;
+        this._lastKalmanLng = null;
+        this._lastKalmanTimestamp = null;
+    }
+}
+
+// Global instance
 window.sensorFusion = new SensorFusionManager().init();
 
 /* ──────────────────────────────────────────────
