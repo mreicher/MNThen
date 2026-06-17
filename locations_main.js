@@ -211,8 +211,8 @@ const locations = [
 
    {
         id: "1021",
-        lat: 45.14434597404372, 
-        lng: -93.00439407460296,
+        lat: 44.95655720725883, 
+        lng: -93.10351790144784,
         name: "Prom Ballroom (1941 - 1987) test",
         title: "Prom Ballroom",
         image: "https://mnthen.com/images/prom1.webp",
