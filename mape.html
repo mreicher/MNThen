@@ -1365,9 +1365,9 @@ class EnterpriseBackgroundSync {
   }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════
-   SENSOR FUSION — Device Orientation + Continuous-Time Kalman Filter
-   ═══════════════════════════════════════════════════════════════════════ */
+/* ──────────────────────────────────────────────
+   SENSOR FUSION — Device Orientation for heading
+   ────────────────────────────────────────────── */
 class SensorFusionManager {
     constructor() {
         this.deviceHeading = null;
@@ -1375,21 +1375,27 @@ class SensorFusionManager {
         this.hasCompass = false;
         this.isAvailable = false;
         this._listener = null;
-
+        this._kalmanFilter = null;
         this._accelerometer = null;
         this._accelAvailable = false;
         this._isMoving = false;
         this._lastAccelMagnitude = 0;
-        this._lastMovementTime = 0;
+        this._filteredSpeedMPS = 0;
+        this._filteredVelocity = null;
 
+        // Tracked handles for destroy()
         this._orientationTestTimer = null;
         this._graceTimerId = null;
+        this._lastMovementTime = 0;
         this._accelGestureHandler = null;
         this._accelPendingPermission = false;
 
-        this._kalmanFilter = null;
-        this._lastKalmanState = null;
-        this._lastIngestedTimestamp = null;
+        // CHANGE: Cache the last Kalman-filtered output position so the DR loop
+        // can extrapolate forward from the smoothed position rather than the raw
+        // GPS fix. Eliminates the overshoot-then-snap every GPS cycle.
+        this._lastKalmanLat = null;
+        this._lastKalmanLng = null;
+        this._lastKalmanTimestamp = null;
     }
 
     init() {
@@ -1407,6 +1413,10 @@ class SensorFusionManager {
     }
 
     _initDeviceOrientation() {
+        // CHANGE: Probe both deviceorientationabsolute and deviceorientation
+        // simultaneously. On Chrome Android the absolute event fires with
+        // absolute:true but the non-absolute one may not, causing the original
+        // single-event probe to miss the compass entirely and time out.
         const testHandler = (e) => {
             const heading = e.webkitCompassHeading ??
                            (e.alpha != null && e.absolute === true
@@ -1430,7 +1440,9 @@ class SensorFusionManager {
             this._orientationTestTimer = null;
             window.removeEventListener('deviceorientationabsolute', testHandler);
             window.removeEventListener('deviceorientation', testHandler);
-            if (!this.hasCompass) console.log('[SensorFusion] No compass available');
+            if (!this.hasCompass) {
+                console.log('[SensorFusion] No compass available');
+            }
         }, 3000);
     }
 
@@ -1451,21 +1463,26 @@ class SensorFusionManager {
                            (e.alpha != null && e.absolute === true
                                ? (360 - e.alpha) % 360
                                : null);
+
             const accuracy = e.webkitCompassAccuracy ?? null;
 
             if (heading != null && isFinite(heading) && heading >= 0 && heading < 360) {
                 if (this.deviceHeading != null) {
                     let diff = Math.abs(heading - this.deviceHeading);
                     if (diff > 180) diff = 360 - diff;
+
+                    // Reject sensor glitches (>150°) and poor-accuracy jumps (>45°)
                     if (diff > 150) return;
                     if (diff > 45 && (accuracy == null || accuracy > 25)) return;
                 }
+
                 this.deviceHeading = heading;
                 this.headingAccuracy = accuracy;
             }
         };
 
         window.addEventListener(eventName, this._listener, true);
+
         if (typeof memoryManager !== 'undefined' && memoryManager.trackEventListener) {
             memoryManager.trackEventListener(window, eventName, this._listener, true);
         }
@@ -1485,6 +1502,7 @@ class SensorFusionManager {
                     } else {
                         this._accelAvailable = false;
                     }
+
                     result.addEventListener('change', () => {
                         if (result.state === 'granted' && !this._accelAvailable) {
                             this._startAccelerometer();
@@ -1492,7 +1510,9 @@ class SensorFusionManager {
                         }
                     });
                 })
-                .catch(() => this._startAccelerometer());
+                .catch(() => {
+                    this._startAccelerometer();
+                });
         } else {
             this._startAccelerometer();
         }
@@ -1500,8 +1520,10 @@ class SensorFusionManager {
 
     _startAccelerometer() {
         if (this._accelAvailable) return;
+
         try {
             this._accelerometer = new Accelerometer({ frequency: 10 });
+
             const MOVEMENT_GRACE_MS = 800;
 
             this._accelerometer.addEventListener('reading', () => {
@@ -1510,12 +1532,18 @@ class SensorFusionManager {
 
                 const magnitude = Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
                 const linearAccel = Math.abs(magnitude - 9.8);
+
                 this._lastAccelMagnitude = linearAccel;
 
                 if (linearAccel > 0.3) {
                     this._isMoving = true;
                     this._lastMovementTime = Date.now();
-                    if (this._graceTimerId != null) clearTimeout(this._graceTimerId);
+
+                    if (this._graceTimerId != null) {
+                        clearTimeout(this._graceTimerId);
+                        this._graceTimerId = null;
+                    }
+
                     this._graceTimerId = setTimeout(() => {
                         this._graceTimerId = null;
                         if (Date.now() - this._lastMovementTime >= MOVEMENT_GRACE_MS - 50) {
@@ -1532,10 +1560,12 @@ class SensorFusionManager {
                 this._accelAvailable = false;
                 this._accelPendingPermission = false;
                 this._isMoving = false;
+
                 if (this._graceTimerId != null) {
                     clearTimeout(this._graceTimerId);
                     this._graceTimerId = null;
                 }
+
                 if (this._accelerometer) {
                     try { this._accelerometer.stop(); } catch (_) {}
                     this._accelerometer = null;
@@ -1545,6 +1575,7 @@ class SensorFusionManager {
             this._accelerometer.start();
             this._accelAvailable = true;
             this._accelPendingPermission = false;
+
         } catch (e) {
             if (e.name === 'NotAllowedError') {
                 console.warn('[SensorFusion] Accelerometer blocked — no user gesture');
@@ -1559,8 +1590,10 @@ class SensorFusionManager {
 
     _attachPermissionGestureHandler() {
         if (this._accelGestureHandler) return;
+
         this._accelGestureHandler = async () => {
             if (!this._accelPendingPermission) return;
+
             try {
                 const result = await navigator.permissions.query({ name: 'accelerometer' });
                 if (result.state === 'granted') {
@@ -1569,9 +1602,11 @@ class SensorFusionManager {
                     return;
                 }
             } catch (_) {}
+
             this._startAccelerometer();
             this._removePermissionGestureHandler();
         };
+
         document.addEventListener('click', this._accelGestureHandler, true);
         document.addEventListener('touchend', this._accelGestureHandler, true);
     }
@@ -1585,13 +1620,26 @@ class SensorFusionManager {
         this._accelPendingPermission = false;
     }
 
-    ingestGPS(rawLat, rawLng, accuracyMeters, timestampMs, gpsSpeedMPS, gpsHeadingDeg) {
-        if (!isFinite(rawLat) || !isFinite(rawLng) || !this._kalmanFilter) return;
+    smoothPosition(rawLat, rawLng, accuracyMeters, timestampMs, gpsSpeedMPS, gpsHeadingDeg) {
+        if (!isFinite(rawLat) || !isFinite(rawLng) || !this._kalmanFilter) {
+            return { lat: rawLat || 0, lng: rawLng || 0, vNorth: 0, vEast: 0, speedMPS: 0 };
+        }
 
+        // Store GPS speed before update() to break the lag-feedback loop:
+        // low Kalman speed → low accelNoise → more lag → even lower Kalman speed
         if (isFinite(gpsSpeedMPS) && gpsSpeedMPS >= 0) {
             this._kalmanFilter._lastGPSSpeedMPS = gpsSpeedMPS;
         }
 
+        // CHANGE: On background resume (dt > 10 s), seed _pendingKalmanSeedVelocity
+        // from the displacement between the last known position and the new fix,
+        // then let update() call _initialize() naturally via its dt > 10 guard.
+        // This preserves the guard's correctness while giving the new filter
+        // instance a meaningful velocity to start from — avoiding the cold-start
+        // lag that made the first few steps after resume feel frozen.
+        // Per Kimi: do NOT bypass the guard with a faked timestamp; that zeroes
+        // velocity while leaving a stale position, causing a large innovation
+        // correction and visible jump on the next update.
         const kf = this._kalmanFilter;
         if (kf.lastTimestamp != null && kf.x != null) {
             const dtMs = timestampMs - kf.lastTimestamp;
@@ -1602,6 +1650,8 @@ class SensorFusionManager {
                     vNorth: ((rawLat - window.lastPosition.lat) / dtSec) * 111111,
                     vEast:  ((rawLng - window.lastPosition.lng) / dtSec) * 111111 * cosLat
                 };
+                // update() will see dt > 10 and call _initialize(), which reads
+                // _pendingKalmanSeedVelocity and seeds velocity correctly.
             }
         }
 
@@ -1609,71 +1659,49 @@ class SensorFusionManager {
 
         if (this._kalmanFilter._justInitialized) {
             let seeded = false;
+
             if (gpsSpeedMPS != null && gpsSpeedMPS > 0.3 &&
                 gpsHeadingDeg != null && isFinite(gpsHeadingDeg)) {
                 const headingRad = gpsHeadingDeg * Math.PI / 180;
-                this._kalmanFilter.seedVelocity(
-                    gpsSpeedMPS * Math.cos(headingRad),
-                    gpsSpeedMPS * Math.sin(headingRad),
-                    10.0
-                );
+                const vNorth = gpsSpeedMPS * Math.cos(headingRad);
+                const vEast  = gpsSpeedMPS * Math.sin(headingRad);
+                this._kalmanFilter.seedVelocity(vNorth, vEast, 10.0);
                 seeded = true;
             }
+
             if (!seeded && window._pendingKalmanSeedVelocity) {
-                const p = window._pendingKalmanSeedVelocity;
-                if (isFinite(p.vNorth) && isFinite(p.vEast)) {
-                    this._kalmanFilter.seedVelocity(p.vNorth, p.vEast, 50.0);
+                const pending = window._pendingKalmanSeedVelocity;
+                if (isFinite(pending.vNorth) && isFinite(pending.vEast)) {
+                    this._kalmanFilter.seedVelocity(pending.vNorth, pending.vEast, 50.0);
                 }
                 window._pendingKalmanSeedVelocity = null;
             }
+
             this._kalmanFilter._justInitialized = false;
         }
 
-        this._lastKalmanState = {
-            lat: result.lat,
-            lng: result.lng,
-            vNorth: this._kalmanFilter.x[2],
-            vEast: this._kalmanFilter.x[3],
-            timestamp: timestampMs,
-            speedMPS: this._kalmanFilter.getSpeedMPS()
-        };
-        this._lastIngestedTimestamp = timestampMs;
+        // Use live filter state in case velocity was just seeded during init —
+        // result.speedMPS is zero when _initialize() ran, even if seedVelocity()
+        // subsequently set x[2]/x[3]. Reading stale result would cause a one-frame
+        // DR stall on every background resume.
+        this._filteredSpeedMPS = this._kalmanFilter.getSpeedMPS();
+        this._filteredVelocity = this._kalmanFilter.getVelocity();
+
+        // Cache the Kalman output position for the DR loop
+        this._lastKalmanLat = result.lat;
+        this._lastKalmanLng = result.lng;
+        this._lastKalmanTimestamp = timestampMs;
+
+        return result;
     }
 
-    getStateAt(atTimestampMs) {
-        if (!this._kalmanFilter || !this._lastKalmanState) return null;
-
-        const dtSec = (atTimestampMs - this._lastKalmanState.timestamp) / 1000;
-
-        if (dtSec <= 0.1) {
-            return {
-                lat: this._lastKalmanState.lat,
-                lng: this._lastKalmanState.lng,
-                vNorth: this._lastKalmanState.vNorth,
-                vEast: this._lastKalmanState.vEast,
-                speedMPS: this._lastKalmanState.speedMPS,
-                timestamp: atTimestampMs
-            };
-        }
-
-        const predLat = this._lastKalmanState.lat +
-            (this._lastKalmanState.vNorth / 111111) * dtSec;
-        const cosLat = Math.cos(this._lastKalmanState.lat * Math.PI / 180);
-        const predLng = this._lastKalmanState.lng +
-            (this._lastKalmanState.vEast / (111111 * cosLat)) * dtSec;
-
-        return {
-            lat: predLat,
-            lng: predLng,
-            vNorth: this._lastKalmanState.vNorth,
-            vEast: this._lastKalmanState.vEast,
-            speedMPS: this._lastKalmanState.speedMPS,
-            timestamp: atTimestampMs
-        };
+    getSmoothedVelocityDegPerSec() {
+        if (!this._kalmanFilter) return { lat: 0, lng: 0 };
+        return this._kalmanFilter.getVelocityDegPerSec();
     }
 
     getFilteredSpeedMPS() {
-        return this._lastKalmanState?.speedMPS || 0;
+        return this._filteredSpeedMPS || 0;
     }
 
     getFilteredHeading() {
@@ -1681,51 +1709,71 @@ class SensorFusionManager {
         return this._kalmanFilter.getHeading();
     }
 
+    // Exposes the last Kalman-filtered position so the DR loop can extrapolate
+    // forward from a smooth origin rather than the raw GPS coordinate.
+    getLastKalmanPosition() {
+        if (this._lastKalmanLat == null) return null;
+        return {
+            lat: this._lastKalmanLat,
+            lng: this._lastKalmanLng,
+            timestamp: this._lastKalmanTimestamp
+        };
+    }
+
     isDeviceMoving(gpsSpeedMPS) {
-        const speed = this.getFilteredSpeedMPS();
-        if (speed >= 0.8) return true;
+        if (this._filteredSpeedMPS >= 0.8) return true;
         if (this._accelAvailable && this._isMoving) return true;
-        if (speed >= 0.5) return true;
+        if (this._filteredSpeedMPS >= 0.5) return true;
         return (gpsSpeedMPS || 0) > 0.5;
     }
 
     getHeading(gpsHeading, speedMPS) {
-        if (gpsHeading != null && isFinite(gpsHeading) && speedMPS > 2) return gpsHeading;
-        if (this.deviceHeading != null) return this.deviceHeading;
+        if (gpsHeading != null && isFinite(gpsHeading) && speedMPS > 2) {
+            return gpsHeading;
+        }
+        if (this.deviceHeading != null) {
+            return this.deviceHeading;
+        }
         return gpsHeading;
     }
 
     destroy() {
         this._clearOrientationTestTimer();
+
         if (this._graceTimerId) {
             clearTimeout(this._graceTimerId);
             this._graceTimerId = null;
         }
+
         if (this._listener) {
             window.removeEventListener('deviceorientation', this._listener, true);
             window.removeEventListener('deviceorientationabsolute', this._listener, true);
             this._listener = null;
         }
+
         this._removePermissionGestureHandler();
+
         if (this._accelerometer) {
             try { this._accelerometer.stop(); } catch (_) {}
             this._accelerometer = null;
         }
+
         if (this._kalmanFilter) {
             this._kalmanFilter.reset();
             this._kalmanFilter = null;
         }
+
         this.isAvailable = false;
         this._accelAvailable = false;
-        this._lastKalmanState = null;
-        this._lastIngestedTimestamp = null;
+        this._lastKalmanLat = null;
+        this._lastKalmanLng = null;
+        this._lastKalmanTimestamp = null;
     }
 }
 
-
-/* ═══════════════════════════════════════════════════════════════════════
-   POSITION KALMAN FILTER — Constant Velocity Model, Local ENU Frame
-   ═══════════════════════════════════════════════════════════════════════ */
+/* ──────────────────────────────────────────────
+   POSITION KALMAN FILTER
+   ────────────────────────────────────────────── */
 class PositionKalmanFilter {
     constructor(options = {}) {
         this.accelNoise = options.accelNoise ?? 1.0;
@@ -1743,16 +1791,15 @@ class PositionKalmanFilter {
         this.refLng = null;
         this._justInitialized = false;
 
+        // Zero-GC scratchpads
         this._P2 = [[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]];
         this._Q  = [[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]];
         this._K  = [[0,0],[0,0],[0,0],[0,0]];
     }
 
     update(lat, lng, accuracyMeters, timestampMs) {
-        if (isFinite(this._lastGPSSpeedMPS) && this._lastGPSSpeedMPS >= 0) {
-            // Already set by ingestGPS; no-op to maintain interface
-        }
-
+        // Adaptive measurement noise floor: tighter when filter has converged
+        // and GPS reports good accuracy, more permissive on cold starts.
         const hasConverged = this.P && this.P[0][0] < 100;
         const floor = (hasConverged && accuracyMeters < 8) ? 2 : 5;
         const R = Math.max(floor, accuracyMeters || this.measurementNoise);
@@ -1770,7 +1817,6 @@ class PositionKalmanFilter {
         this.lastTimestamp = timestampMs;
 
         if (dt <= 0 || dt > 10) {
-            this._lastGPSSpeedMPS = 0;
             this._initialize(lat, lng, R, timestampMs);
             return this._makeResult(lat, lng);
         }
@@ -1781,6 +1827,7 @@ class PositionKalmanFilter {
         const local = this._toLocal(lat, lng);
         this._update(local.north, local.east, R);
 
+        // Shift local reference when approaching numeric limits
         const maxRef = this._maxRefShiftMeters;
         if (Math.abs(this.x[0]) > maxRef || Math.abs(this.x[1]) > maxRef) {
             this._shiftReference();
@@ -1800,9 +1847,18 @@ class PositionKalmanFilter {
         return Math.sqrt(this.x[2] * this.x[2] + this.x[3] * this.x[3]);
     }
 
+    getVelocityDegPerSec() {
+        if (!this.x || this.refLat == null) return { lat: 0, lng: 0 };
+        const cosLat = Math.cos(this.refLat * Math.PI / 180);
+        return {
+            lat: this.x[2] / 111111,
+            lng: this.x[3] / (111111 * cosLat)
+        };
+    }
+
     getHeading() {
         if (!this.x) return null;
-        const speed = this.getSpeedMPS();
+        const speed = Math.sqrt(this.x[2] * this.x[2] + this.x[3] * this.x[3]);
         if (speed < 0.3) return null;
         return (Math.atan2(this.x[3], this.x[2]) * 180 / Math.PI + 360) % 360;
     }
@@ -1816,7 +1872,8 @@ class PositionKalmanFilter {
         this.accelNoise = this._baseAccelNoise;
         this._currentSpeedMPS = 0;
         this._lastGPSSpeedMPS = 0;
-        this._justInitialized = false;
+        this._justInitialized = false; // CHANGE: was missing; stale flag could
+                                       // cause spurious re-seed after reset+reinit
     }
 
     seedVelocity(vNorth, vEast, variance) {
@@ -1827,6 +1884,7 @@ class PositionKalmanFilter {
             const v = variance || 10.0;
             this.P[2][2] = v;
             this.P[3][3] = v;
+            // Zero cross-correlation after seed; _predict rebuilds via F·P·Fᵀ
             this.P[0][2] = 0; this.P[2][0] = 0;
             this.P[1][3] = 0; this.P[3][1] = 0;
         }
@@ -1836,14 +1894,18 @@ class PositionKalmanFilter {
         this.refLat = lat;
         this.refLng = lng;
         this.x = [0, 0, 0, 0];
+
         this.accelNoise = this._baseAccelNoise;
         this._currentSpeedMPS = 0;
 
         const R2 = R * R;
-        const gpsSpeed = this._lastGPSSpeedMPS || 0;
-        const v0 = gpsSpeed > 0.5
-            ? Math.max(25.0, gpsSpeed * gpsSpeed * 4)
-            : 225.0;
+        // Adaptive initial velocity variance: walking-scale when we have a
+        // pending velocity hint (e.g. from displacement seed on background resume),
+        // car-scale otherwise.
+        const hasVelocityHint = window._pendingKalmanSeedVelocity &&
+            (Math.abs(window._pendingKalmanSeedVelocity.vNorth) > 0.1 ||
+             Math.abs(window._pendingKalmanSeedVelocity.vEast) > 0.1);
+        const v0 = hasVelocityHint ? 2.25 : 225.0;
 
         this.P = [
             [R2, 0,  0,  0 ],
@@ -1857,17 +1919,29 @@ class PositionKalmanFilter {
 
     _updateAccelNoise() {
         if (!this.x) return;
-        const kalmanSpeed = this.getSpeedMPS();
+
+        const kalmanSpeed = Math.sqrt(this.x[2] * this.x[2] + this.x[3] * this.x[3]);
+
+        // Use GPS speed as a floor to prevent the lag feedback loop:
+        // low Kalman speed → low accelNoise → more lag → even lower Kalman speed
         const gpsSpeed = this._lastGPSSpeedMPS || 0;
-        const speed = Math.max(kalmanSpeed, gpsSpeed * 0.7);
+        const speed = Math.max(kalmanSpeed, gpsSpeed * 0.8);
+
         this._currentSpeedMPS = speed;
 
-        if (speed >= 15) this.accelNoise = 5.0;
-        else if (speed >= 8) this.accelNoise = 2.0 + (speed - 8) * (3.0 / 7);
-        else if (speed >= 3) this.accelNoise = 1.0 + (speed - 3) * (1.0 / 5);
-        else if (speed >= 0.5) this.accelNoise = 0.5 + (speed - 0.5) * (0.5 / 2.5);
-        else this.accelNoise = 0.5;
-    }
+        // Noise schedule tuned for real walking acceleration (1–2 m/s²).
+            if (speed >= 15) {
+                this.accelNoise = 5.0;
+            } else if (speed >= 8) {
+                this.accelNoise = 1.5 + (speed - 8) * (3.5 / 7);
+            } else if (speed >= 2) {
+                this.accelNoise = 1.5; // Flat through jogging
+            } else if (speed >= 0.3) {
+                this.accelNoise = 0.35 + (speed - 0.3) * (1.2 / 1.7); // 0.35 → 1.5
+            } else {
+                this.accelNoise = 0.35;
+            }
+        }
 
     _predict(dt) {
         const x = this.x;
@@ -1913,7 +1987,7 @@ class PositionKalmanFilter {
         const R2 = R * R;
 
         const y0 = zNorth - this.x[0];
-        const y1 = zEast - this.x[1];
+        const y1 = zEast  - this.x[1];
 
         const S00 = P[0][0] + R2;
         const S11 = P[1][1] + R2;
@@ -1921,6 +1995,7 @@ class PositionKalmanFilter {
 
         const detS = S00 * S11 - S01 * S01;
 
+        // Guard negative determinant from floating-point drift
         if (detS <= 1e-15) {
             K[0][0] = P[0][0] / S00; K[0][1] = 0;
             K[1][0] = 0;             K[1][1] = P[1][1] / S11;
@@ -1950,6 +2025,7 @@ class PositionKalmanFilter {
             P2[3][j] = -K[3][0] * P[0][j] - K[3][1] * P[1][j] + P[3][j];
         }
 
+        // Enforce symmetry to prevent covariance diverging due to float error
         for (let i = 0; i < 4; i++) {
             for (let j = i + 1; j < 4; j++) {
                 const avg = (P2[i][j] + P2[j][i]) * 0.5;
@@ -1987,188 +2063,183 @@ class PositionKalmanFilter {
 
     _makeResult(lat, lng) {
         const vNorth = this.x ? this.x[2] : 0;
-        const vEast = this.x ? this.x[3] : 0;
-        return {
-            lat, lng,
-            vNorth, vEast,
-            speedMPS: Math.sqrt(vNorth * vNorth + vEast * vEast)
-        };
+        const vEast  = this.x ? this.x[3] : 0;
+        const speed  = Math.sqrt(vNorth * vNorth + vEast * vEast);
+        return { lat, lng, vNorth, vEast, speedMPS: speed };
     }
 }
 
+// ── Global instance ──
+window.sensorFusion = new SensorFusionManager().init();
 
-/* ═══════════════════════════════════════════════════════════════════════
-   DEAD RECKONING — Display-Rate Animation Loop with Self-Resume
-   ═══════════════════════════════════════════════════════════════════════ */
+/* ──────────────────────────────────────────────
+   DEAD RECKONING LOOP
+   ────────────────────────────────────────────── */
+
 (function initDeadReckoning() {
-    'use strict';
-
-    const MIN_SPEED_MPS = 0.15;
-    const MIN_CENTER_DRIFT_PX = 3;
-    const MAX_JUMP_METERS = 30;
-
+    let _lastFrameTime = performance.now();
     let _rafId = null;
-    let _active = true;
-    let _lastFrameTime = 0;
-    let _lastAppliedPos = null;
-    let _lastKnownTimestamp = null;
+    let _active = false;
 
-    let _legacyLastLat = null;
-    let _legacyLastLng = null;
-    let _legacyLastTimestamp = null;
-    let _legacyVelocity = { lat: 0, lng: 0 };
+    const MIN_DT_MS = 16;
+    const MIN_SPEED_MPS = 0.15;
+    const MIN_CENTER_DRIFT_PX = 6;
 
-    function frame(nowHighRes) {
+    // Adaptive prediction horizon: shorter at walking speeds to minimize drift,
+    // longer at driving speeds where GPS latency matters more.
+    function getAdaptivePredictAheadSec(speedMPS) {
+        if (speedMPS < 1.5) return 0.6;   // Slow walk: ~0.9m max drift
+        if (speedMPS < 2.5) return 0.9;   // Brisk walk
+        if (speedMPS < 5.0) return 1.3;   // Jogging / slow bike
+        if (speedMPS < 12.0) return 1.8;  // City driving
+        return 2.2;                        // Highway
+    }
+
+    function frame(now) {
         _rafId = null;
 
         const lastPos = window.lastPosition;
 
-        // Self-resume on new GPS tick
-        const currentFixTimestamp = window.lastUpdateTimestamp || (lastPos ? lastPos.timestamp : null);
-        if (currentFixTimestamp && currentFixTimestamp !== _lastKnownTimestamp) {
-            _lastKnownTimestamp = currentFixTimestamp;
-            _active = true;
-        }
-
         if (!lastPos || window.isLocationHuntVisible) {
+            _active = false;
+            return;
+        }
+
+        if (window.isStationary) {
+            const speedMPS = window.sensorFusion
+                ? window.sensorFusion.getFilteredSpeedMPS()
+                : (lastPos.speedMPS || 0);
+            if (speedMPS < MIN_SPEED_MPS) {
+                _active = false;
+                return;
+            }
+        }
+
+        if (window.isMapInteracting) {
+            _lastFrameTime = now;
             _rafId = requestAnimationFrame(frame);
             return;
         }
 
-        if (window.isMapInteracting || window._isProximityZoomAnimating) {
-            _lastFrameTime = nowHighRes;
+        if (window._isProximityZoomAnimating) {
+            _lastFrameTime = now;
             _rafId = requestAnimationFrame(frame);
             return;
         }
+
         if (window._gpsCenteredPanJustOccurred) {
             window._gpsCenteredPanJustOccurred = false;
-            _lastFrameTime = nowHighRes;
+            _lastFrameTime = now;
             _rafId = requestAnimationFrame(frame);
             return;
         }
 
-        const hasSF = !!(window.sensorFusion && typeof window.sensorFusion.getStateAt === 'function');
-        const speedMPS = hasSF
+        const dtMs = now - _lastFrameTime;
+        if (dtMs < MIN_DT_MS) {
+            _rafId = requestAnimationFrame(frame);
+            return;
+        }
+
+        _lastFrameTime = now;
+
+        const vel = window.sensorFusion
+            ? window.sensorFusion.getSmoothedVelocityDegPerSec()
+            : (window.smoothedVelocity || { lat: 0, lng: 0 });
+
+        const speedMPS = window.sensorFusion
             ? window.sensorFusion.getFilteredSpeedMPS()
             : (lastPos.speedMPS || 0);
 
-        // Passive monitoring: keep RAF alive, skip DOM work when slow/stationary
         if (speedMPS < MIN_SPEED_MPS) {
             _active = false;
-            _lastFrameTime = nowHighRes;
-            _lastAppliedPos = null;
+            return;
+        }
+
+        // CHANGE: Use the Kalman-filtered position as the extrapolation origin
+        // instead of the raw GPS lastPos. The Kalman output is the filter's
+        // best smoothed estimate; predicting forward from it means GPS
+        // measurement updates are absorbed silently inside the filter and cause
+        // zero visible discontinuity in the marker position. The original code
+        // predicted from the raw GPS fix, so every ~1 Hz GPS update caused the
+        // marker to snap back and then race forward again.
+        const nowMs = Date.now();
+        let originLat, originLng, originTimestamp;
+
+        const kalmanPos = window.sensorFusion
+            ? window.sensorFusion.getLastKalmanPosition()
+            : null;
+
+        if (kalmanPos && kalmanPos.timestamp != null) {
+            originLat = kalmanPos.lat;
+            originLng = kalmanPos.lng;
+            originTimestamp = kalmanPos.timestamp;
+        } else {
+            originLat = lastPos.lat;
+            originLng = lastPos.lng;
+            originTimestamp = window.lastUpdateTimestamp || nowMs;
+        }
+
+        const timeSinceFixSec = Math.max(0, (nowMs - originTimestamp) / 1000);
+        const predictDtSec = Math.min(getAdaptivePredictAheadSec(speedMPS), timeSinceFixSec);
+
+        if (predictDtSec <= 0) {
             _rafId = requestAnimationFrame(frame);
             return;
         }
 
-        const dt = nowHighRes - _lastFrameTime;
-        _lastFrameTime = nowHighRes;
+        const predictedLat = originLat + vel.lat * predictDtSec;
+        const predictedLng = originLng + vel.lng * predictDtSec;
 
-        const nowMs = Date.now();
-        let state;
-
-        if (hasSF) {
-            state = window.sensorFusion.getStateAt(nowMs);
+        // Sanity-check: discard predictions that jump more than 150 m
+        const jumpLat = Math.abs(predictedLat - originLat) * 111111;
+        const jumpLng = Math.abs(predictedLng - originLng) * 111111 *
+                        Math.cos(originLat * Math.PI / 180);
+        if (jumpLat > 150 || jumpLng > 150) {
+            _lastFrameTime = performance.now();
+            _rafId = requestAnimationFrame(frame);
+            return;
         }
 
-        if (!state) {
-            // Legacy fallback: raw GPS + calculated velocity
-            const originLat = lastPos.lat;
-            const originLng = lastPos.lng;
-            const originTimestamp = window.lastUpdateTimestamp || nowMs;
+        // The origin is already Kalman-smoothed, so the predicted position needs
+        // no additional per-frame clamping or EMA — applying either would only
+        // add latency. Set the marker directly.
+        if (userMarker) {
+            const el = userMarker.getElement();
+            if (el) el.style.transition = 'none';
 
-            if (_legacyLastLat !== null && _legacyLastLng !== null && _legacyLastTimestamp !== null) {
-                const legacyDtSec = (originTimestamp - _legacyLastTimestamp) / 1000;
-                if (legacyDtSec > 0 && legacyDtSec < 10) {
-                    _legacyVelocity.lat = (originLat - _legacyLastLat) / legacyDtSec;
-                    _legacyVelocity.lng = (originLng - _legacyLastLng) / legacyDtSec;
-                }
-            }
+            userMarker.setLatLng([predictedLat, predictedLng]);
 
-            _legacyLastLat = originLat;
-            _legacyLastLng = originLng;
-            _legacyLastTimestamp = originTimestamp;
+            const isCentered = typeof ModeManager !== 'undefined' && ModeManager.isCentered();
+            if (!window._isProximityZoomAnimating && isCentered && window.followUser && map) {
+                const currentCenter = map.getCenter();
+                const targetPx = map.latLngToContainerPoint([predictedLat, predictedLng]);
+                const centerPx = map.latLngToContainerPoint(currentCenter);
+                const driftPx = Math.hypot(targetPx.x - centerPx.x, targetPx.y - centerPx.y);
 
-            const timeSinceFixSec = Math.max(0, (nowMs - originTimestamp) / 1000);
-            const predictDtSec = timeSinceFixSec + 0.5;
-
-            state = {
-                lat: originLat + _legacyVelocity.lat * predictDtSec,
-                lng: originLng + _legacyVelocity.lng * predictDtSec,
-                speedMPS: speedMPS
-            };
-        }
-
-        // Sanity check
-        if (_lastAppliedPos) {
-            const dLat = state.lat - _lastAppliedPos.lat;
-            const dLng = state.lng - _lastAppliedPos.lng;
-            const cosLat = Math.cos(_lastAppliedPos.lat * Math.PI / 180);
-            const jumpM = Math.sqrt(
-                Math.pow(dLat * 111111, 2) +
-                Math.pow(dLng * 111111 * cosLat, 2)
-            );
-
-            if (jumpM > MAX_JUMP_METERS) {
-                if (_lastAppliedPos._frameCount > 5) {
-                    const alpha = 0.25;
-                    state.lat = _lastAppliedPos.lat + dLat * alpha;
-                    state.lng = _lastAppliedPos.lng + dLng * alpha;
+                if (driftPx > MIN_CENTER_DRIFT_PX) {
+                    map.setView([predictedLat, predictedLng], map.getZoom(), {
+                        animate: false,
+                        noMoveStart: true,
+                        noMoveEnd: true
+                    });
                 }
             }
         }
-
-        applyPosition(state.lat, state.lng, speedMPS);
-
-        _lastAppliedPos = {
-            lat: state.lat,
-            lng: state.lng,
-            _frameCount: (_lastAppliedPos?._frameCount || 0) + 1
-        };
 
         _rafId = requestAnimationFrame(frame);
     }
 
-    function applyPosition(lat, lng, speedMPS) {
-        if (!userMarker) return;
+    _active = true;
+    _rafId = requestAnimationFrame(frame);
 
-        const el = userMarker.getElement();
-        if (el) {
-            el.style.transition = 'none';
-            el.style.transform = 'translate3d(0,0,0)';
-        }
-
-        userMarker.setLatLng([lat, lng]);
-
-        const isCentered = typeof ModeManager !== 'undefined' && ModeManager.isCentered();
-        if (!window._isProximityZoomAnimating && isCentered && window.followUser && map) {
-            const targetPx = map.latLngToContainerPoint([lat, lng]);
-            const centerPx = map.latLngToContainerPoint(map.getCenter());
-            const dx = targetPx.x - centerPx.x;
-            const dy = targetPx.y - centerPx.y;
-            const driftPx = Math.hypot(dx, dy);
-
-            if (driftPx > MIN_CENTER_DRIFT_PX) {
-                map.panBy([dx, dy], {
-                    animate: false,
-                    noMoveStart: true,
-                    noMoveEnd: true
-                });
-            }
-        }
-    }
-
-    function stop() {
-        if (_rafId != null) {
-            cancelAnimationFrame(_rafId);
-            _rafId = null;
-        }
-        _active = false;
-        _lastAppliedPos = null;
-    }
-
-    function start() {
+    function _restartIfMoving() {
         if (_active) return;
+        if (window.isLocationHuntVisible) return;
+        const speedMPS = window.sensorFusion
+            ? window.sensorFusion.getFilteredSpeedMPS()
+            : (window.lastPosition?.speedMPS || 0);
+        if (speedMPS < MIN_SPEED_MPS) return;
+        if (window.isStationary && speedMPS < 0.8) return;
         _active = true;
         _lastFrameTime = performance.now();
         _rafId = requestAnimationFrame(frame);
@@ -2190,29 +2261,200 @@ class PositionKalmanFilter {
         return false;
     }
 
-    const api = {
-        stop,
-        start,
-        isActive: () => _active,
-        onMovementResumed: start
-    };
-
     if (!_registerCleanup()) {
-        api._registerCleanup = _registerCleanup;
+        window.deadReckoning = {
+            stop() {
+                if (_rafId != null) {
+                    cancelAnimationFrame(_rafId);
+                    _rafId = null;
+                }
+                _active = false;
+            },
+            start() { _restartIfMoving(); },
+            isActive() { return _active; },
+            onMovementResumed: _restartIfMoving,
+            _registerCleanup: _registerCleanup
+        };
+    } else {
+        window.deadReckoning = {
+            stop() {
+                if (_rafId != null) {
+                    cancelAnimationFrame(_rafId);
+                    _rafId = null;
+                }
+                _active = false;
+            },
+            start() { _restartIfMoving(); },
+            isActive() { return _active; },
+            onMovementResumed: _restartIfMoving
+        };
+    }
+})();
+        
+/* ──────────────────────────────────────────────
+   ZOOM CONTROLLER
+   Manages map zoom authority using a priority system.
+   ────────────────────────────────────────────── */
+(function() {
+  const DEFAULT_ZOOM = 18;
+  const DEFAULT_LOCK_DURATION_MS = 2000;
+
+  class ZoomController {
+    constructor(options = {}) {
+      this.config = {
+        defaultZoom: options.defaultZoom || DEFAULT_ZOOM,
+        lockDurationMs: options.lockDurationMs || DEFAULT_LOCK_DURATION_MS,
+        animationOptions: options.animationOptions || {}
+      };
+      
+      // ── ZERO-GC OPTIMIZATION ──
+      // Replaced array queue with a Map. Provides O(1) lookups,
+      // prevents duplicate sources from spamming the queue, and
+      // eliminates array allocations (reduce/filter) on every tick.
+      this._requests = new Map();
+      
+      this._activeSource = null;
+      this._activePriority = 0;
+      this._activeLevel = this.config.defaultZoom;
+      this._activeLockExpiry = 0;
     }
 
-    window.deadReckoning = api;
+    /**
+     * Request zoom authority.
+     */
+    request(source, level, priority = 1, durationMs) {
+      this._requests.set(source, {
+        level,
+        priority,
+        timestamp: Date.now(),
+        durationMs: durationMs || this.config.lockDurationMs
+      });
+      
+      this._updateState();
+    }
 
-    _lastFrameTime = performance.now();
-    _rafId = requestAnimationFrame(frame);
+    /**
+     * Release zoom authority for a source.
+     */
+    release(source) {
+      if (this._requests.has(source)) {
+        this._requests.delete(source);
+        
+        // If the active source is releasing, immediately clear lock
+        // so the next in line doesn't have to wait for expiry.
+        if (this._activeSource === source) {
+          this._activeSource = null;
+          this._activePriority = 0;
+          this._activeLockExpiry = 0;
+        }
+        
+        this._updateState();
+      }
+    }
+
+    /**
+     * Force re-application of the current active zoom level.
+     */
+    applyPendingZoom() {
+      if (this._activeSource) {
+        this._applyZoom(this._activeLevel);
+      }
+    }
+
+    /**
+     * Returns a snapshot of the current state (backward compatible).
+     */
+    getState() {
+      return {
+        source: this._activeSource,
+        priority: this._activePriority,
+        level: this._activeLevel,
+        lockedUntil: this._activeLockExpiry
+      };
+    }
+
+    /**
+     * Halt everything and reset to default.
+     */
+    stop() {
+      this._requests.clear();
+      this._activeSource = null;
+      this._activePriority = 0;
+      this._activeLevel = this.config.defaultZoom;
+      this._activeLockExpiry = 0;
+    }
+
+    /**
+     * Core logic: Evaluates the map of requests and applies the winner.
+     * Runs in O(N) where N is the number of unique sources (usually < 3).
+     */
+    _updateState() {
+      const now = Date.now();
+
+      // 1. If our current lock expired, clear the active state
+      if (this._activeSource && now >= this._activeLockExpiry) {
+        this._activeSource = null;
+        this._activePriority = 0;
+      }
+
+      // 2. Find the highest priority request currently available
+      let topRequest = null;
+      let topSource = null;
+
+      for (const [source, req] of this._requests.entries()) {
+        // Auto-cleanup: discard requests older than 10 seconds 
+        // if the source crashed/forgot to release
+        if (now - req.timestamp > 10000) {
+          this._requests.delete(source);
+          continue;
+        }
+
+        if (!topRequest || req.priority > topRequest.priority) {
+          topRequest = req;
+          topSource = source;
+        }
+      }
+
+      // 3. Decide whether to apply the new state
+      if (!topRequest) return; // No requests left
+
+      const shouldApply = 
+        !this._activeSource ||                              
+        topSource !== this._activeSource ||                 
+        topRequest.priority > this._activePriority ||      
+        topRequest.level !== this._activeLevel;             
+
+      if (shouldApply) {
+        this._activeSource = topSource;
+        this._activePriority = topRequest.priority;
+        this._activeLevel = topRequest.level;
+        this._activeLockExpiry = now + topRequest.durationMs;
+        
+        this._applyZoom(this._activeLevel);
+      }
+    }
+
+    /**
+     * Executes the zoom on the Leaflet map.
+     */
+_applyZoom(level) {
+    if (!window.map) return;
+    if (window.isMapInteracting) return;
+    try { 
+        window.map.setZoom(level, { 
+            noMoveStart: true, 
+            ...this.config.animationOptions 
+        }); 
+    }
+    catch (error) { 
+        console.error('ZoomController: apply failed:', error); 
+    }
+}
+  }
+
+  if (typeof window !== 'undefined') window.zoomController = new ZoomController();
 })();
 
-
-/* ═══════════════════════════════════════════════════════════════════════
-   GLOBAL INSTANCE
-   ═══════════════════════════════════════════════════════════════════════ */
-window.sensorFusion = new SensorFusionManager().init();
-        
 /* ──────────────────────────────────────────────
    ENTERPRISE INIT
    ────────────────────────────────────────────── */
