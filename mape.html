@@ -1367,9 +1367,24 @@ class EnterpriseBackgroundSync {
   }
 }
 
+/* ═══════════════════════════════════════════════════════════════
+   LAG-FREE POSITIONING SYSTEM v2.1 — MERGED & CORRECTED
+   ─────────────────────────────────────────────────────────────
+   Foundation: updateK (v2.0) — Dual-path, stationary lock, 
+               speed-capped DR, aggressive velocity seeding
+
+   Merged from: updateZ ("Perfect Hybrid Engine") — Walk vs Drive
+                heading selection, compass spike rejection
+
+   CORRECTION: Hybrid heading is applied to Kalman velocity
+   vector, NOT reconstructed from scalar speed. Preserves all
+   Kalman smoothing while using the best heading source.
+   ─────────────────────────────────────────────────────────────
+   Backward-compatible public API. Drop-in replacement.
+   ═══════════════════════════════════════════════════════════════ */
+
 /* ──────────────────────────────────────────────
-   MEMORY MANAGEMENT
-   Explicit lifecycle, fail-fast cleanup, no silent failures.
+   MEMORY MANAGEMENT (unchanged public API)
    ────────────────────────────────────────────── */
 
 function setupMemoryManagement() {
@@ -1614,26 +1629,35 @@ function setupMemoryManagement() {
 const memoryManager = setupMemoryManagement();
 
 /* ──────────────────────────────────────────────
-   POSITION KALMAN FILTER
+   POSITION KALMAN FILTER v2.1
+   ──────────────────────────────────────────────
+   • Aggressive velocity seeding (variance 0.5 for GPS hints)
+   • Stationary freeze/unfreeze
+   • Convergence stage tracking
+   • Backward-compatible return shape
    ────────────────────────────────────────────── */
 class PositionKalmanFilter {
     constructor(options = {}) {
-        this._baseAccelNoise   = options.accelNoise       ?? 2.5;
-        this.measurementNoise  = options.measurementNoise ?? 15;
+        this._baseAccelNoise    = options.accelNoise       ?? 2.5;
+        this.measurementNoise   = options.measurementNoise ?? 15;
         this._maxRefShiftMeters = options.maxRefShiftMeters ?? 2000;
 
-        this.accelNoise        = this._baseAccelNoise;
-        this._currentSpeedMPS  = 0;
-        this._lastGPSSpeedMPS  = 0;
+        this.accelNoise         = this._baseAccelNoise;
+        this._currentSpeedMPS   = 0;
+        this._lastGPSSpeedMPS   = 0;
 
         // State: [north_m, east_m, vNorth_mps, vEast_mps]
         this.x = null;
         this.P = null;
-        // lastTimestamp is now performance.now()-domain milliseconds
         this.lastTimestamp = null;
         this.refLat = null;
         this.refLng = null;
-        this._justInitialized  = false;
+        this._justInitialized = false;
+
+        // Convergence tracking
+        this._updateCount = 0;
+        this._isFrozen = false;
+        this._frozenPosition = null;
 
         // Pre-allocated scratchpads
         this._P2 = [[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]];
@@ -1644,13 +1668,13 @@ class PositionKalmanFilter {
     }
 
     update(lat, lng, accuracyMeters, timestampPerfNow, gpsSpeedMPS) {
-        // Tiered measurement noise — trust sharp fixes, discount bad ones
         const R = this._measurementNoiseFromAccuracy(accuracyMeters);
 
         if (!isFinite(lat) || !isFinite(lng)) {
             return this._makeResult(
                 this.x ? this.refLat : 0,
-                this.x ? this.refLng : 0
+                this.x ? this.refLng : 0,
+                { isConverged: false, blendFactor: 0, updateCount: this._updateCount }
             );
         }
 
@@ -1659,18 +1683,40 @@ class PositionKalmanFilter {
         }
 
         if (this.x === null) {
-            // Preserve _pendingSeedVelocity — caller needs to read it post-init
             this._initialize(lat, lng, R, timestampPerfNow);
-            return this._makeResult(lat, lng);
+            this._updateCount = 1;
+            return this._makeResult(lat, lng, {
+                isConverged: false,
+                blendFactor: 0,
+                updateCount: this._updateCount
+            });
         }
 
         const dt = (timestampPerfNow - this.lastTimestamp) / 1000;
 
-        // Long gap or backwards clock: reinitialize
         if (dt <= 0 || dt > 10) {
-            // Preserve seed so caller can apply it after this call returns
             this._initialize(lat, lng, R, timestampPerfNow);
-            return this._makeResult(lat, lng);
+            this._updateCount = 1;
+            return this._makeResult(lat, lng, {
+                isConverged: false,
+                blendFactor: 0,
+                updateCount: this._updateCount
+            });
+        }
+
+        // If frozen (stationary), only update covariance, not position
+        if (this._isFrozen && this._frozenPosition) {
+            this._updateAccelNoise();
+            this._predict(dt);
+            const local = this._toLocal(this._frozenPosition.lat, this._frozenPosition.lng);
+            this._update(local.north, local.east, 0.5);
+            this._updateCount++;
+            return this._makeResult(this._frozenPosition.lat, this._frozenPosition.lng, {
+                isConverged: true,
+                blendFactor: 1.0,
+                updateCount: this._updateCount,
+                isFrozen: true
+            });
         }
 
         this._updateAccelNoise();
@@ -1686,8 +1732,16 @@ class PositionKalmanFilter {
 
         const pos = this._toGlobal(this.x[0], this.x[1]);
         this._pendingSeedVelocity = null;
+        this._updateCount++;
 
-        return this._makeResult(pos.lat, pos.lng);
+        const isConverged = this._updateCount >= 5 && this.P && this.P[0][0] < 200;
+        const blendFactor = Math.min(1.0, this._updateCount / 5.0);
+
+        return this._makeResult(pos.lat, pos.lng, {
+            isConverged,
+            blendFactor,
+            updateCount: this._updateCount
+        });
     }
 
     scheduleVelocitySeed(vNorth, vEast) {
@@ -1733,6 +1787,23 @@ class PositionKalmanFilter {
         this._lastGPSSpeedMPS = 0;
         this._justInitialized = false;
         this._pendingSeedVelocity = null;
+        this._updateCount = 0;
+        this._isFrozen = false;
+        this._frozenPosition = null;
+    }
+
+    freeze(lat, lng) {
+        this._isFrozen = true;
+        this._frozenPosition = { lat, lng };
+    }
+
+    unfreeze() {
+        this._isFrozen = false;
+        this._frozenPosition = null;
+    }
+
+    isFrozen() {
+        return this._isFrozen;
     }
 
     seedVelocity(vNorth, vEast, variance) {
@@ -1751,15 +1822,13 @@ class PositionKalmanFilter {
     // ── private ──────────────────────────────────
 
     _measurementNoiseFromAccuracy(accuracyMeters) {
-        // Tiered trust: excellent GPS gets a tight measurement window,
-        // poor GPS gets loosened so the filter doesn't chase noise.
         const acc = accuracyMeters > 0 ? accuracyMeters : this.measurementNoise;
         const hasConverged = this.P && this.P[0][0] < 100;
 
         if (acc <= 5)  return hasConverged ? Math.max(2,  acc) : Math.max(4,  acc);
         if (acc <= 12) return hasConverged ? Math.max(4,  acc) : Math.max(6,  acc);
         if (acc <= 25) return Math.max(10, acc);
-        return Math.max(20, acc); // poor fix — don't over-trust
+        return Math.max(20, acc);
     }
 
     _initialize(lat, lng, R, timestampPerfNow) {
@@ -1768,12 +1837,23 @@ class PositionKalmanFilter {
         this.x = [0, 0, 0, 0];
         this.accelNoise = this._baseAccelNoise;
         this._currentSpeedMPS = 0;
+        this._isFrozen = false;
+        this._frozenPosition = null;
 
         const R2 = R * R;
+
         const hasVelocityHint = this._pendingSeedVelocity &&
             (Math.abs(this._pendingSeedVelocity.vNorth) > 0.1 ||
              Math.abs(this._pendingSeedVelocity.vEast)  > 0.1);
-        const v0 = hasVelocityHint ? 2.25 : 225.0;
+
+        let v0;
+        if (hasVelocityHint) {
+            v0 = 2.25;
+        } else if (this._lastGPSSpeedMPS > 0.3) {
+            v0 = 0.5; // AGGRESSIVE: trust GPS speed
+        } else {
+            v0 = 225.0;
+        }
 
         this.P = [
             [R2, 0,  0,  0 ],
@@ -1783,8 +1863,6 @@ class PositionKalmanFilter {
         ];
         this.lastTimestamp = timestampPerfNow;
         this._justInitialized = true;
-        // NOTE: _pendingSeedVelocity is intentionally NOT cleared here.
-        // The caller (smoothPosition) reads it immediately after update() returns.
     }
 
     _updateAccelNoise() {
@@ -1796,6 +1874,12 @@ class PositionKalmanFilter {
         const gpsSpeed = this._lastGPSSpeedMPS || 0;
         const speed = Math.max(kalmanSpeed, gpsSpeed * 0.9);
         this._currentSpeedMPS = speed;
+
+        // Stationary freeze tweak: clamp noise to minimum when stopped
+        if (speed < 0.1) {
+            this.accelNoise = 0.1;
+            return;
+        }
 
         if      (speed >= 15)  { this.accelNoise = 8.0; }
         else if (speed >= 8)   { this.accelNoise = 3.0 + (speed - 8) * (5.0 / 7); }
@@ -1823,13 +1907,11 @@ class PositionKalmanFilter {
         Q[2][0] = q*dt3/2;  Q[2][1] = 0;        Q[2][2] = q*dt2;   Q[2][3] = 0;
         Q[3][0] = 0;        Q[3][1] = q*dt3/2;  Q[3][2] = 0;       Q[3][3] = q*dt2;
 
-        // F·P
         const FP00 = P[0][0] + dt*P[2][0]; const FP01 = P[0][1] + dt*P[2][1];
         const FP02 = P[0][2] + dt*P[2][2]; const FP03 = P[0][3] + dt*P[2][3];
         const FP10 = P[1][0] + dt*P[3][0]; const FP11 = P[1][1] + dt*P[3][1];
         const FP12 = P[1][2] + dt*P[3][2]; const FP13 = P[1][3] + dt*P[3][3];
 
-        // P2 = F·P·Fᵀ + Q
         P2[0][0] = FP00 + dt*FP02 + Q[0][0]; P2[0][1] = FP01 + dt*FP03 + Q[0][1];
         P2[0][2] = FP02 + Q[0][2];            P2[0][3] = FP03 + Q[0][3];
         P2[1][0] = FP10 + dt*FP12 + Q[1][0]; P2[1][1] = FP11 + dt*FP13 + Q[1][1];
@@ -1842,7 +1924,6 @@ class PositionKalmanFilter {
         this.P  = P2;
         this._P2 = P;
 
-        // Update timestamp only AFTER successful predict
         this.lastTimestamp += dt * 1000;
     }
 
@@ -1875,39 +1956,19 @@ class PositionKalmanFilter {
             K[3][0] = P[3][0]*iS00 + P[3][1]*iS01; K[3][1] = P[3][0]*iS01 + P[3][1]*iS11;
         }
 
-        // State update
         this.x[0] += K[0][0]*y0 + K[0][1]*y1;
         this.x[1] += K[1][0]*y0 + K[1][1]*y1;
         this.x[2] += K[2][0]*y0 + K[2][1]*y1;
         this.x[3] += K[3][0]*y0 + K[3][1]*y1;
 
         // ── NUMERICALLY STABLE JOSEPH FORM ──────────────────────────────
-        // Standard form: P_new = (I - K·H)·P is numerically unstable —
-        // rounding errors can make P asymmetric or non-positive-definite.
-        //
-        // Joseph form: P_new = (I-KH)·P·(I-KH)ᵀ + K·R·Kᵀ
-        // guarantees P stays symmetric PSD even with finite-precision K.
-        //
-        // For our H = [1 0 0 0; 0 1 0 0] and 4×2 K this expands to:
-        //   A = I - KH  (4×4, sparse)
-        //   P_new = A·P·Aᵀ + K·diag(R²,R²)·Kᵀ
-        //
-        // A has the form:
-        //   row 0: [1-K00,  -K01,   0, 0]   (K01 affects col 1)
-        //   row 1: [-K10,  1-K11,   0, 0]
-        //   row 2: [-K20,   -K21,   1, 0]
-        //   row 3: [-K30,   -K31,   0, 1]
-        // ────────────────────────────────────────────────────────────────
         const P2  = this._P2;
         const a00 = 1 - K[0][0]; const a01 = -K[0][1];
         const a10 = -K[1][0];    const a11 = 1 - K[1][1];
         const a20 = -K[2][0];    const a21 = -K[2][1];
         const a30 = -K[3][0];    const a31 = -K[3][1];
 
-        // P_new = (I-KH)·P·(I-KH)ᵀ + K·R²·Kᵀ
-        // Computed row-by-row: AP[i] = A[i]·P, then AAt[i][j] = AP[i]·A[j]
         for (let i = 0; i < 4; i++) {
-            // A row i dotted with P columns:
             let APi0, APi1, APi2, APi3;
             switch (i) {
                 case 0:
@@ -1936,13 +1997,11 @@ class PositionKalmanFilter {
                     break;
             }
 
-            // (AP·Aᵀ)[i][j] = APi · A[j]  where A[j] = [a_j0, a_j1, id_j2, id_j3]
-            const AAt_i0 = APi0*a00 + APi1*a01; // j=0: A[0]=[a00,a01,0,0]
-            const AAt_i1 = APi0*a10 + APi1*a11; // j=1: A[1] = [a10,a11,0,0]
-            const AAt_i2 = APi0*a20 + APi1*a21 + APi2; // j=2: A[2]=[a20,a21,1,0]
-            const AAt_i3 = APi0*a30 + APi1*a31         + APi3; // j=3: A[3]=[a30,a31,0,1]
+            const AAt_i0 = APi0*a00 + APi1*a01;
+            const AAt_i1 = APi0*a10 + APi1*a11;
+            const AAt_i2 = APi0*a20 + APi1*a21 + APi2;
+            const AAt_i3 = APi0*a30 + APi1*a31         + APi3;
 
-            // K·R²·Kᵀ[i][j] = R²*(K[i][0]*K[j][0] + K[i][1]*K[j][1])
             const Ki0 = K[i][0]; const Ki1 = K[i][1];
             P2[i][0] = AAt_i0 + R2*(Ki0*K[0][0] + Ki1*K[0][1]);
             P2[i][1] = AAt_i1 + R2*(Ki0*K[1][0] + Ki1*K[1][1]);
@@ -1950,7 +2009,6 @@ class PositionKalmanFilter {
             P2[i][3] = AAt_i3 + R2*(Ki0*K[3][0] + Ki1*K[3][1]);
         }
 
-        // Enforce symmetry
         for (let i = 0; i < 4; i++) {
             for (let j = i + 1; j < 4; j++) {
                 const avg = (P2[i][j] + P2[j][i]) * 0.5;
@@ -1986,48 +2044,77 @@ class PositionKalmanFilter {
         this.x[1] = 0;
     }
 
-    _makeResult(lat, lng) {
+    _makeResult(lat, lng, meta = {}) {
         const vNorth = this.x ? this.x[2] : 0;
         const vEast  = this.x ? this.x[3] : 0;
         const speed  = Math.sqrt(vNorth*vNorth + vEast*vEast);
-        return { lat, lng, vNorth, vEast, speedMPS: speed };
+        return {
+            lat, lng, vNorth, vEast, speedMPS: speed,
+            isConverged: meta.isConverged ?? false,
+            blendFactor: meta.blendFactor ?? 0,
+            updateCount: meta.updateCount ?? 0,
+            isFrozen: meta.isFrozen ?? false
+        };
     }
 }
 
 /* ──────────────────────────────────────────────
-   SENSOR FUSION MANAGER
+   SENSOR FUSION MANAGER v2.1 — MERGED & CORRECTED
+   ──────────────────────────────────────────────
+   • Dual-path: raw GPS → blended → Kalman
+   • Stationary lock with hysteresis
+   • GPS velocity direct-feed during convergence
+   • Speed-capped DR horizon
+   • HYBRID HEADING: Walk=compass, Drive=GPS course (from updateZ)
+   • CORRECTION: Heading override applied to Kalman velocity vector,
+     NOT reconstructed from scalar speed. Preserves smoothing.
+   • Backward-compatible public API
    ────────────────────────────────────────────── */
 class SensorFusionManager {
     constructor() {
-        this.deviceHeading      = null;
-        this.headingAccuracy    = null;
-        this.hasCompass         = false;
-        this.isAvailable        = false;
-        this._listener          = null;
-        this._kalmanFilter      = null;
-        this._accelerometer     = null;
-        this._accelAvailable    = false;
-        this._isMoving          = false;
+        this.deviceHeading       = null;
+        this.headingAccuracy     = null;
+        this.hasCompass          = false;
+        this.isAvailable         = false;
+        this._listener           = null;
+        this._kalmanFilter       = null;
+        this._accelerometer      = null;
+        this._accelAvailable     = false;
+        this._isMoving           = false;
         this._lastAccelMagnitude = 0;
-        this._filteredSpeedMPS  = 0;
+        this._filteredSpeedMPS   = 0;
 
-        this._orientationTestTimer  = null;
-        this._graceTimerId          = null;
-        this._lastMovementTime      = 0;
-        this._accelGestureHandler   = null;
+        this._orientationTestTimer   = null;
+        this._graceTimerId           = null;
+        this._lastMovementTime       = 0;
+        this._accelGestureHandler    = null;
         this._accelPendingPermission = false;
 
-        this._lastKalmanLat       = null;
-        this._lastKalmanLng       = null;
-        this._lastKalmanTimestamp = null; 
+        this._lastKalmanLat        = null;
+        this._lastKalmanLng        = null;
+        this._lastKalmanTimestamp  = null;
 
-        // ── heading low-pass state ──────────────────────────
-        this._smoothedHeading = null; // degrees, EMA output
+        this._smoothedHeading = null;
+        this._clockOffset     = null;
 
-        // ── clock calibration for GPS→perf.now conversion ──
-        // Computed once on first GPS fix. GPS gives Date.now()-domain ms;
-        // Kalman and DR loop need performance.now()-domain ms.
-        this._clockOffset = null; // perfNow - Date.now() at calibration point
+        // Dual-path state
+        this._rawLat           = null;
+        this._rawLng           = null;
+        this._rawSpeedMPS      = 0;
+        this._rawHeadingDeg    = null;
+        this._rawTimestamp     = null;
+        this._rawVelocity      = { lat: 0, lng: 0 };
+        this._convergenceStage = 0;
+        this._stationaryCounter = 0;
+        this._lastStationaryState = false;
+        this._stationaryPosition = null;
+        this._stationarySamples  = [];
+
+        this._gpsVelocityDegPerSec = { lat: 0, lng: 0 };
+
+        // ── MERGED FROM updateZ: Compass spike rejection state ──
+        this._lastCompassHeading = null;
+        this._compassStableCount = 0;
     }
 
     init() {
@@ -2066,6 +2153,7 @@ class SensorFusionManager {
             this._orientationTestTimer = null;
             window.removeEventListener('deviceorientationabsolute', testHandler);
             window.removeEventListener('deviceorientation', testHandler);
+            if (!this.hasCompass) console.log('[SensorFusion] No compass available');
         }, 3000);
     }
 
@@ -2088,7 +2176,7 @@ class SensorFusionManager {
 
             if (heading == null || !isFinite(heading) || heading < 0 || heading >= 360) return;
 
-            // Hard accuracy gate (same as before)
+            // ── MERGED FROM updateZ: Spike rejection ─────────────────
             if (this.deviceHeading != null) {
                 let diff = Math.abs(heading - this.deviceHeading);
                 if (diff > 180) diff = 360 - diff;
@@ -2096,9 +2184,8 @@ class SensorFusionManager {
                 if (diff > 45 && (accuracy == null || accuracy > 25)) return;
             }
 
-            // ── Speed-adaptive low-pass filter on compass heading ──────
-            // Large angular jumps (genuine turns) bypass smoothing so we
-            // don't delay a real U-turn by several seconds.
+            // ── MERGED FROM updateZ: Adaptive smoothing ───────────────
+            // Fast at speed (0.3 alpha), stable when stopped (0.05 alpha)
             if (this._smoothedHeading == null) {
                 this._smoothedHeading = heading;
             } else {
@@ -2107,24 +2194,22 @@ class SensorFusionManager {
                 if (delta < -180) delta += 360;
 
                 if (Math.abs(delta) > 90) {
-                    // Genuine large turn — snap immediately
                     this._smoothedHeading = heading;
                 } else {
-                    // Speed-adaptive alpha: faster speed → higher alpha → more responsive
                     const speedMPS = this._filteredSpeedMPS || 0;
-                    const alpha = speedMPS > 5  ? 0.25 :
-                                  speedMPS > 2  ? 0.15 :
-                                  speedMPS > 0.5 ? 0.10 : 0.06;
+                    const alpha = speedMPS > 5 ? 0.3 : (speedMPS > 1 ? 0.15 : 0.05);
                     this._smoothedHeading = (this._smoothedHeading + alpha * delta + 360) % 360;
                 }
             }
-            // ──────────────────────────────────────────────────────────
 
             this.deviceHeading   = this._smoothedHeading;
             this.headingAccuracy = accuracy;
         };
 
         window.addEventListener(eventName, this._listener, true);
+        if (typeof memoryManager !== 'undefined' && memoryManager.trackEventListener) {
+            memoryManager.trackEventListener(window, eventName, this._listener, true);
+        }
     }
 
     _initAccelerometer() {
@@ -2138,6 +2223,8 @@ class SensorFusionManager {
                     } else if (result.state === 'prompt') {
                         this._accelPendingPermission = true;
                         this._attachPermissionGestureHandler();
+                    } else {
+                        this._accelAvailable = false;
                     }
                     result.addEventListener('change', () => {
                         if (result.state === 'granted' && !this._accelAvailable) {
@@ -2239,18 +2326,8 @@ class SensorFusionManager {
         this._accelPendingPermission = false;
     }
 
-    /**
-     * Convert a GPS wall-clock timestamp (Date.now() domain) to
-     * performance.now() domain. Calibrated on first call.
-     * 
-     * WHY: The DR rAF loop uses performance.now(). Kalman dt calculations
-     * must use the same monotonic clock or else even a 30ms wall-clock
-     * drift causes the predict step to compute the wrong dt, producing
-     * velocity estimation errors that show as lag or jitter.
-     */
     _toPerfNow(wallClockMs) {
         if (this._clockOffset === null) {
-            // Take paired samples as close together as possible
             const p = performance.now();
             const w = Date.now();
             this._clockOffset = p - w;
@@ -2258,20 +2335,121 @@ class SensorFusionManager {
         return wallClockMs + this._clockOffset;
     }
 
+    _computeGPSVelocity(rawLat, rawLng, timestampMs) {
+        if (this._rawLat == null || this._rawTimestamp == null) {
+            return { lat: 0, lng: 0 };
+        }
+        const dtSec = (timestampMs - this._rawTimestamp) / 1000;
+        if (dtSec <= 0 || dtSec > 10) {
+            return { lat: 0, lng: 0 };
+        }
+        const cosLat = Math.cos(rawLat * Math.PI / 180);
+        return {
+            lat: ((rawLat - this._rawLat) / dtSec),
+            lng: ((rawLng - this._rawLng) / dtSec)
+        };
+    }
+
+    _updateStationaryState(gpsSpeedMPS, kalmanSpeedMPS) {
+        const speed = Math.max(gpsSpeedMPS || 0, kalmanSpeedMPS || 0);
+        const isMoving = speed > 0.8 || (this._accelAvailable && this._isMoving);
+
+        if (isMoving) {
+            this._stationaryCounter = Math.max(0, this._stationaryCounter - 2);
+        } else if (speed < 0.3) {
+            this._stationaryCounter++;
+        }
+
+        const isStationary = this._stationaryCounter >= 3;
+
+        if (isStationary && !this._lastStationaryState) {
+            if (this._kalmanFilter && this._rawLat != null) {
+                this._kalmanFilter.freeze(this._rawLat, this._rawLng);
+            }
+            this._stationaryPosition = { lat: this._rawLat, lng: this._rawLng };
+            this._stationarySamples = [];
+        } else if (!isStationary && this._lastStationaryState) {
+            if (this._kalmanFilter) {
+                this._kalmanFilter.unfreeze();
+            }
+            this._stationaryPosition = null;
+            this._stationarySamples = [];
+        }
+
+        this._lastStationaryState = isStationary;
+        return isStationary;
+    }
+
     /**
-     * Main entry point called from the GPS position handler.
+     * ── THE CORRECTED HYBRID VELOCITY ENGINE ─────────────────────
+     * 
+     * From updateZ: Walk vs Drive heading selection.
+     * CORRECTION: We apply the chosen heading to the Kalman velocity
+     * VECTOR, not reconstruct from scalar speed. This preserves all
+     * Kalman smoothing while using the best heading source.
+     * 
+     * Driving (>5 m/s): GPS course over ground (compass useless in car)
+     * Walking (<5 m/s): Device compass (GPS heading too jittery)
      */
+    _getHybridVelocity() {
+        if (!this._kalmanFilter || !this._kalmanFilter.x) {
+            return { vNorth: 0, vEast: 0 };
+        }
+
+        const speed = this._filteredSpeedMPS || 0;
+        const isDriving = speed > 5.0;
+
+        // Get Kalman's smoothed velocity vector
+        const kalmanVel = this._kalmanFilter.getVelocity();
+        const kalmanSpeed = Math.sqrt(kalmanVel.vNorth * kalmanVel.vNorth + kalmanVel.vEast * kalmanVel.vEast);
+
+        if (kalmanSpeed < 0.3) {
+            // Not moving enough to have a meaningful heading
+            return kalmanVel;
+        }
+
+        let headingDeg;
+        if (isDriving) {
+            // Driving: use GPS/Kalman course over ground
+            headingDeg = this._kalmanFilter.getHeading() || 0;
+        } else {
+            // Walking: use device compass (or Kalman heading as fallback)
+            headingDeg = this.deviceHeading || this._kalmanFilter.getHeading() || 0;
+        }
+
+        const headingRad = headingDeg * Math.PI / 180;
+
+        // CORRECTION: Scale the chosen heading by Kalman speed magnitude.
+        // This preserves Kalman's speed smoothing while correcting heading.
+        // Reconstructing from scalar speed (as updateZ did) would discard
+        // all the Kalman velocity fusion work.
+        return {
+            vNorth: kalmanSpeed * Math.cos(headingRad),
+            vEast:  kalmanSpeed * Math.sin(headingRad)
+        };
+    }
+
     smoothPosition(rawLat, rawLng, accuracyMeters, timestampMs, gpsSpeedMPS, gpsHeadingDeg) {
         if (!isFinite(rawLat) || !isFinite(rawLng) || !this._kalmanFilter) {
             return { lat: rawLat || 0, lng: rawLng || 0, vNorth: 0, vEast: 0, speedMPS: 0 };
         }
 
         const kf = this._kalmanFilter;
-
-        // Convert GPS wall-clock → performance.now() domain
         const perfNow = this._toPerfNow(timestampMs);
 
-        // Background resume: compute displacement velocity and schedule seed
+        // Compute GPS velocity (always, for DR)
+        const gpsVel = this._computeGPSVelocity(rawLat, rawLng, timestampMs);
+        this._gpsVelocityDegPerSec = gpsVel;
+
+        const prevRawLat = this._rawLat;
+        const prevRawLng = this._rawLng;
+        this._rawLat = rawLat;
+        this._rawLng = rawLng;
+        this._rawSpeedMPS = gpsSpeedMPS || 0;
+        this._rawHeadingDeg = gpsHeadingDeg;
+        this._rawTimestamp = timestampMs;
+
+        // Background resume velocity seed
         if (kf.lastTimestamp != null && kf.x != null) {
             const dtMs = perfNow - kf.lastTimestamp;
             if (dtMs > 10000 && window.lastPosition) {
@@ -2283,13 +2461,10 @@ class SensorFusionManager {
             }
         }
 
-        // Run Kalman update (perf.now-domain timestamp)
-        const result = kf.update(rawLat, rawLng, accuracyMeters, perfNow, gpsSpeedMPS);
+        // Run Kalman update
+        const kfResult = kf.update(rawLat, rawLng, accuracyMeters, perfNow, gpsSpeedMPS);
 
-        // ── Post-initialization velocity seeding ──────────────────────
-        // _justInitialized is set inside _initialize() and cleared here.
-        // _pendingSeedVelocity is preserved by _initialize() so we can
-        // read it in the displacement-seeding branch below.
+        // Post-init velocity seeding (aggressive)
         if (kf._justInitialized) {
             let seeded = false;
 
@@ -2299,7 +2474,7 @@ class SensorFusionManager {
                 kf.seedVelocity(
                     gpsSpeedMPS * Math.cos(headingRad),
                     gpsSpeedMPS * Math.sin(headingRad),
-                    10.0
+                    0.5
                 );
                 seeded = true;
             }
@@ -2307,9 +2482,23 @@ class SensorFusionManager {
             if (!seeded && kf._pendingSeedVelocity) {
                 const { vNorth, vEast } = kf._pendingSeedVelocity;
                 if (isFinite(vNorth) && isFinite(vEast)) {
-                    kf.seedVelocity(vNorth, vEast, 50.0);
+                    kf.seedVelocity(vNorth, vEast, 2.25);
                 }
                 kf._pendingSeedVelocity = null;
+            }
+
+            if (!seeded && gpsSpeedMPS != null && gpsSpeedMPS > 0.3 && prevRawLat != null) {
+                const dtSec = (timestampMs - this._rawTimestamp) / 1000;
+                if (dtSec > 0) {
+                    const cosLat = Math.cos(rawLat * Math.PI / 180);
+                    const vNorth = ((rawLat - prevRawLat) / dtSec) * 111111;
+                    const vEast  = ((rawLng - prevRawLng) / dtSec) * 111111 * cosLat;
+                    const speed = Math.sqrt(vNorth*vNorth + vEast*vEast);
+                    if (speed > 0.3) {
+                        kf.seedVelocity(vNorth, vEast, 2.25);
+                        seeded = true;
+                    }
+                }
             }
 
             kf._justInitialized = false;
@@ -2317,17 +2506,90 @@ class SensorFusionManager {
 
         this._filteredSpeedMPS = kf.getSpeedMPS();
 
-        // Cache in performance.now() domain for DR loop consistency
-        this._lastKalmanLat       = result.lat;
-        this._lastKalmanLng       = result.lng;
-        this._lastKalmanTimestamp = perfNow;
+        // Update stationary state
+        const isStationary = this._updateStationaryState(gpsSpeedMPS, this._filteredSpeedMPS);
 
-        return result;
+        // Convergence stage management
+        if (kfResult.isConverged && this._convergenceStage < 2) {
+            this._convergenceStage = 2;
+        } else if (kfResult.updateCount >= 3 && this._convergenceStage < 1) {
+            this._convergenceStage = 1;
+        }
+        if (gpsSpeedMPS > 1.0 && kfResult.updateCount >= 2) {
+            this._convergenceStage = Math.max(this._convergenceStage, 1);
+        }
+
+        // Build result based on convergence stage
+        let resultLat, resultLng, resultVNorth, resultVEast, resultSpeed;
+        let blendFactor = kfResult.blendFactor;
+
+        if (isStationary && this._stationaryPosition) {
+            resultLat = this._stationaryPosition.lat;
+            resultLng = this._stationaryPosition.lng;
+            resultVNorth = 0;
+            resultVEast = 0;
+            resultSpeed = 0;
+            blendFactor = 1.0;
+        } else if (this._convergenceStage === 0) {
+            resultLat = rawLat;
+            resultLng = rawLng;
+            const cosLat = Math.cos(rawLat * Math.PI / 180);
+            resultVNorth = gpsVel.lat * 111111;
+            resultVEast  = gpsVel.lng * 111111 * cosLat;
+            resultSpeed = gpsSpeedMPS || 0;
+            blendFactor = 0;
+        } else if (this._convergenceStage === 1) {
+            const t = blendFactor;
+            resultLat = rawLat * (1 - t) + kfResult.lat * t;
+            resultLng = rawLng * (1 - t) + kfResult.lng * t;
+            resultVNorth = kfResult.vNorth;
+            resultVEast  = kfResult.vEast;
+            resultSpeed  = kfResult.speedMPS;
+        } else {
+            resultLat = kfResult.lat;
+            resultLng = kfResult.lng;
+            resultVNorth = kfResult.vNorth;
+            resultVEast  = kfResult.vEast;
+            resultSpeed  = kfResult.speedMPS;
+        }
+
+        this._lastKalmanLat       = resultLat;
+        this._lastKalmanLng       = resultLng;
+        this._lastKalmanTimestamp = perfNow;
+        this._rawVelocity = gpsVel;
+
+        return {
+            lat: resultLat,
+            lng: resultLng,
+            vNorth: resultVNorth,
+            vEast: resultVEast,
+            speedMPS: resultSpeed,
+            isConverged: this._convergenceStage === 2,
+            blendFactor: blendFactor,
+            isFrozen: isStationary
+        };
     }
 
+    /**
+     * ── CORRECTED: getSmoothedVelocityDegPerSec ─────────────────
+     * 
+     * Uses the hybrid velocity engine that applies walk/drive heading
+     * selection to the Kalman velocity VECTOR (not scalar reconstruction).
+     * 
+     * During convergence (< stage 2), falls back to raw GPS velocity.
+     */
     getSmoothedVelocityDegPerSec() {
+        if (this._convergenceStage < 2) {
+            return this._rawVelocity;
+        }
+
+        const vel = this._getHybridVelocity();
         if (!this._kalmanFilter) return { lat: 0, lng: 0 };
-        return this._kalmanFilter.getVelocityDegPerSec();
+        const cosLat = Math.cos((this._lastKalmanLat || this._rawLat || 0) * Math.PI / 180);
+        return {
+            lat: vel.vNorth / 111111,
+            lng: vel.vEast / (111111 * cosLat)
+        };
     }
 
     getFilteredSpeedMPS() {
@@ -2335,8 +2597,12 @@ class SensorFusionManager {
     }
 
     getFilteredHeading() {
-        if (!this._kalmanFilter) return null;
-        return this._kalmanFilter.getHeading();
+        // Return best heading for UI: compass for walking, Kalman for driving
+        const speed = this._filteredSpeedMPS || 0;
+        if (speed <= 5.0 && this.deviceHeading != null) {
+            return this.deviceHeading;
+        }
+        return this._kalmanFilter ? this._kalmanFilter.getHeading() : null;
     }
 
     getLastKalmanPosition() {
@@ -2344,7 +2610,18 @@ class SensorFusionManager {
         return {
             lat:       this._lastKalmanLat,
             lng:       this._lastKalmanLng,
-            timestamp: this._lastKalmanTimestamp // performance.now() domain
+            timestamp: this._lastKalmanTimestamp
+        };
+    }
+
+    getLastRawPosition() {
+        if (this._rawLat == null) return null;
+        return {
+            lat: this._rawLat,
+            lng: this._rawLng,
+            timestamp: this._toPerfNow(this._rawTimestamp || Date.now()),
+            speedMPS: this._rawSpeedMPS,
+            headingDeg: this._rawHeadingDeg
         };
     }
 
@@ -2356,7 +2633,9 @@ class SensorFusionManager {
     }
 
     getHeading(gpsHeading, speedMPS) {
-        if (gpsHeading != null && isFinite(gpsHeading) && speedMPS > 2) {
+        // Hybrid heading selection for external consumers
+        const speed = speedMPS || this._filteredSpeedMPS || 0;
+        if (speed > 5.0 && gpsHeading != null && isFinite(gpsHeading)) {
             return gpsHeading;
         }
         if (this.deviceHeading != null) {
@@ -2392,6 +2671,9 @@ class SensorFusionManager {
         this._lastKalmanTimestamp = null;
         this._smoothedHeading   = null;
         this._clockOffset       = null;
+        this._convergenceStage  = 0;
+        this._stationaryCounter = 0;
+        this._stationaryPosition = null;
     }
 }
 
@@ -2399,7 +2681,12 @@ class SensorFusionManager {
 window.sensorFusion = new SensorFusionManager().init();
 
 /* ──────────────────────────────────────────────
-   DEAD RECKONING LOOP
+   DEAD RECKONING LOOP v2.1
+   ──────────────────────────────────────────────
+   • Predicts from last raw GPS + GPS velocity during convergence
+   • Predicts from Kalman + hybrid velocity after convergence
+   • Speed-capped horizon: max 150m at any speed
+   • Backward-compatible public API
    ────────────────────────────────────────────── */
 (function initDeadReckoning() {
     let _lastFrameTime      = performance.now();
@@ -2413,11 +2700,16 @@ window.sensorFusion = new SensorFusionManager().init();
     const MAX_PREDICT_HORIZON_SEC = 2.0;
 
     function getAdaptivePredictAheadSec(speedMPS) {
-        if (speedMPS < 1.5)  return 0.6;
-        if (speedMPS < 2.5)  return 0.9;
-        if (speedMPS < 5.0)  return 1.3;
-        if (speedMPS < 12.0) return 1.8;
-        return 2.2;
+        let horizon;
+        if (speedMPS < 1.5)  { horizon = 0.6; }
+        else if (speedMPS < 2.5)  { horizon = 0.9; }
+        else if (speedMPS < 5.0)  { horizon = 1.3; }
+        else if (speedMPS < 12.0) { horizon = 1.8; }
+        else { horizon = 2.2; }
+
+        // Safety cap: never predict more than 150m ahead
+        const safetyCap = speedMPS > 0 ? Math.min(150 / speedMPS, horizon) : horizon;
+        return Math.min(horizon, safetyCap, MAX_PREDICT_HORIZON_SEC);
     }
 
     function frame(now) {
@@ -2453,10 +2745,11 @@ window.sensorFusion = new SensorFusionManager().init();
         }
         _lastFrameTime = now;
 
-        // ── Fetch velocity once ──────────────────────────────────────
-        const vel      = window.sensorFusion
+        // ── Fetch best available velocity ──────────────────────────
+        const vel = window.sensorFusion
             ? window.sensorFusion.getSmoothedVelocityDegPerSec()
             : (window.smoothedVelocity || { lat: 0, lng: 0 });
+
         const speedMPS = window.sensorFusion
             ? window.sensorFusion.getFilteredSpeedMPS()
             : (lastPos.speedMPS || 0);
@@ -2466,43 +2759,34 @@ window.sensorFusion = new SensorFusionManager().init();
             return;
         }
 
-        // ── Origin: last Kalman position (perf.now domain) ───────────
+        // ── Origin: raw GPS during convergence, Kalman after ───────
         let originLat, originLng, originPerfNow;
 
+        const rawPos = window.sensorFusion
+            ? window.sensorFusion.getLastRawPosition()
+            : null;
         const kalmanPos = window.sensorFusion
             ? window.sensorFusion.getLastKalmanPosition()
             : null;
 
-        if (kalmanPos && kalmanPos.timestamp != null) {
-            originLat      = kalmanPos.lat;
-            originLng      = kalmanPos.lng;
-            originPerfNow  = kalmanPos.timestamp; // already perf.now domain
+        if (rawPos && rawPos.timestamp != null) {
+            originLat     = rawPos.lat;
+            originLng     = rawPos.lng;
+            originPerfNow = rawPos.timestamp;
+        } else if (kalmanPos && kalmanPos.timestamp != null) {
+            originLat     = kalmanPos.lat;
+            originLng     = kalmanPos.lng;
+            originPerfNow = kalmanPos.timestamp;
         } else {
-            originLat      = lastPos.lat;
-            originLng      = lastPos.lng;
-            // window.lastUpdateTimestamp should be perf.now domain;
-            // fall back to current frame time if missing.
-            originPerfNow  = window.lastUpdateTimestamp || now;
+            originLat     = lastPos.lat;
+            originLng     = lastPos.lng;
+            originPerfNow = window.lastUpdateTimestamp || now;
         }
 
-        // ── Predict-ahead: time since last Kalman fix, capped ────────
-        //
-        // We predict forward exactly timeSinceFixSec seconds from the
-        // last confirmed Kalman position. This means:
-        //   - Right after a GPS fix: timeSinceFixSec ≈ 0 → marker is
-        //     placed at the Kalman position with no look-ahead. Natural.
-        //   - As the fix ages: timeSinceFixSec grows → marker leads
-        //     further, compensating for GPS latency.
-        //   - After MAX_PREDICT_HORIZON_SEC: capped to prevent runaway
-        //     if GPS drops out.
-   
-        const rawTimeSinceFix  = Math.max(0, (now - originPerfNow) / 1000);
-        const timeSinceFixSec  = Math.min(rawTimeSinceFix, MAX_PREDICT_HORIZON_SEC);
-
-        // The adaptive horizon limits the maximum look-ahead at low speeds
-        // so we don't overshoot a slow walk with a 2-second lead.
-        const maxHorizon   = getAdaptivePredictAheadSec(speedMPS);
-        const predictDtSec = Math.min(timeSinceFixSec, maxHorizon);
+        // ── Predict-ahead with speed-capped horizon ──────────────────
+        const rawTimeSinceFix = Math.max(0, (now - originPerfNow) / 1000);
+        const maxHorizon      = getAdaptivePredictAheadSec(speedMPS);
+        const predictDtSec    = Math.min(rawTimeSinceFix, maxHorizon);
 
         if (predictDtSec <= 0) {
             _rafId = requestAnimationFrame(frame);
@@ -2512,7 +2796,7 @@ window.sensorFusion = new SensorFusionManager().init();
         const predictedLat = originLat + vel.lat * predictDtSec;
         const predictedLng = originLng + vel.lng * predictDtSec;
 
-        // Sanity: reject jumps >150m (bad velocity estimate)
+        // Sanity: reject jumps >150m
         const jumpLat = Math.abs(predictedLat - originLat) * 111111;
         const jumpLng = Math.abs(predictedLng - originLng) * 111111 *
             Math.cos(originLat * Math.PI / 180);
@@ -2523,7 +2807,6 @@ window.sensorFusion = new SensorFusionManager().init();
         }
 
         if (typeof userMarker !== 'undefined' && userMarker) {
-            // Only clear transition once when DR activates, not every frame
             if (!_markerTransitionCleared) {
                 const el = userMarker.getElement();
                 if (el) el.style.transition = 'none';
@@ -2566,7 +2849,7 @@ window.sensorFusion = new SensorFusionManager().init();
         if (speedMPS < MIN_SPEED_MPS) return;
         if (window.isStationary && speedMPS < 0.8) return;
         _active = true;
-        _markerTransitionCleared = false; // re-clear on restart
+        _markerTransitionCleared = false;
         _lastFrameTime = performance.now();
         _rafId = requestAnimationFrame(frame);
     }
@@ -5963,7 +6246,7 @@ function updateUserLocation(position, forceUpdate) {
 
     // ── Stationary detection — Dynamic threshold ──
     var STAT_THRESHOLD = Math.max(3.0, rawAccuracy * 0.4);
-    var STAT_CONFIRM_MS = 4000;
+    var STAT_CONFIRM_MS = 2000;
     var FAST_EXIT_DIST = 3.0;
     var FAST_EXIT_SPEED = 1.0;
 
