@@ -5925,27 +5925,33 @@ function _scheduleMapUpdate() {
 }
 
 
-/* ──────────────────────────────────────────────
-   updateUserLocation
-   ────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════
+   updateUserLocation v3.0 — Rewritten for Lag-Free, Jitter-Free Tracking
+   ─────────────────────────────────────────────────────────────
+   • SensorFusionManager is the SINGLE source of truth
+   • Thin orchestrator: validate → fuse → render
+   • All rendering (marker + map) in ONE RAF callback
+   • Stationary state comes ONLY from sensorFusion
+   • Kalman speed used for ALL tier decisions
+   • Backward-compatible public API
+   ═══════════════════════════════════════════════════════════════ */
+
+/**
+ * Main entry point — backward compatible signature.
+ * Orchestrates: GPS validation → sensor fusion → render scheduling.
+ */
 function updateUserLocation(position, forceUpdate) {
     if (forceUpdate === undefined) forceUpdate = false;
 
     var now = performance.now();
+    var currentGen = (window._locationUpdateGeneration || 0) + 1;
+    window._locationUpdateGeneration = currentGen;
 
-    if (map && !window._interactionHandlersSetup) setupMapInteractionHandlers();
-
-    var coords = (position || {}).coords;
-    if (!coords || !Number.isFinite(coords.latitude) || !Number.isFinite(coords.longitude)) return;
-
-    var gpsAge = (Date.now() - (position.timestamp || 0)) / 1000;
-    if (!forceUpdate && gpsAge > 4.0) return;
-
+    // Clear any pending debounce
     if (window._debounceTimeoutId) {
         clearTimeout(window._debounceTimeoutId);
         window._debounceTimeoutId = null;
     }
-    window._locationUpdateGeneration = (window._locationUpdateGeneration || 0) + 1;
 
     // GPS timeout watchdog
     if (window._gpsTimeoutTimer) clearTimeout(window._gpsTimeoutTimer);
@@ -5956,52 +5962,115 @@ function updateUserLocation(position, forceUpdate) {
         }
     }, 30000);
 
-    var lat = coords.latitude;
-    var lng = coords.longitude;
-    var rawAccuracy = coords.accuracy || 20;
-    var rawHeading = coords.heading !== undefined && coords.heading !== null ? coords.heading : null;
-    var rawSpeedMPS = Math.max(0, coords.speed || 0);
+    // Setup map interaction handlers once
+    if (map && !window._interactionHandlersSetup) setupMapInteractionHandlers();
 
-    var currentTime = (position.timestamp && isFinite(position.timestamp))
-        ? position.timestamp
-        : Date.now();
+    // ── STEP 1: Validate and extract GPS fix ─────────────────────
+    var fix = _extractGPSFix(position, forceUpdate);
+    if (!fix) return;
 
     var lastPos = window.lastPosition;
     var timeDelta = (lastPos && window.lastUpdateTime)
-        ? (currentTime - window.lastUpdateTime) / 1000
+        ? (fix.timestamp - window.lastUpdateTime) / 1000
         : 0;
 
-    // ==========================================
-    // ERROR BOUNDARY WITH SAFE RECOVERY
-    // If we crash, we update the clock and raw position so the next tick
-    // sees a sane timeDelta and can properly reject impossible acceleration.
-    // We do NOT publish Kalman-smoothed or derived state.
-    // ==========================================
-    var newPosition = null;
-    
-    try {
+    // ── STEP 2: Handle gaps and seed velocity ────────────────────
+    _handleGPSGap(fix, lastPos, timeDelta);
 
-    // Long gap — soft re-init: preserve heading, seed velocity from displacement.
-    // Do NOT hard-reset the Kalman; let its own dt logic handle the gap.
-    if (timeDelta > 10 && timeDelta < 300 && lastPos) {
-        window.smoothedVelocity = {
-            lat: (lat - lastPos.lat) / timeDelta,
-            lng: (lng - lastPos.lng) / timeDelta
-        };
+    // ── STEP 3: Run sensor fusion (THE SINGLE SOURCE OF TRUTH) ───
+    var fusionResult = _runSensorFusion(fix, lastPos, timeDelta, forceUpdate);
+    if (!fusionResult) {
+        // Quality gate rejected this fix
+        window.lastUpdateTime = fix.timestamp;
+        return;
+    }
 
-        var sv = window.smoothedVelocity;
-        if (Math.abs(sv.lat) > 1e-8 || Math.abs(sv.lng) > 1e-8) {
-            var cosLat = Math.cos(lat * Math.PI / 180);
-            window._pendingKalmanSeedVelocity = {
-                vNorth: sv.lat * 111111,
-                vEast:  sv.lng * 111111 * cosLat
-            };
+    // ── STEP 4: Update global state from fusion result ───────────
+    _publishFusionState(fusionResult, fix);
+
+    // ── STEP 5: Compute proximity, speed tiers, look-ahead ───────
+    var renderState = _buildRenderState(fusionResult, fix, lastPos, timeDelta);
+
+    // ── STEP 6: Schedule unified render (marker + map in RAF) ────
+    _scheduleUnifiedRender(renderState);
+
+    // ── STEP 7: Update legacy state for backward compatibility ────
+    window.lastPosition = {
+        lat: fix.lat, lng: fix.lng,
+        accuracy: fix.accuracy,
+        heading: fusionResult.heading,
+        timestamp: fix.timestamp,
+        speedMPS: fusionResult.speedMPS
+    };
+    window.lastUpdateTime = fix.timestamp;
+    window.lastUpdateTimestamp = fix.timestamp;
+
+    // ── STEP 8: Dead reckoning control ────────────────────────────
+    _controlDeadReckoning(fusionResult);
+
+    // ── STEP 9: Final callbacks ───────────────────────────────────
+    if (typeof updateDistanceBox === 'function') {
+        updateDistanceBox(forceUpdate, window.lastPosition,
+            renderState.closestLocation, renderState.closestDistance);
+    }
+
+    if (typeof _ensureWillChange === 'function') _ensureWillChange();
+    if (typeof _scheduleWillChangeReset === 'function') _scheduleWillChangeReset();
+}
+
+/* ──────────────────────────────────────────────
+   STEP 1: GPS Fix Extraction & Validation
+   ────────────────────────────────────────────── */
+function _extractGPSFix(position, forceUpdate) {
+    var coords = (position || {}).coords;
+    if (!coords || !Number.isFinite(coords.latitude) || !Number.isFinite(coords.longitude)) {
+        return null;
+    }
+
+    var gpsAge = (Date.now() - (position.timestamp || 0)) / 1000;
+    if (!forceUpdate && gpsAge > 4.0) return null;
+
+    var rawHeading = coords.heading !== undefined && coords.heading !== null
+        ? coords.heading
+        : null;
+
+    return {
+        lat: coords.latitude,
+        lng: coords.longitude,
+        accuracy: coords.accuracy || 20,
+        heading: rawHeading,
+        speedMPS: Math.max(0, coords.speed || 0),
+        timestamp: (position.timestamp && isFinite(position.timestamp))
+            ? position.timestamp
+            : Date.now()
+    };
+}
+
+/* ──────────────────────────────────────────────
+   STEP 2: Gap Handling & Velocity Seeding
+   ────────────────────────────────────────────── */
+function _handleGPSGap(fix, lastPos, timeDelta) {
+    if (!lastPos) return;
+
+    // Small gap (10-300s): seed velocity from displacement, don't reset
+    if (timeDelta > 10 && timeDelta < 300) {
+        var dt = timeDelta;
+        var cosLat = Math.cos(fix.lat * Math.PI / 180);
+        var vNorth = ((fix.lat - lastPos.lat) / dt) * 111111;
+        var vEast = ((fix.lng - lastPos.lng) / dt) * 111111 * cosLat;
+
+        if (Math.abs(vNorth) > 0.1 || Math.abs(vEast) > 0.1) {
+            window.sensorFusion._kalmanFilter.scheduleVelocitySeed(vNorth, vEast);
         }
 
         window.isStationary = false;
         window.stationaryStartTime = null;
         window.stationaryLockPosition = null;
-    } else if (timeDelta >= 300 || !lastPos) {
+        return;
+    }
+
+    // Large gap (>300s) or first fix: full reset
+    if (timeDelta >= 300) {
         if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
             window.sensorFusion._kalmanFilter.reset();
         }
@@ -6010,175 +6079,322 @@ function updateUserLocation(position, forceUpdate) {
         window.stationaryStartTime = null;
         window.stationaryLockPosition = null;
     }
+}
 
-    newPosition = {
-        lat: lat, lng: lng,
-        accuracy: rawAccuracy,
-        heading: rawHeading,
-        timestamp: currentTime,
-        speedMPS: rawSpeedMPS
-    };
+/* ──────────────────────────────────────────────
+   STEP 3: Sensor Fusion (Single Source of Truth)
+   ────────────────────────────────────────────── */
+function _runSensorFusion(fix, lastPos, timeDelta, forceUpdate) {
+    if (!window.sensorFusion) {
+        // Fallback if sensor fusion not available
+        return {
+            lat: fix.lat, lng: fix.lng,
+            speedMPS: fix.speedMPS,
+            heading: fix.heading,
+            isConverged: false,
+            blendFactor: 0,
+            isFrozen: false,
+            vNorth: 0, vEast: 0
+        };
+    }
 
-    // Trust GPS doppler speed; only fall back to calculated speed when GPS reports null/very low.
-    var reliableSpeedMPS = rawSpeedMPS;
-    if ((!rawSpeedMPS || rawSpeedMPS < 0.3) && lastPos && timeDelta > 0.15 && timeDelta < 5.0) {
-        var dist = calculateDistance(lastPos, newPosition);
-        if (isFinite(dist) && !(dist > 20 && timeDelta < 1.0)) {
-            reliableSpeedMPS = Math.min(dist / timeDelta, 15);
+    var kf = window.sensorFusion._kalmanFilter;
+
+    // Handle large jumps (>50m or force update)
+    if (lastPos && !forceUpdate) {
+        var jumpDist = calculateDistance(lastPos, fix);
+        var dynamicThreshold = Math.max(50, fix.speedMPS * 3, fix.accuracy * 2.5);
+
+        if (jumpDist > dynamicThreshold) {
+            // Large jump: reset Kalman and use raw position
+            if (kf) kf.reset();
+            window.sensorFusion.smoothPosition(fix.lat, fix.lng, fix.accuracy,
+                fix.timestamp, fix.speedMPS, fix.heading);
+            return {
+                lat: fix.lat, lng: fix.lng,
+                speedMPS: fix.speedMPS,
+                heading: fix.heading,
+                isConverged: false,
+                blendFactor: 0,
+                isFrozen: false,
+                vNorth: 0, vEast: 0
+            };
         }
     }
 
-    window._modeSpeedEMA = window._modeSpeedEMA !== undefined ? window._modeSpeedEMA : reliableSpeedMPS;
-    window._modeSpeedEMA = 0.7 * reliableSpeedMPS + 0.3 * window._modeSpeedEMA;
-    var modeSpeedMPH = Math.min(window._modeSpeedEMA * 2.23694, 120);
+    // Normal path: run sensor fusion
+    var result = window.sensorFusion.smoothPosition(
+        fix.lat, fix.lng, fix.accuracy,
+        fix.timestamp, fix.speedMPS, fix.heading
+    );
 
-    window._visualSpeedEMA = window._visualSpeedEMA !== undefined ? window._visualSpeedEMA : reliableSpeedMPS;
-    window._visualSpeedEMA = 0.5 * reliableSpeedMPS + 0.5 * window._visualSpeedEMA;
-    var speedMPH = Math.min(window._visualSpeedEMA * 2.23694, 120);
-    var speedMPS = window._visualSpeedEMA;
+    // Reject impossible acceleration (only when not converged yet)
+    if (!result.isConverged && lastPos && timeDelta > 0 && timeDelta < 8) {
+        var lastSpeed = (lastPos.speedMPS || 0);
+        var accel = Math.abs(result.speedMPS - lastSpeed) / timeDelta;
+        var speedMPH = result.speedMPS * 2.23694;
 
+        if ((speedMPH < 3 && accel > 25) ||
+            (speedMPH < 8 && accel > 22) ||
+            (speedMPH < 15 && accel > 18) ||
+            (speedMPH < 45 && accel > 15) ||
+            (speedMPH < 80 && accel > 12) ||
+            (speedMPH >= 80 && accel > 10)) {
+            return null; // Reject this fix
+        }
+    }
+
+    return result;
+}
+
+/* ──────────────────────────────────────────────
+   STEP 4: Publish Fusion State Globally
+   ────────────────────────────────────────────── */
+function _publishFusionState(fusionResult, fix) {
+    // The canonical predicted position
+    window._predictedPosition = {
+        lat: fusionResult.lat,
+        lng: fusionResult.lng
+    };
+
+    // Velocity: zero when frozen, otherwise from fusion
+    if (fusionResult.isFrozen) {
+        window.smoothedVelocity = { lat: 0, lng: 0 };
+        window.isStationary = true;
+        window.stationaryLockPosition = { lat: fusionResult.lat, lng: fusionResult.lng };
+    } else {
+        var velDegPerSec = window.sensorFusion.getSmoothedVelocityDegPerSec();
+        window.smoothedVelocity = velDegPerSec;
+        window.isStationary = false;
+        window.stationaryLockPosition = null;
+    }
+
+    // Publish convergence state for UI
+    window._isKalmanConverged = fusionResult.isConverged;
+    window._kalmanBlendFactor = fusionResult.blendFactor;
+}
+
+/* ──────────────────────────────────────────────
+   STEP 5: Build Render State
+   ────────────────────────────────────────────── */
+function _buildRenderState(fusionResult, fix, lastPos, timeDelta) {
+    var speedMPS = fusionResult.speedMPS;
+    var speedMPH = speedMPS * 2.23694;
+
+    // ── Heading: use fusion result, with fallback ────────────────
+    var heading = fusionResult.heading || fix.heading;
+    if (heading == null && lastPos) heading = lastPos.heading;
+
+    // ── Look-ahead position ──────────────────────────────────────
+    var lookAheadSeconds = speedMPH < 3  ? 0.3 :
+                           speedMPH < 15 ? 0.3 + (speedMPH - 3) * 0.06 :
+                           speedMPH < 45 ? 1.0 + (speedMPH - 15) * 0.027 :
+                                          Math.min(2.5, 1.81 + (speedMPH - 45) * 0.02);
+
+    var velocity = window.smoothedVelocity;
+    var lookAheadPos = {
+        lat: fusionResult.lat + velocity.lat * lookAheadSeconds,
+        lng: fusionResult.lng + velocity.lng * lookAheadSeconds
+    };
+    window._lookAheadPos = lookAheadPos;
+
+    // ── Speed tier (using Kalman speed, not raw GPS) ─────────────
+    var tier = _computeSpeedTier(speedMPH, fix.accuracy);
+
+    // ── Direction change factor ──────────────────────────────────
+    var directionChangeFactor = 1.0;
+    if (lastPos && lastPos.heading != null && heading != null) {
+        var diff = Math.abs(heading - lastPos.heading);
+        if (diff > 180) diff = 360 - diff;
+        if (diff > 12) {
+            directionChangeFactor = Math.min(1.3, 1.0 + diff / 200);
+        }
+    }
+
+    // ── East-west movement flag ──────────────────────────────────
+    var eastWestMove = false;
+    if (lastPos && timeDelta > 0) {
+        var latMeters = Math.abs(fix.lat - lastPos.lat) * 111111;
+        var lngMeters = Math.abs(fix.lng - lastPos.lng) * 111111 * Math.cos(fix.lat * Math.PI / 180);
+        eastWestMove = lngMeters > latMeters * 1.2;
+    }
+    if (eastWestMove) {
+        tier.panDuration *= 0.88;
+        tier.easeLinearity *= 0.92;
+        tier.mapUpdateInterval = Math.max(33, tier.mapUpdateInterval * 0.88);
+        tier.minDistanceThreshold *= 0.92;
+    }
+
+    // ── Mode manager ─────────────────────────────────────────────
     var modeChanged = false;
     var isInCenteredMode = false;
     if (typeof ModeManager !== 'undefined' && ModeManager) {
-        modeChanged = ModeManager.update(modeSpeedMPH);
+        modeChanged = ModeManager.update(speedMPH);
         isInCenteredMode = ModeManager.isCentered();
     }
 
+    // ── Proximity calculations ───────────────────────────────────
+    var proximity = _computeProximity(fix, speedMPH);
+
+    // ── Inactivity timer ─────────────────────────────────────────
     if (speedMPH >= 1.0) {
         if (typeof _clearInactivityTimer === 'function') _clearInactivityTimer();
     } else {
         if (typeof _startInactivityTimer === 'function') _startInactivityTimer();
     }
 
-    // GPS recovery
+    // ── GPS recovery state ───────────────────────────────────────
     if (window.isGPSSearching) {
         window.isGPSSearching = false;
-        window.isStationary = false;
-        window.stationaryStartTime = null;
-        window.stationaryLockPosition = null;
-
-        if (lastPos && timeDelta > 0.5 && timeDelta < 120) {
-            var gapDist = calculateDistance(lastPos, newPosition);
-            if (isFinite(gapDist) && gapDist < 200) {
-                var velLat = (lat - lastPos.lat) / timeDelta;
-                var velLng = (lng - lastPos.lng) / timeDelta;
-                window.lastVelocity = { lat: velLat, lng: velLng };
-                window.smoothedVelocity = { lat: velLat, lng: velLng };
-            } else {
-                window.lastVelocity = { lat: 0, lng: 0 };
-                window.smoothedVelocity = { lat: 0, lng: 0 };
-            }
-        } else {
-            window.lastVelocity = { lat: 0, lng: 0 };
-            window.smoothedVelocity = { lat: 0, lng: 0 };
-        }
-
         if (typeof hideGPSSearchingState === 'function') hideGPSSearchingState();
     }
 
-    // Proximity calculations — Always recalculate
-    var closestDistance = Infinity;
-    var closestLocation = null;
-    var locationsWithDistance = [];
+    return {
+        position: { lat: fusionResult.lat, lng: fusionResult.lng },
+        lookAhead: lookAheadPos,
+        heading: heading,
+        speedMPS: speedMPS,
+        speedMPH: speedMPH,
+        isConverged: fusionResult.isConverged,
+        isFrozen: fusionResult.isFrozen,
+        timestamp: fix.timestamp,
+        tier: tier,
+        mapState: {
+            directionChangeFactor: directionChangeFactor,
+            eastWestMove: eastWestMove,
+            speedMPH: speedMPH,
+            modeSpeedMPH: speedMPH,
+            lookAheadSeconds: lookAheadSeconds,
+            isInCenteredMode: isInCenteredMode,
+            modeChanged: modeChanged
+        },
+        closestLocation: proximity.closestLocation,
+        closestDistance: proximity.closestDistance
+    };
+}
 
-    if (Array.isArray(window.gameLocations) && window.gameLocations.length) {
-        var speedFactor = Math.min(speedMPH / 15, 4);
-        var R = 0.015 + 0.01 * speedFactor;
-        for (var i = 0; i < window.gameLocations.length; i++) {
-            var loc = window.gameLocations[i];
-            if (!loc || !loc.lat || loc.lat < lat - R || loc.lat > lat + R ||
-                loc.lng < lng - R || loc.lng > lng + R) continue;
-            var dist2 = calculateDistance(newPosition, loc);
-            locationsWithDistance.push({ location: loc, distance: dist2 });
-            if (dist2 < closestDistance) { closestDistance = dist2; closestLocation = loc; }
+/* ──────────────────────────────────────────────
+   STEP 6: Unified Render (Marker + Map in RAF)
+   ────────────────────────────────────────────── */
+function _scheduleUnifiedRender(renderState) {
+    // Store state for RAF callback
+    window._currentRenderState = renderState;
+    window._currentSpeedTier = renderState.tier;
+    window._currentMapState = renderState.mapState;
+
+    if (window._mapUpdateScheduled) return;
+    window._mapUpdateScheduled = true;
+
+    window._nextLocationUpdateRAF = requestAnimationFrame(function() {
+        try {
+            _executeRender(window._currentRenderState);
+        } finally {
+            window._mapUpdateScheduled = false;
+            window._nextLocationUpdateRAF = null;
         }
-    }
+    });
+}
 
-    window._lastClosestDistance = closestDistance;
-    window._lastClosestLocation = closestLocation;
+function _executeRender(state) {
+    if (!state) return;
 
-    window.proximityState = (closestLocation && closestDistance !== Infinity)
-        ? { closestLocation: closestLocation, distanceMeters: closestDistance } : null;
-
-    if (locationsWithDistance.length &&
-        (!window._lastCacheUpdate || (currentTime - window._lastCacheUpdate) > 5000)) {
-        var cacheFn = window.enterpriseCacheManager && window.enterpriseCacheManager.cacheLocationData;
-        if (cacheFn) {
-            for (var j = 0; j < locationsWithDistance.length; j++) {
-                if (locationsWithDistance[j].distance <= 100) {
-                    cacheFn(locationsWithDistance[j].location, newPosition);
-                }
-            }
-        }
-        window._lastCacheUpdate = currentTime;
-    }
-
-    // First fix
-    if (!lastPos) {
-        _initializeUserLocationState(newPosition, currentTime, forceUpdate);
+    // Safety: if state wasn't published yet, bail
+    var tier = state.tier;
+    var mapState = state.mapState;
+    if (!tier || !mapState) {
+        window.lastMapUpdateTime = Date.now();
         return;
     }
 
-    var distance = calculateDistance(lastPos, newPosition);
-    var latMeters = Math.abs(lat - lastPos.lat) * 111111;
-    var lngMeters = Math.abs(lng - lastPos.lng) * 111111 * Math.cos(lat * Math.PI / 180);
-    var eastWestMove = lngMeters > latMeters * 1.2;
+    // PINCH-ZOOM HAS EXCLUSIVE PRIORITY
+    if (window.isMapInteracting) {
+        window.lastMapUpdateTime = Date.now();
+        return;
+    }
 
-    // Reject impossible acceleration
-    if (timeDelta > 0 && timeDelta < 8) {
-        var lastSpeedMPH = (lastPos.speedMPS || 0) * 2.23694;
-        var accel = Math.abs(speedMPH - lastSpeedMPH) / timeDelta;
-        if ((speedMPH <  3  && accel > 25) ||
-            (speedMPH <  8  && accel > 22) ||
-            (speedMPH < 15  && accel > 18) ||
-            (speedMPH < 45  && accel > 15) ||
-            (speedMPH < 80  && accel > 12) ||
-            (speedMPH >= 80 && accel > 10)) {
-            window.lastUpdateTime = currentTime;
-            return;
+    // PROXIMITY ZOOM
+    if (window._isProximityZoomAnimating) {
+        if (typeof _handleProximityZoomLogic === 'function') {
+            _handleProximityZoomLogic(mapState.modeSpeedMPH, mapState.eastWestMove);
+        }
+        window.lastMapUpdateTime = Date.now();
+        return;
+    }
+
+    // Normal proximity zoom evaluation
+    if (typeof _handleProximityZoomLogic === 'function') {
+        _handleProximityZoomLogic(mapState.modeSpeedMPH, mapState.eastWestMove);
+    }
+
+    // ── UPDATE MARKER (now in same frame as map) ────────────────
+    if (typeof userMarker !== 'undefined' && userMarker) {
+        var markerEl = userMarker.getElement ? userMarker.getElement() : null;
+        if (markerEl) {
+            var isOrangeAccuracy = state.position.accuracy >= 20 && state.position.accuracy < 50;
+            var transitionVal = isOrangeAccuracy ? 'transform 200ms ease-out' : 'none';
+            markerEl.style.transition = transitionVal;
+            var iconEl = markerEl.querySelector('.user-marker-icon');
+            if (iconEl) iconEl.style.transition = transitionVal;
+        }
+        userMarker.setLatLng([state.position.lat, state.position.lng]);
+    }
+
+    // ── UPDATE MAP ───────────────────────────────────────────────
+    if (!map || !window.followUser) {
+        window.lastMapUpdateTime = Date.now();
+        return;
+    }
+
+    var panPos = state.lookAhead || state.position;
+    if (!panPos) {
+        window.lastMapUpdateTime = Date.now();
+        return;
+    }
+
+    var shouldUpdateMap = (Date.now() - (window.lastMapUpdateTime || 0)) > tier.mapUpdateInterval ||
+        mapState.isInCenteredMode || mapState.modeChanged;
+
+    if (shouldUpdateMap) {
+        if (mapState.isInCenteredMode) {
+            _panMapToCenter(panPos, tier, mapState.directionChangeFactor,
+                mapState.eastWestMove, mapState.speedMPH, mapState.lookAheadSeconds);
+        } else {
+            map.panTo([panPos.lat, panPos.lng], {
+                animate: true,
+                duration: Math.max(0.08, tier.panDuration),
+                easeLinearity: tier.easeLinearity,
+                noMoveStart: true
+            });
         }
     }
 
-    // Heading fusion
-    var fusedHeading = window.sensorFusion
-        ? window.sensorFusion.getHeading(rawHeading, speedMPS)
-        : rawHeading;
+    window.lastMapUpdateTime = Date.now();
+}
 
-    var validatedHeading = fusedHeading;
-    var lastHeading = lastPos.heading !== undefined && lastPos.heading !== null ? lastPos.heading : null;
-    var isMoving = window.sensorFusion
-        ? window.sensorFusion.isDeviceMoving(rawSpeedMPS)
-        : (speedMPS > 0.5);
+/* ──────────────────────────────────────────────
+   STEP 7: Dead Reckoning Control
+   ────────────────────────────────────────────── */
+function _controlDeadReckoning(fusionResult) {
+    if (!window.deadReckoning) return;
 
-    if (lastHeading !== null && fusedHeading !== null) {
-        var diff = Math.abs(fusedHeading - lastHeading);
-        if (diff > 180) diff = 360 - diff;
-        if (!isMoving && speedMPS < 1.0 && diff > 90) {
-            validatedHeading = lastHeading;
-        }
+    var shouldRun = !fusionResult.isFrozen &&
+                    !window.isLocationHuntVisible &&
+                    fusionResult.speedMPS >= 0.15;
+
+    if (shouldRun && !window.deadReckoning.isActive()) {
+        window.deadReckoning.start();
+    } else if (!shouldRun && window.deadReckoning.isActive()) {
+        window.deadReckoning.stop();
     }
+}
 
-    var displayHeading = validatedHeading;
-    if (lastHeading !== null && validatedHeading !== null &&
-        Math.abs(validatedHeading - lastHeading) > 180) {
-        displayHeading = validatedHeading < lastHeading
-            ? validatedHeading + 360
-            : validatedHeading - 360;
-    }
-
-    var headingDiff = 0;
-    var directionChangeFactor = 1.0;
-    if (lastHeading !== null && validatedHeading !== null) {
-        headingDiff = Math.abs(validatedHeading - lastHeading);
-        if (headingDiff > 180) headingDiff = 360 - headingDiff;
-        if (headingDiff > 12) {
-            directionChangeFactor = Math.min(1.3, 1.0 + headingDiff / 200);
-        }
-    }
-
-    // Speed tiers
+/* ──────────────────────────────────────────────
+   HELPER: Speed Tier Computation
+   ────────────────────────────────────────────── */
+function _computeSpeedTier(speedMPH, rawAccuracy) {
     var panDuration, easeLinearity, mapUpdateInterval, mapUpdateDistance,
         maxAccuracy, minDistThreshold, maxSpeedThreshold;
+
     if (speedMPH >= 65) {
         panDuration = 0.08; easeLinearity = 0.28; mapUpdateInterval = 80;
         mapUpdateDistance = 12.0; maxAccuracy = 18; minDistThreshold = 2.0; maxSpeedThreshold = 160;
@@ -6199,14 +6415,14 @@ function updateUserLocation(position, forceUpdate) {
         mapUpdateDistance = 2.0; maxAccuracy = 32; minDistThreshold = 0.25; maxSpeedThreshold = 3;
     }
 
-    // Extended orange accuracy scaling (20m and up, capped at 3.5x)
+    // Extended orange accuracy scaling
     if (rawAccuracy >= 20) {
-        var _noiseScale = Math.min(3.5, 1.0 + (rawAccuracy - 20) / 30);
-        mapUpdateDistance *= _noiseScale;
-        minDistThreshold  *= _noiseScale;
+        var noiseScale = Math.min(3.5, 1.0 + (rawAccuracy - 20) / 30);
+        mapUpdateDistance *= noiseScale;
+        minDistThreshold *= noiseScale;
     }
 
-    var speedTier = {
+    return {
         panDuration: panDuration,
         easeLinearity: easeLinearity,
         mapUpdateInterval: Math.max(33, mapUpdateInterval),
@@ -6215,379 +6431,113 @@ function updateUserLocation(position, forceUpdate) {
         minDistanceThreshold: minDistThreshold,
         maxSpeedThreshold: maxSpeedThreshold
     };
+}
 
-    if (eastWestMove) {
-        speedTier.panDuration *= 0.88;
-        speedTier.easeLinearity *= 0.92;
-        speedTier.mapUpdateInterval = Math.max(33, speedTier.mapUpdateInterval * 0.88);
-        speedTier.minDistanceThreshold *= 0.92;
-    }
+/* ──────────────────────────────────────────────
+   HELPER: Proximity Calculations
+   ────────────────────────────────────────────── */
+function _computeProximity(fix, speedMPH) {
+    var closestDistance = Infinity;
+    var closestLocation = null;
+    var locationsWithDistance = [];
 
-    // Publish speed tier globally for RAF live reading
-    window._currentSpeedTier = speedTier;
+    if (Array.isArray(window.gameLocations) && window.gameLocations.length) {
+        var speedFactor = Math.min(speedMPH / 15, 4);
+        var R = 0.015 + 0.01 * speedFactor;
 
-    // Accuracy-aware jump threshold
-    var dynamicJumpThreshold = Math.max(50, speedMPS * 3, rawAccuracy * 2.5);
+        for (var i = 0; i < window.gameLocations.length; i++) {
+            var loc = window.gameLocations[i];
+            if (!loc || !loc.lat || loc.lat < fix.lat - R || loc.lat > fix.lat + R ||
+                loc.lng < fix.lng - R || loc.lng > fix.lng + R) continue;
 
-    if (distance > dynamicJumpThreshold || forceUpdate) {
-        // Isolate large jump handling — if it throws, don't poison our state
-        try {
-            _handleLargeDistanceJump(newPosition, currentTime);
-        } catch (jumpErr) {
-            if (typeof console !== 'undefined' && console.warn) {
-                console.warn('[updateUserLocation] Large jump handler error:', jumpErr);
+            var dist = calculateDistance(fix, loc);
+            locationsWithDistance.push({ location: loc, distance: dist });
+            if (dist < closestDistance) {
+                closestDistance = dist;
+                closestLocation = loc;
             }
         }
-        window.lastUpdateTime = currentTime;
-        if (typeof updateDistanceBox === 'function')
-            updateDistanceBox(forceUpdate, newPosition, closestLocation, closestDistance);
-        return;
     }
 
-    // ── Stationary detection — Dynamic threshold ──
-    var STAT_THRESHOLD = Math.max(3.0, rawAccuracy * 0.4);
-    var STAT_CONFIRM_MS = 2000;
-    var FAST_EXIT_DIST = 3.0;
-    var FAST_EXIT_SPEED = 1.0;
-
-    var isStationaryLocked = window.isStationary && window.stationaryLockPosition;
-    var isDeviceMoving = window.lastValidPosition && window.lastValidPosition.isMoving !== undefined
-        ? window.lastValidPosition.isMoving
+    window._lastClosestDistance = closestDistance;
+    window._lastClosestLocation = closestLocation;
+    window.proximityState = (closestLocation && closestDistance !== Infinity)
+        ? { closestLocation: closestLocation, distanceMeters: closestDistance }
         : null;
 
-    if (isStationaryLocked) {
-        var shouldBreakLock = false;
-
-        if (isDeviceMoving === true && distance >= 1.0) {
-            shouldBreakLock = true;
-        } else if (isDeviceMoving === null) {
-            var calcSpeed = timeDelta > 0 ? distance / timeDelta : 0;
-            if (distance >= FAST_EXIT_DIST && calcSpeed >= FAST_EXIT_SPEED) {
-                shouldBreakLock = true;
-            }
-        } else if (isDeviceMoving === false) {
-            var calcSpeed2 = timeDelta > 0 ? distance / timeDelta : 0;
-            if (distance >= FAST_EXIT_DIST * 2 && calcSpeed2 >= FAST_EXIT_SPEED * 1.25) {
-                shouldBreakLock = true;
+    // Cache nearby locations
+    if (locationsWithDistance.length &&
+        (!window._lastCacheUpdate || (fix.timestamp - window._lastCacheUpdate) > 5000)) {
+        var cacheFn = window.enterpriseCacheManager && window.enterpriseCacheManager.cacheLocationData;
+        if (cacheFn) {
+            for (var j = 0; j < locationsWithDistance.length; j++) {
+                if (locationsWithDistance[j].distance <= 100) {
+                    cacheFn(locationsWithDistance[j].location, fix);
+                }
             }
         }
-
-        if (shouldBreakLock) {
-            window.isStationary = false;
-            window.stationaryLockPosition = null;
-            window.stationaryStartTime = null;
-            window._stationaryNudgeAnchor = null;
-
-            if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
-                var kf = window.sensorFusion._kalmanFilter;
-                var breakoutSpeed = timeDelta > 0 ? distance / timeDelta : 0;
-                if (breakoutSpeed > 0.3 && validatedHeading !== null) {
-                    var rad = validatedHeading * Math.PI / 180;
-                    kf.seedVelocity(
-                        breakoutSpeed * Math.cos(rad),
-                        breakoutSpeed * Math.sin(rad),
-                        15.0
-                    );
-                } else {
-                    kf.reset();
-                }
-                kf._justInitialized = true;
-            }
-
-            window.smoothedVelocity = timeDelta > 0
-                ? { lat: (lat - lastPos.lat) / timeDelta, lng: (lng - lastPos.lng) / timeDelta }
-                : { lat: 0, lng: 0 };
-
-            window.lastPosition = newPosition;
-            window.lastUpdateTime = currentTime;
-            window.lastUpdateTimestamp = currentTime;
-
-            var buffer = window.positionBuffer;
-            if (buffer && buffer.length > 0) {
-                var staleCutoff = currentTime - 10000;
-                while (buffer.length > 0 && (buffer[0].timestamp || 0) < staleCutoff) {
-                    buffer.shift();
-                }
-                if (buffer.length === 0 && typeof seedPositionBuffer === 'function') {
-                    seedPositionBuffer(newPosition, 2);
-                }
-            }
-
-            if (window.deadReckoning && typeof window.deadReckoning.onMovementResumed === 'function') {
-                window.deadReckoning.onMovementResumed();
-            }
-
-        } else {
-            var distFromLock = calculateDistance(window.stationaryLockPosition, newPosition);
-            if (distFromLock < 2.0 && newPosition.accuracy < lastPos.accuracy * 0.7) {
-                scheduleMarkerUpdate(lat, lng, { animate: true, duration: 0.4, easeLinearity: 0.06 });
-
-                if (!window._stationaryNudgeAnchor) {
-                    window._stationaryNudgeAnchor = {
-                        lat: window.stationaryLockPosition.lat,
-                        lng: window.stationaryLockPosition.lng
-                    };
-                }
-                var distFromAnchor = calculateDistance(window._stationaryNudgeAnchor, newPosition);
-                if (distFromAnchor < 1.0) {
-                    window.stationaryLockPosition = { lat: lat, lng: lng };
-                }
-            }
-            window.lastPosition = newPosition;
-            window.lastUpdateTime = currentTime;
-            window.lastUpdateTimestamp = currentTime;
-            if (typeof updateDistanceBox === 'function')
-                updateDistanceBox(forceUpdate, newPosition, closestLocation, closestDistance);
-            return;
-        }
+        window._lastCacheUpdate = fix.timestamp;
     }
 
-    // Check if the user has become stationary
-    var isEffectivelyStill = isDeviceMoving === false
-        ? (distance < STAT_THRESHOLD * 2)
-        : (distance < STAT_THRESHOLD);
+    return { closestLocation, closestDistance };
+}
 
-    if (isEffectivelyStill) {
-        if (!window.stationaryStartTime) window.stationaryStartTime = currentTime;
-        var confirmTime = (isDeviceMoving === false) ? 800 : STAT_CONFIRM_MS;
+/* ──────────────────────────────────────────────
+   HELPER: First Fix Initialization
+   ────────────────────────────────────────────── */
+function _initializeUserLocationState(position, timestamp, forceUpdate) {
+    // This is called on the very first GPS fix
+    // Run it through the normal flow
+    window.lastPosition = null;
+    window.lastUpdateTime = null;
+    updateUserLocation({ coords: position, timestamp: timestamp }, forceUpdate);
+}
 
-        if (currentTime - window.stationaryStartTime >= confirmTime) {
-            _confirmStationary(newPosition, currentTime);
-            if (typeof _cleanupMarkerStyles === 'function') _cleanupMarkerStyles();
-            window.lastUpdateTime = currentTime;
-            return;
-        }
-
-        if (distance > 0.3) {
-            scheduleMarkerUpdate(lat, lng, { animate: true, duration: 0.5, easeLinearity: 0.06 });
-        }
-
-        window.lastPosition = newPosition;
-        window.lastUpdateTime = currentTime;
-        if (typeof updateDistanceBox === 'function')
-            updateDistanceBox(forceUpdate, newPosition, closestLocation, closestDistance);
-        return;
+/* ──────────────────────────────────────────────
+   HELPER: Large Distance Jump Handler
+   ────────────────────────────────────────────── */
+function _handleLargeDistanceJump(position, timestamp) {
+    // Legacy handler — now integrated into _runSensorFusion
+    // Kept for backward compatibility if called externally
+    if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
+        window.sensorFusion._kalmanFilter.reset();
     }
-
-    // Actively moving — clear stationary state
-    window.stationaryStartTime = null;
+    window.smoothedVelocity = { lat: 0, lng: 0 };
     window.isStationary = false;
     window.stationaryLockPosition = null;
+    window.stationaryStartTime = null;
 
-    // Restart dead reckoning
-    if (!window.isStationary && speedMPS >= 0.15 && window.deadReckoning &&
-        typeof window.deadReckoning.start === 'function' &&
-        !window.deadReckoning.isActive()) {
-        window.deadReckoning.start();
-    }
-
-    // Quality gates
-    if (!forceUpdate) {
-        if (newPosition.accuracy > speedTier.maxAccuracy * 3) {
-            window.lastUpdateTime = currentTime;
-            return;
-        }
-        if (distance < speedTier.minDistanceThreshold) {
-            window.lastPosition = newPosition;
-            window.lastUpdateTime = currentTime;
-            if (typeof updateDistanceBox === 'function')
-                updateDistanceBox(forceUpdate, newPosition, closestLocation, closestDistance);
-            return;
-        }
-        if (timeDelta > 0 && distance / timeDelta > speedTier.maxSpeedThreshold) {
-            window.lastUpdateTime = currentTime;
-            return;
-        }
-    }
-
-    // ── Kalman smoothing and shared prediction publication ──
-    var kalmanResult = null;
-    if (window.sensorFusion) {
-        kalmanResult = window.sensorFusion.smoothPosition(
-            lat, lng, rawAccuracy, currentTime, rawSpeedMPS, validatedHeading
-        );
-    }
-
-    var smoothedPosition = kalmanResult || {
-        lat: lat, lng: lng,
-        accuracy: rawAccuracy,
-        heading: validatedHeading,
-        timestamp: currentTime,
-        speedMPS: speedMPS
+    window.lastPosition = {
+        lat: position.lat, lng: position.lng,
+        accuracy: position.accuracy || 20,
+        heading: position.heading,
+        timestamp: timestamp,
+        speedMPS: position.speedMPS || 0
     };
+    window.lastUpdateTime = timestamp;
+    window.lastUpdateTimestamp = timestamp;
 
-    // Publish the Kalman-smoothed position as the canonical prediction
-    window._predictedPosition = { lat: smoothedPosition.lat, lng: smoothedPosition.lng };
-    window._predictedPositionTime = currentTime;
-
-    var kalmanVelocity = window.sensorFusion
-        ? window.sensorFusion.getSmoothedVelocityDegPerSec()
-        : (window.smoothedVelocity || { lat: 0, lng: 0 });
-    window.smoothedVelocity = kalmanVelocity;
-
-    // Calculate look-ahead position with velocity extrapolation
-    var lookAheadSeconds = speedMPH < 3  ? 0.3 :
-                           speedMPH < 15 ? 0.3 + (speedMPH - 3) * 0.06 :
-                           speedMPH < 45 ? 1.0 + (speedMPH - 15) * 0.027 :
-                                          Math.min(2.5, 1.81 + (speedMPH - 45) * 0.02);
-
-    window._lookAheadPos = {
-        lat: smoothedPosition.lat + kalmanVelocity.lat * lookAheadSeconds,
-        lng: smoothedPosition.lng + kalmanVelocity.lng * lookAheadSeconds
-    };
-
-    // Publish ALL map state globally for zero-stale-closure RAF reading
-    window._currentMapState = {
-        directionChangeFactor: directionChangeFactor,
-        eastWestMove: eastWestMove,
-        speedMPH: speedMPH,
-        modeSpeedMPH: modeSpeedMPH,
-        lookAheadSeconds: lookAheadSeconds,
-        isInCenteredMode: isInCenteredMode,
-        modeChanged: modeChanged
-    };
-
-    // Synchronous marker update — uses Kalman-smoothed position (no extrapolation)
-    // Isolated in try/catch so marker failure doesn't kill the GPS loop
-    try {
-        var displayPos = window._predictedPosition;
-        if (userMarker) {
-            var markerEl = userMarker.getElement ? userMarker.getElement() : null;
-            if (markerEl) {
-                var _orangeAccuracy = rawAccuracy >= 20 && rawAccuracy < 50;
-                var _transitionVal = _orangeAccuracy ? 'transform 200ms ease-out' : 'none';
-                markerEl.style.transition = _transitionVal;
-                var iconEl = markerEl.querySelector('.user-marker-icon');
-                if (iconEl) iconEl.style.transition = _transitionVal;
-            }
-            userMarker.setLatLng([displayPos.lat, displayPos.lng]);
-        }
-    } catch (markerErr) {
-        if (typeof console !== 'undefined' && console.warn) {
-            console.warn('[MarkerUpdate] setLatLng failed:', markerErr);
-        }
+    if (typeof userMarker !== 'undefined' && userMarker) {
+        userMarker.setLatLng([position.lat, position.lng]);
     }
 
-    if (typeof _ensureWillChange === 'function') _ensureWillChange();
-    if (typeof _scheduleWillChangeReset === 'function') _scheduleWillChangeReset();
-
-    // ================================================================
-    // RAF COALESCING WITH ZERO STALE CLOSURES
-    // All state read from window. No captured variables.
-    // finally() guarantees flag reset even if callback throws —
-    // prevents deadlock without top-level cancellation overhead.
-    // ================================================================
-    if (!window._mapUpdateScheduled) {
-        window._mapUpdateScheduled = true;
-
-        window._nextLocationUpdateRAF = requestAnimationFrame(function() {
-            // FINALLY GUARANTEE: flag always resets, preventing deadlock
-            try {
-                // Read ALL state live from window — zero closures
-                var state = window._currentMapState;
-                var tier = window._currentSpeedTier;
-
-                // Safety: if state wasn't published yet, bail
-                if (!state || !tier) {
-                    window.lastMapUpdateTime = Date.now();
-                    return;
-                }
-
-                // PINCH-ZOOM HAS EXCLUSIVE PRIORITY
-                // When fingers are on screen, we touch NOTHING
-                if (window.isMapInteracting) {
-                    window.lastMapUpdateTime = Date.now();
-                    return;
-                }
-
-                // PROXIMITY ZOOM: Only runs when NOT interacting
-                // Stuck-flag escape hatch always allowed
-                if (window._isProximityZoomAnimating) {
-                    if (typeof _handleProximityZoomLogic === 'function') {
-                        _handleProximityZoomLogic(state.modeSpeedMPH, state.eastWestMove);
-                    }
-                    window.lastMapUpdateTime = Date.now();
-                    return;
-                }
-
-                // Normal proximity zoom evaluation
-                if (typeof _handleProximityZoomLogic === 'function') {
-                    _handleProximityZoomLogic(state.modeSpeedMPH, state.eastWestMove);
-                }
-
-                // Map panning only if following user and map exists
-                if (!map || !window.followUser) {
-                    window.lastMapUpdateTime = Date.now();
-                    return;
-                }
-
-                // Use look-ahead position for map panning (velocity extrapolation)
-                // Use predicted position as fallback
-                var panPos = window._lookAheadPos || window._predictedPosition;
-                if (!panPos) {
-                    window.lastMapUpdateTime = Date.now();
-                    return;
-                }
-
-                var shouldUpdateMap = (Date.now() - (window.lastMapUpdateTime || 0)) > tier.mapUpdateInterval ||
-                    state.isInCenteredMode || state.modeChanged;
-
-                if (shouldUpdateMap) {
-                    if (state.isInCenteredMode) {
-                        _panMapToCenter(panPos, tier, state.directionChangeFactor,
-                            state.eastWestMove, state.speedMPH, state.lookAheadSeconds);
-                    } else {
-                        map.panTo([panPos.lat, panPos.lng], {
-                            animate: true,
-                            duration: Math.max(0.08, tier.panDuration),
-                            easeLinearity: tier.easeLinearity,
-                            noMoveStart: true
-                        });
-                    }
-                }
-
-                window.lastMapUpdateTime = Date.now();
-            } finally {
-                window._mapUpdateScheduled = false;
-                window._nextLocationUpdateRAF = null;
-            }
-        });
+    if (window.deadReckoning && typeof window.deadReckoning.stop === 'function') {
+        window.deadReckoning.stop();
     }
-    // ================================================================
+}
 
-    // Update state synchronously
-    window.lastPosition = newPosition;
-    window.lastVelocity = window.smoothedVelocity;
-    window.lastUpdateTime = currentTime;
-    window.lastUpdateTimestamp = currentTime;
+/* ──────────────────────────────────────────────
+   LEGACY: _confirmStationary (kept for compatibility)
+   ────────────────────────────────────────────── */
+function _confirmStationary(position, timestamp) {
+    // DEPRECATED: Stationary handling is now done entirely by SensorFusionManager
+    // This function is kept for backward compatibility but does nothing
+    window.isStationary = true;
+    window.stationaryLockPosition = { lat: position.lat, lng: position.lng };
+    window.stationaryStartTime = timestamp;
 
-    // Final DR restart check
-    if (!window.isLocationHuntVisible &&
-        speedMPS >= 0.15 &&
-        window.deadReckoning &&
-        typeof window.deadReckoning.start === 'function' &&
-        !window.deadReckoning.isActive()) {
-        window.deadReckoning.start();
-    }
-
-    if (typeof updateDistanceBox === 'function') {
-        updateDistanceBox(forceUpdate, newPosition, closestLocation, closestDistance);
-    }
-
-    } catch (err) {
-        if (typeof console !== 'undefined' && console.error) {
-            console.error('[updateUserLocation] Error caught, recovering with raw GPS to prevent time-warp:', err);
-        }
-        // CRITICAL: Update the clock so the next tick doesn't falsely trigger
-        // the "Long gap" velocity seeding logic with an accumulated timeDelta.
-        window.lastUpdateTime = currentTime;
-        
-        // CRITICAL: Update lastPosition to the raw GPS fix so the next tick's
-        // "Reject impossible acceleration" logic can correctly identify bounces.
-        // newPosition is validated (finite coords checked at top), so this is safe.
-        if (newPosition) {
-            window.lastPosition = newPosition;
-        }
+    if (window.deadReckoning && typeof window.deadReckoning.stop === 'function') {
+        window.deadReckoning.stop();
     }
 }
         
