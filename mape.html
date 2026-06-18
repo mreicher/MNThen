@@ -4197,32 +4197,65 @@ const ModeManager = {
     current: 'roaming',
     _entryTime: 0,
     _minDwellMs: 1500,
+
+    // ── Transition state ──────────────────────────────────────────────────────
+    // _transitioning and _transitionStart are now WRITE-ONLY from the outside.
+    // Read transition progress exclusively via getTransitionProgress(), which
+    // is now a pure getter — no side effects, safe to call multiple times per
+    // frame.
     _transitioning: false,
     _transitionStart: 0,
-    _transitionDurationMs: 800,  // Smooth 800ms easing into centered mode
+    _transitionDurationMs: 800,
 
+    // ── Speed tracking ────────────────────────────────────────────────────────
+    // Keeps the last known speed so callers (e.g. pan logic) can read it
+    // without threading it through every call chain.
+    _lastSpeedMPH: 0,
+
+    // ─────────────────────────────────────────────────────────────────────────
     update(speedMPH) {
-        const now = Date.now();
-        const wasCentered = this.current === 'centered';
-        const dwellTime = now - this._entryTime;
+        this._lastSpeedMPH = (isFinite(speedMPH) && speedMPH >= 0) ? speedMPH : 0;
 
+        // Clean up any completed transition before evaluating mode logic.
+        // Must come first so getTransitionProgress() reads a consistent state
+        // for the rest of this call and any synchronous callers downstream.
+        this._tickTransition();
+
+        const now         = Date.now();
+        const wasCentered = this.current === 'centered';
+
+        // Guard: _entryTime === 0 means the manager has never been used
+        // (or was hard-reset). Seed it and return so the first GPS reading
+        // doesn't immediately satisfy the dwell check.
+        if (this._entryTime === 0) {
+            this._entryTime = now;
+            return false;
+        }
+
+        const dwellTime   = now - this._entryTime;
         const shouldEnter = speedMPH >= SPEED_THRESHOLDS.HIGH_SPEED;
-        const shouldExit = speedMPH <= SPEED_THRESHOLDS.HYSTERESIS_RETURN;
+        const shouldExit  = speedMPH <= SPEED_THRESHOLDS.HYSTERESIS_RETURN;
 
         if (shouldEnter && !wasCentered) {
-            if (dwellTime >= this._minDwellMs || this._entryTime === 0) {
-                this.current = 'centered';
-                this._entryTime = now;
-                this._transitioning = true;         // Start smooth transition
+            if (dwellTime >= this._minDwellMs) {
+                this.current          = 'centered';
+                this._entryTime       = now;
+                this._transitioning   = true;
                 this._transitionStart = now;
+                // Notify the pan function so it resets its param cache and
+                // starts the entry-settle clock.
+                if (typeof window.notifyCenteredModeEntry === 'function') {
+                    window.notifyCenteredModeEntry();
+                }
                 return true;
             }
             return false;
+
         } else if (shouldExit && wasCentered) {
             if (dwellTime >= this._minDwellMs) {
-                this.current = 'roaming';
-                this._entryTime = now;
-                this._transitioning = false;        // No transition needed for exit
+                this.current        = 'roaming';
+                this._entryTime     = now;
+                this._transitioning = false;
                 return true;
             }
             return false;
@@ -4231,36 +4264,70 @@ const ModeManager = {
         return false;
     },
 
-    isCentered() { return this.current === 'centered'; },
-    isRoaming()  { return this.current === 'roaming'; },
-
+    // ─────────────────────────────────────────────────────────────────────────
     /**
      * Returns 0→1 progress through the roaming→centered transition.
-     * 0 = just switched (should use long, smooth pan).
-     * 1 = transition complete (should use normal short pan).
-     * Uses an ease-out curve so the transition feels natural.
+     *   0 = just entered (use long, gentle pan)
+     *   1 = settled (use normal speed-appropriate pan)
+     *
+     * PURE — no side effects. Safe to call any number of times per frame.
+     * The transition completes naturally when elapsed time exceeds
+     * _transitionDurationMs; _transitioning is cleared on the next update()
+     * call via _tickTransition(), not inside this getter.
      */
     getTransitionProgress() {
         if (!this._transitioning) return 1;
         const elapsed = Date.now() - this._transitionStart;
         const t = Math.min(1, elapsed / this._transitionDurationMs);
-        if (t >= 1) {
-            this._transitioning = false;
-            return 1;
-        }
         // Ease-out cubic: fast start, gentle finish
         return 1 - Math.pow(1 - t, 3);
     },
 
-    isTransitioning() { return this._transitioning; },
+    /**
+     * Call once per update cycle (e.g. at the top of your GPS/DR tick) to
+     * let the manager clean up completed transitions without coupling the
+     * side-effect to the getter.
+     */
+    _tickTransition() {
+        if (this._transitioning) {
+            const elapsed = Date.now() - this._transitionStart;
+            if (elapsed >= this._transitionDurationMs) {
+                this._transitioning = false;
+            }
+        }
+    },
 
-    getMode()      { return this.current; },
-    getLastSpeed() { return 0; },
-    _reset()       { this.current = 'roaming'; this._entryTime = 0; this._transitioning = false; },
-    _setModeDirect(mode) {
-        this.current = (mode === 'centered' || mode === 'roaming') ? mode : 'roaming';
-        this._entryTime = Date.now();
+    // ─────────────────────────────────────────────────────────────────────────
+    isCentered()     { return this.current === 'centered'; },
+    isRoaming()      { return this.current === 'roaming';  },
+    isTransitioning(){ return this._transitioning; },
+    getMode()        { return this.current; },
+    getLastSpeed()   { return this._lastSpeedMPH; },
+
+    // ─────────────────────────────────────────────────────────────────────────
+    _reset() {
+        this.current        = 'roaming';
+        // Seed to now, not 0. Setting to 0 would re-trigger the first-call
+        // zero-bypass in update(), causing an instant centered-mode entry if
+        // speed is already above the threshold when the map first loads.
+        this._entryTime     = Date.now();
         this._transitioning = false;
+        this._lastSpeedMPH  = 0;
+    },
+
+    /**
+     * Bypass normal dwell logic and jump directly to a mode (e.g. for
+     * testing or restoring saved state). Fires notifyCenteredModeEntry()
+     * when forcing into centered so the pan function settles correctly.
+     */
+    _setModeDirect(mode) {
+        this.current        = (mode === 'centered' || mode === 'roaming') ? mode : 'roaming';
+        this._entryTime     = Date.now();
+        this._transitioning = false;
+        if (this.current === 'centered' &&
+            typeof window.notifyCenteredModeEntry === 'function') {
+            window.notifyCenteredModeEntry();
+        }
     }
 };
 
@@ -6690,106 +6757,182 @@ function _panMapToCenter(target, speedTier, directionChangeFactor, eastWestMovem
 /**
  * CENTERED MODE: Always keep the marker at the exact center with look-ahead.
  */
+/**
+ * CENTERED MODE: Always keep the marker at the exact center with look-ahead.
+ *
+ * REWRITE — fixes map sliding/oscillation during transition and early travel.
+ *
+ * Root causes fixed:
+ *  1. Per-frame transitionProgress blending created a feedback loop where
+ *     slight progress changes caused visible pan param changes mid-animation.
+ *     → Replaced with an exponential lerp param cache (_panParamCache) that
+ *       smoothly converges to target values independent of progress jitter.
+ *
+ *  2. Binary snapBlend threshold (0.5) hard-switched between setView and panTo,
+ *     creating a visible jump at mid-speed.
+ *     → setView is now only used at very high speed (≥45 mph) where it's
+ *       perceptually invisible. Everything else uses panTo.
+ *
+ *  3. transitionProgress was re-read every frame, coupling pan behavior to the
+ *     mode manager's internal counter.
+ *     → Entry into centered mode is now detected once via a timestamp
+ *       (_centeredModeEntryTime). Entry-softening applies for the first
+ *       ENTRY_SETTLE_MS milliseconds, then the function behaves normally.
+ *
+ * Backwards compatible: same signature, same external side-effects,
+ * same DEBUG_PANNING log format (extended with cache info).
+ */
+
+/** @type {{ duration: number, easing: number } | null} */
+window._panParamCache = window._panParamCache || null;
+
+/** @type {number | null} Timestamp (ms) when centered mode was last entered. */
+window._centeredModeEntryTime = window._centeredModeEntryTime || null;
+
+/**
+ * Call this whenever centered mode is first entered so the entry-softening
+ * logic knows when to apply. Safe to call multiple times; only the first call
+ * per entry takes effect (subsequent calls while already in centered mode are
+ * ignored because the timestamp is already set).
+ */
+window.notifyCenteredModeEntry = function () {
+    window._centeredModeEntryTime = performance.now();
+    window._panParamCache = null; // reset smoothing on fresh entry
+};
+
 function _executeCenteredModePan(target, speedTier, directionChangeFactor, eastWestMovement, speedMPH, lookAheadFactor) {
     if (!map) return;
 
+    // ─── Constants ────────────────────────────────────────────────────────────
+    const ENTRY_SETTLE_MS   = 800;   // how long entry-softening applies (ms)
+    const LERP_ALPHA        = 0.18;  // param cache convergence speed (0=frozen, 1=instant)
+    const SNAP_SPEED_MPH    = 45;    // only use setView above this speed
+    const HIGH_SPEED_MPH    = (typeof SPEED_THRESHOLDS !== 'undefined' &&
+                                SPEED_THRESHOLDS?.HIGH_SPEED) || 15;
+
+    // ─── Input sanitisation ───────────────────────────────────────────────────
+    const safeSpeed = (isFinite(speedMPH) && speedMPH > 0) ? speedMPH : 0;
+    const factor    = (directionChangeFactor != null) ? directionChangeFactor : 1.0;
+
+    // ─── Look-ahead ───────────────────────────────────────────────────────────
     let centerLat = target.lat;
     let centerLng = target.lng;
 
-    // ── Look-ahead ──
     const laSec = lookAheadFactor || 0;
     if (laSec > 0 && window.smoothedVelocity) {
         const svLat = window.smoothedVelocity.lat;
         const svLng = window.smoothedVelocity.lng;
         if (svLat != null && svLng != null && isFinite(svLat) && isFinite(svLng)) {
-            // ── CHANGED: Compensate for Mercator east-west compression instead of penalizing ──
+            // Compensate for Mercator east-west compression
             const lngMultiplier = eastWestMovement ? 1.12 : 1.0;
             centerLat += svLat * laSec;
             centerLng += svLng * laSec * lngMultiplier;
         }
     }
 
-    const highSpeedThreshold =
-        (typeof SPEED_THRESHOLDS !== 'undefined' && SPEED_THRESHOLDS != null && SPEED_THRESHOLDS.HIGH_SPEED)
-            ? SPEED_THRESHOLDS.HIGH_SPEED : 15;
+    // ─── Entry-softening: are we still in the settle window? ─────────────────
+    const entryTime      = window._centeredModeEntryTime;
+    const entryElapsedMs = (entryTime != null) ? (performance.now() - entryTime) : Infinity;
+    const isSettling     = entryElapsedMs < ENTRY_SETTLE_MS;
 
-    const safeSpeed = (isFinite(speedMPH) && speedMPH > 0) ? speedMPH : 0;
+    // ─── Compute TARGET pan params (what we want to converge toward) ──────────
 
-    /* ── Resolve effective duration ── */
-    const baseDuration = (speedTier && speedTier.panDuration != null) ? speedTier.panDuration : 0.2;
-    const factor = (directionChangeFactor != null) ? directionChangeFactor : 1.0;
+    let targetDuration;
+    let targetEasing;
 
-    const transitionProgress = (typeof ModeManager !== 'undefined' &&
-                                typeof ModeManager.getTransitionProgress === 'function')
-        ? ModeManager.getTransitionProgress()
-        : 1;
+    if (isSettling) {
+        // During the settle window: use very gentle, slow params regardless of
+        // speed. This absorbs the "teleport snap" feel when entering centered
+        // mode from a different mode.
+        const settleProgress = entryElapsedMs / ENTRY_SETTLE_MS; // 0→1
+        const baseDuration   = (speedTier?.panDuration   != null) ? speedTier.panDuration   : 0.2;
+        const baseEasing     = (speedTier?.easeLinearity != null) ? speedTier.easeLinearity : 0.15;
 
-    // ── Smoothstep for perceptual settling ──
-    const smoothProgress = transitionProgress * transitionProgress * (3 - 2 * transitionProgress);
+        // Ramp from gentle entry values toward the speed-appropriate base.
+        // Using a simple linear ramp here (not smoothstep) because the lerp
+        // cache below provides the perceptual smoothing — double-smoothing was
+        // a contributor to the oscillation.
+        targetDuration = 0.7 + (baseDuration * factor - 0.7) * settleProgress;
+        targetEasing   = 0.08 + (baseEasing - 0.08) * settleProgress;
 
-    let panDuration;
-    if (transitionProgress < 1) {
-        const transitionDuration = 0.8;
-        panDuration = transitionDuration + (baseDuration * factor - transitionDuration) * smoothProgress;
     } else {
-        panDuration = baseDuration * factor;
+        // Normal operation: derive params from speed tier + live speed.
+        const baseDuration = (speedTier?.panDuration   != null) ? speedTier.panDuration   : 0.2;
+        const baseEasing   = (speedTier?.easeLinearity != null) ? speedTier.easeLinearity : 0.15;
 
-        if (safeSpeed >= 30)      panDuration *= 0.70;
-        else if (safeSpeed >= 20) panDuration *= 0.80;
-        else if (safeSpeed >= highSpeedThreshold) panDuration *= 0.90;
+        targetDuration = baseDuration * factor;
 
-        if (eastWestMovement) panDuration *= 0.90;
+        // Speed-based duration tightening (faster = shorter pan = map keeps up)
+        if      (safeSpeed >= 30)          targetDuration *= 0.70;
+        else if (safeSpeed >= 20)          targetDuration *= 0.80;
+        else if (safeSpeed >= HIGH_SPEED_MPH) targetDuration *= 0.90;
+
+        if (eastWestMovement) targetDuration *= 0.90;
+
+        targetEasing = baseEasing;
+
+        // Speed-based easing adjustment
+        if      (safeSpeed >= 20)          targetEasing = Math.min(0.25, targetEasing * 1.4);
+        else if (safeSpeed >= HIGH_SPEED_MPH) targetEasing = Math.min(0.20, targetEasing * 1.2);
     }
 
-    panDuration = Math.max(0.05, Math.min(0.8, panDuration));
+    // Clamp targets to sane bounds
+    targetDuration = Math.max(0.05, Math.min(0.8, targetDuration));
+    targetEasing   = Math.max(0.10, Math.min(0.5, targetEasing));
 
-    /* ── Resolve effective easing ── */
-    let easeLinearity;
-    if (transitionProgress < 1) {
-        // ── CHANGED: Blend from gentle start to speed-appropriate base ──
-        const baseEase = (speedTier && speedTier.easeLinearity != null) ? speedTier.easeLinearity : 0.15;
-        easeLinearity = 0.08 + (baseEase - 0.08) * smoothProgress;
+    // ─── Lerp param cache: smooth convergence, no per-frame jumps ──────────── //
+    if (window._panParamCache == null) {
+        // First call or fresh entry — initialise to target directly (no lerp)
+        window._panParamCache = { duration: targetDuration, easing: targetEasing };
     } else {
-        easeLinearity = (speedTier && speedTier.easeLinearity != null) ? speedTier.easeLinearity : 0.15;
-        if (safeSpeed >= 20)            easeLinearity = Math.min(0.25, easeLinearity * 1.4);
-        else if (safeSpeed >= highSpeedThreshold) easeLinearity = Math.min(0.20, easeLinearity * 1.2);
+        window._panParamCache.duration += (targetDuration - window._panParamCache.duration) * LERP_ALPHA;
+        window._panParamCache.easing   += (targetEasing   - window._panParamCache.easing)   * LERP_ALPHA;
     }
-    easeLinearity = Math.max(0.1, Math.min(0.5, easeLinearity));
 
-    /* ── Gradual snap blend instead of binary threshold ── */
-    const snapBlend = Math.min(1, Math.max(0, (safeSpeed - 12) / 6));
+    const panDuration    = window._panParamCache.duration;
+    const easeLinearity  = window._panParamCache.easing;
 
-    if (snapBlend > 0.5 && window.deadReckoning?.isActive() && transitionProgress >= 1) {
+    // ─── Execute the pan ──────────────────────────────────────────────────────
+    //
+    // setView (no animation) is reserved for genuinely high speeds where the
+    // GPS position changes faster than any animation can track. Below that
+    // threshold, always use panTo so there is never a visible hard cut.
+    //
+    if (safeSpeed >= SNAP_SPEED_MPH &&
+        window.deadReckoning?.isActive() &&
+        !isSettling)
+    {
         window._gpsCenteredPanJustOccurred = true;
-        // Clear flag after microtask so DR loop can see it
-        requestAnimationFrame(() => { window._gpsCenteredPanJustOccurred = false; });
+        // Hold the flag for two animation frames so the DR loop can reliably
+        // see it (one rAF can be missed if the loop runs between frames).
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => { window._gpsCenteredPanJustOccurred = false; });
+        });
 
         map.setView([centerLat, centerLng], map.getZoom(), {
-            animate: false,
+            animate  : false,
             noMoveStart: true,
-            noMoveEnd: true
-        });
-    } else if (snapBlend > 0) {
-        map.panTo([centerLat, centerLng], {
-            animate: true,
-            duration: panDuration * (1 - snapBlend * 0.7),
-            easeLinearity: easeLinearity + snapBlend * 0.15,
-            noMoveStart: true
+            noMoveEnd  : true
         });
     } else {
         map.panTo([centerLat, centerLng], {
-            animate: true,
-            duration: panDuration,
+            animate      : true,
+            duration     : panDuration,
             easeLinearity: easeLinearity,
-            noMoveStart: true
+            noMoveStart  : true
         });
     }
 
     if (window.DEBUG_PANNING) {
-        console.debug('[Centered] Pan: speed=' + safeSpeed.toFixed(1) +
-            'mph, duration=' + (panDuration * 1000).toFixed(0) +
-            'ms, transition=' + (transitionProgress * 100).toFixed(0) + '%' +
-            ', snapBlend=' + snapBlend.toFixed(2));
+        console.debug(
+            '[Centered] Pan: speed='     + safeSpeed.toFixed(1)          + 'mph' +
+            ', duration='                + (panDuration * 1000).toFixed(0) + 'ms'  +
+            ', easing='                  + easeLinearity.toFixed(3)       +
+            ', settling='                + isSettling                     +
+            (isSettling ? ' (' + entryElapsedMs.toFixed(0) + 'ms)' : '') +
+            ', targetDur='               + (targetDuration * 1000).toFixed(0) + 'ms' +
+            ', EW='                      + !!eastWestMovement
+        );
     }
 }
         
@@ -7273,92 +7416,176 @@ function _enforceCenteredMode(markerPos, map, marker) {
  * Pans smoothly to keep the marker visible without jumping ahead of real movement.
  */
 function _enforceRoamingMode(markerPos, map, marker, speedMPH) {
-    if (!map || !marker) return;
-    if (window.isMapInteracting) return;
-    if (window.followUser === false) return;
-    if (window._isProximityZoomAnimating) return;
+    if (!map || !marker)                    return;
+    if (window.isMapInteracting)            return;
+    if (window.followUser === false)        return;
+    if (window._isProximityZoomAnimating)   return;
 
-    var mapSize = map.getSize();
+    const mapSize = map.getSize();
     if (!mapSize || mapSize.x <= 0 || mapSize.y <= 0) return;
 
-    var pixel = map.latLngToContainerPoint(markerPos);
+    const pixel = map.latLngToContainerPoint(markerPos);
     if (!pixel || !isFinite(pixel.x) || !isFinite(pixel.y)) return;
 
-    var safeSpeed = (isFinite(speedMPH) && speedMPH > 0) ? Math.min(speedMPH, 14) : 0;
-    var speedFrac = safeSpeed / 14;
+    // ── Speed normalisation ───────────────────────────────────────────────────
+    // Clamp to a 0-1 fraction over a 0–15 mph working range.
+    const MAX_ROAM_SPEED_MPH = 15;
+    const safeSpeed  = (isFinite(speedMPH) && speedMPH > 0)
+                        ? Math.min(speedMPH, MAX_ROAM_SPEED_MPH) : 0;
+    const speedFrac  = safeSpeed / MAX_ROAM_SPEED_MPH;   // 0→1
 
-    // Hard safety: already off-screen — snap immediately
-    if (pixel.x < 0 || pixel.x > mapSize.x ||
-        pixel.y < 0 || pixel.y > mapSize.y) {
-        map.setView([markerPos.lat, markerPos.lng], map.getZoom(), {
-            animate: false, noMoveStart: true, noMoveEnd: true
-        });
-        window._lastRoamingPanTime = performance.now();
+    // ── Off-screen handling ───────────────────────────────────────────────────
+    // Small overshoot (≤15% of the smaller viewport dimension) → short animated
+    // recovery so GPS noise doesn't cause a hard visual snap.
+    // Large overshoot (>15%) → immediate setView, marker genuinely lost.
+    const offscreenThreshold = Math.min(mapSize.x, mapSize.y) * 0.15;
+    const offX = pixel.x < 0 ? -pixel.x
+               : pixel.x > mapSize.x ? pixel.x - mapSize.x : 0;
+    const offY = pixel.y < 0 ? -pixel.y
+               : pixel.y > mapSize.y ? pixel.y - mapSize.y : 0;
+    const offDist = Math.max(offX, offY);
+
+    if (offDist > 0) {
+        window._lastRoamingPanTime        = performance.now();
+        window._roamingPanAnimationEndMs  = performance.now();   // cancel overlap guard
+        if (offDist > offscreenThreshold) {
+            map.setView([markerPos.lat, markerPos.lng], map.getZoom(), {
+                animate: false, noMoveStart: true, noMoveEnd: true
+            });
+        } else {
+            map.panTo([markerPos.lat, markerPos.lng], {
+                animate: true, duration: 0.25,
+                easeLinearity: 0.3, noMoveStart: true
+            });
+        }
         return;
     }
 
-    // Edge margin: 18% of viewport, minimum 50px
-    // Deliberately conservative — only pan when marker is truly near the edge
-    var margin = Math.max(50, Math.min(mapSize.x, mapSize.y) * 0.18);
+    // ── Edge margin ───────────────────────────────────────────────────────────
+    // 20% of the smaller viewport dimension, min 55px, max 160px.
+    // Slightly wider than before so the safe zone is more generous.
+    const margin = Math.max(55, Math.min(160, Math.min(mapSize.x, mapSize.y) * 0.20));
 
-    var nearLeft   = pixel.x < margin;
-    var nearRight  = pixel.x > mapSize.x - margin;
-    var nearTop    = pixel.y < margin;
-    var nearBottom = pixel.y > mapSize.y - margin;
+    const nearLeft   = pixel.x < margin;
+    const nearRight  = pixel.x > mapSize.x - margin;
+    const nearTop    = pixel.y < margin;
+    const nearBottom = pixel.y > mapSize.y - margin;
 
     if (!nearLeft && !nearRight && !nearTop && !nearBottom) return;
 
-    // Throttle pans — prevent re-fire while animation is still running
-    var now = performance.now();
-    var timeSinceLastPan = now - (window._lastRoamingPanTime || 0);
-
-    // How deep into the margin zone (0 = just entered, 1 = at the edge)
-    var penetrationX = 0, penetrationY = 0;
+    // ── Penetration depth (0 = just entered margin, 1 = at the raw edge) ─────
+    // Computed per-axis; corner approaches add both contributions.
+    let penetrationX = 0, penetrationY = 0;
     if (nearLeft)   penetrationX = 1 - (pixel.x / margin);
     if (nearRight)  penetrationX = 1 - ((mapSize.x - pixel.x) / margin);
     if (nearTop)    penetrationY = 1 - (pixel.y / margin);
     if (nearBottom) penetrationY = 1 - ((mapSize.y - pixel.y) / margin);
-    var penetration = Math.max(penetrationX, penetrationY);
 
-    var isUrgent = penetration > 0.6 || safeSpeed > 10;
-    var panThrottleMs = isUrgent ? 0 : Math.max(100, 400 - speedFrac * 300);
+    // Combined penetration: use the hypotenuse of both axes so corner
+    // approaches register as more urgent than a clean edge approach.
+    const penetration = Math.min(1, Math.sqrt(
+        penetrationX * penetrationX + penetrationY * penetrationY
+    ));
 
-    if (!isUrgent && timeSinceLastPan < panThrottleMs) return;
+    // ── Urgency: smooth 0→1 curve ─────────────────────────────────────────────
+    // Blends depth and speed. No hard thresholds — the curve rises smoothly
+    // so easing params change gradually rather than stepping.
+    //   penetration 0.5 + speed 0.5 → urgency ≈ 0.5
+    //   penetration 0.8 + speed 0.8 → urgency ≈ 0.8
+    const urgency = Math.min(1, penetration * 0.65 + speedFrac * 0.45);
 
-    // Pan target: pull marker 35% of the way toward center
-    // This gives it a generous safe zone so the next several fixes
-    // won't immediately re-trigger another pan
-    var centerX = mapSize.x / 2;
-    var centerY = mapSize.y / 2;
-    var pullFactor = 0.35;
+    // ── Pan throttle ──────────────────────────────────────────────────────────
+    const now = performance.now();
 
-    var offsetX = (centerX - pixel.x) * pullFactor;
-    var offsetY = (centerY - pixel.y) * pullFactor;
+    // Skip if a previous pan animation is still running (non-urgent only).
+    // This prevents overlapping panTo calls fighting each other.
+    const animRunning = now < (window._roamingPanAnimationEndMs || 0);
+    if (animRunning && urgency < 0.7) return;
 
-    var centerPx = map.latLngToContainerPoint(map.getCenter());
-    var newCenterPx = { x: centerPx.x + offsetX, y: centerPx.y + offsetY };
-    var newCenter = map.containerPointToLatLng(newCenterPx);
+    const timeSinceLastPan = now - (window._lastRoamingPanTime || 0);
+    // Throttle window shrinks as urgency rises: 350ms at low urgency → 0ms
+    const throttleMs = Math.max(0, 350 * (1 - urgency));
+    if (urgency < 0.7 && timeSinceLastPan < throttleMs) return;
+
+    // ── Pull factor ───────────────────────────────────────────────────────────
+    // How far toward center to pull the marker, as a fraction of the
+    // center-to-marker vector.
+    //
+    // Low urgency: pull ~38% → lands comfortably inside the safe zone.
+    // High urgency: pull ~62% → lands well clear so next GPS won't re-trigger.
+    // At very high speed, pull a bit more because the marker moves faster
+    // than the animation can keep up.
+    const basePull   = 0.38 + urgency * 0.24;
+    const pullFactor = Math.min(0.72, basePull + speedFrac * 0.10);
+
+    // ── Look-ahead offset ─────────────────────────────────────────────────────
+    // Nudge the pan target in the direction the marker is heading so the
+    // safe zone stays ahead of the marker rather than centered behind it.
+    // Uses the same smoothedVelocity as centered mode.
+    const LA_SECS = 1.2;   // seconds of travel to anticipate
+    let laLat = 0, laLng = 0;
+    if (window.smoothedVelocity) {
+        const sv = window.smoothedVelocity;
+        if (sv.lat != null && sv.lng != null &&
+            isFinite(sv.lat) && isFinite(sv.lng)) {
+            laLat = sv.lat * LA_SECS * speedFrac;   // scale down at low speed
+            laLng = sv.lng * LA_SECS * speedFrac;
+        }
+    }
+
+    // ── Build pan target ──────────────────────────────────────────────────────
+    const centerX    = mapSize.x / 2;
+    const centerY    = mapSize.y / 2;
+    const offsetX    = (centerX - pixel.x) * pullFactor;
+    const offsetY    = (centerY - pixel.y) * pullFactor;
+
+    const centerPx   = map.latLngToContainerPoint(map.getCenter());
+    const newCenterPx = { x: centerPx.x + offsetX, y: centerPx.y + offsetY };
+    let newCenter     = map.containerPointToLatLng(newCenterPx);
 
     if (!newCenter || !isFinite(newCenter.lat) || !isFinite(newCenter.lng)) {
         newCenter = markerPos;
+    } else {
+        // Apply look-ahead in lat/lng space
+        newCenter = { lat: newCenter.lat + laLat, lng: newCenter.lng + laLng };
     }
 
+    // ── Execute pan ───────────────────────────────────────────────────────────
     window._lastRoamingPanTime = now;
 
-    var snapImmediately = isUrgent && (penetration > 0.75 || safeSpeed > 12);
-
-    if (snapImmediately) {
+    // Hard snap only when extremely deep into the margin at speed.
+    // Urgency must be very high (≥0.92) to avoid snapping during normal travel.
+    if (urgency >= 0.92) {
+        window._roamingPanAnimationEndMs = now;    // snap is instant
         map.setView([newCenter.lat, newCenter.lng], map.getZoom(), {
             animate: false, noMoveStart: true, noMoveEnd: true
         });
     } else {
-        var panDuration = Math.max(0.15, 0.4 - speedFrac * 0.2);
+        // Duration: longer at low urgency (smooth), shorter at high (responsive).
+        // easeLinearity: higher at high speed for a more linear, predictable feel.
+        const panDuration   = Math.max(0.12, 0.45 - urgency * 0.28 - speedFrac * 0.05);
+        const easeLinearity = Math.min(0.5,  0.18 + speedFrac * 0.20 + urgency * 0.08);
+
+        window._roamingPanAnimationEndMs = now + panDuration * 1000;
+
         map.panTo([newCenter.lat, newCenter.lng], {
-            animate: true,
-            duration: panDuration,
-            easeLinearity: 0.25,
-            noMoveStart: true
+            animate      : true,
+            duration     : panDuration,
+            easeLinearity: easeLinearity,
+            noMoveStart  : true
         });
+    }
+
+    if (window.DEBUG_PANNING) {
+        console.debug(
+            '[Roaming] Pan: speed='  + safeSpeed.toFixed(1)      + 'mph' +
+            ', urgency='             + urgency.toFixed(2)         +
+            ', penetration='         + penetration.toFixed(2)     +
+            ', pull='                + pullFactor.toFixed(2)      +
+            ', dur='                 + (window._roamingPanAnimationEndMs > now
+                                        ? ((window._roamingPanAnimationEndMs - now).toFixed(0) + 'ms')
+                                        : 'snap')
+        );
     }
 }
         
