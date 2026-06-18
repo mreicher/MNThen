@@ -208,7 +208,7 @@ const locations = [
         additionalInfo: "The Samuel H. Morgan Land Fund supports Minnesota land conservation by funding acquisitions to expand state parks, public trails, and green spaces.",
         difficulty: 1
 },
-/*
+
    {
         id: "1021",
         lat: 44.95655720725883, 
@@ -226,7 +226,7 @@ const locations = [
         imageSource: "Image of the Prom Ballroom via Discogs",
         additionalInfo: "The Beach Boys performed at the Prom Ballroom on August 2, 1963, during their first major nationwide tour."
     },
-*/
+
     {
         id: "1022",
         lat: 44.7695002003817,
