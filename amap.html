@@ -5831,68 +5831,54 @@ function _scheduleMapUpdate() {
 }
 
         /* start updateuserlocation */
-
 /* ═══════════════════════════════════════════════════════════════
-   updateUserLocation v3.1 — Continuous Interpolation Engine
+   updateUserLocation v3.2 — Centered Mode + Continuous Interpolation
    ─────────────────────────────────────────────────────────────
-   DROP-IN over v3.0. All public APIs identical.
+   DROP-IN over v3.0 / v3.1. All public APIs identical.
 
-   What changed:
-   • A persistent RAF loop (_continuousRenderLoop) runs between GPS
-     fixes, advancing the marker using smoothedVelocity + hermite
-     interpolation. The marker now moves continuously, not in
-     discrete GPS-event jumps.
-   • _scheduleUnifiedRender feeds waypoints into the loop rather
-     than triggering a one-shot RAF. The loop self-starts on
-     movement and self-stops when frozen/stationary.
-   • _executeRender is unchanged — called by the loop each frame.
-   • All other steps (fusion, gap handling, proximity, etc.)
-     are identical to v3.0.
+   v3.2 fixes:
+   • Centered mode now works correctly. The icon locks to screen
+     center and the map moves under it. The loop reads
+     ModeManager.isCentered() live every frame — not from stale
+     cached mapState — so mode transitions take effect immediately.
+   • In centered mode the loop pans to the RAW interpolated position
+     (not a look-ahead offset). Look-ahead is only applied in roaming
+     mode, where the viewport leads the icon.
+   • Map pan throttle is bypassed in centered mode so the viewport
+     follows the icon every frame, not just at tier.mapUpdateInterval.
+   • modeChanged is read live from ModeManager so transition-frame
+     cache resets happen regardless of GPS event timing.
    ═══════════════════════════════════════════════════════════════ */
 
-/* ─── Interpolation State (module-scoped, not window-polluting) ─── */
+/* ─── Interpolation State ────────────────────────────────────── */
 var _interp = {
-    /* Circular waypoint ring — last 4 fused positions */
     wp: [null, null, null, null],
     wpHead: 0,
 
-    /* Current interpolated position (what the marker actually shows) */
     curLat: null,
     curLng: null,
 
-    /* Target fused position from latest GPS fix */
     tgtLat: null,
     tgtLng: null,
     tgtTime: 0,
 
-    /* Previous target (for hermite tangents) */
     prevLat: null,
     prevLng: null,
     prevTime: 0,
 
-    /* Velocity estimate for dead-reckoning between fixes */
     vLat: 0,
     vLng: 0,
 
-    /* Loop control */
     rafId: null,
     lastFrameTime: 0,
     active: false,
 
-    /* How long (ms) to blend toward a new fix.
-       Shorter = snappier but may stutter on noisy GPS.
-       160ms = ~2-3 frames at 60fps, imperceptible lag. */
     BLEND_MS: 160,
-
-    /* Max extrapolation beyond last fix before we freeze (ms) */
     MAX_EXTRAP_MS: 2500
 };
 
 /* ──────────────────────────────────────────────────────────────────
    CONTINUOUS RENDER LOOP
-   Runs every animation frame when the user is moving.
-   Interpolates marker position between GPS waypoints so motion
-   appears perfectly fluid regardless of GPS update rate.
    ────────────────────────────────────────────────────────────────── */
 function _startContinuousRenderLoop() {
     if (_interp.active) return;
@@ -5912,15 +5898,15 @@ function _stopContinuousRenderLoop() {
 function _continuousRenderLoop(now) {
     if (!_interp.active) return;
 
-    var dt = Math.min(now - _interp.lastFrameTime, 100); /* clamp runaway dt */
+    var dt = Math.min(now - _interp.lastFrameTime, 100);
     _interp.lastFrameTime = now;
 
-    /* ── Decide whether to keep running ──────────────────────────── */
-    var frozen = window.isStationary || (window._currentRenderState && window._currentRenderState.isFrozen);
+    /* ── Stop conditions ─────────────────────────────────────────── */
+    var frozen = window.isStationary ||
+                 (window._currentRenderState && window._currentRenderState.isFrozen);
     var msSinceLastFix = now - _interp.tgtTime;
 
     if (frozen || msSinceLastFix > _interp.MAX_EXTRAP_MS) {
-        /* Snap marker to last known fused position and stop */
         if (_interp.tgtLat !== null && typeof userMarker !== 'undefined' && userMarker) {
             userMarker.setLatLng([_interp.tgtLat, _interp.tgtLng]);
         }
@@ -5932,62 +5918,45 @@ function _continuousRenderLoop(now) {
     var interpLat, interpLng;
 
     if (_interp.curLat === null) {
-        /* First frame: snap to target immediately */
         interpLat = _interp.tgtLat;
         interpLng = _interp.tgtLng;
     } else {
-        /* Hermite blend toward target + dead-reckoning extrapolation.
-           We blend two signals:
-             A) Hermite curve toward the fused GPS target (removes GPS jitter)
-             B) Linear extrapolation using smoothedVelocity (fills gaps between fixes)
-           Alpha controls how much weight goes to the GPS target vs extrapolation. */
-
-        var age = msSinceLastFix;
+        var age     = msSinceLastFix;
         var blendMs = _interp.BLEND_MS;
 
-        /* Alpha: 0 = pure extrapolation, 1 = pulled hard to GPS target */
         var alpha = age < blendMs
-            ? 1.0 - (age / blendMs) * 0.35  /* during blend window: mostly GPS */
-            : 0.65;                           /* after: balanced blend */
+            ? 1.0 - (age / blendMs) * 0.35
+            : 0.65;
 
-        /* Hermite interpolation toward GPS target.
-           t goes 0→1 over BLEND_MS, then continues past 1 (we clamp at 1). */
-        var t = Math.min(1.0, age / blendMs);
+        var t   = Math.min(1.0, age / blendMs);
         var h00 = (2*t*t*t - 3*t*t + 1);
         var h10 = (t*t*t - 2*t*t + t);
         var h01 = (-2*t*t*t + 3*t*t);
         var h11 = (t*t*t - t*t);
 
-        /* Tangent at start: velocity at previous fix */
-        var m0Lat = _interp.vLat * (blendMs / 1000);
-        var m0Lng = _interp.vLng * (blendMs / 1000);
-        /* Tangent at end: current velocity (smoothed) */
-        var vel = window.smoothedVelocity || { lat: 0, lng: 0 };
-        var m1Lat = vel.lat * (blendMs / 1000);
-        var m1Lng = vel.lng * (blendMs / 1000);
-
-        var p0Lat = _interp.prevLat !== null ? _interp.prevLat : _interp.tgtLat;
-        var p0Lng = _interp.prevLng !== null ? _interp.prevLng : _interp.tgtLng;
+        var vel    = window.smoothedVelocity || { lat: 0, lng: 0 };
+        var m0Lat  = _interp.vLat * (blendMs / 1000);
+        var m0Lng  = _interp.vLng * (blendMs / 1000);
+        var m1Lat  = vel.lat * (blendMs / 1000);
+        var m1Lng  = vel.lng * (blendMs / 1000);
+        var p0Lat  = _interp.prevLat !== null ? _interp.prevLat : _interp.tgtLat;
+        var p0Lng  = _interp.prevLng !== null ? _interp.prevLng : _interp.tgtLng;
 
         var hermLat = h00*p0Lat + h10*m0Lat + h01*_interp.tgtLat + h11*m1Lat;
         var hermLng = h00*p0Lng + h10*m0Lng + h01*_interp.tgtLng + h11*m1Lng;
 
-        /* Dead-reckoning extrapolation from current interpolated position */
-        var dtSec = dt / 1000;
+        var dtSec     = dt / 1000;
         var extrapLat = _interp.curLat + vel.lat * dtSec;
         var extrapLng = _interp.curLng + vel.lng * dtSec;
 
-        /* Weighted blend: hermite anchors to GPS reality, extrap provides fluidity */
         interpLat = alpha * hermLat + (1.0 - alpha) * extrapLat;
         interpLng = alpha * hermLng + (1.0 - alpha) * extrapLng;
 
-        /* Micro-smoothing: exponential filter to kill sub-pixel jitter.
-           tau scales with speed — faster = less filtering = more responsive. */
         var speedMPH = (window._currentRenderState && window._currentRenderState.speedMPH) || 0;
         var tau = speedMPH > 30 ? 0.82
                 : speedMPH > 15 ? 0.78
                 : speedMPH > 5  ? 0.72
-                                 : 0.65;
+                                : 0.65;
 
         interpLat = tau * interpLat + (1.0 - tau) * _interp.curLat;
         interpLng = tau * interpLng + (1.0 - tau) * _interp.curLng;
@@ -5996,85 +5965,103 @@ function _continuousRenderLoop(now) {
     _interp.curLat = interpLat;
     _interp.curLng = interpLng;
 
+    /* ── Read mode LIVE — never from stale cached mapState ───────── */
+    var isCentered = (typeof ModeManager !== 'undefined') && ModeManager.isCentered();
+
     /* ── Move marker ──────────────────────────────────────────────── */
     if (typeof userMarker !== 'undefined' && userMarker && interpLat !== null) {
-        userMarker.setLatLng([interpLat, interpLng]);
-
-        /* Accuracy ring: only update styling on GPS events, not every frame */
+        if (isCentered) {
+            /* Centered mode: icon is visually pinned to screen center.
+               We do NOT call setLatLng here — the map moves, not the icon.
+               Leaflet keeps the marker at its LatLng coordinate; as we pan
+               the map to that same coordinate, the icon stays centered. */
+        } else {
+            /* Roaming mode: icon moves across a stationary-ish map. */
+            userMarker.setLatLng([interpLat, interpLng]);
+        }
     }
 
-    /* ── Move map (using the same pan logic, but at frame rate) ──── */
+    /* ── Move map ─────────────────────────────────────────────────── */
     if (map && window.followUser && !window.isMapInteracting && !window._isFittingBounds) {
-        var state = window._currentRenderState;
-        var tier  = window._currentSpeedTier;
+        var state    = window._currentRenderState;
+        var tier     = window._currentSpeedTier;
         var mapState = window._currentMapState;
 
         if (state && tier && mapState) {
-            var vel = window.smoothedVelocity || { lat: 0, lng: 0 };
-            var dtSec = dt / 1000;
-            var speedMPH = state.speedMPH || 0;
+            var vel2        = window.smoothedVelocity || { lat: 0, lng: 0 };
+            var speedMPH2   = state.speedMPH || 0;
+            var now2        = Date.now();
+            var timeSince   = now2 - (window.lastMapUpdateTime || 0);
 
-            /* Look-ahead: compute live from current interpolated pos + velocity */
-            var lookAheadSec = speedMPH < 3  ? 0.3
-                             : speedMPH < 15 ? 0.3 + (speedMPH - 3) * 0.06
-                             : speedMPH < 45 ? 1.0 + (speedMPH - 15) * 0.027
-                             :                 Math.min(2.5, 1.81 + (speedMPH - 45) * 0.02);
+            if (isCentered) {
+                /* ── CENTERED MODE ──────────────────────────────────────
+                   The icon must stay at screen center. We pan the map to
+                   the interpolated position every frame (no throttle —
+                   throttling here is what made it feel laggy/broken).
 
-            var panLat = interpLat + vel.lat * lookAheadSec;
-            var panLng = interpLng + vel.lng * lookAheadSec;
+                   The marker's LatLng is also updated to match so Leaflet
+                   knows where it is for hit-testing, but the visual result
+                   is the map moving, not the icon drifting. */
+                if (typeof userMarker !== 'undefined' && userMarker) {
+                    userMarker.setLatLng([interpLat, interpLng]);
+                }
 
-            /* Throttle map pan to tier's interval — the marker moves every frame,
-               but the viewport only re-centers at the tier rate to avoid
-               dizzying micro-pans at low speed. */
-            var now2 = Date.now();
-            var timeSinceMapUpdate = now2 - (window.lastMapUpdateTime || 0);
+                _panMapToCenter(
+                    { lat: interpLat, lng: interpLng },
+                    tier,
+                    mapState.directionChangeFactor,
+                    mapState.eastWestMove,
+                    speedMPH2,
+                    /* lookAheadFactor: 0 — we pass the real position, not a
+                       projected one. _executeCenteredModePan applies its own
+                       look-ahead internally using smoothedVelocity. */
+                    0
+                );
 
-            if (timeSinceMapUpdate > tier.mapUpdateInterval || mapState.modeChanged) {
-                if (mapState.isInCenteredMode) {
-                    _panMapToCenter(
-                        { lat: panLat, lng: panLng },
-                        tier,
-                        mapState.directionChangeFactor,
-                        mapState.eastWestMove,
-                        speedMPH,
-                        lookAheadSec
-                    );
-                } else {
+                window.lastMapUpdateTime = now2;
+
+            } else {
+                /* ── ROAMING MODE ───────────────────────────────────────
+                   Viewport leads the icon using look-ahead offset.
+                   Throttled by tier.mapUpdateInterval. */
+                var lookAheadSec = speedMPH2 < 3  ? 0.3
+                                 : speedMPH2 < 15 ? 0.3 + (speedMPH2 - 3) * 0.06
+                                 : speedMPH2 < 45 ? 1.0 + (speedMPH2 - 15) * 0.027
+                                 :                  Math.min(2.5, 1.81 + (speedMPH2 - 45) * 0.02);
+
+                var panLat = interpLat + vel2.lat * lookAheadSec;
+                var panLng = interpLng + vel2.lng * lookAheadSec;
+
+                if (timeSince > tier.mapUpdateInterval || mapState.modeChanged) {
                     map.panTo([panLat, panLng], {
                         animate:       true,
                         duration:      Math.max(0.08, tier.panDuration),
                         easeLinearity: tier.easeLinearity,
                         noMoveStart:   true
                     });
+                    window.lastMapUpdateTime = now2;
                 }
-                window.lastMapUpdateTime = now2;
             }
         }
     }
 
-    /* ── Schedule next frame ──────────────────────────────────────── */
     _interp.rafId = requestAnimationFrame(_continuousRenderLoop);
 }
 
 /* ──────────────────────────────────────────────────────────────────
    WAYPOINT INJECTION
-   Called by _scheduleUnifiedRender every time a new fused GPS fix
-   arrives. Feeds the loop new target coordinates and refreshes
-   the velocity used for extrapolation.
    ────────────────────────────────────────────────────────────────── */
 function _injectWaypoint(renderState) {
     var lat = renderState.position.lat;
     var lng = renderState.position.lng;
     var vel = window.smoothedVelocity || { lat: 0, lng: 0 };
 
-    /* Save previous target for hermite tangent */
     if (_interp.tgtLat !== null) {
         _interp.prevLat  = _interp.tgtLat;
         _interp.prevLng  = _interp.tgtLng;
         _interp.prevTime = _interp.tgtTime;
     }
 
-    /* If marker has never been placed, snap immediately */
     if (_interp.curLat === null) {
         _interp.curLat = lat;
         _interp.curLng = lng;
@@ -6086,21 +6073,16 @@ function _injectWaypoint(renderState) {
     _interp.vLat    = vel.lat;
     _interp.vLng    = vel.lng;
 
-    /* Push into waypoint ring (for future use by arc-length speed calc) */
     _interp.wp[_interp.wpHead % 4] = { lat: lat, lng: lng, t: _interp.tgtTime };
     _interp.wpHead++;
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   REWRITTEN FUNCTIONS (drop-in replacements for v3.0)
-   Everything below replaces the equivalently-named function.
-   The signatures and global side-effects are 100% identical.
+   MAIN ENTRY POINT
    ═══════════════════════════════════════════════════════════════ */
-
 function updateUserLocation(position, forceUpdate) {
     if (forceUpdate === undefined) forceUpdate = false;
 
-    var now = performance.now();
     var currentGen = (window._locationUpdateGeneration || 0) + 1;
     window._locationUpdateGeneration = currentGen;
 
@@ -6122,7 +6104,7 @@ function updateUserLocation(position, forceUpdate) {
     var fix = _extractGPSFix(position, forceUpdate);
     if (!fix) return;
 
-    var lastPos = window.lastPosition;
+    var lastPos   = window.lastPosition;
     var timeDelta = (lastPos && window.lastUpdateTime)
         ? (fix.timestamp - window.lastUpdateTime) / 1000
         : 0;
@@ -6139,18 +6121,17 @@ function updateUserLocation(position, forceUpdate) {
 
     var renderState = _buildRenderState(fusionResult, fix, lastPos, timeDelta);
 
-    /* v3.1: feed waypoint into interpolation engine, then let the
-       continuous loop handle all rendering. One-shot RAF is gone. */
     _scheduleUnifiedRender(renderState);
 
     window.lastPosition = {
-        lat: fix.lat, lng: fix.lng,
+        lat:      fix.lat,
+        lng:      fix.lng,
         accuracy: fix.accuracy,
-        heading: fusionResult.heading,
+        heading:  fusionResult.heading,
         timestamp: fix.timestamp,
         speedMPS: fusionResult.speedMPS
     };
-    window.lastUpdateTime = fix.timestamp;
+    window.lastUpdateTime      = fix.timestamp;
     window.lastUpdateTimestamp = fix.timestamp;
 
     _controlDeadReckoning(fusionResult);
@@ -6164,25 +6145,22 @@ function updateUserLocation(position, forceUpdate) {
     if (typeof _scheduleWillChangeReset === 'function') _scheduleWillChangeReset();
 }
 
-/* ── STEP 6 (rewritten): feed the continuous loop ──────────────── */
+/* ── STEP 6: Schedule unified render ───────────────────────────── */
 function _scheduleUnifiedRender(renderState) {
-    /* Store latest state for the loop to read each frame */
     window._currentRenderState = renderState;
     window._currentSpeedTier   = renderState.tier;
     window._currentMapState    = renderState.mapState;
 
-    /* Handle zoom changes and accuracy ring on GPS events (not every frame) */
+    /* GPS-event-only work: zoom, accuracy ring */
     _executeRenderEventUpdates(renderState);
 
-    /* Inject new GPS waypoint into the interpolation engine */
+    /* Feed the interpolation engine */
     _injectWaypoint(renderState);
 
-    /* Start the continuous loop if not already running */
     var isFrozen = renderState.isFrozen || window.isStationary;
     if (!isFrozen) {
         _startContinuousRenderLoop();
     } else {
-        /* Stationary: snap and stop */
         _interp.curLat = renderState.position.lat;
         _interp.curLng = renderState.position.lng;
         _stopContinuousRenderLoop();
@@ -6191,7 +6169,6 @@ function _scheduleUnifiedRender(renderState) {
         }
     }
 
-    /* Cancel any legacy one-shot RAF from v3.0 */
     if (window._nextLocationUpdateRAF) {
         cancelAnimationFrame(window._nextLocationUpdateRAF);
         window._nextLocationUpdateRAF = null;
@@ -6199,12 +6176,10 @@ function _scheduleUnifiedRender(renderState) {
     window._mapUpdateScheduled = false;
 }
 
-/* ── GPS-event-only updates (zoom, accuracy ring) ──────────────── */
+/* ── GPS-event-only render work ────────────────────────────────── */
 function _executeRenderEventUpdates(state) {
-    if (!state) return;
-    if (window.isMapInteracting) return;
+    if (!state || window.isMapInteracting) return;
 
-    /* Range-based zoom */
     var zoomResult = getSpeedBasedZoom(state.speedMPS, state.closestDistance);
     if (zoomResult !== null && map) {
         if (zoomResult.fitBounds && state.closestLocation && !window._isFittingBounds) {
@@ -6227,7 +6202,6 @@ function _executeRenderEventUpdates(state) {
         }
     }
 
-    /* Accuracy ring styling (only needs to change when accuracy changes) */
     if (typeof userMarker !== 'undefined' && userMarker) {
         var markerEl = userMarker.getElement ? userMarker.getElement() : null;
         if (markerEl) {
@@ -6242,10 +6216,7 @@ function _executeRenderEventUpdates(state) {
     window.lastMapUpdateTime = Date.now();
 }
 
-/* ─── All other functions are IDENTICAL to v3.0 ────────────────────
-   Copied verbatim so this file is fully self-contained.
-   ───────────────────────────────────────────────────────────────── */
-
+/* ── STEP 1: GPS Fix Extraction ────────────────────────────────── */
 function _extractGPSFix(position, forceUpdate) {
     var coords = (position || {}).coords;
     if (!coords || !Number.isFinite(coords.latitude) || !Number.isFinite(coords.longitude)) {
@@ -6256,8 +6227,7 @@ function _extractGPSFix(position, forceUpdate) {
     if (!forceUpdate && gpsAge > 4.0) return null;
 
     var rawHeading = coords.heading !== undefined && coords.heading !== null
-        ? coords.heading
-        : null;
+        ? coords.heading : null;
 
     return {
         lat:      coords.latitude,
@@ -6266,16 +6236,16 @@ function _extractGPSFix(position, forceUpdate) {
         heading:  rawHeading,
         speedMPS: Math.max(0, coords.speed || 0),
         timestamp: (position.timestamp && isFinite(position.timestamp))
-            ? position.timestamp
-            : Date.now()
+            ? position.timestamp : Date.now()
     };
 }
 
+/* ── STEP 2: Gap Handling ──────────────────────────────────────── */
 function _handleGPSGap(fix, lastPos, timeDelta) {
     if (!lastPos) return;
 
     if (timeDelta > 10 && timeDelta < 300) {
-        var dt = timeDelta;
+        var dt     = timeDelta;
         var cosLat = Math.cos(fix.lat * Math.PI / 180);
         var vNorth = ((fix.lat - lastPos.lat) / dt) * 111111;
         var vEast  = ((fix.lng - lastPos.lng) / dt) * 111111 * cosLat;
@@ -6284,11 +6254,9 @@ function _handleGPSGap(fix, lastPos, timeDelta) {
             window.sensorFusion._kalmanFilter.scheduleVelocitySeed(vNorth, vEast);
         }
 
-        window.isStationary          = false;
-        window.stationaryStartTime   = null;
+        window.isStationary           = false;
+        window.stationaryStartTime    = null;
         window.stationaryLockPosition = null;
-
-        /* Also reset interpolation on gap so we don't bridge the gap with stale velocity */
         _interp.curLat  = null;
         _interp.prevLat = null;
         return;
@@ -6298,25 +6266,22 @@ function _handleGPSGap(fix, lastPos, timeDelta) {
         if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
             window.sensorFusion._kalmanFilter.reset();
         }
-        window.smoothedVelocity      = { lat: 0, lng: 0 };
-        window.isStationary          = false;
-        window.stationaryStartTime   = null;
+        window.smoothedVelocity       = { lat: 0, lng: 0 };
+        window.isStationary           = false;
+        window.stationaryStartTime    = null;
         window.stationaryLockPosition = null;
-
         _interp.curLat  = null;
         _interp.prevLat = null;
     }
 }
 
+/* ── STEP 3: Sensor Fusion ─────────────────────────────────────── */
 function _runSensorFusion(fix, lastPos, timeDelta, forceUpdate) {
     if (!window.sensorFusion) {
         return {
             lat: fix.lat, lng: fix.lng,
-            speedMPS:    fix.speedMPS,
-            heading:     fix.heading,
-            isConverged: false,
-            blendFactor: 0,
-            isFrozen:    false,
+            speedMPS: fix.speedMPS, heading: fix.heading,
+            isConverged: false, blendFactor: 0, isFrozen: false,
             vNorth: 0, vEast: 0
         };
     }
@@ -6324,22 +6289,19 @@ function _runSensorFusion(fix, lastPos, timeDelta, forceUpdate) {
     var kf = window.sensorFusion._kalmanFilter;
 
     if (lastPos && !forceUpdate) {
-        var jumpDist = calculateDistance(lastPos, fix);
+        var jumpDist         = calculateDistance(lastPos, fix);
         var dynamicThreshold = Math.max(50, fix.speedMPS * 3, fix.accuracy * 2.5);
 
         if (jumpDist > dynamicThreshold) {
             if (kf) kf.reset();
-            _interp.curLat  = null; /* force snap on large jump */
+            _interp.curLat  = null;
             _interp.prevLat = null;
             window.sensorFusion.smoothPosition(fix.lat, fix.lng, fix.accuracy,
                 fix.timestamp, fix.speedMPS, fix.heading);
             return {
                 lat: fix.lat, lng: fix.lng,
-                speedMPS:    fix.speedMPS,
-                heading:     fix.heading,
-                isConverged: false,
-                blendFactor: 0,
-                isFrozen:    false,
+                speedMPS: fix.speedMPS, heading: fix.heading,
+                isConverged: false, blendFactor: 0, isFrozen: false,
                 vNorth: 0, vEast: 0
             };
         }
@@ -6368,19 +6330,16 @@ function _runSensorFusion(fix, lastPos, timeDelta, forceUpdate) {
     return result;
 }
 
+/* ── STEP 4: Publish Fusion State ──────────────────────────────── */
 function _publishFusionState(fusionResult, fix) {
-    window._predictedPosition = {
-        lat: fusionResult.lat,
-        lng: fusionResult.lng
-    };
+    window._predictedPosition = { lat: fusionResult.lat, lng: fusionResult.lng };
 
     if (fusionResult.isFrozen) {
         window.smoothedVelocity       = { lat: 0, lng: 0 };
         window.isStationary           = true;
         window.stationaryLockPosition = { lat: fusionResult.lat, lng: fusionResult.lng };
     } else {
-        var velDegPerSec     = window.sensorFusion.getSmoothedVelocityDegPerSec();
-        window.smoothedVelocity       = velDegPerSec;
+        window.smoothedVelocity       = window.sensorFusion.getSmoothedVelocityDegPerSec();
         window.isStationary           = false;
         window.stationaryLockPosition = null;
     }
@@ -6389,6 +6348,7 @@ function _publishFusionState(fusionResult, fix) {
     window._kalmanBlendFactor = fusionResult.blendFactor;
 }
 
+/* ── STEP 5: Build Render State ────────────────────────────────── */
 function _buildRenderState(fusionResult, fix, lastPos, timeDelta) {
     var speedMPS = fusionResult.speedMPS;
     var speedMPH = speedMPS * 2.23694;
@@ -6401,7 +6361,7 @@ function _buildRenderState(fusionResult, fix, lastPos, timeDelta) {
                          : speedMPH < 45 ? 1.0 + (speedMPH - 15) * 0.027
                          :                 Math.min(2.5, 1.81 + (speedMPH - 45) * 0.02);
 
-    var velocity = window.smoothedVelocity;
+    var velocity    = window.smoothedVelocity;
     var lookAheadPos = {
         lat: fusionResult.lat + velocity.lat * lookAheadSeconds,
         lng: fusionResult.lng + velocity.lng * lookAheadSeconds
@@ -6414,21 +6374,20 @@ function _buildRenderState(fusionResult, fix, lastPos, timeDelta) {
     if (lastPos && lastPos.heading != null && heading != null) {
         var diff = Math.abs(heading - lastPos.heading);
         if (diff > 180) diff = 360 - diff;
-        if (diff > 12) {
-            directionChangeFactor = Math.min(1.3, 1.0 + diff / 200);
-        }
+        if (diff > 12) directionChangeFactor = Math.min(1.3, 1.0 + diff / 200);
     }
 
     var eastWestMove = false;
     if (lastPos && timeDelta > 0) {
         var latMeters = Math.abs(fix.lat - lastPos.lat) * 111111;
-        var lngMeters = Math.abs(fix.lng - lastPos.lng) * 111111 * Math.cos(fix.lat * Math.PI / 180);
+        var lngMeters = Math.abs(fix.lng - lastPos.lng) * 111111
+                        * Math.cos(fix.lat * Math.PI / 180);
         eastWestMove  = lngMeters > latMeters * 1.2;
     }
     if (eastWestMove) {
-        tier.panDuration        *= 0.88;
-        tier.easeLinearity      *= 0.92;
-        tier.mapUpdateInterval   = Math.max(33, tier.mapUpdateInterval * 0.88);
+        tier.panDuration          *= 0.88;
+        tier.easeLinearity        *= 0.92;
+        tier.mapUpdateInterval     = Math.max(33, tier.mapUpdateInterval * 0.88);
         tier.minDistanceThreshold *= 0.92;
     }
 
@@ -6439,7 +6398,7 @@ function _buildRenderState(fusionResult, fix, lastPos, timeDelta) {
         isInCenteredMode = ModeManager.isCentered();
     }
 
-    var proximity = _computeProximity(fix, speedMPH);
+    var proximity = _computeProximity(fix, speedMPH, fix.timestamp);
 
     if (speedMPH >= 1.0) {
         if (typeof _clearInactivityTimer === 'function') _clearInactivityTimer();
@@ -6453,15 +6412,15 @@ function _buildRenderState(fusionResult, fix, lastPos, timeDelta) {
     }
 
     return {
-        position:  { lat: fusionResult.lat, lng: fusionResult.lng },
-        lookAhead: lookAheadPos,
-        heading:   heading,
-        speedMPS:  speedMPS,
-        speedMPH:  speedMPH,
+        position:    { lat: fusionResult.lat, lng: fusionResult.lng },
+        lookAhead:   lookAheadPos,
+        heading:     heading,
+        speedMPS:    speedMPS,
+        speedMPH:    speedMPH,
         isConverged: fusionResult.isConverged,
         isFrozen:    fusionResult.isFrozen,
-        timestamp: fix.timestamp,
-        tier:      tier,
+        timestamp:   fix.timestamp,
+        tier:        tier,
         mapState: {
             directionChangeFactor: directionChangeFactor,
             eastWestMove:          eastWestMove,
@@ -6476,6 +6435,7 @@ function _buildRenderState(fusionResult, fix, lastPos, timeDelta) {
     };
 }
 
+/* ── STEP 7: Dead Reckoning Control ────────────────────────────── */
 function _controlDeadReckoning(fusionResult) {
     if (!window.deadReckoning) return;
 
@@ -6490,6 +6450,7 @@ function _controlDeadReckoning(fusionResult) {
     }
 }
 
+/* ── HELPER: Speed Tier ────────────────────────────────────────── */
 function _computeSpeedTier(speedMPH, rawAccuracy) {
     var panDuration, easeLinearity, mapUpdateInterval, mapUpdateDistance,
         maxAccuracy, minDistThreshold, maxSpeedThreshold;
@@ -6499,19 +6460,19 @@ function _computeSpeedTier(speedMPH, rawAccuracy) {
         mapUpdateDistance = 12.0; maxAccuracy = 18; minDistThreshold = 2.0; maxSpeedThreshold = 160;
     } else if (speedMPH >= 30) {
         panDuration = 0.10; easeLinearity = 0.25; mapUpdateInterval = 110;
-        mapUpdateDistance = 8.0; maxAccuracy = 20; minDistThreshold = 1.2; maxSpeedThreshold = 100;
+        mapUpdateDistance = 8.0;  maxAccuracy = 20; minDistThreshold = 1.2; maxSpeedThreshold = 100;
     } else if (speedMPH >= 15) {
         panDuration = 0.12; easeLinearity = 0.22; mapUpdateInterval = 150;
-        mapUpdateDistance = 6.5; maxAccuracy = 20; minDistThreshold = 0.85; maxSpeedThreshold = 60;
+        mapUpdateDistance = 6.5;  maxAccuracy = 20; minDistThreshold = 0.85; maxSpeedThreshold = 60;
     } else if (speedMPH >= 8) {
         panDuration = 0.25; easeLinearity = 0.18; mapUpdateInterval = 400;
-        mapUpdateDistance = 4.0; maxAccuracy = 25; minDistThreshold = 0.5; maxSpeedThreshold = 15;
+        mapUpdateDistance = 4.0;  maxAccuracy = 25; minDistThreshold = 0.5;  maxSpeedThreshold = 15;
     } else if (speedMPH >= 3) {
         panDuration = 0.35; easeLinearity = 0.15; mapUpdateInterval = 800;
-        mapUpdateDistance = 3.0; maxAccuracy = 28; minDistThreshold = 0.35; maxSpeedThreshold = 8;
+        mapUpdateDistance = 3.0;  maxAccuracy = 28; minDistThreshold = 0.35; maxSpeedThreshold = 8;
     } else {
         panDuration = 0.60; easeLinearity = 0.12; mapUpdateInterval = 1000;
-        mapUpdateDistance = 2.0; maxAccuracy = 32; minDistThreshold = 0.25; maxSpeedThreshold = 3;
+        mapUpdateDistance = 2.0;  maxAccuracy = 32; minDistThreshold = 0.25; maxSpeedThreshold = 3;
     }
 
     if (rawAccuracy >= 20) {
@@ -6531,21 +6492,115 @@ function _computeSpeedTier(speedMPH, rawAccuracy) {
     };
 }
 
-function _confirmStationary(position, timestamp) {
-    /* DEPRECATED: kept for backward compatibility */
-    window.isStationary           = true;
-    window.stationaryLockPosition = { lat: position.lat, lng: position.lng };
-    window.stationaryStartTime    = timestamp;
+/* ── HELPER: Proximity ─────────────────────────────────────────── */
+function _computeProximity(newPosition, speedMPH, currentTime) {
+    var closestDistance = Infinity;
+    var closestLocation = null;
+    var locationsWithDistance = [];
 
+    if (Array.isArray(window.gameLocations) && window.gameLocations.length) {
+        var lat         = newPosition.lat;
+        var lng         = newPosition.lng;
+        var speedFactor = Math.min(speedMPH / 15, 4);
+        var R           = 0.015 + 0.01 * speedFactor;
+
+        for (var i = 0; i < window.gameLocations.length; i++) {
+            var loc = window.gameLocations[i];
+            if (!loc || !loc.lat ||
+                loc.lat < lat - R || loc.lat > lat + R ||
+                loc.lng < lng - R || loc.lng > lng + R) continue;
+
+            var dist = calculateDistance(newPosition, loc);
+            locationsWithDistance.push({ location: loc, distance: dist });
+            if (dist < closestDistance) {
+                closestDistance = dist;
+                closestLocation = loc;
+            }
+        }
+    }
+
+    window._lastClosestDistance = closestDistance;
+    window._lastClosestLocation = closestLocation;
+    window.proximityState = (closestLocation && closestDistance !== Infinity)
+        ? { closestLocation: closestLocation, distanceMeters: closestDistance }
+        : null;
+
+    if (locationsWithDistance.length &&
+        (!window._lastCacheUpdate || (currentTime - window._lastCacheUpdate) > 5000)) {
+        var cacheFn = window.enterpriseCacheManager &&
+                      window.enterpriseCacheManager.cacheLocationData;
+        if (cacheFn) {
+            for (var j = 0; j < locationsWithDistance.length; j++) {
+                if (locationsWithDistance[j].distance <= 100) {
+                    cacheFn(locationsWithDistance[j].location, newPosition);
+                }
+            }
+        }
+        window._lastCacheUpdate = currentTime;
+    }
+
+    return {
+        closestLocation:       closestLocation,
+        closestDistance:       closestDistance,
+        locationsWithDistance: locationsWithDistance
+    };
+}
+
+/* ── LEGACY STUBS (backward compatibility) ─────────────────────── */
+function _initializeUserLocationState(position, timestamp, forceUpdate) {
+    _resetMapToPosition(position, {
+        currentTime:      timestamp,
+        resetType:        'init',
+        forceUpdate:      !!forceUpdate,
+        clearStationary:  true
+    });
+}
+
+function _handleLargeDistanceJump(position, timestamp) {
+    if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
+        window.sensorFusion._kalmanFilter.reset();
+    }
+    window.smoothedVelocity       = { lat: 0, lng: 0 };
+    window.isStationary           = false;
+    window.stationaryLockPosition = null;
+    window.stationaryStartTime    = null;
+
+    _interp.curLat  = null;
+    _interp.prevLat = null;
     _stopContinuousRenderLoop();
 
+    window.lastPosition = {
+        lat:       position.lat,
+        lng:       position.lng,
+        accuracy:  position.accuracy || 20,
+        heading:   position.heading,
+        timestamp: timestamp,
+        speedMPS:  position.speedMPS || 0
+    };
+    window.lastUpdateTime      = timestamp;
+    window.lastUpdateTimestamp = timestamp;
+
+    if (typeof userMarker !== 'undefined' && userMarker) {
+        userMarker.setLatLng([position.lat, position.lng]);
+    }
     if (window.deadReckoning && typeof window.deadReckoning.stop === 'function') {
         window.deadReckoning.stop();
     }
 }
 
-/* _executeRender kept for any external callers in legacy code */
+function _confirmStationary(position, timestamp) {
+    /* DEPRECATED — stationary is driven by fusionResult.isFrozen */
+    window.isStationary           = true;
+    window.stationaryLockPosition = { lat: position.lat, lng: position.lng };
+    window.stationaryStartTime    = timestamp;
+    _stopContinuousRenderLoop();
+    if (window.deadReckoning && typeof window.deadReckoning.stop === 'function') {
+        window.deadReckoning.stop();
+    }
+}
+
 function _executeRender(state) {
+    /* DEPRECATED — kept for external callers */
     _executeRenderEventUpdates(state);
 }
         
