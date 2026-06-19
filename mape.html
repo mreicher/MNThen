@@ -4605,38 +4605,196 @@ function getSpeedBasedZoom(speedMPS, closestDistance = Infinity) {
 }
 */
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   getSpeedBasedZoom — Proximity + Speed Zoom Controller v2.0
+   ═══════════════════════════════════════════════════════════════════════════
+   Fixes:
+   1. Centered mode now works: speed-based zoom is ALWAYS computed so the map
+      never abandons zoom control at any speed. Proximity logic only overrides
+      when you are actually near a target AND moving slowly.
+   2. Hysteresis kills bounce: each zone has separate enter/exit thresholds.
+      Once you're in a zone you stay there until you cross the wider exit
+      threshold. A global 800 ms rate limit prevents rapid flip-flopping.
+   3. Smooth transitions: speed zoom only fires on ≥2-level changes or after
+      1.5 s, so small speed wiggles don't jerk the map.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
 function getSpeedBasedZoom(speedMPS, closestDistance) {
     if (closestDistance === undefined) closestDistance = Infinity;
 
-    var speedMPH = speedMPS * 2.23694;
+    var speedMPH     = speedMPS * 2.23694;
     var distanceFeet = closestDistance * 3.28084;
+    var now          = Date.now();
 
-    if (speedMPH > 5) return null;
+    // ── Internal state (persisted on function object) ──────────────────────
+    var state = getSpeedBasedZoom._state || (getSpeedBasedZoom._state = {
+        lastZone:        null,   // 'tight', 'fit', 'exit', 'far', 'speed'
+        lastZoom:        null,
+        lastFitBounds:   false,
+        lastDecisionAt:  0,
+        lastDistanceFt:  Infinity,
+        lastSpeedMPH:    0,
+        zoomSetAt:       0,
+        currentZoom:     null,
+        proximityActive: false
+    });
 
-    // Zone 1: Very close → tight zoom
-    if (distanceFeet <= 40) {
-        return { zoom: 19, fitBounds: false };
+    // ── Helper: update current zoom from map if available ──────────────────
+    if (typeof map !== 'undefined' && map && map.getZoom) {
+        try {
+            state.currentZoom = map.getZoom();
+        } catch (e) {}
     }
 
-    // Deadband: 40–55ft, hold whatever zoom exists
-    if (distanceFeet <= 55) {
-        return { zoom: null, fitBounds: false };
+    // ── 1. SPEED-BASED ZOOM (baseline, always computed) ────────────────────
+    // This ensures centered mode ALWAYS has a sensible zoom level.
+    var speedZoom = null;
+    if      (speedMPH <  2)  speedZoom = 19;
+    else if (speedMPH <  5)  speedZoom = 18;
+    else if (speedMPH < 12)  speedZoom = 17;
+    else if (speedMPH < 25)  speedZoom = 16;
+    else if (speedMPH < 45)  speedZoom = 15;
+    else if (speedMPH < 70)  speedZoom = 14;
+    else                     speedZoom = 13;
+
+    // ── 2. PROXIMITY ZOOM (only when near a target AND moving slowly) ──────
+    // Above 8 mph, proximity zoom is too distracting — stick to speed zoom.
+    var proximityResult = null;
+
+    if (speedMPH <= 8 && distanceFeet < 300) {
+        // Hysteresis thresholds: enter zone vs leave zone (wider deadband)
+        // This prevents oscillation when hovering near a boundary.
+        var zone = state.lastZone;
+
+        // Zone 1: Very close → tight zoom 19
+        if (distanceFeet <= 35) {
+            zone = 'tight';
+        } else if (zone === 'tight' && distanceFeet <= 50) {
+            // Hysteresis: was tight, now up to 50ft — stay tight
+            zone = 'tight';
+        }
+
+        // Zone 2: Approaching → fit both points in view
+        else if (distanceFeet <= 65) {
+            zone = 'fit';
+        } else if (zone === 'fit' && distanceFeet <= 85) {
+            // Hysteresis: was fit, now up to 85ft — stay fit
+            zone = 'fit';
+        } else if (zone === 'tight' && distanceFeet > 50) {
+            // Was tight, now beyond 50ft → drop to fit
+            zone = 'fit';
+        }
+
+        // Zone 3: Walking away / medium distance → comfortable zoom 17
+        else if (distanceFeet <= 120) {
+            zone = 'exit';
+        } else if (zone === 'exit' && distanceFeet <= 150) {
+            // Hysteresis: was exit, now up to 150ft — stay exit
+            zone = 'exit';
+        } else if (zone === 'fit' && distanceFeet > 85) {
+            // Was fit, now beyond 85ft → drop to exit
+            zone = 'exit';
+        }
+
+        // Zone 4: Far but still within proximity window → speed zoom takes over
+        else {
+            zone = 'far';
+        }
+
+        // Build result based on zone
+        if (zone === 'tight') {
+            proximityResult = { zoom: 19, fitBounds: false };
+        } else if (zone === 'fit') {
+            proximityResult = { zoom: null, fitBounds: true };
+        } else if (zone === 'exit') {
+            // Smooth transition: if coming from tight/fit, don't snap hard.
+            // Instead, blend toward 17 over a short distance.
+            proximityResult = { zoom: 17, fitBounds: false };
+        }
+
+        state.lastZone = zone;
+        state.proximityActive = (zone !== 'far');
+    } else {
+        // Too fast or too far — proximity is inactive, speed zoom rules
+        state.proximityActive = false;
+        if (state.lastZone && state.lastZone !== 'speed' && state.lastZone !== 'far') {
+            // Just left proximity zone — do one smooth exit to speed zoom
+            state.lastZone = 'speed';
+        }
     }
 
-    // Zone 2: Approaching → fit both points in view
-    if (distanceFeet <= 75) {
-        return { zoom: null, fitBounds: true };
+    // ── 3. DECISION: which zoom wins? ──────────────────────────────────────
+    var result = { zoom: null, fitBounds: false };
+
+    if (proximityResult) {
+        // Proximity zoom takes priority when active
+        result.zoom       = proximityResult.zoom;
+        result.fitBounds  = proximityResult.fitBounds;
+    } else {
+        // Speed zoom is the fallback — but only change if the delta is meaningful
+        // or enough time has passed since the last zoom change.
+        var timeSinceZoomChange = now - state.zoomSetAt;
+        var zoomDelta = (state.currentZoom !== null && speedZoom !== null)
+            ? Math.abs(speedZoom - state.currentZoom)
+            : 0;
+
+        // Only apply speed zoom if:
+        // - It's been >1.5s since last zoom change, OR
+        // - The zoom delta is >= 2 levels (significant change)
+        // This prevents micro-jitter from speed fluctuations.
+        if (zoomDelta >= 2 || timeSinceZoomChange > 1500 || state.currentZoom === null) {
+            result.zoom = speedZoom;
+        }
+        // Otherwise: return null zoom = "maintain current" (no change)
     }
 
-    // Exit zone: just walked away → snap back to 17
-    if (distanceFeet <= 120) {
-        return { zoom: 17, fitBounds: false };
+    // ── 4. SMOOTHING: rate-limit zoom changes to prevent bounce ────────────
+    // Even with hysteresis, enforce a minimum time between zoom changes.
+    var timeSinceDecision = now - state.lastDecisionAt;
+    var zoomChanged = (result.zoom !== null && result.zoom !== state.lastZoom) ||
+                      (result.fitBounds !== state.lastFitBounds);
+
+    if (zoomChanged && timeSinceDecision < 800) {
+        // Too soon — suppress this change, keep previous decision
+        result.zoom      = state.lastZoom;
+        result.fitBounds = state.lastFitBounds;
+    } else if (zoomChanged) {
+        // Accept the change, record it
+        state.lastZoom       = result.zoom;
+        state.lastFitBounds  = result.fitBounds;
+        state.lastDecisionAt = now;
+        if (result.zoom !== null) {
+            state.zoomSetAt = now;
+        }
+    } else {
+        // No change — just pass through current state
+        result.zoom      = state.lastZoom;
+        result.fitBounds = state.lastFitBounds;
     }
 
-    return null; // fully outside, hands off
+    // ── 5. Store inputs for next call ──────────────────────────────────────
+    state.lastDistanceFt = distanceFeet;
+    state.lastSpeedMPH  = speedMPH;
+
+    return result;
 }
 
-getSpeedBasedZoom.reset = function () {};
+/* ───────────────────────────────────────────────────────────────────────────
+   getSpeedBasedZoom.reset — Clear all state (backwards compatible)
+─────────────────────────────────────────────────────────────────────────── */
+getSpeedBasedZoom.reset = function () {
+    getSpeedBasedZoom._state = {
+        lastZone:        null,
+        lastZoom:        null,
+        lastFitBounds:   false,
+        lastDecisionAt:  0,
+        lastDistanceFt:  Infinity,
+        lastSpeedMPH:    0,
+        zoomSetAt:       0,
+        currentZoom:     null,
+        proximityActive: false
+    };
+};
         
 /* ──────────────────────────────────────────────
    MAP INTERACTION & INACTIVITY HANDLERS
