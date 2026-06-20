@@ -6057,31 +6057,6 @@ function _panMapToCenter(target, speedTier, directionChangeFactor, eastWestMovem
 /**
  * CENTERED MODE: Always keep the marker at the exact center with look-ahead.
  */
-/**
- * CENTERED MODE: Always keep the marker at the exact center with look-ahead.
- *
- * REWRITE — fixes map sliding/oscillation during transition and early travel.
- *
- * Root causes fixed:
- *  1. Per-frame transitionProgress blending created a feedback loop where
- *     slight progress changes caused visible pan param changes mid-animation.
- *     → Replaced with an exponential lerp param cache (_panParamCache) that
- *       smoothly converges to target values independent of progress jitter.
- *
- *  2. Binary snapBlend threshold (0.5) hard-switched between setView and panTo,
- *     creating a visible jump at mid-speed.
- *     → setView is now only used at very high speed (≥45 mph) where it's
- *       perceptually invisible. Everything else uses panTo.
- *
- *  3. transitionProgress was re-read every frame, coupling pan behavior to the
- *     mode manager's internal counter.
- *     → Entry into centered mode is now detected once via a timestamp
- *       (_centeredModeEntryTime). Entry-softening applies for the first
- *       ENTRY_SETTLE_MS milliseconds, then the function behaves normally.
- *
- * Backwards compatible: same signature, same external side-effects,
- * same DEBUG_PANNING log format (extended with cache info).
- */
 
 /** @type {{ duration: number, easing: number } | null} */
 window._panParamCache = window._panParamCache || null;
@@ -6102,6 +6077,18 @@ window.notifyCenteredModeEntry = function () {
 
 function _executeCenteredModePan(target, speedTier, directionChangeFactor, eastWestMovement, speedMPH, lookAheadFactor) {
     if (!map) return;
+
+    // ─── DEAD RECKONING GUARD ───────────────────────────────────────────────
+    // The Dead Reckoning loop (initDeadReckoning) is now the SOLE writer to 
+    // the map viewport in centered mode. It handles look-ahead and animation 
+    // internally via requestAnimationFrame. If we fire panTo() or setView() 
+    // here, it will fight the DR loop and cause rubber-banding.
+    if (window.deadReckoning && typeof window.deadReckoning.isActive === 'function' && window.deadReckoning.isActive()) {
+        if (window.DEBUG_PANNING) {
+            console.debug('[Centered] Pan skipped: Dead Reckoning loop is handling viewport.');
+        }
+        return; 
+    }
 
     // ─── Constants ────────────────────────────────────────────────────────────
     const ENTRY_SETTLE_MS   = 800;   // how long entry-softening applies (ms)
@@ -6199,8 +6186,7 @@ function _executeCenteredModePan(target, speedTier, directionChangeFactor, eastW
     // threshold, always use panTo so there is never a visible hard cut.
     //
     if (safeSpeed >= SNAP_SPEED_MPH &&
-        window.deadReckoning?.isActive() &&
-        !isSettling)
+        window.deadReckoning?.isActive())
     {
         window._gpsCenteredPanJustOccurred = true;
         // Hold the flag for two animation frames so the DR loop can reliably
@@ -6309,6 +6295,7 @@ function _resetMapToPosition(newPosition, options) {
         window.zoomedInState = false;
         window._lastCenteredMode = false;
         window._viewportSafetyEnforced = false;
+        window.followUser = true;
     } else {
         if (clearStationary && window.stationaryCheckTimeout != null) {
             clearTimeout(window.stationaryCheckTimeout);
@@ -6316,19 +6303,23 @@ function _resetMapToPosition(newPosition, options) {
         }
         window.positionBuffer = [newPosition];
         window.stationaryStartTime = null;
+        // Jump: don't force followUser — respect user's pan choice
     }
 
     window.lastPosition = newPosition;
     window.lastUpdateTime = currentTime;
     window.lastUpdateTimestamp = currentTime;
 
+    // Correct velocity calculation (cos to east component only)
     if (prevPos && prevTime && currentTime) {
         var dtSec = (currentTime - prevTime) / 1000;
         if (dtSec > 0 && dtSec < 120) {
             var latVel = (newPosition.lat - prevPos.lat) / dtSec;
             var lngVel = (newPosition.lng - prevPos.lng) / dtSec;
-            var speedMPS = Math.sqrt(latVel * latVel + lngVel * lngVel) * 111111 *
-                Math.cos((newPosition.lat || 0) * Math.PI / 180);
+            var cosLat = Math.cos((newPosition.lat || 0) * Math.PI / 180);
+            var latMPS = latVel * 111111;
+            var lngMPS = lngVel * 111111 * cosLat;
+            var speedMPS = Math.sqrt(latMPS * latMPS + lngMPS * lngMPS);
             if (speedMPS < 100) {
                 window.lastVelocity = { lat: latVel, lng: lngVel };
                 window.smoothedVelocity = { lat: latVel, lng: lngVel };
@@ -6345,27 +6336,65 @@ function _resetMapToPosition(newPosition, options) {
         window.smoothedVelocity = { lat: 0, lng: 0 };
     }
 
+    // Conditional Kalman reset (only init, >30s gap, or >500m jump)
     if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
         var kf = window.sensorFusion._kalmanFilter;
-        if (resetType !== 'init') {
+        var shouldResetKalman = false;
+
+        if (resetType === 'init') {
+            shouldResetKalman = true;
+        } else if (prevTime && currentTime) {
+            var gapSec = (currentTime - prevTime) / 1000;
+            if (gapSec > 30) {
+                shouldResetKalman = true;
+            }
+            if (prevPos) {
+                var jumpLat = Math.abs(newPosition.lat - prevPos.lat) * 111111;
+                var jumpLng = Math.abs(newPosition.lng - prevPos.lng) * 111111 * 
+                    Math.cos((newPosition.lat || 0) * Math.PI / 180);
+                if (Math.sqrt(jumpLat*jumpLat + jumpLng*jumpLng) > 500) {
+                    shouldResetKalman = true;
+                }
+            }
+        }
+
+        if (shouldResetKalman) {
             kf.reset();
         }
+
         var sv = window.smoothedVelocity;
         if (sv && (Math.abs(sv.lat) > 1e-8 || Math.abs(sv.lng) > 1e-8)) {
             var cosLat = Math.cos((newPosition.lat || 0) * Math.PI / 180);
             var vNorth = sv.lat * 111111;
             var vEast = sv.lng * 111111 * cosLat;
-            if (resetType === 'init') {
-                kf.seedVelocity(vNorth, vEast, 10.0);
-            } else {
-                window._pendingKalmanSeedVelocity = { vNorth: vNorth, vEast: vEast };
-            }
+            
+            // ─── KALMAN HOT-START FIX ───────────────────────────────────────
+            // Use scheduleVelocitySeed() instead of seedVelocity(). 
+            // If shouldResetKalman was true, kf.x is now null. seedVelocity() 
+            // would silently fail. scheduleVelocitySeed() safely queues the 
+            // velocity to be consumed by _initialize() on the next update().
+            kf.scheduleVelocitySeed(vNorth, vEast);
         }
     }
 
     window.isStationary = false;
     window.stationaryLockPosition = null;
-    window.followUser = true;
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // INTERACTION GUARD: Don't fight pinch/pan/zoom gestures
+    // ═══════════════════════════════════════════════════════════════════════
+    if (window.isMapInteracting && window.deadReckoning && 
+        typeof window.deadReckoning.isActive === 'function' && 
+        window.deadReckoning.isActive()) {
+        userMarker.setLatLng([newPosition.lat, newPosition.lng]);
+        if (typeof window.deadReckoning.forceUpdate === 'function') {
+            window.deadReckoning.forceUpdate();
+        }
+        if (typeof window.deadReckoning.invalidateMarkerCache === 'function') {
+            window.deadReckoning.invalidateMarkerCache();
+        }
+        return;
+    }
 
     var mapContainer = map.getContainer();
     var originalTransition = mapContainer.style.transition;
@@ -6387,18 +6416,50 @@ function _resetMapToPosition(newPosition, options) {
             : currentZoom;
     }
 
-    try {
-        userMarker.setLatLng([newPosition.lat, newPosition.lng]);
-        map.setView([newPosition.lat, newPosition.lng], targetZoom, {
-            animate: false,
-            noMoveStart: true,
-            noMoveEnd: true
-        });
-    } catch (error) {
-        console.error(resetType + ' centering failed:', error);
-        var fallbackZoom = (resetType === 'init') ? 18 : currentZoom;
-        map.setView([newPosition.lat, newPosition.lng], fallbackZoom, { animate: false });
-        userMarker.setLatLng([newPosition.lat, newPosition.lng]);
+    // ZoomController integration
+    if (window.zoomController && window.zoomController.getState) {
+        var zcState = window.zoomController.getState();
+        if (zcState && zcState.lockedUntil > Date.now()) {
+            targetZoom = zcState.level;
+        }
+    }
+
+    // ─── DEAD RECKONING VIEWPORT GUARD ───────────────────────────────────────
+    userMarker.setLatLng([newPosition.lat, newPosition.lng]);
+
+    var isDrActive = window.deadReckoning && typeof window.deadReckoning.isActive === 'function' && window.deadReckoning.isActive();
+    var isCentered = typeof ModeManager !== 'undefined' && typeof ModeManager.isCentered === 'function' && ModeManager.isCentered();
+
+    if (isDrActive && isCentered) {
+        if (map.getZoom() !== targetZoom) {
+            try {
+                map.setZoom(targetZoom, { animate: false });
+            } catch (e) {
+                console.error(resetType + ' zoom failed:', e);
+            }
+        }
+    } else {
+        try {
+            map.setView([newPosition.lat, newPosition.lng], targetZoom, {
+                animate: false,
+                noMoveStart: true,
+                noMoveEnd: true
+            });
+        } catch (error) {
+            console.error(resetType + ' centering failed:', error);
+            var fallbackZoom = (resetType === 'init') ? 18 : currentZoom;
+            map.setView([newPosition.lat, newPosition.lng], fallbackZoom, { animate: false });
+        }
+    }
+
+    // Sync DR loop after viewport reset
+    if (window.deadReckoning) {
+        if (typeof window.deadReckoning.start === 'function') {
+            window.deadReckoning.start(); 
+        }
+        if (typeof window.deadReckoning.invalidateMarkerCache === 'function') {
+            window.deadReckoning.invalidateMarkerCache();
+        }
     }
 
     requestAnimationFrame(function () {
@@ -6453,8 +6514,6 @@ function _handleLargeDistanceJump(newPosition, currentTime) {
 }
 
 function _cleanupProximityZoomState() {
-    // No-op — proximity zoom state is now managed by getSpeedBasedZoom._lastAction
-    // Call getSpeedBasedZoom.reset() if you need to clear it explicitly
     getSpeedBasedZoom.reset();
 }
 
@@ -6494,8 +6553,16 @@ function _enforceViewportSafety(speedMPH, currentMarkerPos) {
     }
 }
 
-// Keeps marker within tolerance of exact center. Uses setView at high speed for sub-frame correction.
+/**
+ * Centered mode: Keeps marker within tolerance of exact center. Uses setView at high speed for sub-frame correction.
+ */
 function _enforceCenteredMode(markerPos, map, marker) {
+    // ─── DEAD RECKONING GUARD ───────────────────────────────────────
+    // The DR loop handles centered mode natively via requestAnimationFrame.
+    if (window.deadReckoning && typeof window.deadReckoning.isActive === 'function' && window.deadReckoning.isActive()) {
+        return; 
+    }
+
     var mapSize = map.getSize();
     if (!mapSize || mapSize.x <= 0 || mapSize.y <= 0) return;
 
@@ -6523,8 +6590,8 @@ function _enforceCenteredMode(markerPos, map, marker) {
 
     var speedMPH = speedMPS * 2.23694;
 
-    if (speedMPH >= 15 && window.deadReckoning?.isActive()) {
-        // At high speed with DR active, instant correction — DR handles smoothness
+    if (speedMPH >= 15) {
+        // At high speed, instant correction
         window._gpsCenteredPanJustOccurred = true;
         map.setView([correctedCenter.lat, correctedCenter.lng], map.getZoom(), {
             animate: false, noMoveStart: true, noMoveEnd: true
@@ -6535,14 +6602,26 @@ function _enforceCenteredMode(markerPos, map, marker) {
         map.panTo([correctedCenter.lat, correctedCenter.lng], {
             animate: true, duration: panDuration, easeLinearity: 0.3, noMoveStart: true
         });
-        createTrackedTimeout(function () {
-            window._centeredPanInProgress = false;
-        }, panDuration * 1000 + 50);
+        
+        // Backwards compatible timeout clearing
+        if (typeof createTrackedTimeout === 'function') {
+            createTrackedTimeout(function () { window._centeredPanInProgress = false; }, panDuration * 1000 + 50);
+        } else {
+            setTimeout(function () { window._centeredPanInProgress = false; }, panDuration * 1000 + 50);
+        }
     }
 }
 
-// Keeps marker inside viewport with speed-scaled margins. Pans smoothly without jumping ahead.
+/**
+ * Roaming mode: Keeps marker inside viewport with speed-scaled margins. Pans smoothly without jumping ahead.
+ */
 function _enforceRoamingMode(markerPos, map, marker, speedMPH) {
+    // ─── DEAD RECKONING GUARD ───────────────────────────────────────
+    // If DR is active and the user hasn't explicitly disabled DR roaming, let DR handle it.
+    if (window.deadReckoning && typeof window.deadReckoning.isActive === 'function' && window.deadReckoning.isActive() && !window.DISABLE_DR_ROAMING) {
+        return; 
+    }
+
     if (!map || !marker)             return;
     if (window.isMapInteracting)     return;
     if (window.followUser === false) return;
