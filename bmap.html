@@ -2296,7 +2296,7 @@ window.sensorFusion = new SensorFusionManager().init();
         else                      h = 2.2;     // highway: max prediction (plateau)
                                                // never drops — maintains mirror feel
         const turnFactor = Math.min(1.0, headingChangeDegPerSec / CFG.HEADING_CHANGE_CAP);
-        h *= (1.0 - turnFactor * 0.75);         // sharp turns reduce horizon
+        h *= (1.0 - turnFactor * 0.6);         // sharp turns reduce horizon
         const safetyCap = speedMPS > 0 ? 150 / speedMPS : CFG.MAX_PREDICT_HORIZON;
         return Math.max(0, Math.min(h, safetyCap, CFG.MAX_PREDICT_HORIZON));
     }
@@ -5166,26 +5166,6 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
 
 /**
  * When the device is in stationary-lock, decide what to do this tick.
- * Returns one of three string tokens so the caller can branch cleanly:
- *
- *   'broke'    — lock released, caller should continue with normal movement
- *   'held'     — still locked, caller should return early (state updated here)
- *   'continue' — (should not happen, defensive fallback)
- *
- * All window state mutations that were previously inline are kept here.
- *
- * @param  {{lat,lng,accuracy,heading,timestamp,speedMPS}} newPosition
- * @param  {{lat,lng,accuracy,heading,speedMPS}}           lastPos
- * @param  {number}  distance        metres from last to new
- * @param  {number}  timeDelta       seconds
- * @param  {number}  speedMPS
- * @param  {number|null} validatedHeading
- * @param  {boolean|null} isDeviceMoving
- * @param  {number}  currentTime
- * @param  {boolean} forceUpdate
- * @param  {*}       closestLocation
- * @param  {number}  closestDistance
- * @returns {'broke'|'held'}
  */
 function _handleStationaryLocked(
     newPosition, lastPos, distance, timeDelta, speedMPS, validatedHeading,
@@ -5210,7 +5190,7 @@ function _handleStationaryLocked(
     }
 
     if (shouldBreakLock) {
-        window.isStationary          = false;
+        window.isStationary           = false;
         window.stationaryLockPosition = null;
         window.stationaryStartTime    = null;
         window._stationaryNudgeAnchor = null;
@@ -5218,17 +5198,38 @@ function _handleStationaryLocked(
         if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
             var kf = window.sensorFusion._kalmanFilter;
             var breakoutSpeed = timeDelta > 0 ? distance / timeDelta : 0;
+
+            // KEY FIX: seed BEFORE reset so the filter initialises with real
+            // velocity on the very next update() call, instead of cold-starting
+            // with zero velocity and fighting 1–2 GPS cycles to re-converge.
             if (breakoutSpeed > 0.3 && validatedHeading !== null) {
                 var rad = validatedHeading * Math.PI / 180;
-                kf.seedVelocity(
-                    breakoutSpeed * Math.cos(rad),
-                    breakoutSpeed * Math.sin(rad),
-                    15.0
-                );
-            } else {
-                kf.reset();
+                // Store as pending seed; survives the reset path inside smoothPosition
+                kf._pendingSeedVelocity = {
+                    vNorth: breakoutSpeed * Math.cos(rad),
+                    vEast:  breakoutSpeed * Math.sin(rad)
+                };
+                kf._lastSeedVelocity = kf._pendingSeedVelocity;
             }
-            kf._justInitialized = true;
+
+            // Boost velocity variance so the filter accepts the new motion
+            // immediately rather than fighting its low-variance stationary state.
+            if (kf.P && kf.x) {
+                kf.P[2][2] = 225; kf.P[3][3] = 225;
+                kf.P[0][2] = 0;   kf.P[2][0] = 0;
+                kf.P[1][3] = 0;   kf.P[3][1] = 0;
+            }
+
+            // Unfreeze — the filter was frozen in stationary mode
+            kf.unfreeze();
+        }
+
+        // Also tell sensorFusion's own stationary tracker to unfreeze
+        if (window.sensorFusion) {
+            window.sensorFusion._lastStationaryState = false;
+            window.sensorFusion._stationaryCounter   = 0;
+            window.sensorFusion._stationaryPosition  = null;
+            window.sensorFusion._stationarySamples   = [];
         }
 
         window.smoothedVelocity = timeDelta > 0
@@ -5236,9 +5237,9 @@ function _handleStationaryLocked(
                 lng: (newPosition.lng - lastPos.lng) / timeDelta }
             : { lat: 0, lng: 0 };
 
-        window.lastPosition          = newPosition;
-        window.lastUpdateTime        = currentTime;
-        window.lastUpdateTimestamp   = currentTime;
+        window.lastPosition        = newPosition;
+        window.lastUpdateTime      = currentTime;
+        window.lastUpdateTimestamp = currentTime;
 
         // Purge stale position buffer
         var buffer = window.positionBuffer;
@@ -5252,9 +5253,15 @@ function _handleStationaryLocked(
             }
         }
 
-        if (window.deadReckoning &&
-            typeof window.deadReckoning.onMovementResumed === 'function') {
-            window.deadReckoning.onMovementResumed();
+        // ForceUpdate() — not onMovementResumed() — guarantees the RAF
+        // loop restarts AND flushes the interaction-fade timer so the next frame
+        // writes immediately rather than waiting out the 250 ms fade window.
+        if (window.deadReckoning) {
+            if (typeof window.deadReckoning.forceUpdate === 'function') {
+                window.deadReckoning.forceUpdate();
+            } else if (typeof window.deadReckoning.onMovementResumed === 'function') {
+                window.deadReckoning.onMovementResumed();
+            }
         }
 
         return 'broke';
@@ -5263,10 +5270,11 @@ function _handleStationaryLocked(
         // Still locked — allow fine nudge if accuracy improved significantly
         var distFromLock = calculateDistance(window.stationaryLockPosition, newPosition);
         if (distFromLock < 2.0 && newPosition.accuracy < lastPos.accuracy * 0.7) {
-            scheduleMarkerUpdate(
-                newPosition.lat, newPosition.lng,
-                { animate: true, duration: 0.4, easeLinearity: 0.06 }
-            );
+            // Do NOT call scheduleMarkerUpdate here — dead-reckoning owns the marker.
+            // Just update the frozen position so the DR loop snaps to the better fix.
+            if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
+                window.sensorFusion._kalmanFilter.freeze(newPosition.lat, newPosition.lng);
+            }
             if (!window._stationaryNudgeAnchor) {
                 window._stationaryNudgeAnchor = {
                     lat: window.stationaryLockPosition.lat,
@@ -5286,11 +5294,9 @@ function _handleStationaryLocked(
         if (typeof updateDistanceBox === 'function') {
             updateDistanceBox(forceUpdate, newPosition, closestLocation, closestDistance);
         }
-
         return 'held';
     }
 }
-
 
 /* ─── 7. RAF MAP UPDATE ─────────────────────────────────────────────────────── */
 
@@ -5361,22 +5367,21 @@ function _scheduleMapUpdate() {
 /* ═══════════════════════════════════════════════════════════════
    updateUserLocation  
    ─────────────────────────────────────────────────────────────*/
- 
-function updateUserLocation(position, forceUpdate) {
+ function updateUserLocation(position, forceUpdate) {
     if (forceUpdate === undefined) forceUpdate = false;
- 
+
     var now = performance.now();
     var currentGen = (window._locationUpdateGeneration || 0) + 1;
     window._locationUpdateGeneration = currentGen;
- 
+
     if (window._debounceTimeoutId) {
         clearTimeout(window._debounceTimeoutId);
         window._debounceTimeoutId = null;
     }
- 
+
     // ── STEP 1: Validate and extract GPS fix ─────────────────────
     var fix = _extractGPSFix(position, forceUpdate);
- 
+
     if (fix) {
         if (window._gpsTimeoutTimer) {
             clearTimeout(window._gpsTimeoutTimer);
@@ -5396,60 +5401,71 @@ function updateUserLocation(position, forceUpdate) {
         }, 30000);
         return;
     }
- 
+
     var lastPos = window.lastPosition;
- 
+
     // ── First fix: init path ──────────────────────────────────────
     if (!lastPos) {
         _initializeUserLocationState(fix, fix.timestamp, forceUpdate);
         return;
     }
- 
+
     var timeDelta = (lastPos && window.lastUpdateTime)
         ? (fix.timestamp - window.lastUpdateTime) / 1000
         : 0;
- 
+
     // ── STEP 2: Handle gaps and seed velocity ─────────────────────
     _handleGPSGap(fix, lastPos, timeDelta);
- 
+
+    // ── STEP 2b: Pre-boost velocity variance on stationary breakout ──
+    // Ensures the Kalman filter accepts new motion this cycle instead
+    // of waiting a full GPS interval to re-converge.
+    if (window.isStationary && window.sensorFusion && window.sensorFusion.isDeviceMoving(fix.speedMPS)) {
+        var kf = window.sensorFusion._kalmanFilter;
+        if (kf && kf.P && kf.x) {
+            kf.P[2][2] = 225; kf.P[3][3] = 225;
+            kf.P[0][2] = 0;   kf.P[2][0] = 0;
+            kf.P[1][3] = 0;   kf.P[3][1] = 0;
+        }
+    }
+
     // ── STEP 3: Sensor fusion ─────────────────────────────────────
     var fusionResult = _runSensorFusion(fix, lastPos, timeDelta, forceUpdate);
     if (!fusionResult) {
         window.lastUpdateTime = fix.timestamp;
         return;
     }
- 
+
     // ── STEP 4: Publish global state ──────────────────────────────
     _publishFusionState(fusionResult, fix);
- 
+
     // ── STEP 5: Compute render state ──────────────────────────────
     var renderState = _buildRenderState(fusionResult, fix, lastPos, timeDelta);
- 
-    // ── STEP 6: Schedule unified render ──────────────────────────
-    // FIX #2: pass centeredMode flag so _scheduleUnifiedRender never
-    // calls an animated pan when centered mode is active.
+
+    // ── STEP 6: Schedule unified render ───────────────────────────
     _scheduleUnifiedRender(renderState);
- 
+
     // ── STEP 7: Update legacy state ───────────────────────────────
     window.lastPosition = {
-        lat: fix.lat, lng: fix.lng,
-        accuracy: fix.accuracy,
-        heading: fusionResult.heading,
+        lat:       fix.lat,
+        lng:       fix.lng,
+        accuracy:  fix.accuracy,
+        heading:   fusionResult.heading,
         timestamp: fix.timestamp,
-        speedMPS: fusionResult.speedMPS
+        speedMPS:  fusionResult.speedMPS
     };
-    window.lastUpdateTime = fix.timestamp;
+    window.lastUpdateTime      = fix.timestamp;
     window.lastUpdateTimestamp = fix.timestamp;
- 
-    // ── STEP 8: Dead reckoning control ───────────────────────────
+
+    // ── STEP 8: Dead reckoning control ────────────────────────────
     _controlDeadReckoning(fusionResult);
- 
+
     // ── STEP 9: Final callbacks ───────────────────────────────────
     if (typeof updateDistanceBox === 'function') {
         updateDistanceBox(forceUpdate, window.lastPosition,
             renderState.closestLocation, renderState.closestDistance);
     }
- 
+
     if (typeof _ensureWillChange === 'function') _ensureWillChange();
     if (typeof _scheduleWillChangeReset === 'function') _scheduleWillChangeReset();
 }
@@ -5606,24 +5622,29 @@ function _publishFusionState(fusionResult, fix) {
 function _buildRenderState(fusionResult, fix, lastPos, timeDelta) {
     var speedMPS = fusionResult.speedMPS;
     var speedMPH = speedMPS * 2.23694;
- 
-    var heading = fusionResult.heading || fix.heading;
+
+    // Use != null instead of || to preserve a valid heading of 0 (due north)
+    var heading = fusionResult.heading != null ? fusionResult.heading : fix.heading;
     if (heading == null && lastPos) heading = lastPos.heading;
- 
+
     var lookAheadSeconds = speedMPH < 3  ? 0.3 :
-                           speedMPH < 15 ? 0.3 + (speedMPH - 3) * 0.06 :
+                           speedMPH < 15 ? 0.3 + (speedMPH - 3)  * 0.06 :
                            speedMPH < 45 ? 1.0 + (speedMPH - 15) * 0.027 :
-                                          Math.min(2.5, 1.81 + (speedMPH - 45) * 0.02);
- 
-    var velocity = window.smoothedVelocity;
+                                           Math.min(2.5, 1.81 + (speedMPH - 45) * 0.02);
+
+    // Prefer SensorFusion's Kalman-filtered velocity over raw smoothedVelocity
+    var velocity = (window.sensorFusion
+        ? window.sensorFusion.getSmoothedVelocityDegPerSec()
+        : null) || window.smoothedVelocity || { lat: 0, lng: 0 };
+
     var lookAheadPos = {
         lat: fusionResult.lat + velocity.lat * lookAheadSeconds,
         lng: fusionResult.lng + velocity.lng * lookAheadSeconds
     };
     window._lookAheadPos = lookAheadPos;
- 
+
     var tier = _computeSpeedTier(speedMPH, fix.accuracy);
- 
+
     var directionChangeFactor = 1.0;
     if (lastPos && lastPos.heading != null && heading != null) {
         var diff = Math.abs(heading - lastPos.heading);
@@ -5632,58 +5653,58 @@ function _buildRenderState(fusionResult, fix, lastPos, timeDelta) {
             directionChangeFactor = Math.min(1.3, 1.0 + diff / 200);
         }
     }
- 
+
     var eastWestMove = false;
     if (lastPos && timeDelta > 0) {
         var latMeters = Math.abs(fix.lat - lastPos.lat) * 111111;
         var lngMeters = Math.abs(fix.lng - lastPos.lng) * 111111 * Math.cos(fix.lat * Math.PI / 180);
-        eastWestMove = lngMeters > latMeters * 1.2;
+        eastWestMove  = lngMeters > latMeters * 1.2;
     }
     if (eastWestMove) {
-        tier.panDuration *= 0.88;
-        tier.easeLinearity *= 0.92;
-        tier.mapUpdateInterval = Math.max(33, tier.mapUpdateInterval * 0.88);
+        tier.panDuration          *= 0.88;
+        tier.easeLinearity        *= 0.92;
+        tier.mapUpdateInterval     = Math.max(33, tier.mapUpdateInterval * 0.88);
         tier.minDistanceThreshold *= 0.92;
     }
- 
-    var modeChanged = false;
+
+    var modeChanged      = false;
     var isInCenteredMode = false;
     if (typeof ModeManager !== 'undefined' && ModeManager) {
-        modeChanged = ModeManager.update(speedMPH);
+        modeChanged      = ModeManager.update(speedMPH);
         isInCenteredMode = ModeManager.isCentered();
     }
- 
+
     var proximity = _computeProximity(fix, speedMPH);
- 
+
     if (speedMPH >= 1.0) {
-        if (typeof _clearInactivityTimer === 'function') _clearInactivityTimer();
+        if (typeof _clearInactivityTimer  === 'function') _clearInactivityTimer();
     } else {
-        if (typeof _startInactivityTimer === 'function') _startInactivityTimer();
+        if (typeof _startInactivityTimer  === 'function') _startInactivityTimer();
     }
- 
+
     if (window.isGPSSearching) {
         window.isGPSSearching = false;
         if (typeof hideGPSSearchingState === 'function') hideGPSSearchingState();
     }
- 
+
     return {
-        position: { lat: fusionResult.lat, lng: fusionResult.lng },
-        lookAhead: lookAheadPos,
-        heading: heading,
-        speedMPS: speedMPS,
-        speedMPH: speedMPH,
-        isConverged: fusionResult.isConverged,
-        isFrozen: fusionResult.isFrozen,
-        timestamp: fix.timestamp,
-        tier: tier,
+        position:        { lat: fusionResult.lat, lng: fusionResult.lng },
+        lookAhead:       lookAheadPos,
+        heading:         heading,
+        speedMPS:        speedMPS,
+        speedMPH:        speedMPH,
+        isConverged:     fusionResult.isConverged,
+        isFrozen:        fusionResult.isFrozen,
+        timestamp:       fix.timestamp,
+        tier:            tier,
         mapState: {
             directionChangeFactor: directionChangeFactor,
-            eastWestMove: eastWestMove,
-            speedMPH: speedMPH,
-            modeSpeedMPH: speedMPH,
-            lookAheadSeconds: lookAheadSeconds,
-            isInCenteredMode: isInCenteredMode,
-            modeChanged: modeChanged
+            eastWestMove:          eastWestMove,
+            speedMPH:              speedMPH,
+            modeSpeedMPH:          speedMPH,
+            lookAheadSeconds:      lookAheadSeconds,
+            isInCenteredMode:      isInCenteredMode,
+            modeChanged:           modeChanged
         },
         closestLocation: proximity.closestLocation,
         closestDistance: proximity.closestDistance
