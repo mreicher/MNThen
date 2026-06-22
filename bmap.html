@@ -1025,6 +1025,7 @@
 
   const DEBUG = location.search.includes('sw_debug');
   let updateInterval = null;
+  let regScope = null;
 
   const msgHandler = e => {
     if (e?.data?.type === 'SW_ACTIVATED' && DEBUG) {
@@ -1034,12 +1035,13 @@
 
   const askToUpdate = (newWorker) => {
     if (confirm('A new version is available. Reload now?')) {
-      newWorker.addEventListener('statechange', function onStateChange() {
+      const onStateChange = () => {
         if (newWorker.state === 'activated') {
           newWorker.removeEventListener('statechange', onStateChange);
           location.reload();
         }
-      });
+      };
+      newWorker.addEventListener('statechange', onStateChange);
       try {
         newWorker.postMessage({ type: 'SKIP_WAITING' });
         if (DEBUG) console.log('Sent SKIP_WAITING to SW');
@@ -1049,46 +1051,58 @@
     }
   };
 
-  const handleUpdate = reg => {
+  const handleUpdate = (reg) => {
     const newWorker = reg.installing || reg.waiting;
     if (!newWorker) return;
-    if (newWorker.state === 'installed' || newWorker.state === 'waiting') {
+
+    const state = newWorker.state;
+    if (state === 'activated') return;
+    if (state === 'installed' || state === 'waiting') {
       askToUpdate(newWorker);
       return;
     }
-    newWorker.addEventListener('statechange', function onStateChange() {
+
+    const onStateChange = () => {
       if (newWorker.state === 'installed' || newWorker.state === 'waiting') {
         askToUpdate(newWorker);
         newWorker.removeEventListener('statechange', onStateChange);
       }
-    });
+    };
+    newWorker.addEventListener('statechange', onStateChange);
   };
 
   const onLoad = () => {
     if (!('serviceWorker' in navigator)) return;
+
     navigator.serviceWorker.register('/sw.js').then(reg => {
+      regScope = reg.scope;
       if (DEBUG) console.log('SW registered:', reg);
-      navigator.serviceWorker.addEventListener('message', msgHandler);
+
       if (reg.waiting) askToUpdate(reg.waiting);
       else if (reg.installing) handleUpdate(reg);
+
       reg.addEventListener('updatefound', () => handleUpdate(reg));
+
       updateInterval = setInterval(() => {
-        if (!navigator.onLine) return;
-        // getRegistration takes scope, not script URL
-        navigator.serviceWorker.getRegistration('/').then(r => {
-          if (r) r.update().catch(err => console.warn('SW update failed:', err));
-        }).catch(err => console.warn('SW reg lookup failed:', err));
+        if (!navigator.onLine || !regScope) return;
+        navigator.serviceWorker.getRegistration(regScope)
+          .then(r => r?.update())
+          .catch(() => {});
       }, 60 * 60 * 1000);
     }).catch(err => console.error('SW registration failed:', err));
   };
 
   const onUnload = () => {
-    if (updateInterval) { clearInterval(updateInterval); updateInterval = null; }
-    if (navigator.serviceWorker) navigator.serviceWorker.removeEventListener('message', msgHandler);
+    if (updateInterval) {
+      clearInterval(updateInterval);
+      updateInterval = null;
+    }
+    if (DEBUG) navigator.serviceWorker?.removeEventListener('message', msgHandler);
   };
 
+  if (DEBUG) navigator.serviceWorker?.addEventListener('message', msgHandler);
+
   window.addEventListener('load', onLoad, { once: true });
-  window.addEventListener('beforeunload', onUnload);
   window.addEventListener('pagehide', onUnload);
   window.teardownEnterpriseSW = onUnload;
 })();
@@ -1108,15 +1122,15 @@ class EnterpriseCacheManager {
   init() {
     this.cleanupExpiredCache();
     this._cleanupInterval = setInterval(() => this.cleanupExpiredCache(), 60 * 60 * 1000);
-    return Promise.resolve();
   }
 
-  async cacheLocationData(location, userPosition) {
+  cacheLocationData(location, userPosition) {
     if (!userPosition || !location?.id) return;
-    const dist = this._calculateDistance(userPosition, location);
-    if (dist > this.proximityThresholdMeters) return;
+    if (this._distance(userPosition, location) > this.proximityThresholdMeters) return;
+
     const key = `${this.cachePrefix}location_${location.id}`;
-    const entry = { location, timestamp: Date.now(), distanceMeters: dist };
+    const entry = { location, timestamp: Date.now() };
+
     try {
       localStorage.setItem(key, JSON.stringify(entry));
     } catch (e) {
@@ -1124,30 +1138,26 @@ class EnterpriseCacheManager {
         this.cleanupOldestEntries();
         try {
           localStorage.setItem(key, JSON.stringify(entry));
-        } catch (retryErr) {
-          console.warn('[Cache] Failed to store even after cleanup:', retryErr);
+        } catch {
+          console.warn('[Cache] Quota exceeded even after cleanup');
         }
       }
     }
   }
 
-  async encryptData(data) { return data; }
-  async decryptData(data) { return data; }
-  async getEncryptionKey() { return null; }
-  async getOrCreateKeyData() { return new Uint8Array(32); }
-
   getCachedLocation(locationId) {
     const key = `${this.cachePrefix}location_${locationId}`;
     const raw = localStorage.getItem(key);
     if (!raw) return null;
+
     try {
       const parsed = JSON.parse(raw);
-      if (!parsed?.timestamp || Date.now() - parsed.timestamp > this.maxCacheAge) {
+      if (Date.now() - parsed.timestamp > this.maxCacheAge) {
         localStorage.removeItem(key);
         return null;
       }
       return parsed.location;
-    } catch (e) {
+    } catch {
       localStorage.removeItem(key);
       return null;
     }
@@ -1156,39 +1166,40 @@ class EnterpriseCacheManager {
   cleanupExpiredCache() {
     const now = Date.now();
     const toRemove = [];
+
     for (let i = 0; i < localStorage.length; i++) {
       const key = localStorage.key(i);
-      if (!key?.startsWith(this.cachePrefix) || key.endsWith('crypto-key')) continue;
+      if (!key?.startsWith(this.cachePrefix)) continue;
+
       try {
         const parsed = JSON.parse(localStorage.getItem(key));
-        if (!parsed?.timestamp || now - parsed.timestamp > this.maxCacheAge) {
-          toRemove.push(key);
-        }
-      } catch (e) {
+        if (now - parsed.timestamp > this.maxCacheAge) toRemove.push(key);
+      } catch {
         toRemove.push(key);
       }
     }
-    for (const key of toRemove) {
-      localStorage.removeItem(key);
-    }
+
+    toRemove.forEach(k => localStorage.removeItem(k));
   }
 
   cleanupOldestEntries() {
     const entries = [];
+
     for (let i = 0; i < localStorage.length; i++) {
       const key = localStorage.key(i);
-      if (!key?.startsWith(this.cachePrefix) || key.endsWith('crypto-key')) continue;
+      if (!key?.startsWith(this.cachePrefix)) continue;
+
       try {
         const parsed = JSON.parse(localStorage.getItem(key));
-        if (parsed?.timestamp != null) entries.push({ key, timestamp: parsed.timestamp });
-      } catch (e) {}
+        entries.push({ key, timestamp: parsed.timestamp });
+      } catch {}
     }
-    if (entries.length === 0) return;
+
+    if (!entries.length) return;
+
     entries.sort((a, b) => a.timestamp - b.timestamp);
     const removeCount = Math.max(1, Math.ceil(entries.length * this._quotaRemoveRatio));
-    for (let i = 0; i < removeCount; i++) {
-      localStorage.removeItem(entries[i].key);
-    }
+    entries.slice(0, removeCount).forEach(e => localStorage.removeItem(e.key));
   }
 
   stopPeriodicCleanup() {
@@ -1198,8 +1209,8 @@ class EnterpriseCacheManager {
     }
   }
 
-  _calculateDistance(pos1, pos2) {
-    return calculateDistance(pos1, pos2);
+  _distance(a, b) {
+    return calculateDistance(a, b);
   }
 }
         
@@ -1208,40 +1219,25 @@ class EnterpriseCacheManager {
    ────────────────────────────────────────────── */
 class EnterpriseSecurityManager {
   constructor(options = {}) {
-    this.config = {
-      inMemoryLogLimit: options.inMemoryLogLimit || 100,
-      persistedLogKey: options.persistedLogKey || 'securityAuditLog',
-      enablePersistence: false
-    };
-    this.sessionToken = Math.random().toString(36).slice(2, 10);
-    this.auditLog = [];
-    this.cspViolations = [];
+    this._logLimit = options.inMemoryLogLimit || 100;
+    this._auditLog = [];
+    this._cspViolations = [];
     this._cspHandler = null;
   }
 
-  generateSecureToken() {
-    console.warn('[Security] generateSecureToken uses Math.random — not cryptographically secure');
-    return this.sessionToken;
-  }
-
   logSecurityEvent(event, details) {
-    if (event === 'SESSION_START') {
-      console.log(`[Security] Session: ${this.sessionToken}`);
-      return;
-    }
-    const method = event === 'CSP_VIOLATION' ? 'warn' : 'debug';
-    console[method](`[Security] ${event}`, details || '');
-    if (this.auditLog.length < this.config.inMemoryLogLimit) {
-      this.auditLog.push({ event, timestamp: Date.now() });
+    console.log(`[Security] ${event}`, details || '');
+    if (this._auditLog.length < this._logLimit) {
+      this._auditLog.push({ event, timestamp: Date.now() });
     }
   }
 
   monitorCSPViolations() {
-    if (this._cspHandler) return; // Prevent duplicate listeners
+    if (this._cspHandler) return;
     this._cspHandler = (e) => {
       console.warn(`[CSP] ${e.violatedDirective}: ${e.blockedURI?.slice(0, 100)}`);
-      if (this.cspViolations.length < 50) {
-        this.cspViolations.push({
+      if (this._cspViolations.length < 50) {
+        this._cspViolations.push({
           timestamp: Date.now(),
           directive: e.violatedDirective,
           blockedURI: e.blockedURI?.slice(0, 100)
@@ -1253,15 +1249,13 @@ class EnterpriseSecurityManager {
 
   init() {
     this.monitorCSPViolations();
-    this.logSecurityEvent('SESSION_START');
   }
 
-  getAuditLog() { return [...this.auditLog]; }
-  clearAuditLog() { this.auditLog = []; this.cspViolations = []; }
-  getCSPViolations() { return [...this.cspViolations]; }
-  clearCSPViolations() { this.cspViolations = []; }
+  getAuditLog() { return [...this._auditLog]; }
+  clearAuditLog() { this._auditLog = []; }
+  getCSPViolations() { return [...this._cspViolations]; }
+  clearCSPViolations() { this._cspViolations = []; }
   forgetUser() { this.clearAuditLog(); this.clearCSPViolations(); }
-  _persistLogEntry() {}
 
   destroy() {
     if (this._cspHandler) {
@@ -1288,85 +1282,74 @@ class EnterprisePerformanceMonitor {
    ────────────────────────────────────────────── */
 class EnterpriseBackgroundSync {
   constructor(options = {}) {
-    this._config = {
-      maxRetries: options.maxRetries || 3,
-      baseDelay: options.baseDelay || 100,
-      backoffFactor: options.backoffFactor || 2,
-      maxQueueSize: options.maxQueueSize || 100
-    };
-    this.syncQueue = [];
-    this.isOnline = navigator.onLine;
-    this.processing = false;
+    this._maxRetries = options.maxRetries || 3;
+    this._baseDelay = options.baseDelay || 100;
+    this._backoffFactor = options.backoffFactor || 2;
+    this._maxQueueSize = options.maxQueueSize || 100;
+    this._queue = [];
+    this._processing = false;
+    this._stopped = false;
     this._retryTimeout = null;
-    this._onlineHandler = () => { this.isOnline = true; this.process(); };
-    this._offlineHandler = () => { this.isOnline = false; };
+    
+    this._onlineHandler = () => { if (!this._stopped) this._process(); };
     window.addEventListener('online', this._onlineHandler);
-    window.addEventListener('offline', this._offlineHandler);
   }
 
   addToSyncQueue(data) {
-    if (this.syncQueue.length >= this._config.maxQueueSize) this.syncQueue.shift();
-    this.syncQueue.push({ data, retries: 0, timestamp: Date.now() });
-    if (this.isOnline) queueMicrotask(() => this.process());
+    if (!data?.handler || typeof data.handler !== 'function') {
+      console.error('Sync item missing handler:', data);
+      return;
+    }
+    if (this._queue.length >= this._maxQueueSize) this._queue.shift();
+    this._queue.push({ data, retries: 0 });
+    if (navigator.onLine && !this._stopped && !this._processing) {
+      queueMicrotask(() => this._process());
+    }
   }
 
   async process() {
-    if (this.processing || !this.isOnline || !this.syncQueue.length) return;
-    this.processing = true;
+    return this._process();
+  }
 
-    while (this.syncQueue.length > 0 && this.isOnline) {
-      const item = this.syncQueue[0]; // Peek, don't shift yet
+  async _process() {
+    if (this._processing || this._stopped || !navigator.onLine || !this._queue.length) return;
+    this._processing = true;
 
-      if (typeof item.data?.handler !== 'function') {
-        console.error('Sync item missing handler:', item.data);
-        this.syncQueue.shift(); // Drop bad item
-        continue;
-      }
+    while (this._queue.length > 0 && !this._stopped && navigator.onLine) {
+      const item = this._queue[0];
 
       try {
         await item.data.handler(item.data);
-        this.syncQueue.shift(); // Success: remove
-      } catch (error) {
+        this._queue.shift();
+      } catch {
         item.retries++;
-        if (item.retries < this._config.maxRetries) {
-          const delay = this._config.baseDelay * Math.pow(this._config.backoffFactor, item.retries);
-          
-          // Stash timeout so stop() can cancel it
-          await new Promise(r => {
-            this._retryTimeout = setTimeout(() => {
-              this._retryTimeout = null;
-              r();
-            }, delay);
-          });
-          
-          // Continue loop — item is still at front, will retry
-        } else {
+        if (item.retries >= this._maxRetries) {
           console.error('Sync permanently failed:', item.data);
-          this.syncQueue.shift(); // Drop exhausted item
+          this._queue.shift();
+          continue;
         }
+        await new Promise(r => {
+          this._retryTimeout = setTimeout(() => {
+            this._retryTimeout = null;
+            r();
+          }, this._baseDelay * Math.pow(this._backoffFactor, item.retries));
+        });
       }
     }
 
-    this.processing = false;
-    
-    // Safety: if items arrived during final retry, kick off again
-    if (this.syncQueue.length > 0 && this.isOnline) {
-      queueMicrotask(() => this.process());
-    }
+    this._processing = false;
   }
 
   stop() {
+    this._stopped = true;
     if (this._retryTimeout) {
       clearTimeout(this._retryTimeout);
       this._retryTimeout = null;
     }
     window.removeEventListener('online', this._onlineHandler);
-    window.removeEventListener('offline', this._offlineHandler);
-    this.processing = false;
-    this.isOnline = false; // Prevent queued microtasks from restarting
   }
 }
-
+        
 /* ──────────────────────────────────────────────
    MEMORY MANAGEMENT
    ────────────────────────────────────────────── */
@@ -4205,28 +4188,6 @@ const ModeManager = {
 
 window.ModeManager = ModeManager;
         
-// Expose threshold for backward compatibility
-const HIGH_SPEED_THRESHOLD_MPH = SPEED_THRESHOLDS.HIGH_SPEED;
-
-/** Returns 0-1 scale of update aggressiveness. Low speed (≤2 MPH): returns ~0.0 */
-function speedAggressiveness(speedMPH, loSpeed = 2, hiSpeed = 15, exponent = 0.6) {
-    if (speedMPH <= loSpeed) return 0;
-    if (speedMPH >= hiSpeed) return 1;
-    const t = (speedMPH - loSpeed) / (hiSpeed - loSpeed);
-    return Math.pow(t, exponent);
-}
-
-/** Returns aggressiveness for high-speed scenarios */
-function highSpeedAggressiveness(speedMPH) {
-    return speedAggressiveness(speedMPH, 15, 65, 0.7);
-}
-
-/* DISABLED: Speed-based zoom changes removed. 
-function getSpeedBasedZoom(speedMPS, closestDistance = Infinity) {
-    return 18;
-}
-*/
-
 function getSpeedBasedZoom(speedMPS, closestDistance) {
     if (closestDistance === undefined) closestDistance = Infinity;
 
@@ -4933,181 +4894,10 @@ function _prefetchMapTiles(location, now) {
     }
 
 })();
-        
-/* ──────────────────────────────────────────────────────────────────────────────
-   updateUserLocation — REFACTORED
-   ──────────────────────────────────────────────────────────────────────────────
-
-   Public surface / window globals / call signatures: 100% backwards compatible.
-   All behaviour is preserved exactly. What changed is structure only:
-
-     _getSpeedTier(speedMPH, rawAccuracy, eastWestMove)  → pure, returns tier
-     _getLookAheadSeconds(speedMPH)                      → pure, returns number
-     _computeProximity(newPosition, speedMPH)            → pure-ish, returns obj
-     _detectEastWestMove(lat, lng, lastPos)              → pure, returns bool
-     _rejectImpossibleAcceleration(…)                    → pure, returns bool
-     _handleStationaryLocked(…)                          → returns decision enum
-     _scheduleMapUpdate()                                → owns all RAF logic
-     updateUserLocation(position, forceUpdate)           → orchestrator ~90 lines
-
-   ──────────────────────────────────────────────────────────────────────────── */
-
-
-/* ─── 1. SPEED TIER ────────────────────────────────────────────────────────── */
-
-/**
- * Returns the map-update speed tier for the current speed and accuracy.
- * Pure function — no side effects, no window reads.
- *
- * Tiers are defined as a sorted lookup table; we walk from fastest down so the
- * first match wins (same semantics as the original if/else chain, but the table
- * is trivially editable and the noise-scaling and east-west adjustment are
- * applied here in one place instead of scattered).
- *
- * @param  {number}  speedMPH
- * @param  {number}  rawAccuracy   metres
- * @param  {boolean} eastWestMove
- * @returns {{
- *   panDuration: number, easeLinearity: number,
- *   mapUpdateInterval: number, mapUpdateDistance: number,
- *   maxAccuracy: number, minDistanceThreshold: number, maxSpeedThreshold: number
- * }}
- */
-function _getSpeedTier(speedMPH, rawAccuracy, eastWestMove) {
-    // [ minSpeedMPH, panDuration, easeLinearity, mapUpdateInterval,
-    //   mapUpdateDistance, maxAccuracy, minDistThreshold, maxSpeedThreshold ]
-    var TIERS = [
-        [ 65, 0.08, 0.28,  80, 12.0, 18, 2.00, 160 ],
-        [ 30, 0.10, 0.25, 110,  8.0, 20, 1.20, 100 ],
-        [ 15, 0.12, 0.22, 150,  6.5, 20, 0.85,  60 ],
-        [  8, 0.25, 0.18, 400,  4.0, 25, 0.50,  15 ],
-        [  3, 0.35, 0.15, 800,  3.0, 28, 0.35,   8 ],
-        [  0, 0.60, 0.12, 1000, 2.0, 32, 0.25,   3 ],
-    ];
-
-    var row = TIERS[TIERS.length - 1]; // default: slowest
-    for (var i = 0; i < TIERS.length; i++) {
-        if (speedMPH >= TIERS[i][0]) { row = TIERS[i]; break; }
-    }
-
-    var panDuration       = row[1];
-    var easeLinearity     = row[2];
-    var mapUpdateInterval = row[3];
-    var mapUpdateDistance = row[4];
-    var maxAccuracy       = row[5];
-    var minDistThreshold  = row[6];
-    var maxSpeedThreshold = row[7];
-
-    // Extended orange accuracy scaling (20 m and up, capped at 3.5×)
-    if (rawAccuracy >= 20) {
-        var noiseScale    = Math.min(3.5, 1.0 + (rawAccuracy - 20) / 30);
-        mapUpdateDistance *= noiseScale;
-        minDistThreshold  *= noiseScale;
-    }
-
-    // East-west move: tighten intervals and thresholds slightly
-    if (eastWestMove) {
-        panDuration          *= 0.88;
-        easeLinearity        *= 0.92;
-        mapUpdateInterval    *= 0.88;
-        minDistThreshold     *= 0.92;
-    }
-
-    return {
-        panDuration:          panDuration,
-        easeLinearity:        easeLinearity,
-        mapUpdateInterval:    Math.max(33, mapUpdateInterval),
-        mapUpdateDistance:    mapUpdateDistance,
-        maxAccuracy:          maxAccuracy,
-        minDistanceThreshold: minDistThreshold,
-        maxSpeedThreshold:    maxSpeedThreshold,
-    };
-}
-
-
-/* ─── 2. LOOK-AHEAD SECONDS ────────────────────────────────────────────────── */
-
-/**
- * Returns how many seconds ahead to extrapolate the map pan position.
- * Pure piecewise-linear function — replaces the nested ternary chain.
- *
- * Breakpoints: 0→0.3 s, 3→0.3 s, 15→1.0 s, 45→1.81 s (capped 2.5 s)
- *
- * NOTE — deliberate fix vs original: the original formula
- *   `0.3 + (speed - 3) * 0.06` reached ~1.014 s at 14.9 mph then snapped
- *   DOWN to 1.0 s at 15 mph — a discontinuity where look-ahead briefly
- *   decreases as speed increases.  The slope is corrected here to
- *   (1.0 - 0.3) / 12 ≈ 0.0583 so the curve arrives at exactly 1.0 s at
- *   15 mph with no snap.  If you need the original values verbatim, replace
- *   the 3–15 mph line with: `return 0.3 + (speedMPH - 3) * 0.06;`
- *
- * @param  {number} speedMPH
- * @returns {number}
- */
-function _getLookAheadSeconds(speedMPH) {
-    if (speedMPH <  3)  return 0.3;
-    if (speedMPH < 15)  return 0.3  + (speedMPH - 3)  * (0.7  / 12);   // arrives at 1.0 s
-    if (speedMPH < 45)  return 1.0  + (speedMPH - 15) * (0.81 / 30);   // arrives at 1.81 s
-    return Math.min(2.5, 1.81 + (speedMPH - 45) * 0.02);
-}
-
-
-/* ─── 3. EAST-WEST MOVE DETECTION ─────────────────────────────────────────── */
-
-/**
- * Returns true when the dominant axis of movement is east-west.
- * Pure function.
- *
- * @param  {number} lat
- * @param  {number} lng
- * @param  {{lat:number, lng:number}} lastPos
- * @returns {boolean}
- */
-function _detectEastWestMove(lat, lng, lastPos) {
-    var latMeters = Math.abs(lat - lastPos.lat) * 111111;
-    var lngMeters = Math.abs(lng - lastPos.lng) * 111111 * Math.cos(lat * Math.PI / 180);
-    return lngMeters > latMeters * 1.2;
-}
-
-
-/* ─── 4. IMPOSSIBLE-ACCELERATION REJECTION ─────────────────────────────────── */
-
-/**
- * Returns true when the speed change between ticks is physically implausible
- * and the current fix should be dropped.
- * Pure function.
- *
- * @param  {number} speedMPH       current smoothed speed
- * @param  {number} lastSpeedMPH   previous smoothed speed
- * @param  {number} timeDelta      seconds between fixes
- * @returns {boolean}              true → reject this fix
- */
-function _rejectImpossibleAcceleration(speedMPH, lastSpeedMPH, timeDelta) {
-    if (timeDelta <= 0 || timeDelta >= 8) return false;
-
-    var accel = Math.abs(speedMPH - lastSpeedMPH) / timeDelta;
-
-    // Thresholds tighten as speed rises (harder to accelerate fast at speed)
-    if (speedMPH <  3  && accel > 25) return true;
-    if (speedMPH <  8  && accel > 22) return true;
-    if (speedMPH < 15  && accel > 18) return true;
-    if (speedMPH < 45  && accel > 15) return true;
-    if (speedMPH < 80  && accel > 12) return true;
-    /* speedMPH >= 80 */  return accel > 10;
-}
-
-
-/* ─── 5. PROXIMITY CALCULATION ─────────────────────────────────────────────── */
 
 /**
  * Finds the closest game location to newPosition and optionally feeds the
  * enterprise cache.  Writes window.proximityState, window._lastClosestDistance,
- * window._lastClosestLocation as side-effects (unchanged from original).
- *
- * @param  {{lat:number, lng:number}} newPosition
- * @param  {number} speedMPH
- * @param  {number} currentTime   ms epoch
- * @returns {{ closestLocation, closestDistance, locationsWithDistance }}
  */
 function _computeProximity(newPosition, speedMPH, currentTime) {
     var closestDistance = Infinity;
@@ -5160,145 +4950,6 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
     return { closestLocation: closestLocation, closestDistance: closestDistance,
              locationsWithDistance: locationsWithDistance };
 }
-
-
-/* ─── 6. STATIONARY-LOCKED DECISION ────────────────────────────────────────── */
-
-/**
- * When the device is in stationary-lock, decide what to do this tick.
- */
-function _handleStationaryLocked(
-    newPosition, lastPos, distance, timeDelta, speedMPS, validatedHeading,
-    isDeviceMoving, currentTime, forceUpdate, closestLocation, closestDistance
-) {
-    var FAST_EXIT_DIST  = 3.0;
-    var FAST_EXIT_SPEED = 1.0;
-    var shouldBreakLock = false;
-
-    if (isDeviceMoving === true && distance >= 1.0) {
-        shouldBreakLock = true;
-    } else if (isDeviceMoving === null) {
-        var calcSpeed = timeDelta > 0 ? distance / timeDelta : 0;
-        if (distance >= FAST_EXIT_DIST && calcSpeed >= FAST_EXIT_SPEED) {
-            shouldBreakLock = true;
-        }
-    } else if (isDeviceMoving === false) {
-        var calcSpeed2 = timeDelta > 0 ? distance / timeDelta : 0;
-        if (distance >= FAST_EXIT_DIST * 2 && calcSpeed2 >= FAST_EXIT_SPEED * 1.25) {
-            shouldBreakLock = true;
-        }
-    }
-
-    if (shouldBreakLock) {
-        window.isStationary           = false;
-        window.stationaryLockPosition = null;
-        window.stationaryStartTime    = null;
-        window._stationaryNudgeAnchor = null;
-
-        if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
-            var kf = window.sensorFusion._kalmanFilter;
-            var breakoutSpeed = timeDelta > 0 ? distance / timeDelta : 0;
-
-            // KEY FIX: seed BEFORE reset so the filter initialises with real
-            // velocity on the very next update() call, instead of cold-starting
-            // with zero velocity and fighting 1–2 GPS cycles to re-converge.
-            if (breakoutSpeed > 0.3 && validatedHeading !== null) {
-                var rad = validatedHeading * Math.PI / 180;
-                // Store as pending seed; survives the reset path inside smoothPosition
-                kf._pendingSeedVelocity = {
-                    vNorth: breakoutSpeed * Math.cos(rad),
-                    vEast:  breakoutSpeed * Math.sin(rad)
-                };
-                kf._lastSeedVelocity = kf._pendingSeedVelocity;
-            }
-
-            // Boost velocity variance so the filter accepts the new motion
-            // immediately rather than fighting its low-variance stationary state.
-            if (kf.P && kf.x) {
-                kf.P[2][2] = 225; kf.P[3][3] = 225;
-                kf.P[0][2] = 0;   kf.P[2][0] = 0;
-                kf.P[1][3] = 0;   kf.P[3][1] = 0;
-            }
-
-            // Unfreeze — the filter was frozen in stationary mode
-            kf.unfreeze();
-        }
-
-        // Also tell sensorFusion's own stationary tracker to unfreeze
-        if (window.sensorFusion) {
-            window.sensorFusion._lastStationaryState = false;
-            window.sensorFusion._stationaryCounter   = 0;
-            window.sensorFusion._stationaryPosition  = null;
-            window.sensorFusion._stationarySamples   = [];
-        }
-
-        window.smoothedVelocity = timeDelta > 0
-            ? { lat: (newPosition.lat - lastPos.lat) / timeDelta,
-                lng: (newPosition.lng - lastPos.lng) / timeDelta }
-            : { lat: 0, lng: 0 };
-
-        window.lastPosition        = newPosition;
-        window.lastUpdateTime      = currentTime;
-        window.lastUpdateTimestamp = currentTime;
-
-        // Purge stale position buffer
-        var buffer = window.positionBuffer;
-        if (buffer && buffer.length > 0) {
-            var staleCutoff = currentTime - 10000;
-            while (buffer.length > 0 && (buffer[0].timestamp || 0) < staleCutoff) {
-                buffer.shift();
-            }
-            if (buffer.length === 0 && typeof seedPositionBuffer === 'function') {
-                seedPositionBuffer(newPosition, 2);
-            }
-        }
-
-        // ForceUpdate() — not onMovementResumed() — guarantees the RAF
-        // loop restarts AND flushes the interaction-fade timer so the next frame
-        // writes immediately rather than waiting out the 250 ms fade window.
-        if (window.deadReckoning) {
-            if (typeof window.deadReckoning.forceUpdate === 'function') {
-                window.deadReckoning.forceUpdate();
-            } else if (typeof window.deadReckoning.onMovementResumed === 'function') {
-                window.deadReckoning.onMovementResumed();
-            }
-        }
-
-        return 'broke';
-
-    } else {
-        // Still locked — allow fine nudge if accuracy improved significantly
-        var distFromLock = calculateDistance(window.stationaryLockPosition, newPosition);
-        if (distFromLock < 2.0 && newPosition.accuracy < lastPos.accuracy * 0.7) {
-            // Do NOT call scheduleMarkerUpdate here — dead-reckoning owns the marker.
-            // Just update the frozen position so the DR loop snaps to the better fix.
-            if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
-                window.sensorFusion._kalmanFilter.freeze(newPosition.lat, newPosition.lng);
-            }
-            if (!window._stationaryNudgeAnchor) {
-                window._stationaryNudgeAnchor = {
-                    lat: window.stationaryLockPosition.lat,
-                    lng: window.stationaryLockPosition.lng
-                };
-            }
-            var distFromAnchor = calculateDistance(window._stationaryNudgeAnchor, newPosition);
-            if (distFromAnchor < 1.0) {
-                window.stationaryLockPosition = { lat: newPosition.lat, lng: newPosition.lng };
-            }
-        }
-
-        window.lastPosition        = newPosition;
-        window.lastUpdateTime      = currentTime;
-        window.lastUpdateTimestamp = currentTime;
-
-        if (typeof updateDistanceBox === 'function') {
-            updateDistanceBox(forceUpdate, newPosition, closestLocation, closestDistance);
-        }
-        return 'held';
-    }
-}
-
-/* ─── 7. RAF MAP UPDATE ─────────────────────────────────────────────────────── */
 
 /**
  * Schedules a single coalesced requestAnimationFrame to pan the map.
@@ -5906,137 +5557,7 @@ function _computeSpeedTier(speedMPH, rawAccuracy) {
         maxSpeedThreshold: maxSpeedThreshold
     };
 }
- 
-/* ──────────────────────────────────────────────
-   HELPER: Proximity Calculations 
-   ────────────────────────────────────────────── */
-function _computeProximity(fix, speedMPH) {
-    var closestDistance = Infinity;
-    var closestLocation = null;
-    var locationsWithDistance = [];
- 
-    if (Array.isArray(window.gameLocations) && window.gameLocations.length) {
-        var speedFactor = Math.min(speedMPH / 15, 4);
-        var R = 0.015 + 0.01 * speedFactor;
- 
-        for (var i = 0; i < window.gameLocations.length; i++) {
-            var loc = window.gameLocations[i];
-            if (!loc || !loc.lat || loc.lat < fix.lat - R || loc.lat > fix.lat + R ||
-                loc.lng < fix.lng - R || loc.lng > fix.lng + R) continue;
- 
-            var dist = calculateDistance(fix, loc);
-            locationsWithDistance.push({ location: loc, distance: dist });
-            if (dist < closestDistance) {
-                closestDistance = dist;
-                closestLocation = loc;
-            }
-        }
-    }
- 
-    window._lastClosestDistance = closestDistance;
-    window._lastClosestLocation = closestLocation;
-    window.proximityState = (closestLocation && closestDistance !== Infinity)
-        ? { closestLocation: closestLocation, distanceMeters: closestDistance }
-        : null;
- 
-    if (locationsWithDistance.length &&
-        (!window._lastCacheUpdate || (fix.timestamp - window._lastCacheUpdate) > 5000)) {
-        var cacheFn = window.enterpriseCacheManager && window.enterpriseCacheManager.cacheLocationData;
-        if (cacheFn) {
-            for (var j = 0; j < locationsWithDistance.length; j++) {
-                if (locationsWithDistance[j].distance <= 100) {
-                    cacheFn(locationsWithDistance[j].location, fix);
-                }
-            }
-        }
-        window._lastCacheUpdate = fix.timestamp;
-    }
- 
-    return { closestLocation: closestLocation, closestDistance: closestDistance };
-}
- 
-/* ──────────────────────────────────────────────
-   LEGACY: _confirmStationary 
-   ────────────────────────────────────────────── */
-function _confirmStationary(position, timestamp) {
-    window.isStationary = true;
-    window.stationaryLockPosition = { lat: position.lat, lng: position.lng };
-    window.stationaryStartTime = timestamp;
- 
-    if (window.deadReckoning && typeof window.deadReckoning.stop === 'function') {
-        window.deadReckoning.stop();
-    }
-}
-        
-function _estimateApproachSpeedMPS() {
-    if (!window.proximityState || !window.lastVelocity) return 0;
-
-    const closest = window.proximityState.closestLocation;
-    if (!closest || !closest.lat || !closest.lng) return 0;
-
-    const userPos = window.lastPosition;
-    if (!userPos) return 0;
-
-    const dLat = closest.lat - userPos.lat;
-    const dLng = closest.lng - userPos.lng;
-    const bearingToLoc = Math.atan2(dLng * Math.cos(userPos.lat * Math.PI / 180), dLat);
-
-    const vNorth = window.lastVelocity.lat * 111111;
-    const vEast = window.lastVelocity.lng * 111111 *
-                  Math.cos(userPos.lat * Math.PI / 180);
-    const userBearing = Math.atan2(vEast, vNorth);
-
-    const speed = Math.sqrt(vNorth * vNorth + vEast * vEast);
-    let angleDiff = Math.abs(userBearing - bearingToLoc);
-    if (angleDiff > Math.PI) angleDiff = 2 * Math.PI - angleDiff;
-
-    if (angleDiff > Math.PI / 2) return 0;
-    return speed * Math.cos(angleDiff);
-}
-
-/* ──────────────────────────────────────────────
-   Compute map center that keeps user in center 60%
-   and location visible. Returns { lat, lng }.
-   If location is already visible, returns userLL unchanged.
-   ────────────────────────────────────────────── */
-function _computeFramingCenter(userLL, locationLL, zoom) {
-    if (!userLL || !locationLL) return userLL;
-
-    // Check if location is already visible at current zoom
-    const bounds = map.getBounds();
-    if (bounds.contains(locationLL)) return userLL;
-
-    // Location is off-screen. Compute minimal shift to bring it in
-    // while keeping user in center 60% of viewport.
-    const size = map.getSize();
-    const userPx = map.project(userLL, zoom);
-    const locPx = map.project(locationLL, zoom);
-
-    // Center 60% box: ±30% from center in each dimension
-    const maxOffsetX = size.x * 0.30;
-    const maxOffsetY = size.y * 0.30;
-
-    const centerPx = map.project(map.getCenter(), zoom);
-    const dx = locPx.x - centerPx.x;
-    const dy = locPx.y - centerPx.y;
-
-    // How much do we need to shift center so location is at edge of 60% box?
-    let shiftX = 0, shiftY = 0;
-
-    if (Math.abs(dx) > maxOffsetX) {
-        shiftX = dx > 0 ? dx - maxOffsetX : dx + maxOffsetX;
-    }
-    if (Math.abs(dy) > maxOffsetY) {
-        shiftY = dy > 0 ? dy - maxOffsetY : dy + maxOffsetY;
-    }
-
-    // If shift is tiny, don't bother
-    if (Math.abs(shiftX) < 5 && Math.abs(shiftY) < 5) return userLL;
-
-    const newCenterPx = L.point(centerPx.x + shiftX, centerPx.y + shiftY);
-    return map.unproject(newCenterPx, zoom);
-}
-        
+          
 /*  Pans the map to keep the user centered — **centered mode only**. */
 function _panMapToCenter(target, speedTier, directionChangeFactor, eastWestMovement, speedMPH, lookAheadFactor) {
     lookAheadFactor = lookAheadFactor || 0;
@@ -6076,169 +5597,122 @@ function _panMapToCenter(target, speedTier, directionChangeFactor, eastWestMovem
 
 
 /**
- * CENTERED MODE: Always keep the marker at the exact center with look-ahead.
+ * CENTERED MODE: Keep marker centered with look-ahead.
  */
 
-/** @type {{ duration: number, easing: number } | null} */
 window._panParamCache = window._panParamCache || null;
-
-/** @type {number | null} Timestamp (ms) when centered mode was last entered. */
 window._centeredModeEntryTime = window._centeredModeEntryTime || null;
 
-/**
- * Call this whenever centered mode is first entered so the entry-softening
- * logic knows when to apply. Safe to call multiple times; only the first call
- * per entry takes effect (subsequent calls while already in centered mode are
- * ignored because the timestamp is already set).
- */
+/** Call when entering centered mode. Idempotent per entry. */
 window.notifyCenteredModeEntry = function () {
     window._centeredModeEntryTime = performance.now();
-    window._panParamCache = null; // reset smoothing on fresh entry
+    window._panParamCache = null;
 };
 
 function _executeCenteredModePan(target, speedTier, directionChangeFactor, eastWestMovement, speedMPH, lookAheadFactor) {
     if (!map) return;
 
-    // ─── DEAD RECKONING GUARD ───────────────────────────────────────────────
-    // The Dead Reckoning loop (initDeadReckoning) is now the SOLE writer to 
-    // the map viewport in centered mode. It handles look-ahead and animation 
-    // internally via requestAnimationFrame. If we fire panTo() or setView() 
-    // here, it will fight the DR loop and cause rubber-banding.
-    if (window.deadReckoning && typeof window.deadReckoning.isActive === 'function' && window.deadReckoning.isActive()) {
+    // DR loop owns the viewport in centered mode; don't fight it.
+    if (window.deadReckoning?.isActive?.()) {
         if (window.DEBUG_PANNING) {
-            console.debug('[Centered] Pan skipped: Dead Reckoning loop is handling viewport.');
+            console.debug('[Centered] Pan skipped: DR loop active.');
         }
-        return; 
+        return;
     }
 
-    // ─── Constants ────────────────────────────────────────────────────────────
-    const ENTRY_SETTLE_MS   = 800;   // how long entry-softening applies (ms)
-    const LERP_ALPHA        = 0.18;  // param cache convergence speed (0=frozen, 1=instant)
-    const SNAP_SPEED_MPH    = 45;    // only use setView above this speed
-    const HIGH_SPEED_MPH    = (typeof SPEED_THRESHOLDS !== 'undefined' &&
-                                SPEED_THRESHOLDS?.HIGH_SPEED) || 15;
+    const ENTRY_SETTLE_MS = 800;
+    const LERP_ALPHA = 0.18;
+    const SNAP_SPEED_MPH = 45;
+    const HIGH_SPEED_MPH = SPEED_THRESHOLDS?.HIGH_SPEED || 15;
 
-    // ─── Input sanitisation ───────────────────────────────────────────────────
-    const safeSpeed = (isFinite(speedMPH) && speedMPH > 0) ? speedMPH : 0;
-    const factor    = (directionChangeFactor != null) ? directionChangeFactor : 1.0;
+    const safeSpeed = isFinite(speedMPH) && speedMPH > 0 ? speedMPH : 0;
+    const factor = directionChangeFactor ?? 1.0;
 
-    // ─── Look-ahead ───────────────────────────────────────────────────────────
+    // Apply look-ahead.
     let centerLat = target.lat;
     let centerLng = target.lng;
 
     const laSec = lookAheadFactor || 0;
     if (laSec > 0 && window.smoothedVelocity) {
-        const svLat = window.smoothedVelocity.lat;
-        const svLng = window.smoothedVelocity.lng;
+        const { lat: svLat, lng: svLng } = window.smoothedVelocity;
         if (svLat != null && svLng != null && isFinite(svLat) && isFinite(svLng)) {
-            // Compensate for Mercator east-west compression
-            const lngMultiplier = eastWestMovement ? 1.12 : 1.0;
+            const lngMul = eastWestMovement ? 1.12 : 1.0;
             centerLat += svLat * laSec;
-            centerLng += svLng * laSec * lngMultiplier;
+            centerLng += svLng * laSec * lngMul;
         }
     }
 
-    // ─── Entry-softening: are we still in the settle window? ─────────────────
-    const entryTime      = window._centeredModeEntryTime;
-    const entryElapsedMs = (entryTime != null) ? (performance.now() - entryTime) : Infinity;
-    const isSettling     = entryElapsedMs < ENTRY_SETTLE_MS;
+    // Entry softening: gentle params for 800ms after mode entry.
+    const entryElapsed = window._centeredModeEntryTime != null
+        ? performance.now() - window._centeredModeEntryTime
+        : Infinity;
+    const isSettling = entryElapsed < ENTRY_SETTLE_MS;
 
-    // ─── Compute TARGET pan params (what we want to converge toward) ──────────
+    const baseDur = speedTier?.panDuration ?? 0.2;
+    const baseEase = speedTier?.easeLinearity ?? 0.15;
 
-    let targetDuration;
-    let targetEasing;
+    let targetDur, targetEase;
 
     if (isSettling) {
-        // During the settle window: use very gentle, slow params regardless of
-        // speed. This absorbs the "teleport snap" feel when entering centered
-        // mode from a different mode.
-        const settleProgress = entryElapsedMs / ENTRY_SETTLE_MS; // 0→1
-        const baseDuration   = (speedTier?.panDuration   != null) ? speedTier.panDuration   : 0.2;
-        const baseEasing     = (speedTier?.easeLinearity != null) ? speedTier.easeLinearity : 0.15;
-
-        // Ramp from gentle entry values toward the speed-appropriate base.
-        // Using a simple linear ramp here (not smoothstep) because the lerp
-        // cache below provides the perceptual smoothing — double-smoothing was
-        // a contributor to the oscillation.
-        targetDuration = 0.7 + (baseDuration * factor - 0.7) * settleProgress;
-        targetEasing   = 0.08 + (baseEasing - 0.08) * settleProgress;
-
+        const p = entryElapsed / ENTRY_SETTLE_MS;
+        targetDur = 0.7 + (baseDur * factor - 0.7) * p;
+        targetEase = 0.08 + (baseEase - 0.08) * p;
     } else {
-        // Normal operation: derive params from speed tier + live speed.
-        const baseDuration = (speedTier?.panDuration   != null) ? speedTier.panDuration   : 0.2;
-        const baseEasing   = (speedTier?.easeLinearity != null) ? speedTier.easeLinearity : 0.15;
+        targetDur = baseDur * factor;
+        if (safeSpeed >= 30) targetDur *= 0.70;
+        else if (safeSpeed >= 20) targetDur *= 0.80;
+        else if (safeSpeed >= HIGH_SPEED_MPH) targetDur *= 0.90;
+        if (eastWestMovement) targetDur *= 0.90;
 
-        targetDuration = baseDuration * factor;
-
-        // Speed-based duration tightening (faster = shorter pan = map keeps up)
-        if      (safeSpeed >= 30)          targetDuration *= 0.70;
-        else if (safeSpeed >= 20)          targetDuration *= 0.80;
-        else if (safeSpeed >= HIGH_SPEED_MPH) targetDuration *= 0.90;
-
-        if (eastWestMovement) targetDuration *= 0.90;
-
-        targetEasing = baseEasing;
-
-        // Speed-based easing adjustment
-        if      (safeSpeed >= 20)          targetEasing = Math.min(0.25, targetEasing * 1.4);
-        else if (safeSpeed >= HIGH_SPEED_MPH) targetEasing = Math.min(0.20, targetEasing * 1.2);
+        targetEase = baseEase;
+        if (safeSpeed >= 20) targetEase = Math.min(0.25, targetEase * 1.4);
+        else if (safeSpeed >= HIGH_SPEED_MPH) targetEase = Math.min(0.20, targetEase * 1.2);
     }
 
-    // Clamp targets to sane bounds
-    targetDuration = Math.max(0.05, Math.min(0.8, targetDuration));
-    targetEasing   = Math.max(0.10, Math.min(0.5, targetEasing));
+    targetDur = Math.max(0.05, Math.min(0.8, targetDur));
+    targetEase = Math.max(0.10, Math.min(0.5, targetEase));
 
-    // ─── Lerp param cache: smooth convergence, no per-frame jumps ──────────── //
+    // Smooth param convergence.
     if (window._panParamCache == null) {
-        // First call or fresh entry — initialise to target directly (no lerp)
-        window._panParamCache = { duration: targetDuration, easing: targetEasing };
+        window._panParamCache = { duration: targetDur, easing: targetEase };
     } else {
-        window._panParamCache.duration += (targetDuration - window._panParamCache.duration) * LERP_ALPHA;
-        window._panParamCache.easing   += (targetEasing   - window._panParamCache.easing)   * LERP_ALPHA;
+        window._panParamCache.duration += (targetDur - window._panParamCache.duration) * LERP_ALPHA;
+        window._panParamCache.easing += (targetEase - window._panParamCache.easing) * LERP_ALPHA;
     }
 
-    const panDuration    = window._panParamCache.duration;
-    const easeLinearity  = window._panParamCache.easing;
+    const panDur = window._panParamCache.duration;
+    const panEase = window._panParamCache.easing;
 
-    // ─── Execute the pan ──────────────────────────────────────────────────────
-    //
-    // setView (no animation) is reserved for genuinely high speeds where the
-    // GPS position changes faster than any animation can track. Below that
-    // threshold, always use panTo so there is never a visible hard cut.
-    //
-    if (safeSpeed >= SNAP_SPEED_MPH &&
-        window.deadReckoning?.isActive())
-    {
+    // Snap at very high speed; pan otherwise.
+    if (safeSpeed >= SNAP_SPEED_MPH && window.deadReckoning?.isActive()) {
         window._gpsCenteredPanJustOccurred = true;
-        // Hold the flag for two animation frames so the DR loop can reliably
-        // see it (one rAF can be missed if the loop runs between frames).
         requestAnimationFrame(() => {
             requestAnimationFrame(() => { window._gpsCenteredPanJustOccurred = false; });
         });
 
         map.setView([centerLat, centerLng], map.getZoom(), {
-            animate  : false,
+            animate: false,
             noMoveStart: true,
-            noMoveEnd  : true
+            noMoveEnd: true
         });
     } else {
         map.panTo([centerLat, centerLng], {
-            animate      : true,
-            duration     : panDuration,
-            easeLinearity: easeLinearity,
-            noMoveStart  : true
+            animate: true,
+            duration: panDur,
+            easeLinearity: panEase,
+            noMoveStart: true
         });
     }
 
     if (window.DEBUG_PANNING) {
         console.debug(
-            '[Centered] Pan: speed='     + safeSpeed.toFixed(1)          + 'mph' +
-            ', duration='                + (panDuration * 1000).toFixed(0) + 'ms'  +
-            ', easing='                  + easeLinearity.toFixed(3)       +
-            ', settling='                + isSettling                     +
-            (isSettling ? ' (' + entryElapsedMs.toFixed(0) + 'ms)' : '') +
-            ', targetDur='               + (targetDuration * 1000).toFixed(0) + 'ms' +
-            ', EW='                      + !!eastWestMovement
+            '[Centered] speed=' + safeSpeed.toFixed(1) + 'mph' +
+            ', dur=' + (panDur * 1000).toFixed(0) + 'ms' +
+            ', ease=' + panEase.toFixed(3) +
+            ', settling=' + isSettling +
+            (isSettling ? ' (' + entryElapsed.toFixed(0) + 'ms)' : '') +
+            ', targetDur=' + (targetDur * 1000).toFixed(0) + 'ms' +
+            ', EW=' + !!eastWestMovement
         );
     }
 }
@@ -6518,18 +5992,6 @@ function _initializeUserLocationState(newPosition, currentTime, forceUpdate) {
         currentTime: currentTime,
         resetType: 'init',
         forceUpdate: !!forceUpdate,
-        clearStationary: true
-    });
-}
-
-/**
- * Handles large distance jumps by delegating to the shared reset function.
- */
-function _handleLargeDistanceJump(newPosition, currentTime) {
-    _resetMapToPosition(newPosition, {
-        currentTime: currentTime,
-        resetType: 'jump',
-        forceUpdate: false,
         clearStationary: true
     });
 }
@@ -9340,59 +8802,7 @@ function ensureGPSActive() {
         console.log("GPS watch active - awaiting fresh updates");
     }
 }
-
-function closeModalWithAnimation(fadeDuration) {
-    const additionalInfoContainer = cachedElements.additionalInfoContainer || 
-        document.querySelector('.additional-info-container');
-    const lochuntContainer = cachedElements.lochuntContainer || 
-        document.querySelector('.lochunt-container');
-
-    // Null checks prevent fatal errors if elements are already gone
-    if (additionalInfoContainer) {
-        additionalInfoContainer.classList.add('fade-out');
         
-        setTimeout(() => {
-            if (additionalInfoContainer) {
-                additionalInfoContainer.style.display = 'none';
-                additionalInfoContainer.classList.remove('fade-out', 'fade-in');
-            }
-
-            if (lochuntContainer) {
-                lochuntContainer.classList.add('fade-out');
-                
-                setTimeout(() => {
-                    if (lochuntContainer) {
-                        lochuntContainer.style.display = 'none';
-                        lochuntContainer.classList.remove('fade-out');
-                    }
-                    
-                    finalizeModalClose();
-                    
-                }, fadeDuration);
-            } else {
-                finalizeModalClose();
-            }
-        }, fadeDuration);
-    } else {
-        // If additional info is missing, proceed directly to closing the main container
-        if (lochuntContainer) {
-            lochuntContainer.classList.add('fade-out');
-            
-            setTimeout(() => {
-                if (lochuntContainer) {
-                    lochuntContainer.style.display = 'none';
-                    lochuntContainer.classList.remove('fade-out');
-                }
-                finalizeModalClose();
-            }, fadeDuration);
-        } else {
-            finalizeModalClose();
-        }
-    }
-}
-        
-
-
 function _restoreFullTracking() {
     window.followUser = true;
     window.isMapInteracting = false;
