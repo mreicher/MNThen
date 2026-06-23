@@ -2446,8 +2446,9 @@ window.sensorFusion = new SensorFusionManager().init();
     const _isStationary = () => window.sensorFusion?._lastStationaryState            ?? window.isStationary;
 
     function _isCenteredMode() {
-        return !!(window.followUser && typeof ModeManager !== 'undefined' && ModeManager.isCentered?.());
-    }
+    return !!(window.followUser && typeof ModeManager !== 'undefined' && 
+              (ModeManager.isCentered?.() || ModeManager.shouldTrackCentered?.()));
+}
 
     function _getPredictHorizon(speedMPS, headingChangeDegPerSec) {
         let h;
@@ -2530,19 +2531,21 @@ window.sensorFusion = new SensorFusionManager().init();
         kf.seedVelocity(_lastGoodSpeedMPS * Math.cos(rad), _lastGoodSpeedMPS * Math.sin(rad), 2.0);
     }
 
-    function frame(now) {
+       function frame(now) {
         _rafId = null;
-
+    
         const lastPos = window.lastPosition;
         if (!lastPos || window.isLocationHuntVisible) { _active = false; return; }
-
+    
         const speedMPS   = _getSpeedMPS();
         const stationary = _isStationary();
         const centered   = _isCenteredMode();
-
-        // Roaming: stop when stationary. Centered: keep running to hold viewport lock.
+    
+        // Stop if not following. In roaming, stop when stationary.
+        // Centered mode keeps running regardless of speed/stationary state.
+        if (!window.followUser) { _active = false; return; }
         if (!centered && stationary && speedMPS < CFG.MIN_SPEED_MPS) { _active = false; return; }
-
+    
         const isInteracting = window.isMapInteracting || window._isProximityZoomAnimating || window._gpsCenteredPanJustOccurred;
         if (isInteracting) {
             _interactionEndTime = now + CFG.INTERACTION_FADE_MS;
@@ -2551,18 +2554,18 @@ window.sensorFusion = new SensorFusionManager().init();
             return;
         }
         if (now < _interactionEndTime) { _lastFrameTime = now; _rafId = requestAnimationFrame(frame); return; }
-
+    
         const dtMs = now - _lastFrameTime;
         if (dtMs < CFG.MIN_DT_MS) { _rafId = requestAnimationFrame(frame); return; }
         _lastFrameTime = now;
-
+    
         // Best available position origin
         const kp = _getKalmanPos(), rp = _getRawPos();
         let oLat, oLng, oTs;
         if      (kp?.timestamp != null) { oLat = kp.lat; oLng = kp.lng; oTs = kp.timestamp; }
         else if (rp?.timestamp != null) { oLat = rp.lat; oLng = rp.lng; oTs = rp.timestamp; }
         else                            { oLat = lastPos.lat; oLng = lastPos.lng; oTs = window.lastUpdateTimestamp || now; }
-
+    
         // Heading change rate (exponential smooth)
         const hdg = _getHeading();
         if (_lastHeadingDeg != null && hdg != null) {
@@ -2572,35 +2575,33 @@ window.sensorFusion = new SensorFusionManager().init();
             _headingChangeRate = _headingChangeRate * 0.85 + (Math.abs(d) / (Math.max(dtMs, 16) / 1000)) * 0.15;
         }
         if (hdg != null) _lastHeadingDeg = hdg;
-
+    
         // Cache last good velocity for resume seeding
         const vel = _getVelocity();
         const vm = Math.sqrt(vel.lat*vel.lat + vel.lng*vel.lng);
         if (vm > 0.001) { _lastGoodVelocity = { lat: vel.lat, lng: vel.lng }; _lastGoodSpeedMPS = speedMPS; }
-
-        // Dead-reckoning prediction — always from live Kalman origin + velocity.
-        // No dependency on window._lookAheadPos; eliminates stale-position jumps.
+    
+        // Dead-reckoning prediction
         let pLat, pLng;
         const rawAge = Math.max(0, (now - oTs) / 1000);
         const hor    = _getPredictHorizon(speedMPS, _headingChangeRate);
         const pDt    = Math.min(rawAge, hor);
-
+    
         if (pDt <= 0 || speedMPS < CFG.LOW_SPEED_CUTOFF_MPS || stationary) {
             pLat = oLat; pLng = oLng;
         } else {
             pLat = oLat + vel.lat * pDt;
             pLng = oLng + vel.lng * pDt;
-            // Safety clamp: reject if prediction jumps > 150 m from origin
             const jN = Math.abs(pLat - oLat) * 111111;
             const jE = Math.abs(pLng - oLng) * 111111 * Math.cos(oLat * Math.PI / 180);
             if (jN > 150 || jE > 150) { pLat = oLat; pLng = oLng; }
         }
-
+    
         _lastPredictedPos = { lat: pLat, lng: pLng };
         _setMarkerPosition(pLat, pLng);
-
+    
         if (!map || window._isProximityZoomAnimating) { _rafId = requestAnimationFrame(frame); return; }
-
+    
         if (centered) {
             _snapViewport(pLat, pLng);
         } else if (window.followUser) {
@@ -2611,7 +2612,7 @@ window.sensorFusion = new SensorFusionManager().init();
                 _queueFreePan(pLat, pLng, _getPanDuration(speedMPS));
             }
         }
-
+    
         _rafId = requestAnimationFrame(frame);
     }
 
@@ -2646,11 +2647,10 @@ window.sensorFusion = new SensorFusionManager().init();
         onMovementResumed: _start,
 
         // Called by the GPS update path when a new fix arrives.
-        // Does NOT reset _centeredLat/Lng — that was the rubber-band source.
-        // The next frame will naturally pick up the new Kalman position and
-        // either pass the deadband check or write the new viewport position.
         forceUpdate() {
-            _interactionEndTime = _now() + CFG.INTERACTION_FADE_MS;
+            // Just ensure the loop is running when a fresh GPS fix arrives.
+            // Removed the 250ms interaction stall — that was freezing the viewport
+            // on every GPS fix, causing the marker to run ahead of the map.
             if (!_active) _start();
         },
 
@@ -5592,28 +5592,28 @@ function _scheduleUnifiedRender(renderState) {
  
 function _executeRender(state) {
     if (!state) return;
- 
+
     var tier     = state.tier;
     var mapState = state.mapState;
- 
+
     if (!tier || !mapState) {
         window.lastMapUpdateTime = Date.now();
         return;
     }
- 
+
     if (window.isMapInteracting) {
         window.lastMapUpdateTime = Date.now();
         return;
     }
- 
+
     // ── RANGE-BASED ZOOM (walking only) ──────────────────────────
     var zoomResult = getSpeedBasedZoom(state.speedMPS, state.closestDistance);
- 
+
     if (zoomResult !== null && map) {
         if (zoomResult.fitBounds && state.closestLocation && !window._isFittingBounds) {
             var userLatLng   = [state.position.lat, state.position.lng];
             var targetLatLng = [state.closestLocation.lat, state.closestLocation.lng];
- 
+
             window._isFittingBounds = true;
             map.fitBounds(L.latLngBounds([userLatLng, targetLatLng]), {
                 padding:  [60, 60],
@@ -5624,86 +5624,87 @@ function _executeRender(state) {
             map.once('moveend zoomend', function () {
                 window._isFittingBounds = false;
             });
- 
+
         } else if (zoomResult.zoom !== null && map.getZoom() !== zoomResult.zoom) {
             map.setZoom(zoomResult.zoom, { animate: true, duration: 0.25 });
         }
     }
- 
+
     // ── UPDATE MARKER ─────────────────────────────────────────────
-        if (typeof userMarker !== 'undefined' && userMarker) {
-            var markerEl = userMarker.getElement ? userMarker.getElement() : null;
-        
-            if (markerEl) {
-                var isOrangeAccuracy  = state.position.accuracy >= 20 && state.position.accuracy < 50;
-                var transitionVal     = isOrangeAccuracy ? 'transform 200ms ease-out' : 'none';
-                markerEl.style.transition = transitionVal;
-        
-                var iconEl = markerEl.querySelector('.user-marker-icon');
-                if (iconEl) iconEl.style.transition = transitionVal;
-            }
-        
-            // When DR is active it owns the marker exclusively.
-            // GPS path must not touch it or the two loops fight each other.
-            var drActive = window.deadReckoning && window.deadReckoning.isActive();
-            if (!drActive) {
-                var renderLat = state.position.lat;
-                var renderLng = state.position.lng;
-                userMarker.setLatLng([renderLat, renderLng]);
-            }
+    if (typeof userMarker !== 'undefined' && userMarker) {
+        var markerEl = userMarker.getElement ? userMarker.getElement() : null;
+
+        if (markerEl) {
+            var isOrangeAccuracy  = state.position.accuracy >= 20 && state.position.accuracy < 50;
+            var transitionVal     = isOrangeAccuracy ? 'transform 200ms ease-out' : 'none';
+            markerEl.style.transition = transitionVal;
+
+            var iconEl = markerEl.querySelector('.user-marker-icon');
+            if (iconEl) iconEl.style.transition = transitionVal;
         }
-         
+
+        // DR loop owns the marker exclusively when active.
+        // GPS path must not touch it or the two loops fight each other.
+        var drActive = window.deadReckoning && window.deadReckoning.isActive();
+        if (!drActive) {
+            userMarker.setLatLng([state.position.lat, state.position.lng]);
+        }
+    }
+
     // ── UPDATE MAP ────────────────────────────────────────────────
     if (!map || !window.followUser) {
         window.lastMapUpdateTime = Date.now();
         return;
     }
- 
-    // In centered mode the DR RAF loop owns the viewport via
-    // animate:false setView. Do NOT issue any panTo here or the two
-    // callers will fight and produce rubber-band artifacts.
+
+    // Centered mode: DR loop owns viewport via animate:false setView.
+    // Just ensure DR loop is running and return — never panTo here.
     if (mapState.isInCenteredMode) {
-        // Kick the DR loop's forceUpdate so it re-locks the viewport
-        // on this same frame rather than waiting for its next tick.
         if (window.deadReckoning && typeof window.deadReckoning.forceUpdate === 'function') {
             window.deadReckoning.forceUpdate();
         }
         window.lastMapUpdateTime = Date.now();
         return;
     }
- 
-if (shouldUpdateMap) {
-    var speedMPH = state.speedMPH || 0;
-    var panPos   = state.lookAhead || state.position;
 
-    if (speedMPH >= 45) {
-        // Above 45mph GPS fixes arrive faster than any animation can complete.
-        // Snap directly and let the DR loop own visual smoothness.
-        map.setView([panPos.lat, panPos.lng], map.getZoom(), {
-            animate:    false,
-            noMoveStart: true,
-            noMoveEnd:  true,
-        });
-    } else {
-        // Cancel any in-flight pan before issuing a new one — prevents
-        // Leaflet from queueing animations and falling behind.
-        if (map._panAnim?._inProgress) map.stop();
-
-        // Scale animation duration down as speed increases so each pan
-        // completes before the next GPS fix arrives (~110ms at driving speed).
-        var duration = speedMPH >= 20
-            ? Math.max(0.06, tier.panDuration * (1 - (speedMPH - 20) / 50))
-            : Math.max(0.08, tier.panDuration);
-
-        map.panTo([panPos.lat, panPos.lng], {
-            animate:      true,
-            duration:     duration,
-            easeLinearity: tier.easeLinearity,
-            noMoveStart:  true,
-        });
+    // Roaming mode: DR loop owns viewport when active (60fps vs 1Hz GPS).
+    // Only fall through to pan logic when DR is not running (true stationary
+    // or very low speed) so the two paths never fight each other.
+    var drActive = window.deadReckoning && window.deadReckoning.isActive();
+    if (drActive) {
+        window.lastMapUpdateTime = Date.now();
+        return;
     }
-}
- 
+
+    // ── ROAMING PAN (DR inactive only) ───────────────────────────
+    if (shouldUpdateMap) {
+        var speedMPH = state.speedMPH || 0;
+        var panPos   = state.lookAhead || state.position;
+
+        if (speedMPH >= 45) {
+            // Above 45mph snap directly — DR loop owns smoothness.
+            map.setView([panPos.lat, panPos.lng], map.getZoom(), {
+                animate:     false,
+                noMoveStart: true,
+                noMoveEnd:   true,
+            });
+        } else {
+            // Cancel any in-flight pan before issuing a new one.
+            if (map._panAnim?._inProgress) map.stop();
+
+            var duration = speedMPH >= 20
+                ? Math.max(0.06, tier.panDuration * (1 - (speedMPH - 20) / 50))
+                : Math.max(0.08, tier.panDuration);
+
+            map.panTo([panPos.lat, panPos.lng], {
+                animate:       true,
+                duration:      duration,
+                easeLinearity: tier.easeLinearity,
+                noMoveStart:   true,
+            });
+        }
+    }
+
     window.lastMapUpdateTime = Date.now();
 }
  
@@ -5712,11 +5713,13 @@ if (shouldUpdateMap) {
    ────────────────────────────────────────────── */
 function _controlDeadReckoning(fusionResult) {
     if (!window.deadReckoning) return;
- 
+
+    const centered = typeof ModeManager !== 'undefined' && ModeManager.isCentered?.();
+
     var shouldRun = !fusionResult.isFrozen &&
                     !window.isLocationHuntVisible &&
-                    fusionResult.speedMPS >= 0.15;
- 
+                    (centered || fusionResult.speedMPS >= 0.15);
+
     if (shouldRun && !window.deadReckoning.isActive()) {
         window.deadReckoning.start();
     } else if (!shouldRun && window.deadReckoning.isActive()) {
