@@ -37,7 +37,7 @@ const locations = [
         additionalInfo: "Eyedea's music often delved into philosophy, psychology, and social issues, reflecting his thoughtful and introspective nature.",
         difficulty: 2
     },
-/*
+
     {
         id: "1012",
         lat: 44.1680805962643,
@@ -47,7 +47,7 @@ const locations = [
         image: "https://mnthen.com/markers/mankato/images/mankato_38.webp",
         creator: "Matt Reicher",
         city: "Mankato",
-        audio: "/audio/mankato/man_dakota_38.mp3", 
+        audio: "/audio/exhibits/dakota_conflict.mp3", 
         tours: "event",
         summary: "The 1862 Dakota War ended with the largest mass hanging in U.S. history—38 Dakota men—marking the fall of Native resistance in the region.",
         today: "Reconcilliation Park",
@@ -56,7 +56,6 @@ const locations = [
         additionalInfo: "After the U.S.-Dakota War, 2,000 Dakota were captured; President Lincoln commuted the sentences of all but 39 of the 303 condemned to die.",
         difficulty: 1
     },
-*/
     {
         id: "1013",
         lat: 44.961337319371076,
