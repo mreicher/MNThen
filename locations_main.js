@@ -126,10 +126,10 @@ const locations = [
         city: "St. Paul",
         audio: "/audio/exhibit/whiskey.mp3",
         tours: "person",
-        summary: "Whiskey, a rebellious Army horse, became a famed jumper under Lt. Hazelrigg at Fort Snelling. They stayed bonded until Whiskey’s death in 1943.",
+        summary: "A renegade horse became the Army's smartest jumper. His grave on a Fort Snelling bluff still draws visitors to learn his story.",
         today: "Near the Visitor Center",
         link: "https://mnthen.com/blog/people/whiskey.html",
-        imageSource: "Whiskey with Captain W.R. Hazelrigg (1943)",
+        imageSource: "Photo of Whiskey the Horse Gravesite (by the Author)",
         additionalInfo: "Whiskey was buried with full military honors, marking the end of an era where horses played a significant role in the U.S. Army.",
         difficulty: 1
     },
