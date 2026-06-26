@@ -119,7 +119,7 @@ const locations = [
         lng: -93.18772007741772,
         name: "Whiskey the Horse (c. 1911 - 1943)",
         title: "Whiskey the Horse (c. 1911 - 1943)",
-        image: "https://mnthen.com/images/whiskey.jpg",
+        image: "https://mnthen.com/exhibit/images/whiskey.jpg",
         creator: "Matt Reicher",
         city: "St. Paul",
         audio: "/audio/exhibit/whiskey.mp3",
