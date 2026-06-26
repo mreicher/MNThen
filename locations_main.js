@@ -129,7 +129,7 @@ const locations = [
         summary: "A renegade horse became the Army's smartest jumper. His grave on a Fort Snelling bluff still draws visitors to learn his story.",
         today: "Near the Visitor Center",
         link: "https://mnthen.com/blog/people/whiskey.html",
-        imageSource: "Photo of Whiskey the Horse Gravesite (by the Author)",
+        imageSource: "Captain W.R. Hazelrigg and Whiskey jumping a picnic table. (MNHS)",
         additionalInfo: "Whiskey was buried with full military honors, marking the end of an era where horses played a significant role in the U.S. Army.",
         difficulty: 1
     },
