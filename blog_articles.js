@@ -345,7 +345,7 @@ const blogArticles = [
     "icon": "fa-user",
     "author": "Matt Reicher",
     "date": "August 24, 2024",
-    "image": "https://mnthen.com/images/whiskey.jpg",
+    "image": "https://mnthen.com/images/exhibit/whiskey.jpg",
     "url": "https://mnthen.com/blog/people/whiskey.html",
     "keywords": ["saint paul", "st. paul", "fort snelling", "army", "horse", "grave", "person", "all"]
   },
