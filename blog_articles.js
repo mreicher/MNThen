@@ -340,7 +340,7 @@ const blogArticles = [
     "keywords": ["saint paul", "st. paul", "beer", "brewer", "pioneer", "keller", "person", "all"]
   },
   {
-    "headline": "Whiskey the Horse (c. 1911 - 1943)",
+    "headline": "Whiskey the Horse (1911 - 1943)",
     "blurb": "Whiskey, an exceptional Army horse at Fort Snelling, gained fame for his jumping prowess and enduring bond with Lt. William Hazelrigg.",
     "icon": "fa-user",
     "author": "Matt Reicher",
