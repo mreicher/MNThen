@@ -485,7 +485,7 @@ const blogArticles = [
     "icon": "fa-user",
     "author": "Matt Reicher",
     "date": "September 4, 2023",
-    "image": "https://mnthen.com/images/wsp_eyedea.webp",
+    "image": "https://mnthen.com/images/exhibit/eyedea.jpg",
     "url": "https://mnthen.com/blog/people/eyedea_larsen.html",
     "keywords": ["saint paul", "st. paul", "rap", "hip", "hop", "Rhymesayers", "person", "all"]
   },
