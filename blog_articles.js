@@ -435,7 +435,7 @@ const blogArticles = [
     "icon": "fa-user",
     "author": "Matt Reicher",
     "date": "April 27, 2024",
-    "image": "https://mnthen.com/images/gangster/clifford/clifford1.jpg",
+    "image": "https://mnthen.com/images/exhibit/clifford1.jpg",
     "url": "https://mnthen.com/blog/people/clifford.html",
     "keywords": ["brothel", "St. Paul", "Saint Paul", "gangster", "person", "Nina", "all"]
   },
