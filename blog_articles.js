@@ -475,7 +475,7 @@ const blogArticles = [
     "icon": "fa-calendar",
     "author": "Matt Reicher",
     "date": "October 4, 2023",
-    "image": "https://mnthen.com/markers/mankato/images/mankato_38.webp",
+    "image": "https://mnthen.com/images/exhibit/dakota_38.jpg",
     "url": "https://mnthen.com/blog/event/dakota_conflict.html",
     "keywords": ["Dakota", "dakota", "Mankato", "1982", "war", "conflict", "event", "all"]
   },
