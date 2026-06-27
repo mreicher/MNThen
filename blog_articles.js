@@ -65,7 +65,7 @@ const blogArticles = [
   "icon": "fa-calendar",
   "author": "Matt Reicher",
   "date": "December 20, 2025",
-  "image": "https://www.mnthen.com/tour/NE/gallery/NE_johns_bar1.jpg",
+  "image": "https://www.mnthen.com/images/blog/johns_bar.jpg",
   "url": "https://www.mnthen.com/blog/event/johnsbar.html",
   "keywords": ["john's bar", "funhouse scandal", "mann act", "gawron brothers", "northeast minneapolis", "prostitution scandal", "tony jaros", "river garden", "1950s", "event", "all"]
 },
