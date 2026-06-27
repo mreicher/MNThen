@@ -308,7 +308,7 @@ const locations = [
   "lng": -93.09783889422603,
   "name": "Nina Clifford (c. 1851 - 1929)",
   "title": "Nina Clifford",
-  "image": "https://mnthen.com/images/gangster/clifford/clifford1.jpg",
+  "image": "https://mnthen.com/images/exhibit/clifford1.jpg",
   "creator": "Matt Reicher",
   "city": "St. Paul",
   "audio": "/audio/exhibit/clifford.mp3",
@@ -318,7 +318,7 @@ const locations = [
   "link": "https://mnthen.com/blog/people/clifford.html",
   "imageSource": "Image of Clifford’s brothel via MNopedia",
   "additionalInfo": "Legend claimed secret tunnels connected Clifford's brothel to the exclusive Minnesota Club, though this was later debunked.",
-    difficulty: 1
+    difficulty: 2
 },
     /*
 {
