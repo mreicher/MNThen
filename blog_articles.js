@@ -445,7 +445,7 @@ const blogArticles = [
     "icon": "fa-calendar",
     "author": "Matt Reicher",
     "date": "April 27, 2024",
-    "image": "https://mnthen.com/tour/hamm/gallery/kidnap/hamm_kidnap1.jpg",
+    "image": "https://mnthen.com/images/exhibit/hamm_kidnap.jpg",
     "url": "https://mnthen.com/blog/event/hamm_kidnap.html",
     "keywords": ["kidnapping", "st. paul", "saint paul", "gangster", "Karpis", "Barker", "event", "all"]
   },
@@ -455,7 +455,7 @@ const blogArticles = [
     "icon": "fa-building",
     "author": "Matt Reicher",
     "date": "November 12. 2023",
-    "image": "https://mnthen.com/tour/hamm/gallery/mansion/hamm_mansion5.jpg",
+    "image": "https://mnthen.com/images/exhibit/hamm_mansion.jpg",
     "url": "https://mnthen.com/blog/place/stp_hamm_mansion.html",
     "keywords": ["saint paul", "st. paul", "hamm", "mansion", "east side", "place", "all"]
   },
