@@ -1,5 +1,24 @@
 const locations = [
 
+        {
+        id: "1010",
+        lat: 45.05702204168715,
+        lng: -92.9591929076619,
+        name: "Wildwood Amusement Park (1889 - 1932)",
+        title: "Wildwood Amusement Park",
+        image: "https://mnthen.com/locations/gallery/mahtomedi/wildwood/wildwood_2.jpg",
+        creator: "Matt Reicher",
+        city: "Mahtomedi",
+        audio: "/audio/exhibit/wildwood.mp3", 
+        tours: "history",
+        summary: "Wildwood Amusement Park thrilled Twin Cities crowds for 30+ years with rides, shows & lakeside fun. It closed after years of financial issues.",
+        today: "Southeast corner of White Bear Lake",
+        link: "https://mnthen.com/blog/place/wildwood.html",
+        imageSource: "Image of the slide at Wildwood Park c. 1905 via MPRNews",
+        additionalInfo: "Visitors didn’t just arrive by streetcar — some came by steamboat across White Bear Lake to spend the day swimming, dancing, and riding Wildwood’s coaster.",
+        difficulty: 2
+    },
+    
     {
         id: "1011",
         lat: 44.922167523742054,
@@ -134,7 +153,7 @@ const locations = [
         additionalInfo: "In 1976, Swede Hollow was transformed into a nature sanctuary with trails and signs commemorating the communities that once lived there.",
         difficulty: 2
     },
-
+/*
     {
         id: "1018",
         lat: 44.956571587648774,
@@ -153,7 +172,7 @@ const locations = [
         additionalInfo: "After serving as Minnesota's governor, Merriam was appointed by President McKinley to direct the U.S. Census Bureau in 1899.",
         difficulty: 1
     },
-
+*/
     {
         id: "1019",
         lat: 45.08421675605315,
@@ -220,7 +239,7 @@ const locations = [
         image: "https://mnthen.com/images/northfield.jpg",
         creator: "Matt Reicher",
         city: "Northfield",
-        audio: "/audio/northfield.mp3",
+        audio: "/audio/exhibit/northfield.mp3",
         tours: "event",
         summary: "In 1876, Jesse James’ gang botched a Northfield bank robbery as armed townsfolk fought back. Two died, the Youngers were caught, Jesse escaped.",
         today: "Northfield History Center",
@@ -305,7 +324,7 @@ const locations = [
         additionalInfo: "The Barker-Karpis gang brought in a strategist from Al Capone's Chicago syndicate to help plan Hamm Jr.'s kidnapping.",
         difficulty: 1
     },
-
+/*
     {
         id: "1030",
         lat: 44.987154491771946,
@@ -324,7 +343,7 @@ const locations = [
         additionalInfo: "Guy Fieri featured Nye's on Season 13 of Food Network’s \"Diners, Drive-Ins and Dives,\" praising their pierogi and prime rib sandwich.",
         difficulty: 1
     },
-
+*/
     {
         id: "1031",
         lat: 45.20298779768933,
