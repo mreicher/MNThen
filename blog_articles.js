@@ -535,7 +535,7 @@ const blogArticles = [
     "icon": "fa-building",
     "author": "Matt Reicher",
     "date": "July 24, 2023",
-    "image": "https://mnthen.com/locations/gallery/mpls/gramma_b/mpls_gramma_b_1.jpg",
+    "image": "https://mnthen.com/images/blog/mpls_gramma_b_1.jpg",
     "url": "https://mnthen.com/blog/place/mpls_gramma_b.html",
     "keywords": ["northeast", "Northeast", "Minneapolis", "saloon", "bar", "place", "all"]
   },
@@ -545,7 +545,7 @@ const blogArticles = [
     "icon": "fa-building",
     "author": "Matt Reicher",
     "date": "July 23, 2023",
-    "image": "https://mnthen.com/locations/gallery/mpls/premium/mpls_grain_belt_1.jpg",
+    "image": "https://mnthen.com/images/exhibit/mpls_grain_belt.jpg",
     "url": "https://mnthen.com/blog/place/mpls_grain_belt.html",
     "keywords": ["premium", "grain belt", "sign", "minneapolis", "Minneapolis", "beer", "place", "all"]
   },
@@ -555,7 +555,7 @@ const blogArticles = [
     "icon": "fa-building",
     "author": "Matt Reicher",
     "date": "July 22, 2023",
-    "image": "https://mnthen.com/locations/gallery/mahtomedi/wildwood/wildwood_2.jpg",
+    "image": "https://mnthen.com/images/blog/wildwood_2.jpg",
     "url": "https://mnthen.com/blog/place/wildwood.html",
     "keywords": ["amusement", "park", "mahtomedi", "wildwood", "streetcar", "place", "all"]
   },
