@@ -64,7 +64,7 @@ const locations = [
         lng: -93.26445659478223,
         name: "Father Louis Hennepin Suspension Bridge",
         title: "Father Louis Hennepin Suspension Bridge",
-        image: "https://mnthen.com/locations/gallery/mpls/henn_bridge/henn_bridge_1.jpg",
+        image: "https://mnthen.com/images/exhibit/henn_bridge_1.jpg",
         creator: "Matt Reicher",
         city: "Minneapolis",
         audio: "/audio/exhibit/hennepin.mp3", 
