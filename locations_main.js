@@ -29,7 +29,7 @@ const locations = [
         image: "https://mnthen.com/markers/mankato/images/mankato_38.webp",
         creator: "Matt Reicher",
         city: "Mankato",
-        audio: "/audio/exhibits/dakota_conflict.mp3", 
+        audio: "/audio/exhibit/dakota_conflict.mp3", 
         tours: "event",
         summary: "The 1862 Dakota War ended with the largest mass hanging in U.S. history—38 Dakota men—marking the fall of Native resistance in the region.",
         today: "Reconcilliation Park",
