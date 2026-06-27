@@ -1,18 +1,17 @@
 // sw.js – Minnesota Then Service Worker
-// Version: 4.5.2 (hybrid: update + timer + CORS audio + offline hardening)
+// Version: 4.6.0 (fixed: offline fallback, URL normalization, cache sync)
 
-const CACHE_NAME = 'mnthen-v4-ios-5';
-const SHELL_CACHE = 'mnthen-shell-v5';
+const CACHE_NAME    = 'mnthen-v4-ios-5';
+const SHELL_CACHE   = 'mnthen-shell-v5';
 const RUNTIME_CACHE = 'mnthen-runtime-v5';
-const AUDIO_CACHE = 'mnthen-audio-v5';
-const TILE_CACHE = 'mnthen-tiles-v5';
+const AUDIO_CACHE   = 'mnthen-audio-v5';
+const TILE_CACHE    = 'mnthen-tiles-v5';
 
 const MAX_RUNTIME = 100;
-const MAX_AUDIO = 100;
-const MAX_TILES = 1500;
-const MAX_SHELL = 50;
+const MAX_AUDIO   = 100;
+const MAX_TILES   = 1500;
+const MAX_SHELL   = 50;
 
-// Restore CORS audio domains
 const CORS_AUDIO_DOMAINS = [
   'storage.googleapis.com',
   'firebasestorage.googleapis.com',
@@ -23,6 +22,7 @@ const CORS_AUDIO_DOMAINS = [
 const SHELL_RESOURCES = [
   '/',
   '/index.html',
+  '/offline.html',
   '/map.html',
   '/css/mainmap.css',
   '/css/mnthen_main_map2.css',
@@ -52,7 +52,6 @@ async function trimCache(cacheName, maxEntries) {
     const cache = await caches.open(cacheName);
     const keys = await cache.keys();
     if (keys.length > maxEntries) {
-      // Delete in parallel for massive speed improvement over sequential await
       await Promise.all(
         keys.slice(0, keys.length - maxEntries).map(key => cache.delete(key))
       );
@@ -60,6 +59,15 @@ async function trimCache(cacheName, maxEntries) {
   } catch (e) {
     console.warn('[SW] trimCache failed safely:', e);
   }
+}
+
+// Normalize root path to /index.html for consistent cache matching
+function normalizeRequest(req) {
+  const url = new URL(req.url);
+  if (url.pathname === '/' || url.pathname === '') {
+    return new Request(url.origin + '/index.html');
+  }
+  return req;
 }
 
 // ---------- strategies ----------
@@ -74,13 +82,12 @@ async function cacheFirst(req, cacheName = CACHE_NAME) {
     const timeoutId = setTimeout(() => controller.abort(), 10000);
     const res = await fetch(req, { signal: controller.signal });
     clearTimeout(timeoutId);
-    
+
     if (res.ok && res.status === 200 && res.type !== 'opaque') {
       cache.put(req, res.clone()).catch(() => {});
     }
     return res;
   } catch (e) {
-    // hit is guaranteed null here, avoiding dead code
     return new Response('Offline', { status: 503 });
   }
 }
@@ -91,7 +98,7 @@ async function networkFirst(req) {
     const timeoutId = setTimeout(() => controller.abort(), 8000);
     const res = await fetch(req, { cache: 'no-cache', signal: controller.signal });
     clearTimeout(timeoutId);
-    
+
     if (res.ok && res.status === 200) {
       const cache = await caches.open(RUNTIME_CACHE);
       cache.put(req, res.clone()).catch(() => {});
@@ -100,7 +107,12 @@ async function networkFirst(req) {
     return res;
   } catch (e) {
     const cache = await caches.open(RUNTIME_CACHE);
-    return (await cache.match(req)) || new Response('Offline', { status: 503 });
+    const cached = await cache.match(req);
+    if (cached) return cached;
+
+    // Serve offline.html for navigation requests instead of plain text
+    const offline = await caches.match('/offline.html');
+    return offline || new Response('Offline', { status: 503 });
   }
 }
 
@@ -113,28 +125,24 @@ async function staleWhileRevalidate(req) {
       if (res.ok && res.status === 200) cache.put(req, res.clone()).catch(() => {});
       return res;
     })
-    // If network fails and cache is null, returning undefined crashes e.respondWith. 
-    // Return 503 instead.
-    .catch(() => new Response('Offline', { status: 503 })); 
+    .catch(() => new Response('Offline', { status: 503 }));
 
   return cached || update;
 }
 
 async function handleAudio(req) {
   if (req.headers.has('range')) {
-    // Must catch offline failure on range requests to prevent SW crash
     return fetch(req).catch(() => new Response('Offline', { status: 503 }));
   }
-  
+
   const cache = await caches.open(AUDIO_CACHE);
   const hit = await cache.match(req);
   if (hit) return hit;
 
-  // Wrap in try/catch to prevent unhandled rejections when offline
   try {
     const corsMode = isCORSAudio(req.url) ? 'cors' : 'same-origin';
     const res = await fetch(req, { mode: corsMode, credentials: 'same-origin' });
-    
+
     if (res.ok && res.status === 200 && res.type !== 'opaque') {
       cache.put(req, res.clone()).catch(() => {});
       trimCache(AUDIO_CACHE, MAX_AUDIO);
@@ -148,17 +156,19 @@ async function handleAudio(req) {
 // ---------- fetch ----------
 
 self.addEventListener('fetch', e => {
-  const { request: req } = e;
-  const url = req.url;
+  const { request: rawReq } = e;
+  const url = rawReq.url;
 
-  if (req.method !== 'GET') return;
+  if (rawReq.method !== 'GET') return;
+
+  // Normalize root requests before routing
+  const req = normalizeRequest(rawReq);
 
   if (req.destination === 'document') {
     e.respondWith(networkFirst(req));
     return;
   }
 
-  // Performance: Evaluate high-traffic/cheap checks before expensive regexes
   if (TILE_REGEX.test(url)) {
     e.respondWith(cacheFirst(req, TILE_CACHE));
     return;
@@ -190,7 +200,7 @@ self.addEventListener('fetch', e => {
 // ---------- lifecycle ----------
 
 self.addEventListener('install', e => {
-  console.log('[SW] 4.5.2 installing');
+  console.log('[SW] 4.6.0 installing');
   e.waitUntil(
     caches.open(SHELL_CACHE)
       .then(c => c.addAll(SHELL_RESOURCES))
@@ -203,7 +213,7 @@ self.addEventListener('install', e => {
 });
 
 self.addEventListener('activate', e => {
-  console.log('[SW] 4.5.2 activating');
+  console.log('[SW] 4.6.0 activating');
   e.waitUntil(
     caches.keys().then(names =>
       Promise.all(
@@ -261,4 +271,4 @@ self.addEventListener('unhandledrejection', e => {
   e.preventDefault();
 });
 
-console.log('[SW] 4.5.2 ready (hybrid: update + timeouts + CORS audio + offline hardening)');
+console.log('[SW] 4.6.0 ready (offline fallback + URL normalization)');
