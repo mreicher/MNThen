@@ -565,7 +565,7 @@ const blogArticles = [
     "icon": "fa-user",
     "author": "Matt Reicher",
     "date": "July 17, 2023",
-    "image": "https://mnthen.com/tour/capitol/gallery/olson/olson_1.jpg",
+    "image": "https://mnthen.com/images/blog/olson.jpg",
     "url": "https://mnthen.com/blog/people/olson.html",
     "keywords": ["saint paul", "st. paul", "politics", "govenor", "olson", "Olson", "person", "all"]
   },
