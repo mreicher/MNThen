@@ -495,7 +495,7 @@ const blogArticles = [
     "icon": "fa-calendar",
     "author": "Matt Reicher",
     "date": "September 1, 2023",
-    "image": "https://mnthen.com/images/gangster/gangster_lincoln_ct.jpg",
+    "image": "https://www.mnthen.com/images/blog/lincoln_ct.jpg",
     "url": "https://mnthen.com/blog/event/shootout_lincoln_ct.html",
     "keywords": ["saint paul", "st. paul", "gangster", "lincoln", "Lincoln", "Dillinger", "dillinger", "event", "all"]
   },
