@@ -83,7 +83,7 @@ const locations = [
         lng: -93.10223181529494,
         name: "Minnesota’s Third State Capitol",
         title: "Minnesota’s Third State Capitol",
-        image: "https://mnthen.com/exhibit/images/capitol3.jpg",
+        image: "https://mnthen.com/images/exhibit/capitol3.jpg",
         creator: "Brian C. Pease",
         city: "St. Paul",
         audio: "/audio/exhibit/capitol3.mp3",
