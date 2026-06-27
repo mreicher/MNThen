@@ -515,7 +515,7 @@ const blogArticles = [
     "icon": "fa-calendar",
     "author": "Matt Reicher",
     "date": "August 23, 2023",
-    "image": "https://mnthen.com/images/erickson.jpg",
+    "image": "https://mnthen.com/images/blog/gangster_erickson.jpg",
     "url": "https://mnthen.com/blog/event/erickson.html",
     "keywords": ["saint paul", "st. paul", "gangster", "barker", "karpis", "shooting", "event", "all"]
   },
