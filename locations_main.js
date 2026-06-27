@@ -50,7 +50,7 @@ const locations = [
         city: "Mankato",
         audio: "/audio/exhibit/dakota_conflict.mp3", 
         tours: "event",
-        summary: "The 1862 Dakota War ended with the largest mass hanging in U.S. history—38 Dakota men—marking the fall of Native resistance in the region.",
+        summary: "On December 26, 1862, 38 Dakota men were hanged in Mankato in the largest single-day mass execution in U.S. history.",
         today: "Reconcilliation Park",
         link: "https://mnthen.com/blog/event/dakota_conflict.html",
         imageSource: "The Dakota 38 Memorial via Library of Congress",
