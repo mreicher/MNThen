@@ -75,7 +75,7 @@ const blogArticles = [
   "icon": "fa-user",
   "author": "Matt Reicher",
   "date": "December 19, 2025",
-  "image": "https://www.mnthen.com/images/gangster/hogan/stp_hogan.jpg",
+  "image": "https://www.mnthen.com/images/blog/hogan.jpg",
   "url": "https://www.mnthen.com/blog/people/hogan.html",
   "keywords": ["dapper dan hogan", "st paul", "o'connor layover agreement", "green lantern saloon", "harry dutch sawyer", "minnesota crime", "gangsters", "car bombing", "people", "all"]
 },
