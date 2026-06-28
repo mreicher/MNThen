@@ -1,5 +1,5 @@
 // sw.js – Minnesota Then Service Worker
-// Version: 4.6.0 (fixed: offline fallback, URL normalization, cache sync)
+// Version: 4.6.1 (resilient install, no single 404 kills activation)
 
 const CACHE_NAME    = 'mnthen-v4-ios-5';
 const SHELL_CACHE   = 'mnthen-shell-v5';
@@ -61,7 +61,6 @@ async function trimCache(cacheName, maxEntries) {
   }
 }
 
-// Normalize root path to /index.html for consistent cache matching
 function normalizeRequest(req) {
   const url = new URL(req.url);
   if (url.pathname === '/' || url.pathname === '') {
@@ -70,9 +69,33 @@ function normalizeRequest(req) {
   return req;
 }
 
+// Cache each resource individually — failures don't block others
+async function cacheShellResources(cache) {
+  const results = await Promise.all(
+    SHELL_RESOURCES.map(async (path) => {
+      const req = new Request(path, { cache: 'reload' });
+      try {
+        const res = await fetch(req);
+        if (res.ok && res.status === 200) {
+          await cache.put(req, res.clone());
+          return { path, ok: true };
+        }
+        throw new Error('HTTP ' + res.status);
+      } catch (err) {
+        console.warn('[SW] Shell resource failed:', path, err.message);
+        return { path, ok: false, error: err.message };
+      }
+    })
+  );
+  const ok = results.filter(r => r.ok).length;
+  const failed = results.filter(r => !r.ok).map(r => r.path);
+  console.log('[SW] Cached', ok, '/', SHELL_RESOURCES.length, 'shell resources');
+  if (failed.length) console.warn('[SW] Failed:', failed.join(', '));
+}
+
 // ---------- strategies ----------
 
-async function cacheFirst(req, cacheName = CACHE_NAME) {
+async function cacheFirst(req, cacheName) {
   const cache = await caches.open(cacheName);
   const hit = await cache.match(req);
   if (hit) return hit;
@@ -110,7 +133,6 @@ async function networkFirst(req) {
     const cached = await cache.match(req);
     if (cached) return cached;
 
-    // Serve offline.html for navigation requests instead of plain text
     const offline = await caches.match('/offline.html');
     return offline || new Response('Offline', { status: 503 });
   }
@@ -161,7 +183,6 @@ self.addEventListener('fetch', e => {
 
   if (rawReq.method !== 'GET') return;
 
-  // Normalize root requests before routing
   const req = normalizeRequest(rawReq);
 
   if (req.destination === 'document') {
@@ -190,30 +211,31 @@ self.addEventListener('fetch', e => {
   }
 
   if (/\.(css|js|png|jpg|jpeg|gif|svg|webp|ico|woff|woff2)$/i.test(url)) {
-    e.respondWith(cacheFirst(req));
+    e.respondWith(cacheFirst(req, CACHE_NAME));
     return;
   }
 
-  e.respondWith(cacheFirst(req));
+  e.respondWith(cacheFirst(req, CACHE_NAME));
 });
 
 // ---------- lifecycle ----------
 
 self.addEventListener('install', e => {
-  console.log('[SW] 4.6.0 installing');
+  console.log('[SW] 4.6.1 installing');
   e.waitUntil(
     caches.open(SHELL_CACHE)
-      .then(c => c.addAll(SHELL_RESOURCES))
+      .then(cache => cacheShellResources(cache))
       .then(() => self.skipWaiting())
       .catch(err => {
-        console.error('[SW] install failed:', err);
-        throw err;
+        console.error('[SW] install error (non-fatal):', err);
+        // Still activate even if everything failed — SW is better than no SW
+        return self.skipWaiting();
       })
   );
 });
 
 self.addEventListener('activate', e => {
-  console.log('[SW] 4.6.0 activating');
+  console.log('[SW] 4.6.1 activating');
   e.waitUntil(
     caches.keys().then(names =>
       Promise.all(
@@ -271,4 +293,4 @@ self.addEventListener('unhandledrejection', e => {
   e.preventDefault();
 });
 
-console.log('[SW] 4.6.0 ready (offline fallback + URL normalization)');
+console.log('[SW] 4.6.1 ready (resilient install)');
