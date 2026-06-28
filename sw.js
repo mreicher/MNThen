@@ -28,7 +28,7 @@ const SHELL_RESOURCES = [
   '/manifest.json',
   '/locations_main.js',
   '/images/logo.webp',
-  '/images/index/index_header.jpg'
+  '/images/header/index_header.jpg'
 ];
 
 const AUDIO_EXTS = /\.(mp3|wav|ogg|m4a|aac|flac|weba)$/i;
