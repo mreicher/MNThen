@@ -9,6 +9,7 @@ window.locations_h = [
         city: "West Saint Paul",
         creator: "Matt Reicher",
         link: "http://www.historictwincities.com/2021/07/12/barker-karpis-gang-hideout-house-1031-south-robert-street/",
+        summary: "Wildwood Amusement Park thrilled Twin Cities crowds for 30+ years with rides, shows & lakeside fun. It closed after years of financial issues.",
         imageSource: "Former Barker-Karpis WSP Hideout via <a href='https://www.atlasobscura.com/places/barker-karpis-hideout-house' target=_blank>Atlas Obscura</a>.",
         trivia: {
             question: "What was the name of Nick Hannegraf's Tavern?",
@@ -16,6 +17,7 @@ window.locations_h = [
             answer: 0
         }
     },
+    
     {
         id: 2,
         name: "O'Connor Layover Agreement",
