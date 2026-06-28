@@ -24,12 +24,11 @@ const SHELL_RESOURCES = [
   '/index.html',
   '/offline.html',
   '/map.html',
-  '/css/mainmap.css',
-  '/css/mnthen_main_map2.css',
+  '/css/map-styles.css',
   '/manifest.json',
   '/locations_main.js',
   '/images/logo.webp',
-  '/images/index/index_1.jpg'
+  '/images/index/index_header.jpg'
 ];
 
 const AUDIO_EXTS = /\.(mp3|wav|ogg|m4a|aac|flac|weba)$/i;
