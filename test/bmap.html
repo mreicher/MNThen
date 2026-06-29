@@ -1567,24 +1567,29 @@ class EnterpriseBackgroundSync {
             return { lat: (rawLat - this._rawLat) / dtSec, lng: (rawLng - this._rawLng) / dtSec };
         }
     
-        _updateStationaryState(gpsSpeedMPS, kalmanSpeedMPS) {
+      _updateStationaryState(gpsSpeedMPS, kalmanSpeedMPS, rawLat, rawLng) {
             const speed = Math.max(gpsSpeedMPS || 0, kalmanSpeedMPS || 0);
             const isMoving = speed > 0.8 || (this._accelAvailable && this._isMoving);
-    
+        
             if (isMoving)         { this._stationaryCounter = Math.max(0, this._stationaryCounter - 2); }
             else if (speed < 0.3) { this._stationaryCounter++; }
-    
+        
             const isStationary = speed < 0.3 || this._stationaryCounter >= 5;
-    
+        
             if (isStationary && !this._lastStationaryState) {
                 // Transition to stationary — freeze immediately.
+                // Use raw position as fallback if Kalman hasn't produced output yet.
                 this._unfreezeCounter = 0;
-                if (this._kalmanFilter && this._lastKalmanLat != null) {
-                    this._kalmanFilter.freeze(this._lastKalmanLat, this._lastKalmanLng);
+                const freezeLat = this._lastKalmanLat != null ? this._lastKalmanLat : rawLat;
+                const freezeLng = this._lastKalmanLng != null ? this._lastKalmanLng : rawLng;
+                if (this._kalmanFilter && freezeLat != null && freezeLng != null) {
+                    this._kalmanFilter.freeze(freezeLat, freezeLng);
                 }
-                this._stationaryPosition = { lat: this._lastKalmanLat, lng: this._lastKalmanLng };
-                this._stationarySamples  = [];
-            
+                this._stationaryPosition = (freezeLat != null && freezeLng != null)
+                    ? { lat: freezeLat, lng: freezeLng }
+                    : null;
+                this._stationarySamples = [];
+        
             } else if (!isStationary && this._lastStationaryState) {
                 // Transition to moving — require 3 consecutive moving frames before
                 // unfreezing. Prevents rapid freeze/unfreeze at walking-pace boundary
@@ -1600,7 +1605,7 @@ class EnterpriseBackgroundSync {
                 // Return current stationary state while hysteresis counter builds.
                 return true;
             }
-            
+        
             if (isStationary) this._unfreezeCounter = 0;
             this._lastStationaryState = isStationary;
             return isStationary;
@@ -1690,7 +1695,7 @@ class EnterpriseBackgroundSync {
             const kfResult = kf.update(rawLat, rawLng, accuracyMeters, perfNow, gpsSpeedMPS);
     
             this._filteredSpeedMPS = kf.getSpeedMPS();
-            const isStationary = this._updateStationaryState(gpsSpeedMPS, this._filteredSpeedMPS);
+            const isStationary = this._updateStationaryState(gpsSpeedMPS, this._filteredSpeedMPS, rawLat, rawLng);
     
             if      (kfResult.isConverged && this._convergenceStage < 2)      { this._convergenceStage = 2; }
             else if (kfResult.updateCount >= 3 && this._convergenceStage < 1) { this._convergenceStage = 1; }
@@ -1883,7 +1888,17 @@ class EnterpriseBackgroundSync {
     }
 
     function _setMarkerPosition(lat, lng) {
-        if (typeof userMarker !== 'undefined' && userMarker) userMarker.setLatLng([lat, lng]);
+        if (typeof userMarker === 'undefined' || !userMarker) return;
+        // DR runs inside its own rAF frame already — call scheduleMarkerUpdate
+        // so GPS and DR writes are coalesced through the same pending slot.
+        // The _drOwnsMarker flag tells scheduleMarkerUpdate to accept this write
+        // unconditionally and causes GPS writes to be dropped until DR releases.
+        window._drOwnsMarker = true;
+        if (typeof scheduleMarkerUpdate === 'function') {
+            scheduleMarkerUpdate(lat, lng);
+        } else {
+            userMarker.setLatLng([lat, lng]);
+        }
     }
 
     function _getDriftThreshold(s) {
@@ -2066,7 +2081,8 @@ class EnterpriseBackgroundSync {
             _panTarget = null;
             _centeredLat = null;
             _centeredLng = null;
-            _preArmExpiry = 0;          // ← NEW: Clear grace period on explicit stop
+            _preArmExpiry = 0;
+            window._drOwnsMarker = false;   // ← release marker back to GPS
             const el = _getMarkerEl();
             if (el) { el.style.willChange = ''; el.style.transition = ''; _markerTransSet = false; }
         },
@@ -2880,7 +2896,7 @@ function updateAccuracyIndicator(accuracy) {
 /* ──────────────────────────────────────────────
    USER LOCATION INITIALIZATION
    ────────────────────────────────────────────── */
-     function initializeUserLocation(position) {
+    function initializeUserLocation(position) {
         position = window._consumeWarmupPosition?.(position) ?? position;
     
         if (!position?.coords) {
@@ -2954,36 +2970,41 @@ function updateAccuracyIndicator(accuracy) {
                 speedMPS: speed || 0,
             });
     
-            // Seed Kalman during loading screen so it's converged at fade.
             const kf = window.sensorFusion?._kalmanFilter;
             if (kf) {
                 const hasWarmStartHistory = window._warmupFixCount >= 2 &&
-                                            window._warmupPositionHistory &&
-                                            window._warmupPositionHistory.length >= 2;
+                                            window._warmupPositionHistory?.length >= 2;
                 const hasReliableMotion = speed > 0.5 && heading != null && isFinite(heading);
     
                 if (hasWarmStartHistory) {
-                    // HISTORY PATH: Feed actual warm-start fixes — strictly better than
-                    // seeding because it derives velocity from real measured deltas.
-                    // Skip index 0: dt≈0 after _initialize(), so _predict() is a no-op
-                    // and _update() burns ~200 FP ops for zero state change.
+                    // Place marker at last known fix immediately, backfill KF history
+                    // in rAF chunks to avoid blocking the main thread at load.
                     const history = window._warmupPositionHistory;
-                    for (let i = 1; i < history.length; i++) {
-                        const fix = history[i];
-                        const fixPerfNow = window.sensorFusion._toPerfNow(fix.timestamp);
-                        kf.update(fix.lat, fix.lng, fix.accuracy, fixPerfNow, fix.speedMPS);
+                    const lastFix = history[history.length - 1];
+                    if (lastFix) userMarker.setLatLng([lastFix.lat, lastFix.lng]);
+    
+                    let idx = 1;
+                    function backfillChunk() {
+                        const end = Math.min(idx + 3, history.length);
+                        for (; idx < end; idx++) {
+                            const fix = history[idx];
+                            kf.update(fix.lat, fix.lng, fix.accuracy,
+                                window.sensorFusion._toPerfNow(fix.timestamp), fix.speedMPS);
+                        }
+                        if (idx < history.length) {
+                            if (typeof requestIdleCallback === 'function') {
+                                requestIdleCallback(backfillChunk, { timeout: 50 });
+                            } else {
+                                requestAnimationFrame(backfillChunk);
+                            }
+                        }
                     }
-                    // History feed has established velocity — no seed needed.
+                    requestAnimationFrame(backfillChunk);
+    
                 } else if (hasReliableMotion) {
-                    // SEED PATH: No history but GPS gave us speed + heading. Use it.
                     const rad = heading * Math.PI / 180;
                     kf.seedVelocity(speed * Math.cos(rad), speed * Math.sin(rad), 0.5);
-                } else if (window._warmupPosition) {
-                    // WEAK SEED PATH: One warm-start fix, no heading. High variance
-                    // so filter learns quickly from first real fixes.
-                    kf.seedVelocity(0, 0, 6.0);
                 } else {
-                    // COLD START PATH: No data at all. Zero velocity, high variance.
                     kf.seedVelocity(0, 0, 6.0);
                 }
             }
@@ -3004,9 +3025,7 @@ function updateAccuracyIndicator(accuracy) {
                 }
             });
     
-            // ── Apply pending position BEFORE marking init complete ──
-            // If a better fix arrived during initialization, apply it now so
-            // the user starts with the most accurate position available.
+            // Apply any better fix that arrived during initialization.
             const pending = window._pendingInitPosition;
             if (pending) {
                 window._pendingInitPosition = null;
@@ -3039,7 +3058,6 @@ function updateAccuracyIndicator(accuracy) {
             }
     
             window._drPreArmed = true;
-    
             if (window.deadReckoning && typeof window.deadReckoning.start === 'function') {
                 window.deadReckoning.start();
             }
@@ -3877,7 +3895,7 @@ function getSpeedBasedZoom(speedMPS, closestDistance) {
             getSpeedBasedZoom._lastAction = 'zoomed-in';
             return { zoom: 19, fitBounds: false };
         }
-        return null; // already zoomed in, hold position
+        return null;
     }
 
     // ── Zone 2: Deadband (45–60ft) → hold, no action ────────────────────────
@@ -3886,25 +3904,25 @@ function getSpeedBasedZoom(speedMPS, closestDistance) {
     }
 
     // ── Zone 3: Outside (>60ft) ──────────────────────────────────────────────
-    // Only fire zoom-out if we actually zoomed IN during this visit.
-    // 'idle' (app start, pinch zoom, between POIs) never triggers a zoom-out.
-    if (getSpeedBasedZoom._lastAction === 'zoomed-in') {
+    // Fire zoom-out if we zoomed in during this visit OR if we just closed
+    // a location page (pendingZoomOut flag set by handleContinueClick).
+    if (getSpeedBasedZoom._lastAction === 'zoomed-in' || getSpeedBasedZoom._pendingZoomOut) {
         getSpeedBasedZoom._lastAction = 'idle';
+        getSpeedBasedZoom._pendingZoomOut = false;
         return { zoom: 17, fitBounds: false };
     }
 
-    // Already idle or already zoomed-out — hands off the map
     return null;
 }
 
-// Three states:
-//   null  → first render ever, identical behaviour to 'idle'
-//   'idle'      → between POIs, after app open, after pinch zoom reset
-//   'zoomed-in' → currently inside a POI visit, zoom 19 was applied
 getSpeedBasedZoom._lastAction = null;
+getSpeedBasedZoom._pendingZoomOut = false;
 
 getSpeedBasedZoom.reset = function () {
-    getSpeedBasedZoom._lastAction = null;
+    // Don't wipe _lastAction to null — set pendingZoomOut so the
+    // next GPS tick fires a zoom-out regardless of prior state.
+    getSpeedBasedZoom._pendingZoomOut = true;
+    getSpeedBasedZoom._lastAction = 'idle';
 };
         
 /* ──────────────────────────────────────────────
@@ -4197,7 +4215,7 @@ function handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, c
 /* ──────────────────────────────────────────────
    TRIGGER ZONE HANDLER (≤20ft)
    ────────────────────────────────────────────── */
-    function _handlePrefetchZone(location, distanceFeet, now) {
+     function _handlePrefetchZone(location, distanceFeet, now) {
         if (!location || !location.id) return;
     
         // Initialize prefetch state tracking if needed
@@ -4230,11 +4248,9 @@ function handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, c
             const preloadAudio = document.createElement('audio');
             preloadAudio.preload = 'auto';
             preloadAudio.src = location.audio;
-            preloadAudio.load();
             preloadAudio.playsInline = true;
-            preloadAudio.style.display = 'none';
-            preloadAudio.setAttribute('aria-hidden', 'true');
-            document.body.appendChild(preloadAudio);
+            // Keep it off-DOM entirely — appending to body causes orphan race with Leaflet
+            preloadAudio.load();
     
             window._prefetchedAudio = preloadAudio;
             window._prefetchedAudioSrc = location.audio;
@@ -4576,21 +4592,30 @@ function _prefetchMapTiles(location, now) {
      * Schedule a marker position update coalesced to the next animation frame.
      */
     function scheduleMarkerUpdate(lat, lng, options) {
-        // Always overwrite pending coords.  The RAF callback reads the latest
-        // value at paint time — intermediate positions are intentionally dropped.
-        _pendingLat = lat;
-        _pendingLng = lng;
-        _pendingOpts = options || null;
-
-        // Arm willChange *before* the paint so the browser can promote the
-        // compositor layer ahead of the transform change, not after.
-        _ensureWillChange();
-
-        // Guard: if a RAF is already queued it will pick up the new coords above.
-        if (_rafId !== null) return;
-
-        _rafId = requestAnimationFrame(_commitMarkerUpdate);
-    }
+            // If DR is active and this update is coming from GPS (not DR), drop it.
+            // DR writes set _drOwnsMarker = true before calling here, so they pass.
+            // GPS writes arrive with _drOwnsMarker already true but without setting
+            // it, so we check the DR active state directly as the gate.
+            if (window._drOwnsMarker && !(window.deadReckoning && window.deadReckoning.isActive())) {
+                // DR just stopped but flag hasn't cleared yet — let GPS through
+                window._drOwnsMarker = false;
+            }
+            if (window._drOwnsMarker && (window.deadReckoning && window.deadReckoning.isActive())) {
+                // DR is active. Only accept if this call came FROM DR (flag was just set).
+                // Clear the flag after accepting so the next GPS call is blocked again.
+                window._drOwnsMarker = false;  // consumed — DR sets it fresh each frame
+            } else if (window.deadReckoning && window.deadReckoning.isActive()) {
+                // GPS trying to write while DR is active — drop it
+                return;
+            }
+        
+            _pendingLat  = lat;
+            _pendingLng  = lng;
+            _pendingOpts = options || null;
+            _ensureWillChange();
+            if (_rafId !== null) return;
+            _rafId = requestAnimationFrame(_commitMarkerUpdate);
+        }
 
     /**
      * Release all resources and cancel any pending update.
@@ -4702,167 +4727,161 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
 /**
  * Schedules a single coalesced requestAnimationFrame to pan the map.
  */
-   function _scheduleMapUpdate() {
-    // Use a separate "generation" counter instead of the RAF id as guard.
-    // This allows us to detect if a newer update arrived while the current
-    // RAF is executing, and schedule a follow-up frame.
+     function _scheduleMapUpdate() {
+        window._mapUpdateGeneration = (window._mapUpdateGeneration || 0) + 1;
+        const myGeneration = window._mapUpdateGeneration;
     
-    window._mapUpdateGeneration = (window._mapUpdateGeneration || 0) + 1;
-    const myGeneration = window._mapUpdateGeneration;
-
-    // If RAF already pending, just bump the generation — the pending RAF
-    // will see the generation changed and re-schedule itself.
-    if (window._nextLocationUpdateRAF != null) return;
-
-    window._nextLocationUpdateRAF = requestAnimationFrame(function executeMapUpdate() {
-        // Clear the RAF handle FIRST, before any work, so that
-        // if _scheduleMapUpdate() is called during _executeRender(), it
-        // sees a null handle and can queue a new RAF.
-        window._nextLocationUpdateRAF = null;
-
-        const state = window._currentMapState;
-        if (!state) {
-            window.lastMapUpdateTime = performance.now();
-            return;
-        }
-
-        try {
-            _executeRender(state);
-        } catch (err) {
-            console.warn('[_scheduleMapUpdate] render failed:', err);
-        }
-
-        // If the generation changed during execution, a newer update
-        // arrived and we need to schedule another frame.
-        if (window._mapUpdateGeneration !== myGeneration) {
-            // Don't call _scheduleMapUpdate() recursively — that would
-            // re-enter the guard logic. Queue directly.
-            window._nextLocationUpdateRAF = requestAnimationFrame(executeMapUpdate);
-        }
-    });
-}
+        if (window._nextLocationUpdateRAF != null) return;
+    
+        window._nextLocationUpdateRAF = requestAnimationFrame(function executeMapUpdate() {
+            window._nextLocationUpdateRAF = null;
+    
+            const state = window._currentMapState;
+            if (!state) {
+                window.lastMapUpdateTime = performance.now();
+                return;
+            }
+    
+            let renderFailed = false;
+            try {
+                _executeRender(state);
+            } catch (err) {
+                console.warn('[_scheduleMapUpdate] render failed:', err);
+                // Reset generation so the next GPS update gets a clean slate
+                // instead of immediately re-queuing a frame that will also throw.
+                window._mapUpdateGeneration = myGeneration;
+                renderFailed = true;
+            }
+    
+            if (!renderFailed && window._mapUpdateGeneration !== myGeneration) {
+                window._nextLocationUpdateRAF = requestAnimationFrame(executeMapUpdate);
+            }
+        });
+    }
 
 /* ═══════════════════════════════════════════════════════════════
    updateUserLocation  
    ─────────────────────────────────────────────────────────────*/
-       function updateUserLocation(position, forceUpdate) {
-            if (forceUpdate === undefined) forceUpdate = false;
-        
-            var now = performance.now();
-        
-            // Re-entry guard — catches duplicate callbacks from Android fused provider.
-            if (!forceUpdate && now - (window._lastUpdateUserLocation || 0) < 8) return;
-            window._lastUpdateUserLocation = now;
-        
-            // ── Deferred speed zoom reset ───────────────────────────────────────────
-            // Location page was just closed. Don't act on stale closestDistance.
-            // Wait for first fresh GPS fix with real-world distance before resetting.
-            if (window._deferSpeedZoomReset) {
-                getSpeedBasedZoom.reset();
-                window._deferSpeedZoomReset = false;
-            }
-        
-            if (window._debounceTimeoutId) {
-                clearTimeout(window._debounceTimeoutId);
-                window._debounceTimeoutId = null;
-            }
-        
-            // ── STEP 1: Validate and extract GPS fix ─────────────────────
-            var fix = _extractGPSFix(position, forceUpdate);
-        
-            if (fix) {
-                if (window._gpsTimeoutTimer) {
-                    clearTimeout(window._gpsTimeoutTimer);
-                    window._gpsTimeoutTimer = null;
-                }
-                if (window.isGPSSearching) {
-                    window.isGPSSearching = false;
-                    if (typeof hideGPSSearchingState === 'function') hideGPSSearchingState();
-                }
-            } else {
-                // Only start the timer if one isn't already running — continuous bad
-                // fixes must not keep resetting the countdown or searching state
-                // never shows.
-                if (!window._gpsTimeoutTimer) {
-                    window._gpsTimeoutTimer = createTrackedTimeout(function() {
-                        window._gpsTimeoutTimer = null;
-                        if (!window.isGPSSearching) {
-                            window.isGPSSearching = true;
-                            if (typeof showGPSSearchingState === 'function') showGPSSearchingState();
-                        }
-                    }, 30000);
-                }
-                return;
-            }
-        
-            var lastPos = window.lastPosition;
-        
-            // ── First fix: init path ──────────────────────────────────────
-            if (!lastPos) {
-                _initializeUserLocationState(fix, fix.timestamp, forceUpdate);
-                return;
-            }
-        
-            // ── Clamp timeDelta to non-negative to prevent stale timestamp issues ──
-            // When _initializeUserLocationState sets lastUpdateTime from Date.now() (wall clock)
-            // but fix.timestamp comes from the GPS (which may lag behind wall clock), timeDelta
-            // can become negative. Negative values silently bypass all gap-handling logic.
-            var timeDelta = (lastPos && window.lastUpdateTime)
-                ? Math.max(0, (fix.timestamp - window.lastUpdateTime) / 1000)
-                : 0;
-        
-            // ── STEP 2: Handle gaps and seed velocity ─────────────────────
-            _handleGPSGap(fix, lastPos, timeDelta);
-        
-            // ── STEP 2b: Pre-boost velocity variance on stationary breakout ──
-            if (window.isStationary && window.sensorFusion.isDeviceMoving(rawSpeedMPS ?? 0.8)) {
-                const kf = window.sensorFusion._kalmanFilter;
-                if (kf && kf.x) {
-                    kf.seedVelocity(kf.x[2], kf.x[3], 25.0);
-                }
-            }
-        
-            // ── STEP 3: Sensor fusion ─────────────────────────────────────
-            var fusionResult = _runSensorFusion(fix, lastPos, timeDelta, forceUpdate);
-            if (!fusionResult) {
-                // Do NOT advance lastUpdateTime — position didn't update so the
-                // next timeDelta should still measure from the last good fix.
-                return;
-            }
-        
-            // ── STEP 4: Publish global state ──────────────────────────────
-            _publishFusionState(fusionResult, fix);
-        
-            // ── STEP 5: Compute render state ──────────────────────────────
-            var renderState = _buildRenderState(fusionResult, fix, lastPos, timeDelta);
-        
-            // ── STEP 6: Schedule unified render ───────────────────────────
-            _scheduleUnifiedRender(renderState);
-        
-            // ── STEP 7: Update legacy state ───────────────────────────────
-            window.lastPosition = {
-                lat:       fix.lat,
-                lng:       fix.lng,
-                accuracy:  fix.accuracy,
-                heading:   fusionResult.heading,
-                timestamp: fix.timestamp,
-                speedMPS:  fusionResult.speedMPS
-            };
-            window.lastUpdateTime      = fix.timestamp;
-            window.lastUpdateTimestamp = fix.timestamp;
-        
-            // ── STEP 8: Dead reckoning control ────────────────────────────
-            _controlDeadReckoning(fusionResult);
-        
-            // ── STEP 9: Final callbacks ───────────────────────────────────
-            if (typeof updateDistanceBox === 'function') {
-                updateDistanceBox(forceUpdate, window.lastPosition,
-                    renderState.closestLocation, renderState.closestDistance);
-            }
-        
-            if (typeof _ensureWillChange === 'function') _ensureWillChange();
-            if (typeof _scheduleWillChangeReset === 'function') _scheduleWillChangeReset();
+     function updateUserLocation(position, forceUpdate) {
+        if (forceUpdate === undefined) forceUpdate = false;
+    
+        var now = performance.now();
+    
+        // Re-entry guard — catches duplicate callbacks from Android fused provider.
+        if (!forceUpdate && now - (window._lastUpdateUserLocation || 0) < 8) return;
+        window._lastUpdateUserLocation = now;
+    
+        // ── Deferred speed zoom reset ───────────────────────────────────────────
+        // Location page was just closed. Don't act on stale closestDistance.
+        // Wait for first fresh GPS fix with real-world distance before resetting.
+        if (window._deferSpeedZoomReset) {
+            getSpeedBasedZoom.reset();
+            window._deferSpeedZoomReset = false;
         }
+    
+        if (window._debounceTimeoutId) {
+            clearTimeout(window._debounceTimeoutId);
+            window._debounceTimeoutId = null;
+        }
+    
+        // ── STEP 1: Validate and extract GPS fix ─────────────────────
+        var fix = _extractGPSFix(position, forceUpdate);
+    
+        if (fix) {
+            if (window._gpsTimeoutTimer) {
+                clearTimeout(window._gpsTimeoutTimer);
+                window._gpsTimeoutTimer = null;
+            }
+            if (window.isGPSSearching) {
+                window.isGPSSearching = false;
+                if (typeof hideGPSSearchingState === 'function') hideGPSSearchingState();
+            }
+        } else {
+            // Only start the timer if one isn't already running — continuous bad
+            // fixes must not keep resetting the countdown or searching state
+            // never shows.
+            if (!window._gpsTimeoutTimer) {
+                window._gpsTimeoutTimer = createTrackedTimeout(function() {
+                    window._gpsTimeoutTimer = null;
+                    if (!window.isGPSSearching) {
+                        window.isGPSSearching = true;
+                        if (typeof showGPSSearchingState === 'function') showGPSSearchingState();
+                    }
+                }, 30000);
+            }
+            return;
+        }
+    
+        var lastPos = window.lastPosition;
+    
+        // ── First fix: init path ──────────────────────────────────────
+        if (!lastPos) {
+            _initializeUserLocationState(fix, fix.timestamp, forceUpdate);
+            return;
+        }
+    
+        // ── Clamp timeDelta to non-negative to prevent stale timestamp issues ──
+        // When _initializeUserLocationState sets lastUpdateTime from Date.now() (wall clock)
+        // but fix.timestamp comes from the GPS (which may lag behind wall clock), timeDelta
+        // can become negative. Negative values silently bypass all gap-handling logic.
+        var timeDelta = (lastPos && window.lastUpdateTime)
+            ? Math.max(0, (fix.timestamp - window.lastUpdateTime) / 1000)
+            : 0;
+    
+        // ── STEP 2: Handle gaps and seed velocity ─────────────────────
+        _handleGPSGap(fix, lastPos, timeDelta);
+    
+        // ── STEP 2b: Pre-boost velocity variance on stationary breakout ──
+        // FIXED: use fix.speedMPS (in scope) instead of rawSpeedMPS (out of scope)
+        if (window.isStationary && fix && window.sensorFusion &&
+            window.sensorFusion.isDeviceMoving(fix.speedMPS ?? 0.8)) {
+            const kf = window.sensorFusion._kalmanFilter;
+            if (kf && kf.x) {
+                kf.seedVelocity(kf.x[2], kf.x[3], 25.0);
+            }
+        }
+    
+        // ── STEP 3: Sensor fusion ─────────────────────────────────────
+        var fusionResult = _runSensorFusion(fix, lastPos, timeDelta, forceUpdate);
+        if (!fusionResult) {
+            // Do NOT advance lastUpdateTime — position didn't update so the
+            // next timeDelta should still measure from the last good fix.
+            return;
+        }
+    
+        // ── STEP 4: Publish global state ──────────────────────────────
+        _publishFusionState(fusionResult, fix);
+    
+        // ── STEP 5: Compute render state ──────────────────────────────
+        var renderState = _buildRenderState(fusionResult, fix, lastPos, timeDelta);
+    
+        // ── STEP 6: Schedule unified render ───────────────────────────
+        _scheduleUnifiedRender(renderState);
+    
+        // ── STEP 7: Update legacy state ───────────────────────────────
+        window.lastPosition = {
+            lat:       fix.lat,
+            lng:       fix.lng,
+            accuracy:  fix.accuracy,
+            heading:   fusionResult.heading,
+            timestamp: fix.timestamp,
+            speedMPS:  fusionResult.speedMPS
+        };
+        window.lastUpdateTime      = fix.timestamp;
+        window.lastUpdateTimestamp = fix.timestamp;
+    
+        // ── STEP 8: Dead reckoning control ────────────────────────────
+        _controlDeadReckoning(fusionResult);
+    
+        // ── STEP 9: Final callbacks ───────────────────────────────────
+        if (typeof updateDistanceBox === 'function') {
+            updateDistanceBox(forceUpdate, window.lastPosition,
+                renderState.closestLocation, renderState.closestDistance);
+        }
+    
+        if (typeof _ensureWillChange === 'function') _ensureWillChange();
+        if (typeof _scheduleWillChangeReset === 'function') _scheduleWillChangeReset();
+    }
  
 /* ──────────────────────────────────────────────
    STEP 1: GPS Fix Extraction & Validation 
@@ -5141,23 +5160,13 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
    ────────────────────────────────────────────── */
     function _scheduleUnifiedRender(renderState) {
         window._currentRenderState = renderState;
-        window._currentSpeedTier = renderState.tier;
-        window._currentMapState = renderState.mapState;
-     
-        if (window._mapUpdateScheduled) return;
-        window._mapUpdateScheduled = true;
-     
-        window._nextLocationUpdateRAF = requestAnimationFrame(function() {
-            try {
-                _executeRender(window._currentRenderState);
-            } finally {
-                window._mapUpdateScheduled = false;
-                window._nextLocationUpdateRAF = null;
-            }
-        });
+        window._currentSpeedTier   = renderState.tier;
+        window._currentMapState    = renderState;   // _scheduleMapUpdate reads this
+    
+        _scheduleMapUpdate();
     }
  
-        function _executeRender(state) {
+      function _executeRender(state) {
         if (!state) return;
     
         // GUARD: user is interacting — don't touch anything
@@ -5193,11 +5202,11 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
             }
         }
     
-        // ── MARKER: DR owns it when active ───────────────────────────
+        // ── MARKER: route through scheduleMarkerUpdate so GPS and DR
+        //    writes are coalesced. scheduleMarkerUpdate drops this call
+        //    automatically when DR is active and owns the marker.
         if (typeof userMarker !== 'undefined' && userMarker) {
-            if (!(window.deadReckoning && window.deadReckoning.isActive())) {
-                userMarker.setLatLng([state.position.lat, state.position.lng]);
-            }
+            scheduleMarkerUpdate(state.position.lat, state.position.lng);
         }
     
         if (!map || !window.followUser) {
@@ -6758,188 +6767,144 @@ window._openLocationPage = function(location) {
   }
 };
         
-function showLocationHunt(location, options) {
-    // options.source: 'proximity' | 'manual' (default: 'manual')
-    // Proximity-triggered opens already have per-location debounce in
-    // _handleTriggerZone. Only apply the global debounce for manual
-    // (tap) interactions to prevent double-taps on mobile.
-    const source = (options && options.source) || 'manual';
-    const now = Date.now();
+    function showLocationHunt(location, options) {
+        const source = (options && options.source) || 'manual';
+        const now = Date.now();
     
-    if (typeof window.lastFunctionCall === 'undefined') {
-        window.lastFunctionCall = 0;
-    }
-
-    // Per-location debounce instead of global.
-    // Prevents the same location from being opened twice in rapid
-    // succession (double-tap), but allows different locations to
-    // open immediately one after another.
-    if (!window._showLocationHuntLastCall) {
-        window._showLocationHuntLastCall = {};
-    }
-
-    const locationId = location ? location.id : 'unknown';
-    const lastCallForThisLocation = window._showLocationHuntLastCall[locationId] || 0;
-
-    // Only apply debounce for manual (tap) interactions.
-    // Proximity opens have their own debounce in _handleTriggerZone.
-    const DEBOUNCE_TIME = (source === 'manual' && typeof DEBOUNCE_TIME_MS !== 'undefined')
-        ? DEBOUNCE_TIME_MS
-        : 0;
-
-    if (now - lastCallForThisLocation < DEBOUNCE_TIME) {
-        return;
-    }
-
-    window._showLocationHuntLastCall[locationId] = now;
-    window.lastFunctionCall = now;
-
-    // Set location state
-    window.lastVisitedLocationId = location.id;
-    window.isLocationHuntVisible = true;
-    window.isMapInteracting = true;
-
-    // Clean up any previous audio player instance before replacing the DOM
-    if (typeof window.audioPlayerCleanup === 'function') {
-        window.audioPlayerCleanup();
-        window.audioPlayerCleanup = null;
-    }
-
-    // Clear any saved audio position so the new location always starts fresh
-    try { localStorage.removeItem('audioPosition'); } catch (e) {}
-
-    // Get or create container
-    const lochuntContainer = cachedElements.lochuntContainer || document.querySelector('.lochunt-container');
-    if (!lochuntContainer) {
-        return;
-    }
-
-    lochuntContainer.innerHTML = '';
-    lochuntContainer.style.display = 'flex';
-    lochuntContainer.classList.add('fade-in');
-
-    // Announce to screen readers
-    if (typeof announceToScreenReader === 'function') {
-        announceToScreenReader(`Opened location: ${location.name}`);
-    }
-
-    // Create scrollable content container
-    const scrollableContent = document.createElement('div');
-    scrollableContent.style.cssText = `
-        flex: 1;
-        overflow-y: auto;
-        -webkit-overflow-scrolling: touch;
-        scroll-behavior: smooth;
-        will-change: scroll-position;
-    `;
-
-    // Create and append location image
-    const locationImage = document.createElement('img');
-    locationImage.src = location.image;
-    locationImage.alt = location.name;
-    locationImage.style.cssText = `
-        width: 100%;
-        height: 45vh;
-        object-fit: cover;
-        object-position: center;
-    `;
-    locationImage.loading = 'eager';
-    scrollableContent.appendChild(locationImage);
-
-    // Create content container
-    const contentContainer = document.createElement('div');
-    contentContainer.classList.add('lochunt-content');
-    contentContainer.style.cssText = `
-        padding: 24px;
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        max-width: 800px;
-        margin: 0 auto;
-    `;
-
-    // Create location info section
-    const locationInfo = document.createElement('div');
-    locationInfo.classList.add('lochunt-info');
-    locationInfo.style.cssText = `
-        text-align: center;
-        width: 100%;
-        margin-bottom: 15px;
-    `;
-
-    const locationName = document.createElement('h1');
-    locationName.id = 'locationTitle';
-    locationName.textContent = location.name;
-    locationName.style.cssText = `
-        font-size: clamp(1.8rem, 4vw, 2.5rem);
-        font-weight: 700;
-        color: #1a1a1a;
-        margin-bottom: 8px;
-        line-height: 1.2;
-    `;
-
-    const locationCity = document.createElement('p');
-    locationCity.textContent = location.city;
-    locationCity.style.cssText = `
-        font-size: clamp(1.1rem, 2vw, 1.3rem);
-        color: #2c5282;
-        font-weight: 600;
-        margin-bottom: 4px;
-    `;
-
-    const locationCreator = document.createElement('p');
-    locationCreator.id = 'locationCreator';
-    locationCreator.textContent = `Created by: ${location.creator}`;
-    locationCreator.style.cssText = `
-        font-size: calc(0.9rem + 0.4vw);
-        color: #666666;
-        font-weight: 500;
-    `;
-
-    locationInfo.appendChild(locationName);
-    locationInfo.appendChild(locationCity);
-    locationInfo.appendChild(locationCreator);
-    contentContainer.appendChild(locationInfo);
-
-    if (typeof createAudioPlayer === 'function') {
-        const audioPlayerContainer = createAudioPlayer(location.audio);
-        contentContainer.appendChild(audioPlayerContainer);
-    }
-
-    scrollableContent.appendChild(contentContainer);
-    lochuntContainer.appendChild(scrollableContent);
-
-    if (typeof createBottomActionBar === 'function') {
-        const bottomActionBar = createBottomActionBar(location);
-        bottomActionBar.style.cssText += `
-            position: sticky;
-            bottom: 0;
-            width: 100%;
-        `;
-        lochuntContainer.appendChild(bottomActionBar);
-    }
-
-    requestAnimationFrame(() => {
-        if (typeof initAudioPlayer === 'function') {
-            window.audioPlayerCleanup = initAudioPlayer();
+        if (!window._showLocationHuntLastCall) window._showLocationHuntLastCall = {};
+        const locationId = location ? location.id : 'unknown';
+        const lastCallForThisLocation = window._showLocationHuntLastCall[locationId] || 0;
+        const DEBOUNCE_TIME = (source === 'manual' && typeof DEBOUNCE_TIME_MS !== 'undefined') ? DEBOUNCE_TIME_MS : 0;
+        if (now - lastCallForThisLocation < DEBOUNCE_TIME) return;
+    
+        window._showLocationHuntLastCall[locationId] = now;
+        window.lastFunctionCall = now;
+        window.lastVisitedLocationId = location.id;
+        window.isLocationHuntVisible = true;
+        window.isMapInteracting = true;
+    
+        if (typeof window.audioPlayerCleanup === 'function') {
+            window.audioPlayerCleanup();
+            window.audioPlayerCleanup = null;
         }
-    });
-
-    if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
-        const userPos = userMarker ? userMarker.getLatLng() : null;
-        if (userPos && gameLocations) {
-            navigator.serviceWorker.controller.postMessage({
-                type: 'PREFETCH_AUDIO',
-                data: {
-                    userLocation: { lat: userPos.lat, lng: userPos.lng },
-                    locations: gameLocations
+    
+        try { localStorage.removeItem('audioPosition'); } catch (e) {}
+    
+        const lochuntContainer = cachedElements.lochuntContainer || document.querySelector('.lochunt-container');
+        if (!lochuntContainer) return;
+    
+        lochuntContainer.innerHTML = '';
+        lochuntContainer.style.display = 'flex';
+        lochuntContainer.classList.add('fade-in');
+    
+        if (typeof announceToScreenReader === 'function') {
+            announceToScreenReader(`Opened location: ${location.name}`);
+        }
+    
+        // ── PHASE 1: Paint image immediately — user sees content this frame ──
+        const scrollableContent = document.createElement('div');
+        scrollableContent.style.cssText = `
+            flex: 1;
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
+            scroll-behavior: smooth;
+            will-change: scroll-position;
+        `;
+    
+        const locationImage = document.createElement('img');
+        locationImage.src = location.image;
+        locationImage.alt = location.name;
+        locationImage.style.cssText = `
+            width: 100%;
+            height: 45vh;
+            object-fit: cover;
+            object-position: center;
+        `;
+        locationImage.loading = 'eager';
+        scrollableContent.appendChild(locationImage);
+        lochuntContainer.appendChild(scrollableContent);
+    
+        // ── PHASE 2: Build the rest next frame — image is already visible ──
+        requestAnimationFrame(() => {
+            const contentContainer = document.createElement('div');
+            contentContainer.classList.add('lochunt-content');
+            contentContainer.style.cssText = `
+                padding: 24px;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                max-width: 800px;
+                margin: 0 auto;
+            `;
+    
+            const locationInfo = document.createElement('div');
+            locationInfo.classList.add('lochunt-info');
+            locationInfo.style.cssText = `text-align: center; width: 100%; margin-bottom: 15px;`;
+    
+            const locationName = document.createElement('h1');
+            locationName.id = 'locationTitle';
+            locationName.textContent = location.name;
+            locationName.style.cssText = `
+                font-size: clamp(1.8rem, 4vw, 2.5rem);
+                font-weight: 700; color: #1a1a1a;
+                margin-bottom: 8px; line-height: 1.2;
+            `;
+    
+            const locationCity = document.createElement('p');
+            locationCity.textContent = location.city;
+            locationCity.style.cssText = `
+                font-size: clamp(1.1rem, 2vw, 1.3rem);
+                color: #2c5282; font-weight: 600; margin-bottom: 4px;
+            `;
+    
+            const locationCreator = document.createElement('p');
+            locationCreator.id = 'locationCreator';
+            locationCreator.textContent = `Created by: ${location.creator}`;
+            locationCreator.style.cssText = `
+                font-size: calc(0.9rem + 0.4vw); color: #666666; font-weight: 500;
+            `;
+    
+            locationInfo.appendChild(locationName);
+            locationInfo.appendChild(locationCity);
+            locationInfo.appendChild(locationCreator);
+            contentContainer.appendChild(locationInfo);
+    
+            if (typeof createAudioPlayer === 'function') {
+                const audioPlayerContainer = createAudioPlayer(location.audio);
+                contentContainer.appendChild(audioPlayerContainer);
+            }
+    
+            scrollableContent.appendChild(contentContainer);
+    
+            if (typeof createBottomActionBar === 'function') {
+                const bottomActionBar = createBottomActionBar(location);
+                bottomActionBar.style.cssText += `position: sticky; bottom: 0; width: 100%;`;
+                lochuntContainer.appendChild(bottomActionBar);
+            }
+    
+            // ── PHASE 3: Init audio player after DOM is in place ──
+            requestAnimationFrame(() => {
+                if (typeof initAudioPlayer === 'function') {
+                    window.audioPlayerCleanup = initAudioPlayer();
                 }
             });
-        }
+    
+            if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
+                const userPos = userMarker ? userMarker.getLatLng() : null;
+                if (userPos && gameLocations) {
+                    navigator.serviceWorker.controller.postMessage({
+                        type: 'PREFETCH_AUDIO',
+                        data: {
+                            userLocation: { lat: userPos.lat, lng: userPos.lng },
+                            locations: gameLocations
+                        }
+                    });
+                }
+            }
+        });
     }
-}
 
-      function createAudioPlayer(audioSrc) {
+     function createAudioPlayer(audioSrc) {
         const audioPlayerContainer = document.createElement('div');
         audioPlayerContainer.classList.add('audio-player');
         audioPlayerContainer.style.cssText = `
@@ -6954,6 +6919,7 @@ function showLocationHunt(location, options) {
         if (window._prefetchedAudio && window._prefetchedAudioSrc === audioSrc) {
             audio = window._prefetchedAudio;
             audio.id = 'locationAudio';
+            audio.dataset.isPrefetched = 'true'; // tells initAudioPlayer to skip load()
             audio.removeAttribute('aria-hidden');
             audio.style.display = '';
             window._prefetchedAudio = null;
@@ -6963,6 +6929,7 @@ function showLocationHunt(location, options) {
             audio.id = 'locationAudio';
             audio.src = audioSrc;
             audio.preload = 'auto';
+            delete audio.dataset.isPrefetched;
         }
     
         audio.playsInline = true;
@@ -7285,587 +7252,591 @@ function showSourcePopup(title, content) {
     closeButton.focus();
 }
 
-function initAudioPlayer() {
-    const audio             = document.getElementById('locationAudio');
-    const playPauseBtn      = document.getElementById('playPauseBtn');
-    const rewindBtn         = document.getElementById('rewindBtn');
-    const forwardBtn        = document.getElementById('forwardBtn');
-    const progressBar       = document.getElementById('progressBar');
-    const progressContainer = document.querySelector('.progress');
-    const currentTimeSpan   = document.getElementById('currentTime');
-    const durationSpan      = document.getElementById('duration');
-
-    if (!audio || !playPauseBtn || !progressBar) {
-        console.error('[Audio] Required elements missing');
-        return function noop() {};
-    }
-
-    // ─── Platform Detection ───────────────────────────────────────────────
-    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
-
-    // ─── Save original source ─────────────────────────────────────────────
-    if (audio.src && audio.src !== window.location.href && !audio.dataset.originalSrc) {
-        audio.dataset.originalSrc = audio.src;
-    }
-
-    // ─── State ────────────────────────────────────────────────────────────
-    let wakeLock             = null;
-    let isPlayerActive       = true;
-    let retryCount           = 0;
-    const maxRetries         = 3;
-    let lastPlaybackPosition = 0;
-    let userWantsPlayback    = false;
-    let screenWentAway       = false;
-    let wasPlayingWhenHidden = false;
-    let mediaSessionReady    = false;
-
-    // ─── Shared AudioContext ───────────────────────────────────────────────
-    function getSharedAudioContext() {
-        const ctx = window._sharedAudioCtx;
+    function initAudioPlayer() {
+            const audio             = document.getElementById('locationAudio');
+            const playPauseBtn      = document.getElementById('playPauseBtn');
+            const rewindBtn         = document.getElementById('rewindBtn');
+            const forwardBtn        = document.getElementById('forwardBtn');
+            const progressBar       = document.getElementById('progressBar');
+            const progressContainer = document.querySelector('.progress');
+            const currentTimeSpan   = document.getElementById('currentTime');
+            const durationSpan      = document.getElementById('duration');
         
-        if (ctx) {
-            if (ctx.state === 'closed') {
-                window._sharedAudioCtx = null;
-            } else if (ctx.state === 'suspended' || ctx.state === 'interrupted') {
-                ctx.resume().catch(() => {
-                    window._sharedAudioCtx = null;
-                });
-                return ctx;
-            } else if (ctx.state === 'running') {
-                return ctx;
+            if (!audio || !playPauseBtn || !progressBar) {
+                console.error('[Audio] Required elements missing');
+                return function noop() {};
             }
-        }
-    
-        try {
-            const AC = window.AudioContext || window.webkitAudioContext;
-            if (!AC) return null;
-            
-            window._sharedAudioCtx = new AC();
-            
-            // Guard: only bind interaction listeners once across all context creations
-            if (!window._sharedAudioCtxInteractionBound) {
-                window._sharedAudioCtxInteractionBound = true;
+        
+            // ─── Platform Detection ───────────────────────────────────────────────
+            const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+        
+            // ─── Save original source ─────────────────────────────────────────────
+            if (audio.src && audio.src !== window.location.href && !audio.dataset.originalSrc) {
+                audio.dataset.originalSrc = audio.src;
+            }
+        
+            // ─── State ────────────────────────────────────────────────────────────
+            let wakeLock             = null;
+            let isPlayerActive       = true;
+            let retryCount           = 0;
+            const maxRetries         = 3;
+            let lastPlaybackPosition = 0;
+            let userWantsPlayback    = false;
+            let screenWentAway       = false;
+            let wasPlayingWhenHidden = false;
+            let mediaSessionReady    = false;
+        
+            // ─── Shared AudioContext ───────────────────────────────────────────────
+            function getSharedAudioContext() {
+                const ctx = window._sharedAudioCtx;
                 
-                const resumeOnInteraction = () => {
-                    if (window._sharedAudioCtx && window._sharedAudioCtx.state === 'suspended') {
-                        window._sharedAudioCtx.resume().catch(() => {});
+                if (ctx) {
+                    if (ctx.state === 'closed') {
+                        window._sharedAudioCtx = null;
+                    } else if (ctx.state === 'suspended' || ctx.state === 'interrupted') {
+                        ctx.resume().catch(() => {
+                            window._sharedAudioCtx = null;
+                        });
+                        return ctx;
+                    } else if (ctx.state === 'running') {
+                        return ctx;
                     }
-                };
-                document.addEventListener('click', resumeOnInteraction, { once: true });
-                document.addEventListener('touchstart', resumeOnInteraction, { once: true });
+                }
+            
+                try {
+                    const AC = window.AudioContext || window.webkitAudioContext;
+                    if (!AC) return null;
+                    
+                    window._sharedAudioCtx = new AC();
+                    
+                    // Guard: only bind interaction listeners once across all context creations
+                    if (!window._sharedAudioCtxInteractionBound) {
+                        window._sharedAudioCtxInteractionBound = true;
+                        
+                        const resumeOnInteraction = () => {
+                            if (window._sharedAudioCtx && window._sharedAudioCtx.state === 'suspended') {
+                                window._sharedAudioCtx.resume().catch(() => {});
+                            }
+                        };
+                        document.addEventListener('click', resumeOnInteraction, { once: true });
+                        document.addEventListener('touchstart', resumeOnInteraction, { once: true });
+                    }
+                    
+                    return window._sharedAudioCtx;
+                } catch (e) {
+                    console.warn('[Audio] AudioContext creation failed:', e);
+                    window._sharedAudioCtx = null;
+                    return null;
+                }
             }
             
-            return window._sharedAudioCtx;
-        } catch (e) {
-            console.warn('[Audio] AudioContext creation failed:', e);
-            window._sharedAudioCtx = null;
-            return null;
-        }
-    }
-    
-    // BEFOREUNLOAD — fixed variable name, null after close
-    window.addEventListener('beforeunload', function () {
-        const ctx = window._sharedAudioCtx;
-        if (ctx && ctx.state !== 'closed') {
-            try { ctx.close(); } catch (_) {}
-        }
-        window._sharedAudioCtx = null;
-    });
-
-    // ─── Media Session API ────────────────────────────────────────────────
-    function setupMediaSession() {
-        if (mediaSessionReady || !('mediaSession' in navigator)) return;
-        mediaSessionReady = true;
-
-        try {
-            navigator.mediaSession.metadata = new MediaMetadata({
-                title:  document.getElementById('locationTitle')?.textContent   || 'Minnesota Then',
-                artist: document.getElementById('locationCreator')?.textContent || 'Historical Audio',
-                album:  'Minnesota Then Tour',
-                artwork: [
-                    { src: 'https://www.mnthen.com/images/icon-192.png', sizes: '192x192', type: 'image/png' },
-                    { src: 'https://www.mnthen.com/images/icon-512.png', sizes: '512x512', type: 'image/png' }
-                ]
-            });
-
-            navigator.mediaSession.setActionHandler('play',         () => { if (audio.paused)  togglePlay(); });
-            navigator.mediaSession.setActionHandler('pause',        () => { if (!audio.paused) togglePlay(); });
-            navigator.mediaSession.setActionHandler('seekbackward', (d) => { seek(-(d.seekOffset || 10)); });
-            navigator.mediaSession.setActionHandler('seekforward',  (d) => { seek(d.seekOffset || 10);   });
-
-            updateMediaSessionPosition();
-        } catch (e) {
-            console.warn('[Audio] Media Session setup failed:', e);
-        }
-    }
-
-    function updateMediaSessionPosition() {
-        if (!('mediaSession' in navigator) || !navigator.mediaSession.setPositionState) return;
-        if (!isFinite(audio.duration)) return;
-        try {
-            navigator.mediaSession.setPositionState({
-                duration:     audio.duration,
-                playbackRate: audio.playbackRate,
-                position:     Math.min(audio.currentTime, audio.duration)
-            });
-        } catch (e) {}
-    }
-
-    // ─── Wake Lock ────────────────────────────────────────────────────────
-    const supportsWakeLock = 'wakeLock' in navigator;
-
-    async function requestWakeLock() {
-        if (!supportsWakeLock || !isPlayerActive || wakeLock) return;
-        try {
-            wakeLock = await navigator.wakeLock.request('screen');
-            wakeLock.addEventListener('release', () => { wakeLock = null; });
-        } catch (err) {}
-    }
-
-    async function releaseWakeLock() {
-        if (wakeLock) {
-            try { await wakeLock.release(); } catch (e) {}
-            wakeLock = null;
-        }
-    }
-
-    // ─── Position Throttle ────────────────────────────────────────────────
-    let _lastSaveTime = 0;
-    function throttledSavePosition(time) {
-        const now = Date.now();
-        if (now - _lastSaveTime >= 1000) {
-            _lastSaveTime = now;
-            try { localStorage.setItem('audioPosition', time.toString()); } catch (e) {}
-        }
-    }
-
-    // ─── Visibility / Background Handling ─────────────────────────────────
-    const visibilityHandler = () => {
-        if (document.hidden) {
-            if (!isNaN(audio.currentTime) && audio.currentTime > 0) {
-                lastPlaybackPosition = audio.currentTime;
-                throttledSavePosition(audio.currentTime);
-            }
-
-            if (userWantsPlayback) {
-                wasPlayingWhenHidden = true;
-                screenWentAway = true;
-
-                if (!audio.paused) {
-                    audio.pause();
+            // BEFOREUNLOAD — fixed variable name, null after close
+            window.addEventListener('beforeunload', function () {
+                const ctx = window._sharedAudioCtx;
+                if (ctx && ctx.state !== 'closed') {
+                    try { ctx.close(); } catch (_) {}
                 }
-
+                window._sharedAudioCtx = null;
+            });
+        
+            // ─── Media Session API ────────────────────────────────────────────────
+            function setupMediaSession() {
+                if (mediaSessionReady || !('mediaSession' in navigator)) return;
+                mediaSessionReady = true;
+        
+                try {
+                    navigator.mediaSession.metadata = new MediaMetadata({
+                        title:  document.getElementById('locationTitle')?.textContent   || 'Minnesota Then',
+                        artist: document.getElementById('locationCreator')?.textContent || 'Historical Audio',
+                        album:  'Minnesota Then Tour',
+                        artwork: [
+                            { src: 'https://www.mnthen.com/images/icon-192.png', sizes: '192x192', type: 'image/png' },
+                            { src: 'https://www.mnthen.com/images/icon-512.png', sizes: '512x512', type: 'image/png' }
+                        ]
+                    });
+        
+                    navigator.mediaSession.setActionHandler('play',         () => { if (audio.paused)  togglePlay(); });
+                    navigator.mediaSession.setActionHandler('pause',        () => { if (!audio.paused) togglePlay(); });
+                    navigator.mediaSession.setActionHandler('seekbackward', (d) => { seek(-(d.seekOffset || 10)); });
+                    navigator.mediaSession.setActionHandler('seekforward',  (d) => { seek(d.seekOffset || 10);   });
+        
+                    updateMediaSessionPosition();
+                } catch (e) {
+                    console.warn('[Audio] Media Session setup failed:', e);
+                }
+            }
+        
+            function updateMediaSessionPosition() {
+                if (!('mediaSession' in navigator) || !navigator.mediaSession.setPositionState) return;
+                if (!isFinite(audio.duration)) return;
+                try {
+                    navigator.mediaSession.setPositionState({
+                        duration:     audio.duration,
+                        playbackRate: audio.playbackRate,
+                        position:     Math.min(audio.currentTime, audio.duration)
+                    });
+                } catch (e) {}
+            }
+        
+            // ─── Wake Lock ────────────────────────────────────────────────────────
+            const supportsWakeLock = 'wakeLock' in navigator;
+        
+            async function requestWakeLock() {
+                if (!supportsWakeLock || !isPlayerActive || wakeLock) return;
+                try {
+                    wakeLock = await navigator.wakeLock.request('screen');
+                    wakeLock.addEventListener('release', () => { wakeLock = null; });
+                } catch (err) {}
+            }
+        
+            async function releaseWakeLock() {
+                if (wakeLock) {
+                    try { await wakeLock.release(); } catch (e) {}
+                    wakeLock = null;
+                }
+            }
+        
+            // ─── Position Throttle ────────────────────────────────────────────────
+            let _lastSaveTime = 0;
+            function throttledSavePosition(time) {
+                const now = Date.now();
+                if (now - _lastSaveTime >= 1000) {
+                    _lastSaveTime = now;
+                    try { localStorage.setItem('audioPosition', time.toString()); } catch (e) {}
+                }
+            }
+        
+            // ─── Visibility / Background Handling ─────────────────────────────────
+            const visibilityHandler = () => {
+                if (document.hidden) {
+                    if (!isNaN(audio.currentTime) && audio.currentTime > 0) {
+                        lastPlaybackPosition = audio.currentTime;
+                        throttledSavePosition(audio.currentTime);
+                    }
+        
+                    if (userWantsPlayback) {
+                        wasPlayingWhenHidden = true;
+                        screenWentAway = true;
+        
+                        if (!audio.paused) {
+                            audio.pause();
+                        }
+        
+                        playPauseBtn.innerHTML = '<i class="bi bi-play" aria-hidden="true"></i>'; 
+                        playPauseBtn.setAttribute('aria-label', 'Play');
+                        releaseWakeLock();
+                    }
+                    
+                    // FIXED: Suspend AudioContext to free resources, track state for resume
+                    var ctx = window._sharedAudioCtx;
+                    if (ctx && ctx.state === 'running') {
+                        ctx.suspend().catch(function(){});
+                    }
+                } else {
+                    // Returning to foreground
+                    if (screenWentAway && wasPlayingWhenHidden) {
+                        var ctx = window._sharedAudioCtx;
+                        
+                        function tryResume() {
+                            // FIXED: Check if current position is actually buffered before resuming
+                            var buffered = audio.buffered;
+                            var pos = audio.currentTime;
+                            var canResume = false;
+                            
+                            if (buffered.length > 0) {
+                                for (var i = 0; i < buffered.length; i++) {
+                                    if (pos >= buffered.start(i) && pos <= buffered.end(i)) {
+                                        canResume = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            if (!canResume && pos > 0) {
+                                // FIXED: Stuck in unbuffered gap — run recovery instead of blind resume
+                                console.log('[Audio] Resume position not buffered, recovering');
+                                attemptRecovery();
+                            } else if (userWantsPlayback && audio.paused) {
+                                togglePlay();
+                            }
+                            
+                            screenWentAway = false;
+                            wasPlayingWhenHidden = false;
+                        }
+                        
+                        // FIXED: Resume AudioContext first, then check buffer state
+                        if (ctx && (ctx.state === 'suspended' || ctx.state === 'interrupted')) {
+                            ctx.resume().then(tryResume).catch(tryResume);
+                        } else {
+                            setTimeout(tryResume, 300);
+                        }
+                    }
+                }
+            };
+            document.addEventListener('visibilitychange', visibilityHandler);
+        
+            const blurHandler = () => {
+                if (!isNaN(audio.currentTime) && audio.currentTime > 0) {
+                    lastPlaybackPosition = audio.currentTime;
+                }
+            };
+            window.addEventListener('blur', blurHandler);
+        
+            // ─── Audio Element Events ─────────────────────────────────────────────
+            audio.addEventListener('play', () => {
+                playPauseBtn.innerHTML = '<i class="bi bi-pause" aria-hidden="true"></i>'; 
+                playPauseBtn.setAttribute('aria-label', 'Pause');
+                if (typeof announceToScreenReader === 'function') {
+                    announceToScreenReader('Audio playback started');
+                }
+            });
+        
+            audio.addEventListener('pause', () => {
                 playPauseBtn.innerHTML = '<i class="bi bi-play" aria-hidden="true"></i>'; 
                 playPauseBtn.setAttribute('aria-label', 'Play');
                 releaseWakeLock();
-            }
-            
-            // FIXED: Suspend AudioContext to free resources, track state for resume
-            var ctx = window._sharedAudioCtx;
-            if (ctx && ctx.state === 'running') {
-                ctx.suspend().catch(function(){});
-            }
-        } else {
-            // Returning to foreground
-            if (screenWentAway && wasPlayingWhenHidden) {
-                var ctx = window._sharedAudioCtx;
-                
-                function tryResume() {
-                    // FIXED: Check if current position is actually buffered before resuming
-                    var buffered = audio.buffered;
-                    var pos = audio.currentTime;
-                    var canResume = false;
-                    
-                    if (buffered.length > 0) {
-                        for (var i = 0; i < buffered.length; i++) {
-                            if (pos >= buffered.start(i) && pos <= buffered.end(i)) {
-                                canResume = true;
-                                break;
-                            }
-                        }
+                if (typeof announceToScreenReader === 'function') {
+                    announceToScreenReader('Audio playback paused');
+                }
+            });
+        
+            // ─── Core Playback Toggle ─────────────────────────────────────────────
+            function togglePlay() {
+                if (!isPlayerActive) return;
+        
+                const hasValidSrc = audio.src &&
+                                    audio.src !== window.location.href &&
+                                    audio.src !== '' &&
+                                    audio.src !== 'about:blank';
+                if (!hasValidSrc) return;
+        
+                if (audio.paused) {
+                    const resumePos = audio.dataset.resumePosition;
+                    if (resumePos && parseFloat(resumePos) > 0) {
+                        audio.currentTime = parseFloat(resumePos);
+                        delete audio.dataset.resumePosition;
                     }
-                    
-                    if (!canResume && pos > 0) {
-                        // FIXED: Stuck in unbuffered gap — run recovery instead of blind resume
-                        console.log('[Audio] Resume position not buffered, recovering');
-                        attemptRecovery();
-                    } else if (userWantsPlayback && audio.paused) {
-                        togglePlay();
+        
+                    getSharedAudioContext();
+        
+                    const playPromise = audio.play();
+        
+                    if (playPromise !== undefined) {
+                        playPromise
+                            .then(() => {
+                                userWantsPlayback = true;
+                                requestWakeLock();
+                                setupMediaSession();
+                                retryCount = 0;
+                            })
+                            .catch((error) => {
+                                if (error.name === 'AbortError') return;
+                                handlePlayError(error);
+                            });
                     }
-                    
+                } else {
+                    audio.pause();
+                    userWantsPlayback = false;
+                    if (!isNaN(audio.currentTime)) {
+                        lastPlaybackPosition = audio.currentTime;
+                    }
+                }
+            }
+        
+            // ─── Error Handling ───────────────────────────────────────────────────
+            function handlePlayError(error) {
+                console.error('[Audio] Play failed:', error?.name, error?.message);
+        
+                releaseWakeLock();
+                playPauseBtn.innerHTML = '<i class="bi bi-play" aria-hidden="true"></i>';
+                playPauseBtn.setAttribute('aria-label', 'Play');
+        
+                if (error?.name === 'NotAllowedError') {
+                    showSourcePopup(
+                        'Tap to Play Audio',
+                        'Please tap the play button again to start audio playback.'
+                    );
+                } else if (error?.name === 'NotSupportedError') {
+                    showSourcePopup(
+                        'Audio Error',
+                        'This audio format is not supported on your device.'
+                    );
+                } else if (screenWentAway || wasPlayingWhenHidden) {
+                    const pos = lastPlaybackPosition || 0;
+                    audio.dataset.resumePosition = pos.toString();
+                    showSourcePopup(
+                        'Audio Interrupted',
+                        `Audio was paused when you left the screen. Press play to resume from ${formatTime(pos)}.`
+                    );
                     screenWentAway = false;
                     wasPlayingWhenHidden = false;
+                } else if (retryCount < maxRetries) {
+                    retryCount++;
+                    setTimeout(() => attemptRecovery(), 1000 * retryCount);
+                } else {
+                    playPauseBtn.innerHTML = '<i class="bi bi-exclamation-triangle" aria-hidden="true"></i>'; 
+                    playPauseBtn.setAttribute('aria-label', 'Audio Error');
+                    showSourcePopup(
+                        'Audio Error',
+                        'Unable to play audio after multiple attempts. Please refresh and try again.'
+                    );
+                }
+            }
+        
+            // ─── Recovery ─────────────────────────────────────────────────────────
+            function attemptRecovery() {
+                if (!isPlayerActive) return;
+        
+                console.log(`[Audio] Recovery attempt ${retryCount}/${maxRetries}`);
+        
+                const savedPos  = lastPlaybackPosition || 0;
+                const targetSrc = audio.dataset.originalSrc || audio.getAttribute('data-src');
+        
+                if (audio.error || !audio.src || audio.src === window.location.href) {
+                    if (targetSrc) audio.src = targetSrc;
+                    audio.load();
+                }
+        
+                // FIXED: Check if saved position is actually buffered. If stalled near
+                // 10s boundary (metadata preload limit on mobile Safari), seek to a
+                // buffered region instead of re-hitting the same gap.
+                var resumePos = savedPos;
+                var buffered = audio.buffered;
+                var isBuffered = false;
+                
+                if (buffered.length > 0) {
+                    for (var i = 0; i < buffered.length; i++) {
+                        if (savedPos >= buffered.start(i) && savedPos <= buffered.end(i)) {
+                            isBuffered = true;
+                            break;
+                        }
+                    }
                 }
                 
-                // FIXED: Resume AudioContext first, then check buffer state
-                if (ctx && (ctx.state === 'suspended' || ctx.state === 'interrupted')) {
-                    ctx.resume().then(tryResume).catch(tryResume);
+                // If position is not in any buffered range, back up slightly to
+                // force the browser to fetch from a known-good buffered region
+                if (!isBuffered && savedPos > 0) {
+                    resumePos = Math.max(0, savedPos - 1);
+                    console.log('[Audio] Position not buffered, seeking to:', resumePos);
+                }
+        
+                var fired = false;
+                function onReady() {
+                    if (fired) return;
+                    fired = true;
+                    
+                    audio.removeEventListener('loadedmetadata', onReady);
+                    audio.removeEventListener('canplay', onReady);
+                    audio.removeEventListener('canplaythrough', onReady);
+        
+                    if (resumePos > 0 && !screenWentAway) {
+                        audio.currentTime = resumePos;
+                    } else if (screenWentAway) {
+                        audio.currentTime = 0;
+                    }
+                    
+                    retryCount = 0;
+                }
+        
+                audio.addEventListener('loadedmetadata', onReady);
+                audio.addEventListener('canplay', onReady);
+                audio.addEventListener('canplaythrough', onReady);
+                
+                // If already ready, fire immediately
+                if (audio.readyState >= 2 && audio.duration > 0) {
+                    onReady();
+                }
+            }
+        
+            // ─── Seek ─────────────────────────────────────────────────────────────
+            function seek(seconds) {
+                if (!isPlayerActive || !isFinite(audio.duration)) return;
+                audio.currentTime = Math.max(0, Math.min(audio.currentTime + seconds, audio.duration));
+                updateMediaSessionPosition();
+                if (typeof announceToScreenReader === 'function') {
+                    const direction = seconds > 0 ? 'forward' : 'backward';
+                    announceToScreenReader(`Skipped ${Math.abs(seconds)} seconds ${direction}`);
+                }
+            }
+        
+            // ─── Progress UI ──────────────────────────────────────────────────────
+            function updateProgress() {
+                if (!isPlayerActive || !isFinite(audio.duration)) return;
+                const percent = (audio.currentTime / audio.duration) * 100;
+                progressBar.style.width = `${percent}%`;
+                currentTimeSpan.textContent = formatTime(audio.currentTime);
+        
+                if (audio.currentTime > 0) {
+                    lastPlaybackPosition = audio.currentTime;
+                    throttledSavePosition(audio.currentTime);
+                }
+            }
+        
+            function setProgress(e) {
+                if (!isPlayerActive || !isFinite(audio.duration)) return;
+                const rect = progressContainer.getBoundingClientRect();
+                const clientX = e.clientX ?? e.touches?.[0]?.clientX;
+                if (clientX === undefined || rect.width <= 0) return;
+                audio.currentTime = Math.max(0, Math.min(((clientX - rect.left) / rect.width) * audio.duration, audio.duration)); 
+                updateMediaSessionPosition();
+                if (typeof announceToScreenReader === 'function') {
+                    announceToScreenReader(`Jumped to ${formatTime(audio.currentTime)}`);
+                }
+            }
+        
+            function setDuration() {
+                if (!isPlayerActive || !isFinite(audio.duration)) return;
+                durationSpan.textContent = formatTime(audio.duration);
+                updateMediaSessionPosition();
+            }
+        
+            function formatTime(seconds) {
+                if (!isFinite(seconds) || seconds < 0) return '0:00';
+                const mins = Math.floor(seconds / 60);
+                const secs = Math.floor(seconds % 60);
+                return `${mins}:${secs.toString().padStart(2, '0')}`;
+            }
+        
+            // ─── Event Bindings ───────────────────────────────────────────────────
+            playPauseBtn.addEventListener('click', togglePlay);
+            rewindBtn?.addEventListener('click',  () => seek(-10));
+            forwardBtn?.addEventListener('click', () => seek(10));
+        
+            audio.addEventListener('timeupdate',    updateProgress);
+            audio.addEventListener('loadedmetadata', setDuration);
+            audio.addEventListener('durationchange', setDuration);
+        
+            audio.addEventListener('ended', () => {
+                userWantsPlayback = false;
+                playPauseBtn.innerHTML = '<i class="bi bi-play" aria-hidden="true"></i>'; 
+                playPauseBtn.setAttribute('aria-label', 'Play');
+                releaseWakeLock();
+                progressBar.style.width = '0%';
+        
+                try { localStorage.removeItem('audioPosition'); } catch (e) {}
+        
+                if ('mediaSession' in navigator) {
+                    navigator.mediaSession.playbackState = 'none';
+                }
+        
+                if (typeof announceToScreenReader === 'function') {
+                    announceToScreenReader('Audio playback completed');
+                }
+                if (typeof showAdditionalInfo === 'function') {
+                    showAdditionalInfo();
+                }
+            });
+        
+            audio.addEventListener('error', (e) => {
+                console.error('[Audio] Element error:', audio.error?.code, audio.error?.message);
+                if (!isPlayerActive) return;
+        
+                releaseWakeLock();
+                playPauseBtn.innerHTML = '<i class="bi bi-play" aria-hidden="true"></i>'; 
+                playPauseBtn.setAttribute('aria-label', 'Play');
+        
+                if (screenWentAway || wasPlayingWhenHidden) {
+                    const pos = lastPlaybackPosition || 0;
+                    audio.dataset.resumePosition = pos.toString();
+                    showSourcePopup(
+                        'Audio Interrupted',
+                        `Audio was paused when you left the screen. Press play to resume from ${formatTime(pos)}.`
+                    );
+                    attemptRecovery();
+                    screenWentAway = false;
+                    wasPlayingWhenHidden = false;
+                } else if (retryCount < maxRetries) {
+                    retryCount++;
+                    setTimeout(() => attemptRecovery(), 1000 * retryCount);
                 } else {
-                    setTimeout(tryResume, 300);
+                    playPauseBtn.innerHTML = '<i class="bi bi-exclamation-triangle" aria-hidden="true"></i>'; 
+                    playPauseBtn.setAttribute('aria-label', 'Audio Error');
+                    showSourcePopup(
+                        'Audio Error',
+                        'Unable to recover audio. Please refresh and try again.'
+                    );
                 }
-            }
-        }
-    };
-    document.addEventListener('visibilitychange', visibilityHandler);
-
-    const blurHandler = () => {
-        if (!isNaN(audio.currentTime) && audio.currentTime > 0) {
-            lastPlaybackPosition = audio.currentTime;
-        }
-    };
-    window.addEventListener('blur', blurHandler);
-
-    // ─── Audio Element Events ─────────────────────────────────────────────
-    audio.addEventListener('play', () => {
-        playPauseBtn.innerHTML = '<i class="bi bi-pause" aria-hidden="true"></i>'; 
-        playPauseBtn.setAttribute('aria-label', 'Pause');
-        if (typeof announceToScreenReader === 'function') {
-            announceToScreenReader('Audio playback started');
-        }
-    });
-
-    audio.addEventListener('pause', () => {
-        playPauseBtn.innerHTML = '<i class="bi bi-play" aria-hidden="true"></i>'; 
-        playPauseBtn.setAttribute('aria-label', 'Play');
-        releaseWakeLock();
-        if (typeof announceToScreenReader === 'function') {
-            announceToScreenReader('Audio playback paused');
-        }
-    });
-
-    // ─── Core Playback Toggle ─────────────────────────────────────────────
-    function togglePlay() {
-        if (!isPlayerActive) return;
-
-        const hasValidSrc = audio.src &&
-                            audio.src !== window.location.href &&
-                            audio.src !== '' &&
-                            audio.src !== 'about:blank';
-        if (!hasValidSrc) return;
-
-        if (audio.paused) {
-            const resumePos = audio.dataset.resumePosition;
-            if (resumePos && parseFloat(resumePos) > 0) {
-                audio.currentTime = parseFloat(resumePos);
-                delete audio.dataset.resumePosition;
-            }
-
-            getSharedAudioContext();
-
-            const playPromise = audio.play();
-
-            if (playPromise !== undefined) {
-                playPromise
-                    .then(() => {
-                        userWantsPlayback = true;
-                        requestWakeLock();
-                        setupMediaSession();
-                        retryCount = 0;
-                    })
-                    .catch((error) => {
-                        if (error.name === 'AbortError') return;
-                        handlePlayError(error);
-                    });
-            }
-        } else {
-            audio.pause();
-            userWantsPlayback = false;
-            if (!isNaN(audio.currentTime)) {
-                lastPlaybackPosition = audio.currentTime;
-            }
-        }
-    }
-
-    // ─── Error Handling ───────────────────────────────────────────────────
-    function handlePlayError(error) {
-        console.error('[Audio] Play failed:', error?.name, error?.message);
-
-        releaseWakeLock();
-        playPauseBtn.innerHTML = '<i class="bi bi-play" aria-hidden="true"></i>';
-        playPauseBtn.setAttribute('aria-label', 'Play');
-
-        if (error?.name === 'NotAllowedError') {
-            showSourcePopup(
-                'Tap to Play Audio',
-                'Please tap the play button again to start audio playback.'
-            );
-        } else if (error?.name === 'NotSupportedError') {
-            showSourcePopup(
-                'Audio Error',
-                'This audio format is not supported on your device.'
-            );
-        } else if (screenWentAway || wasPlayingWhenHidden) {
-            const pos = lastPlaybackPosition || 0;
-            audio.dataset.resumePosition = pos.toString();
-            showSourcePopup(
-                'Audio Interrupted',
-                `Audio was paused when you left the screen. Press play to resume from ${formatTime(pos)}.`
-            );
-            screenWentAway = false;
-            wasPlayingWhenHidden = false;
-        } else if (retryCount < maxRetries) {
-            retryCount++;
-            setTimeout(() => attemptRecovery(), 1000 * retryCount);
-        } else {
-            playPauseBtn.innerHTML = '<i class="bi bi-exclamation-triangle" aria-hidden="true"></i>'; 
-            playPauseBtn.setAttribute('aria-label', 'Audio Error');
-            showSourcePopup(
-                'Audio Error',
-                'Unable to play audio after multiple attempts. Please refresh and try again.'
-            );
-        }
-    }
-
-    // ─── Recovery ─────────────────────────────────────────────────────────
-    function attemptRecovery() {
-        if (!isPlayerActive) return;
-
-        console.log(`[Audio] Recovery attempt ${retryCount}/${maxRetries}`);
-
-        const savedPos  = lastPlaybackPosition || 0;
-        const targetSrc = audio.dataset.originalSrc || audio.getAttribute('data-src');
-
-        if (audio.error || !audio.src || audio.src === window.location.href) {
-            if (targetSrc) audio.src = targetSrc;
-            audio.load();
-        }
-
-        // FIXED: Check if saved position is actually buffered. If stalled near
-        // 10s boundary (metadata preload limit on mobile Safari), seek to a
-        // buffered region instead of re-hitting the same gap.
-        var resumePos = savedPos;
-        var buffered = audio.buffered;
-        var isBuffered = false;
+            });
         
-        if (buffered.length > 0) {
-            for (var i = 0; i < buffered.length; i++) {
-                if (savedPos >= buffered.start(i) && savedPos <= buffered.end(i)) {
-                    isBuffered = true;
-                    break;
+            // Touch scrubbing support
+            if (progressContainer) {
+                progressContainer.addEventListener('click', setProgress);
+                
+                let isScrubbing = false;
+                
+                const handleScrubStart = (e) => {
+                    isScrubbing = true;
+                    setProgress(e);
+                };
+                
+                const handleScrubMove = (e) => {
+                    if (!isScrubbing) return;
+                    setProgress(e);
+                    e.preventDefault();
+                };
+                
+                const handleScrubEnd = () => {
+                    isScrubbing = false;
+                };
+                
+                progressContainer.addEventListener('touchstart', handleScrubStart, { passive: false });
+                progressContainer.addEventListener('touchmove', handleScrubMove, { passive: false });
+                progressContainer.addEventListener('touchend', handleScrubEnd);
+                progressContainer.addEventListener('touchcancel', handleScrubEnd);
+            }
+        
+            // Network recovery
+            const onlineHandler = () => {
+                if (audio.error && isPlayerActive) {
+                    console.log('[Audio] Network recovered, attempting reload');
+                    attemptRecovery();
                 }
-            }
-        }
+            };
+            window.addEventListener('online', onlineHandler);
         
-        // If position is not in any buffered range, back up slightly to
-        // force the browser to fetch from a known-good buffered region
-        if (!isBuffered && savedPos > 0) {
-            resumePos = Math.max(0, savedPos - 1);
-            console.log('[Audio] Position not buffered, seeking to:', resumePos);
-        }
-
-        var fired = false;
-        function onReady() {
-            if (fired) return;
-            fired = true;
-            
-            audio.removeEventListener('loadedmetadata', onReady);
-            audio.removeEventListener('canplay', onReady);
-            audio.removeEventListener('canplaythrough', onReady);
-
-            if (resumePos > 0 && !screenWentAway) {
-                audio.currentTime = resumePos;
-            } else if (screenWentAway) {
+            // ─── Initial Load ─────────────────────────────────────────────────────
+            // Only load if NOT reusing a prefetched element that's already buffered.
+            // Calling load() on a buffered audio resets readyState and forces re-download.
+            if (!audio.dataset.isPrefetched) {
+                audio.load();
+            }
+        
+            const resetToStart = () => {
                 audio.currentTime = 0;
+                audio.removeEventListener('loadedmetadata', resetToStart);
+            };
+        
+            if (audio.readyState >= 1) {
+                audio.currentTime = 0;
+            } else {
+                audio.addEventListener('loadedmetadata', resetToStart);
             }
+        
+            // ─── Cleanup ──────────────────────────────────────────────────────────
+            return function cleanup() {
+                console.log('[Audio] Cleanup starting');
+                isPlayerActive = false;
+                releaseWakeLock();
             
-            retryCount = 0;
+                document.removeEventListener('visibilitychange', visibilityHandler);
+                window.removeEventListener('blur',   blurHandler);
+                window.removeEventListener('online', onlineHandler);
+                
+                if (progressContainer && progressContainer.isConnected) {
+                    progressContainer.removeEventListener('touchstart', handleScrubStart);
+                    progressContainer.removeEventListener('touchmove', handleScrubMove);
+                    progressContainer.removeEventListener('touchend', handleScrubEnd);
+                    progressContainer.removeEventListener('touchcancel', handleScrubEnd);
+                }
+            
+                if (audio && audio.isConnected) {
+                    audio.pause();
+                    userWantsPlayback = false;
+                }
+            
+                console.log('[Audio] Cleanup complete');
+            };
         }
-
-        audio.addEventListener('loadedmetadata', onReady);
-        audio.addEventListener('canplay', onReady);
-        audio.addEventListener('canplaythrough', onReady);
-        
-        // If already ready, fire immediately
-        if (audio.readyState >= 2 && audio.duration > 0) {
-            onReady();
-        }
-    }
-
-    // ─── Seek ─────────────────────────────────────────────────────────────
-    function seek(seconds) {
-        if (!isPlayerActive || !isFinite(audio.duration)) return;
-        audio.currentTime = Math.max(0, Math.min(audio.currentTime + seconds, audio.duration));
-        updateMediaSessionPosition();
-        if (typeof announceToScreenReader === 'function') {
-            const direction = seconds > 0 ? 'forward' : 'backward';
-            announceToScreenReader(`Skipped ${Math.abs(seconds)} seconds ${direction}`);
-        }
-    }
-
-    // ─── Progress UI ──────────────────────────────────────────────────────
-    function updateProgress() {
-        if (!isPlayerActive || !isFinite(audio.duration)) return;
-        const percent = (audio.currentTime / audio.duration) * 100;
-        progressBar.style.width = `${percent}%`;
-        currentTimeSpan.textContent = formatTime(audio.currentTime);
-
-        if (audio.currentTime > 0) {
-            lastPlaybackPosition = audio.currentTime;
-            throttledSavePosition(audio.currentTime);
-        }
-    }
-
-    function setProgress(e) {
-        if (!isPlayerActive || !isFinite(audio.duration)) return;
-        const rect = progressContainer.getBoundingClientRect();
-        const clientX = e.clientX ?? e.touches?.[0]?.clientX;
-        if (clientX === undefined || rect.width <= 0) return;
-        audio.currentTime = Math.max(0, Math.min(((clientX - rect.left) / rect.width) * audio.duration, audio.duration)); 
-        updateMediaSessionPosition();
-        if (typeof announceToScreenReader === 'function') {
-            announceToScreenReader(`Jumped to ${formatTime(audio.currentTime)}`);
-        }
-    }
-
-    function setDuration() {
-        if (!isPlayerActive || !isFinite(audio.duration)) return;
-        durationSpan.textContent = formatTime(audio.duration);
-        updateMediaSessionPosition();
-    }
-
-    function formatTime(seconds) {
-        if (!isFinite(seconds) || seconds < 0) return '0:00';
-        const mins = Math.floor(seconds / 60);
-        const secs = Math.floor(seconds % 60);
-        return `${mins}:${secs.toString().padStart(2, '0')}`;
-    }
-
-    // ─── Event Bindings ───────────────────────────────────────────────────
-    playPauseBtn.addEventListener('click', togglePlay);
-    rewindBtn?.addEventListener('click',  () => seek(-10));
-    forwardBtn?.addEventListener('click', () => seek(10));
-
-    audio.addEventListener('timeupdate',    updateProgress);
-    audio.addEventListener('loadedmetadata', setDuration);
-    audio.addEventListener('durationchange', setDuration);
-
-    audio.addEventListener('ended', () => {
-        userWantsPlayback = false;
-        playPauseBtn.innerHTML = '<i class="bi bi-play" aria-hidden="true"></i>'; 
-        playPauseBtn.setAttribute('aria-label', 'Play');
-        releaseWakeLock();
-        progressBar.style.width = '0%';
-
-        try { localStorage.removeItem('audioPosition'); } catch (e) {}
-
-        if ('mediaSession' in navigator) {
-            navigator.mediaSession.playbackState = 'none';
-        }
-
-        if (typeof announceToScreenReader === 'function') {
-            announceToScreenReader('Audio playback completed');
-        }
-        if (typeof showAdditionalInfo === 'function') {
-            showAdditionalInfo();
-        }
-    });
-
-    audio.addEventListener('error', (e) => {
-        console.error('[Audio] Element error:', audio.error?.code, audio.error?.message);
-        if (!isPlayerActive) return;
-
-        releaseWakeLock();
-        playPauseBtn.innerHTML = '<i class="bi bi-play" aria-hidden="true"></i>'; 
-        playPauseBtn.setAttribute('aria-label', 'Play');
-
-        if (screenWentAway || wasPlayingWhenHidden) {
-            const pos = lastPlaybackPosition || 0;
-            audio.dataset.resumePosition = pos.toString();
-            showSourcePopup(
-                'Audio Interrupted',
-                `Audio was paused when you left the screen. Press play to resume from ${formatTime(pos)}.`
-            );
-            attemptRecovery();
-            screenWentAway = false;
-            wasPlayingWhenHidden = false;
-        } else if (retryCount < maxRetries) {
-            retryCount++;
-            setTimeout(() => attemptRecovery(), 1000 * retryCount);
-        } else {
-            playPauseBtn.innerHTML = '<i class="bi bi-exclamation-triangle" aria-hidden="true"></i>'; 
-            playPauseBtn.setAttribute('aria-label', 'Audio Error');
-            showSourcePopup(
-                'Audio Error',
-                'Unable to recover audio. Please refresh and try again.'
-            );
-        }
-    });
-
-    // Touch scrubbing support
-    if (progressContainer) {
-        progressContainer.addEventListener('click', setProgress);
-        
-        let isScrubbing = false;
-        
-        const handleScrubStart = (e) => {
-            isScrubbing = true;
-            setProgress(e);
-        };
-        
-        const handleScrubMove = (e) => {
-            if (!isScrubbing) return;
-            setProgress(e);
-            e.preventDefault();
-        };
-        
-        const handleScrubEnd = () => {
-            isScrubbing = false;
-        };
-        
-        progressContainer.addEventListener('touchstart', handleScrubStart, { passive: false });
-        progressContainer.addEventListener('touchmove', handleScrubMove, { passive: false });
-        progressContainer.addEventListener('touchend', handleScrubEnd);
-        progressContainer.addEventListener('touchcancel', handleScrubEnd);
-    }
-
-    // Network recovery
-    const onlineHandler = () => {
-        if (audio.error && isPlayerActive) {
-            console.log('[Audio] Network recovered, attempting reload');
-            attemptRecovery();
-        }
-    };
-    window.addEventListener('online', onlineHandler);
-
-    // ─── Initial Load ─────────────────────────────────────────────────────
-    audio.load();
-
-    const resetToStart = () => {
-        audio.currentTime = 0;
-        audio.removeEventListener('loadedmetadata', resetToStart);
-    };
-
-    if (audio.readyState >= 1) {
-        audio.currentTime = 0;
-    } else {
-        audio.addEventListener('loadedmetadata', resetToStart);
-    }
-
-    // ─── Cleanup ──────────────────────────────────────────────────────────
-    return function cleanup() {
-        console.log('[Audio] Cleanup starting');
-        isPlayerActive = false;
-        releaseWakeLock();
-    
-        document.removeEventListener('visibilitychange', visibilityHandler);
-        window.removeEventListener('blur',   blurHandler);
-        window.removeEventListener('online', onlineHandler);
-        
-        if (progressContainer && progressContainer.isConnected) {
-            progressContainer.removeEventListener('touchstart', handleScrubStart);
-            progressContainer.removeEventListener('touchmove', handleScrubMove);
-            progressContainer.removeEventListener('touchend', handleScrubEnd);
-            progressContainer.removeEventListener('touchcancel', handleScrubEnd);
-        }
-    
-        if (audio && audio.isConnected) {
-            audio.pause();
-            userWantsPlayback = false;
-        }
-    
-        console.log('[Audio] Cleanup complete');
-    };
-}
         
 function showAdditionalInfo() {
     const locationId = window.lastVisitedLocationId || lastVisitedLocationId;
