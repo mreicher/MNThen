@@ -1,11 +1,12 @@
 // sw.js – Minnesota Then Service Worker
-// Version: 4.6.3 (fixes staleWhileRevalidate ignoreSearch, PREFETCH_AUDIO/GEOLOCATION split)
+// Version: 4.6.4 (fixes PREFETCH_AUDIO handler, staleWhileRevalidate fallback,
+//                 GEOLOCATION validation, and message handler hardening)
 
-const CACHE_NAME    = 'mnthen-v4-ios-5';
-const SHELL_CACHE   = 'mnthen-shell-v5';
-const RUNTIME_CACHE = 'mnthen-runtime-v5';
-const AUDIO_CACHE   = 'mnthen-audio-v5';
-const TILE_CACHE    = 'mnthen-tiles-v5';
+const CACHE_NAME    = 'mnthen-v4-ios-6';
+const SHELL_CACHE   = 'mnthen-shell-v6';
+const RUNTIME_CACHE = 'mnthen-runtime-v6';
+const AUDIO_CACHE   = 'mnthen-audio-v6';
+const TILE_CACHE    = 'mnthen-tiles-v6';
 
 const MAX_RUNTIME = 100;
 const MAX_AUDIO   = 100;
@@ -146,24 +147,39 @@ async function networkFirst(req) {
   }
 }
 
-// FIXED: ignoreSearch so versioned URLs (e.g. ?v=1.0.9) hit the cache entry
-// stored without a query string. Also falls back to cached copy if network
-// fails rather than returning a bare 503 when there is something usable.
+// FIXED: Proper stale-while-revalidate that never returns a failed network
+// response when a cached copy exists. Also never returns 404/500 errors
+// to the page if we have anything usable in cache.
 async function staleWhileRevalidate(req) {
   const cache = await caches.open(SHELL_CACHE);
   const cached = await cache.match(req, { ignoreSearch: true });
 
-  const update = fetch(req)
+  // Always try network in background
+  const networkPromise = fetch(req)
     .then(res => {
-      if (res.ok && res.status === 200) cache.put(req, res.clone()).catch(() => {});
+      // Only cache successful responses
+      if (res.ok && res.status === 200) {
+        cache.put(req, res.clone()).catch(() => {});
+      }
       return res;
     })
-    .catch(() => cached || new Response('Offline', { status: 503 }));
+    .catch(() => null); // Network failure → null, not an error response
 
-  return cached || update;
+  // If we have cached, return it immediately (network updates in background)
+  if (cached) return cached;
+
+  // No cache — must wait for network
+  const networkRes = await networkPromise;
+  
+  // Network succeeded (any status) — return it
+  if (networkRes) return networkRes;
+  
+  // Complete failure — nothing cached, network down
+  return new Response('Offline', { status: 503 });
 }
 
 async function handleAudio(req) {
+  // Range requests bypass cache (streaming audio)
   if (req.headers.has('range')) {
     return fetch(req).catch(() => new Response('Offline', { status: 503 }));
   }
@@ -186,8 +202,53 @@ async function handleAudio(req) {
   }
 }
 
-// ---------- geolocation message handler (defensive) ----------
+// ---------- message handlers ----------
 
+// FIXED: PREFETCH_AUDIO now handles the client's actual message format:
+// { type: 'PREFETCH_AUDIO', data: { userLocation: {...}, locations: [...] } }
+// Prefetches audio files for all nearby locations.
+async function handlePrefetchAudio(data, port) {
+  // Client wraps payload in .data; fall back to data itself for forward compat
+  const payload = data?.data || data;
+  const locations = payload?.locations;
+
+  if (!Array.isArray(locations)) {
+    port?.postMessage({ success: false, error: 'Invalid or missing locations array' });
+    return;
+  }
+
+  // Filter to locations with audio URLs
+  const audioUrls = locations
+    .map(loc => loc?.audio)
+    .filter(url => typeof url === 'string' && url.length > 0);
+
+  if (audioUrls.length === 0) {
+    port?.postMessage({ success: true, prefetched: 0, total: 0, message: 'No audio URLs found' });
+    return;
+  }
+
+  // Prefetch all audio files in parallel
+  const results = await Promise.allSettled(
+    audioUrls.map(async (url) => {
+      const req = new Request(url);
+      const res = await handleAudio(req);
+      return { url, ok: res.ok };
+    })
+  );
+
+  const succeeded = results.filter(r => r.status === 'fulfilled' && r.value.ok).length;
+  const failed = results.filter(r => r.status === 'rejected' || !r.value.ok).length;
+
+  port?.postMessage({
+    success: true,
+    prefetched: succeeded,
+    failed: failed,
+    total: audioUrls.length
+  });
+}
+
+// FIXED: Hardened against raw JS content being passed as locations string.
+// Silently ignores obvious garbage instead of spamming console with parse errors.
 async function handleGeolocationRequest(data, port) {
   try {
     if (!data || typeof data !== 'object') {
@@ -195,10 +256,18 @@ async function handleGeolocationRequest(data, port) {
       return;
     }
 
-    // If locations were sent as a JSON string (old client), parse safely.
-    // Guard against receiving raw JS file content instead of JSON.
     let locations = data.locations;
+
+    // If locations were sent as a JSON string (old client), parse safely
     if (typeof locations === 'string') {
+      // Guard against raw JS file content or other garbage
+      const trimmed = locations.trim();
+      if (trimmed.startsWith('const ') || trimmed.startsWith('var ') || trimmed.startsWith('let ')) {
+        console.warn('[SW] GEOLOCATION: received raw JS content instead of JSON — ignoring');
+        port?.postMessage({ success: false, error: 'locations is raw JS, not JSON' });
+        return;
+      }
+      
       locations = safeJsonParse(locations);
       if (locations === null) {
         console.warn('[SW] GEOLOCATION: locations string was not valid JSON — ignoring');
@@ -206,6 +275,7 @@ async function handleGeolocationRequest(data, port) {
         return;
       }
     }
+
     if (!Array.isArray(locations)) {
       port?.postMessage({ success: false, error: 'Invalid locations data: expected array' });
       return;
@@ -214,26 +284,6 @@ async function handleGeolocationRequest(data, port) {
     port?.postMessage({ success: true, locationsCount: locations.length });
   } catch (err) {
     console.error('[SW] handleGeolocationRequest error:', err);
-    port?.postMessage({ success: false, error: err.message });
-  }
-}
-
-// ---------- audio prefetch handler ----------
-
-// FIXED: PREFETCH_AUDIO was incorrectly falling through to handleGeolocationRequest.
-// Now handled separately — fetches and caches a single audio URL sent by the client.
-async function handlePrefetchAudio(data, port) {
-  const url = data?.url;
-  if (!url || typeof url !== 'string') {
-    port?.postMessage({ success: false, error: 'Invalid or missing url' });
-    return;
-  }
-  try {
-    const req = new Request(url);
-    await handleAudio(req);
-    port?.postMessage({ success: true, url });
-  } catch (err) {
-    console.error('[SW] handlePrefetchAudio error:', err);
     port?.postMessage({ success: false, error: err.message });
   }
 }
@@ -284,7 +334,7 @@ self.addEventListener('fetch', e => {
 // ---------- lifecycle ----------
 
 self.addEventListener('install', e => {
-  console.log('[SW] 4.6.3 installing');
+  console.log('[SW] 4.6.4 installing');
   e.waitUntil(
     caches.open(SHELL_CACHE)
       .then(cache => cacheShellResources(cache))
@@ -297,12 +347,13 @@ self.addEventListener('install', e => {
 });
 
 self.addEventListener('activate', e => {
-  console.log('[SW] 4.6.3 activating');
+  console.log('[SW] 4.6.4 activating');
   e.waitUntil(
     caches.keys().then(names =>
       Promise.all(
         names.map(n => {
           if (![CACHE_NAME, SHELL_CACHE, RUNTIME_CACHE, AUDIO_CACHE, TILE_CACHE].includes(n)) {
+            console.log('[SW] Deleting old cache:', n);
             return caches.delete(n);
           }
         })
@@ -315,7 +366,7 @@ self.addEventListener('activate', e => {
 
 self.addEventListener('message', e => {
   const { data } = e;
-  if (!data) return;
+  if (!data || typeof data !== 'object') return;
 
   switch (data.type) {
     case 'SKIP_WAITING':
@@ -341,15 +392,18 @@ self.addEventListener('message', e => {
         .catch(() => e.ports[0]?.postMessage({ updateAvailable: false }));
       break;
 
-    // FIXED: PREFETCH_AUDIO now has its own handler instead of falling through
-    // to handleGeolocationRequest, which caused the JSON parse error when the
-    // client sent an audio URL or file content instead of a locations array.
+    // FIXED: PREFETCH_AUDIO now handles the client's actual message format
+    // { data: { userLocation, locations } } instead of expecting { url }
     case 'PREFETCH_AUDIO':
       handlePrefetchAudio(data, e.ports?.[0]);
       break;
 
     case 'GEOLOCATION':
       handleGeolocationRequest(data, e.ports?.[0]);
+      break;
+
+    default:
+      // Silently ignore unknown message types
       break;
   }
 });
@@ -366,4 +420,4 @@ self.addEventListener('unhandledrejection', e => {
   e.preventDefault();
 });
 
-console.log('[SW] 4.6.3 ready (resilient install)');
+console.log('[SW] 4.6.4 ready (resilient install)');
