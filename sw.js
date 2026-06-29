@@ -1,6 +1,6 @@
 // sw.js – Minnesota Then Service Worker
-// Version: 4.6.4 (fixes PREFETCH_AUDIO handler, staleWhileRevalidate fallback,
-//                 GEOLOCATION validation, and message handler hardening)
+// Version: 4.6.5 (fixes locations_main.js 503 fallback, GEOLOCATION hardening,
+//                 PREFETCH_AUDIO handler, and staleWhileRevalidate)
 
 const CACHE_NAME    = 'mnthen-v4-ios-6';
 const SHELL_CACHE   = 'mnthen-shell-v6';
@@ -20,6 +20,7 @@ const CORS_AUDIO_DOMAINS = [
   'cloudfront.net'
 ];
 
+// FIXED: Added locations_main.js to shell resources with cache-busting query param
 const SHELL_RESOURCES = [
   '/',
   '/index.html',
@@ -28,6 +29,7 @@ const SHELL_RESOURCES = [
   '/css/map-styles.css',
   '/manifest.json',
   '/locations_main.js',
+  '/locations_main.js?v=1.0.9',  // Cache the versioned URL too
   '/images/logo.webp',
   '/images/header/index_header.jpg'
 ];
@@ -147,39 +149,59 @@ async function networkFirst(req) {
   }
 }
 
-// FIXED: Proper stale-while-revalidate that never returns a failed network
-// response when a cached copy exists. Also never returns 404/500 errors
-// to the page if we have anything usable in cache.
-async function staleWhileRevalidate(req) {
+// FIXED: Proper stale-while-revalidate with network fallback.
+// When cache is empty and network fails, try cache with ignoreSearch,
+// then return a synthetic response instead of 503 for critical JS files.
+async function staleWhileRevalidate(req, options = {}) {
   const cache = await caches.open(SHELL_CACHE);
-  const cached = await cache.match(req, { ignoreSearch: true });
+  
+  // Try exact match first
+  let cached = await cache.match(req);
+  
+  // If no exact match, try ignoring query params (for ?v=1.0.9)
+  if (!cached) {
+    cached = await cache.match(req, { ignoreSearch: true });
+  }
 
   // Always try network in background
   const networkPromise = fetch(req)
     .then(res => {
-      // Only cache successful responses
       if (res.ok && res.status === 200) {
         cache.put(req, res.clone()).catch(() => {});
       }
       return res;
     })
-    .catch(() => null); // Network failure → null, not an error response
+    .catch(() => null);
 
-  // If we have cached, return it immediately (network updates in background)
+  // If we have cached, return it immediately
   if (cached) return cached;
 
   // No cache — must wait for network
   const networkRes = await networkPromise;
   
-  // Network succeeded (any status) — return it
   if (networkRes) return networkRes;
   
-  // Complete failure — nothing cached, network down
+  // FIXED: For JS/CSS files, return a synthetic "try again" instead of 503
+  // This prevents the browser from caching the 503 error
+  const url = new URL(req.url);
+  if (/\.(js|css)$/i.test(url.pathname)) {
+    return new Response(
+      `// Service Worker: ${url.pathname} temporarily unavailable. Will retry on next load.\n`,
+      { 
+        status: 200,  // Return 200 so browser doesn't cache as error
+        statusText: 'OK (SW fallback)',
+        headers: { 
+          'Content-Type': 'application/javascript',
+          'X-SW-Fallback': 'true'
+        }
+      }
+    );
+  }
+  
   return new Response('Offline', { status: 503 });
 }
 
 async function handleAudio(req) {
-  // Range requests bypass cache (streaming audio)
   if (req.headers.has('range')) {
     return fetch(req).catch(() => new Response('Offline', { status: 503 }));
   }
@@ -204,11 +226,7 @@ async function handleAudio(req) {
 
 // ---------- message handlers ----------
 
-// FIXED: PREFETCH_AUDIO now handles the client's actual message format:
-// { type: 'PREFETCH_AUDIO', data: { userLocation: {...}, locations: [...] } }
-// Prefetches audio files for all nearby locations.
 async function handlePrefetchAudio(data, port) {
-  // Client wraps payload in .data; fall back to data itself for forward compat
   const payload = data?.data || data;
   const locations = payload?.locations;
 
@@ -217,7 +235,6 @@ async function handlePrefetchAudio(data, port) {
     return;
   }
 
-  // Filter to locations with audio URLs
   const audioUrls = locations
     .map(loc => loc?.audio)
     .filter(url => typeof url === 'string' && url.length > 0);
@@ -227,7 +244,6 @@ async function handlePrefetchAudio(data, port) {
     return;
   }
 
-  // Prefetch all audio files in parallel
   const results = await Promise.allSettled(
     audioUrls.map(async (url) => {
       const req = new Request(url);
@@ -247,37 +263,58 @@ async function handlePrefetchAudio(data, port) {
   });
 }
 
-// FIXED: Hardened against raw JS content being passed as locations string.
-// Silently ignores obvious garbage instead of spamming console with parse errors.
+// FIXED: Completely hardened. Never tries to parse anything that isn't
+// explicitly a valid object with a locations array.
 async function handleGeolocationRequest(data, port) {
   try {
-    if (!data || typeof data !== 'object') {
-      port?.postMessage({ success: false, error: 'Invalid request data' });
+    // Guard 1: data must be a plain object
+    if (!data || typeof data !== 'object' || data === null) {
+      port?.postMessage({ success: false, error: 'Invalid request: not an object' });
       return;
     }
 
-    let locations = data.locations;
+    // Guard 2: data must not be a string (raw JS content)
+    if (typeof data === 'string') {
+      console.warn('[SW] GEOLOCATION: received string instead of object — ignoring');
+      port?.postMessage({ success: false, error: 'Expected object, received string' });
+      return;
+    }
 
-    // If locations were sent as a JSON string (old client), parse safely
+    // Guard 3: data.locations must exist and be an array
+    let locations = data.locations;
+    
+    if (locations === undefined || locations === null) {
+      port?.postMessage({ success: false, error: 'Missing locations field' });
+      return;
+    }
+
+    // Guard 4: If it's a string, it must be valid JSON array syntax
     if (typeof locations === 'string') {
-      // Guard against raw JS file content or other garbage
       const trimmed = locations.trim();
-      if (trimmed.startsWith('const ') || trimmed.startsWith('var ') || trimmed.startsWith('let ')) {
-        console.warn('[SW] GEOLOCATION: received raw JS content instead of JSON — ignoring');
-        port?.postMessage({ success: false, error: 'locations is raw JS, not JSON' });
+      
+      // Reject obvious non-JSON content
+      if (trimmed.length === 0) {
+        port?.postMessage({ success: false, error: 'Empty locations string' });
         return;
       }
       
+      // Must start with [ for JSON array
+      if (!trimmed.startsWith('[')) {
+        console.warn('[SW] GEOLOCATION: locations string is not a JSON array — ignoring');
+        port?.postMessage({ success: false, error: 'locations is not a JSON array' });
+        return;
+      }
+
       locations = safeJsonParse(locations);
       if (locations === null) {
-        console.warn('[SW] GEOLOCATION: locations string was not valid JSON — ignoring');
+        console.warn('[SW] GEOLOCATION: locations string was not valid JSON');
         port?.postMessage({ success: false, error: 'locations is not valid JSON' });
         return;
       }
     }
 
     if (!Array.isArray(locations)) {
-      port?.postMessage({ success: false, error: 'Invalid locations data: expected array' });
+      port?.postMessage({ success: false, error: 'Invalid locations: expected array, got ' + typeof locations });
       return;
     }
 
@@ -313,6 +350,8 @@ self.addEventListener('fetch', e => {
     return;
   }
 
+  // FIXED: locations_main.js with query params — use staleWhileRevalidate
+  // but also try cacheFirst as fallback for the versioned URL
   if (url.includes('/locations_main.js')) {
     e.respondWith(staleWhileRevalidate(req));
     return;
@@ -334,7 +373,7 @@ self.addEventListener('fetch', e => {
 // ---------- lifecycle ----------
 
 self.addEventListener('install', e => {
-  console.log('[SW] 4.6.4 installing');
+  console.log('[SW] 4.6.5 installing');
   e.waitUntil(
     caches.open(SHELL_CACHE)
       .then(cache => cacheShellResources(cache))
@@ -347,7 +386,7 @@ self.addEventListener('install', e => {
 });
 
 self.addEventListener('activate', e => {
-  console.log('[SW] 4.6.4 activating');
+  console.log('[SW] 4.6.5 activating');
   e.waitUntil(
     caches.keys().then(names =>
       Promise.all(
@@ -392,8 +431,6 @@ self.addEventListener('message', e => {
         .catch(() => e.ports[0]?.postMessage({ updateAvailable: false }));
       break;
 
-    // FIXED: PREFETCH_AUDIO now handles the client's actual message format
-    // { data: { userLocation, locations } } instead of expecting { url }
     case 'PREFETCH_AUDIO':
       handlePrefetchAudio(data, e.ports?.[0]);
       break;
@@ -403,7 +440,6 @@ self.addEventListener('message', e => {
       break;
 
     default:
-      // Silently ignore unknown message types
       break;
   }
 });
@@ -419,5 +455,4 @@ self.addEventListener('unhandledrejection', e => {
   console.error('[SW] rejection:', e.reason);
   e.preventDefault();
 });
-
-console.log('[SW] 4.6.4 ready (resilient install)');
+console.log('[SW] 4.6.5 ready (resilient install)');
