@@ -1,5 +1,5 @@
 // sw.js – Minnesota Then Service Worker
-// Version: 4.6.1 (resilient install, no single 404 kills activation)
+// Version: 4.6.2 (resilient install, no single 404 kills activation)
 
 const CACHE_NAME    = 'mnthen-v4-ios-5';
 const SHELL_CACHE   = 'mnthen-shell-v5';
@@ -66,6 +66,15 @@ function normalizeRequest(req) {
     return new Request(url.origin + '/index.html');
   }
   return req;
+}
+
+// Safe JSON parse — returns null instead of throwing on invalid JSON
+function safeJsonParse(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
 }
 
 // Cache each resource individually — failures don't block others
@@ -174,6 +183,34 @@ async function handleAudio(req) {
   }
 }
 
+// ---------- geolocation message handler (defensive) ----------
+
+async function handleGeolocationRequest(data, port) {
+  try {
+    // Guard: if data is not an object, bail
+    if (!data || typeof data !== 'object') {
+      port?.postMessage({ success: false, error: 'Invalid request data' });
+      return;
+    }
+
+    // If locations were sent as a JSON string (old client), parse safely
+    let locations = data.locations;
+    if (typeof locations === 'string') {
+      locations = safeJsonParse(locations);
+    }
+    if (!Array.isArray(locations)) {
+      port?.postMessage({ success: false, error: 'Invalid locations data' });
+      return;
+    }
+
+    // Your geolocation logic here — placeholder returns success
+    port?.postMessage({ success: true, locationsCount: locations.length });
+  } catch (err) {
+    console.error('[SW] handleGeolocationRequest error:', err);
+    port?.postMessage({ success: false, error: err.message });
+  }
+}
+
 // ---------- fetch ----------
 
 self.addEventListener('fetch', e => {
@@ -220,21 +257,20 @@ self.addEventListener('fetch', e => {
 // ---------- lifecycle ----------
 
 self.addEventListener('install', e => {
-  console.log('[SW] 4.6.1 installing');
+  console.log('[SW] 4.6.2 installing');
   e.waitUntil(
     caches.open(SHELL_CACHE)
       .then(cache => cacheShellResources(cache))
       .then(() => self.skipWaiting())
       .catch(err => {
         console.error('[SW] install error (non-fatal):', err);
-        // Still activate even if everything failed — SW is better than no SW
         return self.skipWaiting();
       })
   );
 });
 
 self.addEventListener('activate', e => {
-  console.log('[SW] 4.6.1 activating');
+  console.log('[SW] 4.6.2 activating');
   e.waitUntil(
     caches.keys().then(names =>
       Promise.all(
@@ -277,6 +313,11 @@ self.addEventListener('message', e => {
         .then(() => e.ports[0]?.postMessage({ updateAvailable: true }))
         .catch(() => e.ports[0]?.postMessage({ updateAvailable: false }));
       break;
+
+    case 'PREFETCH_AUDIO':
+    case 'GEOLOCATION':
+      handleGeolocationRequest(data, e.ports?.[0]);
+      break;
   }
 });
 
@@ -292,4 +333,4 @@ self.addEventListener('unhandledrejection', e => {
   e.preventDefault();
 });
 
-console.log('[SW] 4.6.1 ready (resilient install)');
+console.log('[SW] 4.6.2 ready (resilient install)');
