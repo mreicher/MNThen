@@ -3111,17 +3111,13 @@ function updateAccuracyIndicator(accuracy) {
     
             const opts = getWatchOptions();
             
-            // OPTIMIZATION: Use opts.maximumAge instead of 0.
-            // Since initializeUserLocation just fetched a fresh position, 
-            // the OS has a hot fix ready. Setting this to 0 ignores that hot fix
-            // and forces a wait for the next satellite cycle.
             window.positionWatchId = navigator.geolocation.watchPosition(
                 handlePositionUpdate,
                 handleLocationError,
                 { 
                     enableHighAccuracy: true, 
                     timeout: opts.timeout, 
-                    maximumAge: opts.maximumAge // <--- CHANGED FROM 0
+                    maximumAge: opts.maximumAge
                 }
             );
     
@@ -3129,22 +3125,31 @@ function updateAccuracyIndicator(accuracy) {
                 window._positionUpdatesListenersSetup = true;
     
                 const onlineHandler = () => {
-                    if (window.onlineRestartTimeout) clearTimeout(window.onlineRestartTimeout);
-                    window.onlineRestartTimeout = createTrackedTimeout(() => {
-                        if (window.positionWatchId == null) {
-                            const restartOpts = getWatchOptions();
-                            window.positionWatchId = navigator.geolocation.watchPosition(
-                                handlePositionUpdate,
-                                handleLocationError,
-                                { 
-                                    enableHighAccuracy: true, 
-                                    timeout: restartOpts.timeout, 
-                                    maximumAge: restartOpts.maximumAge 
-                                }
-                            );
-                        }
+                    if (window.onlineRestartTimeout) {
+                        clearTimeout(window.onlineRestartTimeout);
                         window.onlineRestartTimeout = null;
-                    }, 500);
+                    }
+                    
+                    window.onlineRestartTimeout = createTrackedTimeout(() => {
+                        window.onlineRestartTimeout = null;
+                        
+                        if (window.positionWatchId != null) {
+                            navigator.geolocation.clearWatch(window.positionWatchId);
+                        }
+                        
+                        const restartOpts = getWatchOptions();
+                        window.positionWatchId = navigator.geolocation.watchPosition(
+                            handlePositionUpdate,
+                            handleLocationError,
+                            { 
+                                enableHighAccuracy: true, 
+                                timeout: restartOpts.timeout, 
+                                maximumAge: 0
+                            }
+                        );
+                        
+                        console.log('[GPS] Restarted watch after network recovery');
+                    }, 800);
                 };
     
                 const offlineHandler = () => {
@@ -3152,16 +3157,41 @@ function updateAccuracyIndicator(accuracy) {
                         clearTimeout(window.onlineRestartTimeout);
                         window.onlineRestartTimeout = null;
                     }
+                    
+                    window._networkWasOffline = true;
+                    
+                    window.onlineRestartTimeout = createTrackedTimeout(() => {
+                        window.onlineRestartTimeout = null;
+                        
+                        if (window.positionWatchId != null) {
+                            navigator.geolocation.clearWatch(window.positionWatchId);
+                        }
+                        
+                        window.positionWatchId = navigator.geolocation.watchPosition(
+                            handlePositionUpdate,
+                            handleLocationError,
+                            { 
+                                enableHighAccuracy: false,
+                                timeout: 30000, 
+                                maximumAge: 10000
+                            }
+                        );
+                        
+                        console.log('[GPS] Fallback to pure GPS after offline stall');
+                    }, 10000);
                 };
     
                 window.addEventListener('online', onlineHandler);
                 window.addEventListener('offline', offlineHandler);
     
-                // Safety check for memory manager (in case it loads late)
                 if (typeof memoryManager?.trackEventListener === 'function') {
                     memoryManager.trackEventListener(window, 'online', onlineHandler);
                     memoryManager.trackEventListener(window, 'offline', offlineHandler);
                 }
+                
+                // These names must match disposeMapLoop() cleanup:
+                window._networkOnlineHandler = onlineHandler;
+                window._networkOfflineHandler = offlineHandler;
             }
     
             return window.positionWatchId;
@@ -4714,6 +4744,14 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
         if (!forceUpdate && now - (window._lastUpdateUserLocation || 0) < 8) return;
         window._lastUpdateUserLocation = now;
     
+        // ── Deferred speed zoom reset ───────────────────────────────────────────
+        // Location page was just closed. Don't act on stale closestDistance.
+        // Wait for first fresh GPS fix with real-world distance before resetting.
+        if (window._deferSpeedZoomReset) {
+            getSpeedBasedZoom.reset();
+            window._deferSpeedZoomReset = false;
+        }
+    
         if (window._debounceTimeoutId) {
             clearTimeout(window._debounceTimeoutId);
             window._debounceTimeoutId = null;
@@ -5297,7 +5335,8 @@ function disposeMapLoop() {
         '_visualFallbackTimer',
         '_markerFallbackTimer',
         'inactivityTimer',
-        '_cooldownExpiryTimeout'
+        '_cooldownExpiryTimeout',
+        'onlineRestartTimeout'  // <-- ADDED: network transition timeout
     ];
     for (const key of timeoutHandles) {
         if (window[key] != null) {
@@ -5311,6 +5350,17 @@ function disposeMapLoop() {
         clearInterval(window._gpsPowerInterval);
         window._gpsPowerInterval = null;
     }
+
+    // ── Network transition listener cleanup (ADDED for Issue 1) ──
+    if (window._networkOnlineHandler) {
+        window.removeEventListener('online', window._networkOnlineHandler);
+        window._networkOnlineHandler = null;
+    }
+    if (window._networkOfflineHandler) {
+        window.removeEventListener('offline', window._networkOfflineHandler);
+        window._networkOfflineHandler = null;
+    }
+    window._networkWasOffline = false;
 
     // ── Derived state cleanup ──
     window._cooldownExpiryLocationId = null;
@@ -6887,7 +6937,11 @@ function createAudioPlayer(audioSrc) {
     const audio = document.createElement('audio');
     audio.id = 'locationAudio';
     audio.src = audioSrc;
-    audio.preload = 'metadata'; // 'Metadata' prevents auto-downloading huge files on mobile data
+    
+ Use 'auto' for full progressive
+    // download of location audio (typically 2-5MB).
+    audio.preload = 'auto';
+    audio.playsInline = true;
 
     const audioProgress = document.createElement('div');
     audioProgress.classList.add('audio-progress');
@@ -6977,9 +7031,6 @@ function createAudioButton(iconName, id, ariaLabel) {
     button.id = id;
     button.classList.add('audio-button');
     button.setAttribute('aria-label', ariaLabel);
-    
-    // Added aria-hidden="true" to the icon so screen readers 
-    // don't announce the icon class alongside the button's aria-label
     button.innerHTML = `<i class="bi bi-${iconName}" aria-hidden="true"></i>`;
     
     button.style.cssText = `
@@ -7227,7 +7278,6 @@ function initAudioPlayer() {
 
     // ─── Platform Detection ───────────────────────────────────────────────
     const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
-    // Removed unused isAndroid variable
 
     // ─── Save original source ─────────────────────────────────────────────
     if (audio.src && audio.src !== window.location.href && !audio.dataset.originalSrc) {
@@ -7246,7 +7296,7 @@ function initAudioPlayer() {
     let mediaSessionReady    = false;
 
     // ─── Shared AudioContext ───────────────────────────────────────────────
-   function getSharedAudioContext() {
+    function getSharedAudioContext() {
         const ctx = window._sharedAudioCtx;
         
         if (ctx) {
@@ -7385,24 +7435,50 @@ function initAudioPlayer() {
                 playPauseBtn.setAttribute('aria-label', 'Play');
                 releaseWakeLock();
             }
+            
+            // FIXED: Suspend AudioContext to free resources, track state for resume
+            var ctx = window._sharedAudioCtx;
+            if (ctx && ctx.state === 'running') {
+                ctx.suspend().catch(function(){});
+            }
         } else {
+            // Returning to foreground
             if (screenWentAway && wasPlayingWhenHidden) {
-                if (window._sharedAudioCtx &&
-                    (window._sharedAudioCtx.state === 'suspended' ||
-                     window._sharedAudioCtx.state === 'interrupted')) {
-                    window._sharedAudioCtx.resume().catch(() => {});
-                }
-
-                setTimeout(() => {
-                    if (screenWentAway && audio.paused) {
-                        showSourcePopup(
-                            'Audio Paused',
-                            `Press play to resume from ${formatTime(lastPlaybackPosition)}`
-                        );
-                        screenWentAway = false;
-                        wasPlayingWhenHidden = false;
+                var ctx = window._sharedAudioCtx;
+                
+                function tryResume() {
+                    // FIXED: Check if current position is actually buffered before resuming
+                    var buffered = audio.buffered;
+                    var pos = audio.currentTime;
+                    var canResume = false;
+                    
+                    if (buffered.length > 0) {
+                        for (var i = 0; i < buffered.length; i++) {
+                            if (pos >= buffered.start(i) && pos <= buffered.end(i)) {
+                                canResume = true;
+                                break;
+                            }
+                        }
                     }
-                }, 300);
+                    
+                    if (!canResume && pos > 0) {
+                        // FIXED: Stuck in unbuffered gap — run recovery instead of blind resume
+                        console.log('[Audio] Resume position not buffered, recovering');
+                        attemptRecovery();
+                    } else if (userWantsPlayback && audio.paused) {
+                        togglePlay();
+                    }
+                    
+                    screenWentAway = false;
+                    wasPlayingWhenHidden = false;
+                }
+                
+                // FIXED: Resume AudioContext first, then check buffer state
+                if (ctx && (ctx.state === 'suspended' || ctx.state === 'interrupted')) {
+                    ctx.resume().then(tryResume).catch(tryResume);
+                } else {
+                    setTimeout(tryResume, 300);
+                }
             }
         }
     };
@@ -7525,27 +7601,60 @@ function initAudioPlayer() {
         const savedPos  = lastPlaybackPosition || 0;
         const targetSrc = audio.dataset.originalSrc || audio.getAttribute('data-src');
 
-        if (targetSrc && (!audio.src || audio.src === window.location.href)) {
-            audio.src = targetSrc;
-        }
-
         if (audio.error || !audio.src || audio.src === window.location.href) {
+            if (targetSrc) audio.src = targetSrc;
             audio.load();
         }
 
-        const onReady = () => {
-            if (savedPos > 0 && !screenWentAway) {
-                audio.currentTime = savedPos;
+        // FIXED: Check if saved position is actually buffered. If stalled near
+        // 10s boundary (metadata preload limit on mobile Safari), seek to a
+        // buffered region instead of re-hitting the same gap.
+        var resumePos = savedPos;
+        var buffered = audio.buffered;
+        var isBuffered = false;
+        
+        if (buffered.length > 0) {
+            for (var i = 0; i < buffered.length; i++) {
+                if (savedPos >= buffered.start(i) && savedPos <= buffered.end(i)) {
+                    isBuffered = true;
+                    break;
+                }
+            }
+        }
+        
+        // If position is not in any buffered range, back up slightly to
+        // force the browser to fetch from a known-good buffered region
+        if (!isBuffered && savedPos > 0) {
+            resumePos = Math.max(0, savedPos - 1);
+            console.log('[Audio] Position not buffered, seeking to:', resumePos);
+        }
+
+        var fired = false;
+        function onReady() {
+            if (fired) return;
+            fired = true;
+            
+            audio.removeEventListener('loadedmetadata', onReady);
+            audio.removeEventListener('canplay', onReady);
+            audio.removeEventListener('canplaythrough', onReady);
+
+            if (resumePos > 0 && !screenWentAway) {
+                audio.currentTime = resumePos;
             } else if (screenWentAway) {
                 audio.currentTime = 0;
             }
+            
             retryCount = 0;
-            audio.removeEventListener('loadedmetadata', onReady);
-            audio.removeEventListener('canplay', onReady);
-        };
+        }
 
         audio.addEventListener('loadedmetadata', onReady);
         audio.addEventListener('canplay', onReady);
+        audio.addEventListener('canplaythrough', onReady);
+        
+        // If already ready, fire immediately
+        if (audio.readyState >= 2 && audio.duration > 0) {
+            onReady();
+        }
     }
 
     // ─── Seek ─────────────────────────────────────────────────────────────
@@ -7658,8 +7767,7 @@ function initAudioPlayer() {
         }
     });
 
-    // Added touch scrubbing support. The setProgress function 
-    // already handled e.touches, but the events were never bound!
+    // Touch scrubbing support
     if (progressContainer) {
         progressContainer.addEventListener('click', setProgress);
         
@@ -7673,7 +7781,7 @@ function initAudioPlayer() {
         const handleScrubMove = (e) => {
             if (!isScrubbing) return;
             setProgress(e);
-            e.preventDefault(); // Prevent page scrolling while scrubbing
+            e.preventDefault();
         };
         
         const handleScrubEnd = () => {
@@ -7732,8 +7840,8 @@ function initAudioPlayer() {
         }
     
         console.log('[Audio] Cleanup complete');
-        };
-    }
+    };
+}
         
 function showAdditionalInfo() {
     const locationId = window.lastVisitedLocationId || lastVisitedLocationId;
@@ -7876,7 +7984,11 @@ function handleContinueClick() {
     window._inProximityZone            = false;
     window._proximityZoomActive        = false;
 
-    getSpeedBasedZoom.reset();
+    // DEFERRED: Don't reset speed zoom immediately — the render state still
+    // carries the old closestDistance from inside the location page. The
+    // next fresh GPS fix in updateUserLocation() will apply the reset when
+    // real-world distance data is available.
+    window._deferSpeedZoomReset = true;
     clearStationaryState();
 
     // ── Cancel countdown timers ──────────────────────────────────────────────
