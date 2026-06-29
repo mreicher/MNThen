@@ -1,5 +1,5 @@
 // sw.js – Minnesota Then Service Worker
-// Version: 4.6.2 (resilient install, no single 404 kills activation)
+// Version: 4.6.3 (fixes staleWhileRevalidate ignoreSearch, PREFETCH_AUDIO/GEOLOCATION split)
 
 const CACHE_NAME    = 'mnthen-v4-ios-5';
 const SHELL_CACHE   = 'mnthen-shell-v5';
@@ -146,16 +146,19 @@ async function networkFirst(req) {
   }
 }
 
+// FIXED: ignoreSearch so versioned URLs (e.g. ?v=1.0.9) hit the cache entry
+// stored without a query string. Also falls back to cached copy if network
+// fails rather than returning a bare 503 when there is something usable.
 async function staleWhileRevalidate(req) {
   const cache = await caches.open(SHELL_CACHE);
-  const cached = await cache.match(req);
+  const cached = await cache.match(req, { ignoreSearch: true });
 
   const update = fetch(req)
     .then(res => {
       if (res.ok && res.status === 200) cache.put(req, res.clone()).catch(() => {});
       return res;
     })
-    .catch(() => new Response('Offline', { status: 503 }));
+    .catch(() => cached || new Response('Offline', { status: 503 }));
 
   return cached || update;
 }
@@ -187,26 +190,50 @@ async function handleAudio(req) {
 
 async function handleGeolocationRequest(data, port) {
   try {
-    // Guard: if data is not an object, bail
     if (!data || typeof data !== 'object') {
       port?.postMessage({ success: false, error: 'Invalid request data' });
       return;
     }
 
-    // If locations were sent as a JSON string (old client), parse safely
+    // If locations were sent as a JSON string (old client), parse safely.
+    // Guard against receiving raw JS file content instead of JSON.
     let locations = data.locations;
     if (typeof locations === 'string') {
       locations = safeJsonParse(locations);
+      if (locations === null) {
+        console.warn('[SW] GEOLOCATION: locations string was not valid JSON — ignoring');
+        port?.postMessage({ success: false, error: 'locations is not valid JSON' });
+        return;
+      }
     }
     if (!Array.isArray(locations)) {
-      port?.postMessage({ success: false, error: 'Invalid locations data' });
+      port?.postMessage({ success: false, error: 'Invalid locations data: expected array' });
       return;
     }
 
-    // Your geolocation logic here — placeholder returns success
     port?.postMessage({ success: true, locationsCount: locations.length });
   } catch (err) {
     console.error('[SW] handleGeolocationRequest error:', err);
+    port?.postMessage({ success: false, error: err.message });
+  }
+}
+
+// ---------- audio prefetch handler ----------
+
+// FIXED: PREFETCH_AUDIO was incorrectly falling through to handleGeolocationRequest.
+// Now handled separately — fetches and caches a single audio URL sent by the client.
+async function handlePrefetchAudio(data, port) {
+  const url = data?.url;
+  if (!url || typeof url !== 'string') {
+    port?.postMessage({ success: false, error: 'Invalid or missing url' });
+    return;
+  }
+  try {
+    const req = new Request(url);
+    await handleAudio(req);
+    port?.postMessage({ success: true, url });
+  } catch (err) {
+    console.error('[SW] handlePrefetchAudio error:', err);
     port?.postMessage({ success: false, error: err.message });
   }
 }
@@ -257,7 +284,7 @@ self.addEventListener('fetch', e => {
 // ---------- lifecycle ----------
 
 self.addEventListener('install', e => {
-  console.log('[SW] 4.6.2 installing');
+  console.log('[SW] 4.6.3 installing');
   e.waitUntil(
     caches.open(SHELL_CACHE)
       .then(cache => cacheShellResources(cache))
@@ -270,7 +297,7 @@ self.addEventListener('install', e => {
 });
 
 self.addEventListener('activate', e => {
-  console.log('[SW] 4.6.2 activating');
+  console.log('[SW] 4.6.3 activating');
   e.waitUntil(
     caches.keys().then(names =>
       Promise.all(
@@ -314,7 +341,13 @@ self.addEventListener('message', e => {
         .catch(() => e.ports[0]?.postMessage({ updateAvailable: false }));
       break;
 
+    // FIXED: PREFETCH_AUDIO now has its own handler instead of falling through
+    // to handleGeolocationRequest, which caused the JSON parse error when the
+    // client sent an audio URL or file content instead of a locations array.
     case 'PREFETCH_AUDIO':
+      handlePrefetchAudio(data, e.ports?.[0]);
+      break;
+
     case 'GEOLOCATION':
       handleGeolocationRequest(data, e.ports?.[0]);
       break;
@@ -333,4 +366,4 @@ self.addEventListener('unhandledrejection', e => {
   e.preventDefault();
 });
 
-console.log('[SW] 4.6.2 ready (resilient install)');
+console.log('[SW] 4.6.3 ready (resilient install)');
