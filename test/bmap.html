@@ -1935,12 +1935,13 @@ class EnterpriseBackgroundSync {
         map.setView([lat, lng], map.getZoom(), { animate: false, reset: false, pan: { noMoveStart: true } });
     }
 
-    function _seedVelocityOnResume() {
-        if (!window.sensorFusion || !_lastGoodSpeedMPS || _lastHeadingDeg == null) return;
-        const kf = window.sensorFusion._kalmanFilter;
-        if (!kf || kf.x === null || _lastGoodSpeedMPS < 0.3) return;
-        const rad = _lastHeadingDeg * Math.PI / 180;
-        kf.seedVelocity(_lastGoodSpeedMPS * Math.cos(rad), _lastGoodSpeedMPS * Math.sin(rad), 2.0);
+    function _snapViewport(lat, lng) {
+        if (!map) return;
+        const c  = map.getCenter();
+        const dN = (lat - c.lat) * 111111;
+        const dE = (lng - c.lng) * 111111 * Math.cos(lat * Math.PI / 180);
+        if (Math.sqrt(dN * dN + dE * dE) < CFG.CENTERED_DEADBAND_M) return;
+        map.setView([lat, lng], map.getZoom(), { animate: false, reset: false, pan: { noMoveStart: true } });
     }
 
     function frame(now) {
@@ -3207,102 +3208,111 @@ function updateAccuracyIndicator(accuracy) {
 /* ──────────────────────────────────────────────
    POSITION UPDATE HANDLER
    ────────────────────────────────────────────── */
-    function handlePositionUpdate(position) {
-        if (!position?.coords ||
-            isNaN(position.coords.latitude) ||
-            isNaN(position.coords.longitude)) {
+  function handlePositionUpdate(position) {
+    if (!position?.coords ||
+        isNaN(position.coords.latitude) ||
+        isNaN(position.coords.longitude)) {
+        return;
+    }
+
+    // Defer if the Kalman filter is still backfilling warm-start history.
+    // Letting a live fix interleave with backfill can invert timestamp
+    // order inside kf.update(), which forces an unwanted reinitialization
+    // and causes the position to snap backward (rubber-banding).
+    if (window._kalmanBackfilling) {
+        window._pendingGPSDuringBackfill = position;
+        return;
+    }
+
+    const positionTimestamp = position.timestamp || Date.now();
+    const currentTime = Date.now();
+
+    // Discard stale fixes (> 30 seconds old)
+    if (currentTime - positionTimestamp > 30_000) return;
+
+    // Background throttle: one fix per 30s when tab is hidden
+    if (document.hidden) {
+        if (!window._lastBackgroundUpdate || currentTime - window._lastBackgroundUpdate > 30_000) {
+            window._lastBackgroundUpdate = currentTime;
+        } else {
             return;
         }
-    
-        const positionTimestamp = position.timestamp || Date.now();
-        const currentTime = Date.now();
-    
-        // Discard stale fixes (> 30 seconds old)
-        if (currentTime - positionTimestamp > 30_000) return;
-    
-        // Background throttle: one fix per 30s when tab is hidden
-        if (document.hidden) {
-            if (!window._lastBackgroundUpdate || currentTime - window._lastBackgroundUpdate > 30_000) {
-                window._lastBackgroundUpdate = currentTime;
-            } else {
-                return;
-            }
-        }
-    
-        const rawLat = position.coords.latitude;
-        const rawLng = position.coords.longitude;
-        const rawAccuracy = position.coords.accuracy || 20;
-        
-        const rawSpeedMPS = (position.coords.speed != null && isFinite(position.coords.speed))
+    }
+
+    const rawLat = position.coords.latitude;
+    const rawLng = position.coords.longitude;
+    const rawAccuracy = position.coords.accuracy || 20;
+
+    const rawSpeedMPS = (position.coords.speed != null && isFinite(position.coords.speed))
         ? Math.max(0, position.coords.speed)
         : null;
-        
-        const rawHeading = position.coords.heading ?? null;
-    
-        let fusedLat = rawLat;
-        let fusedLng = rawLng;
-        let fusedHeading = rawHeading;
-        let isMoving = rawSpeedMPS != null ? rawSpeedMPS > 0.5 : false;
-    
-        if (window.sensorFusion) {
-            // Pre-boost Kalman velocity variance if the device
-            // just started moving from a stationary state. Without this,
-            // smoothPosition() processes the fix with low velocity variance
-            // (from the stationary period), causing the filter to resist
-            // tracking the new movement for an entire GPS cycle (~1s).
-            if (window.isStationary && window.sensorFusion.isDeviceMoving(rawSpeedMPS ?? 0.8)) {
-                const kf = window.sensorFusion._kalmanFilter;
-                if (kf && kf.P && kf.x) {
-                    kf.P[2][2] = 225;
-                    kf.P[3][3] = 225;
-                    kf.P[0][2] = 0; kf.P[2][0] = 0;
-                    kf.P[1][3] = 0; kf.P[3][1] = 0;
-                }
+
+    const rawHeading = position.coords.heading ?? null;
+
+    let fusedLat = rawLat;
+    let fusedLng = rawLng;
+    let fusedHeading = rawHeading;
+    let isMoving = rawSpeedMPS != null ? rawSpeedMPS > 0.5 : false;
+
+    if (window.sensorFusion) {
+        // Pre-boost Kalman velocity variance if the device
+        // just started moving from a stationary state. Without this,
+        // smoothPosition() processes the fix with low velocity variance
+        // (from the stationary period), causing the filter to resist
+        // tracking the new movement for an entire GPS cycle (~1s).
+        if (window.isStationary && window.sensorFusion.isDeviceMoving(rawSpeedMPS ?? 0.8)) {
+            const kf = window.sensorFusion._kalmanFilter;
+            if (kf && kf.P && kf.x) {
+                kf.P[2][2] = 225;
+                kf.P[3][3] = 225;
+                kf.P[0][2] = 0; kf.P[2][0] = 0;
+                kf.P[1][3] = 0; kf.P[3][1] = 0;
             }
-    
-            const smoothed = window.sensorFusion.smoothPosition(
-                rawLat, rawLng, rawAccuracy, positionTimestamp,
-                rawSpeedMPS, (rawSpeedMPS != null && rawSpeedMPS >= 0.5) ? rawHeading : null
-            );
-            fusedLat = smoothed.lat;
-            fusedLng = smoothed.lng;
-            fusedHeading = window.sensorFusion.getHeading(rawHeading, rawSpeedMPS);
-            isMoving = window.sensorFusion.isDeviceMoving(rawSpeedMPS);
         }
-    
-        window.lastPositionAccuracy = rawAccuracy;
-        window.lastValidPosition = {
-            lat: fusedLat,
-            lng: fusedLng,
-            timestamp: positionTimestamp,
-            accuracy: rawAccuracy,
-            speedMPS: rawSpeedMPS,
-            heading: fusedHeading,
-            isMoving
-        };
-    
-        if (window.lastUpdateTime) {
-            window.timeSinceLastUpdate = currentTime - window.lastUpdateTime;
-        }
-        window.lastUpdateTime = currentTime;
-    
-        const enhancedPosition = {
-            timestamp: positionTimestamp,
-            coords: {
-                latitude: fusedLat,
-                longitude: fusedLng,
-                accuracy: rawAccuracy,
-                altitude: position.coords.altitude,
-                altitudeAccuracy: position.coords.altitudeAccuracy,
-                heading: fusedHeading,
-                speed: rawSpeedMPS
-            }
-        };
-    
-        // Force update at high speed so map keeps up
-        const forceUpdate = rawSpeedMPS > 10;
-        updateUserLocation(enhancedPosition, forceUpdate);
+
+        const smoothed = window.sensorFusion.smoothPosition(
+            rawLat, rawLng, rawAccuracy, positionTimestamp,
+            rawSpeedMPS, (rawSpeedMPS != null && rawSpeedMPS >= 0.5) ? rawHeading : null
+        );
+        fusedLat = smoothed.lat;
+        fusedLng = smoothed.lng;
+        fusedHeading = window.sensorFusion.getHeading(rawHeading, rawSpeedMPS);
+        isMoving = window.sensorFusion.isDeviceMoving(rawSpeedMPS);
     }
+
+    window.lastPositionAccuracy = rawAccuracy;
+    window.lastValidPosition = {
+        lat: fusedLat,
+        lng: fusedLng,
+        timestamp: positionTimestamp,
+        accuracy: rawAccuracy,
+        speedMPS: rawSpeedMPS,
+        heading: fusedHeading,
+        isMoving
+    };
+
+    if (window.lastUpdateTime) {
+        window.timeSinceLastUpdate = currentTime - window.lastUpdateTime;
+    }
+    window.lastUpdateTime = currentTime;
+
+    const enhancedPosition = {
+        timestamp: positionTimestamp,
+        coords: {
+            latitude: fusedLat,
+            longitude: fusedLng,
+            accuracy: rawAccuracy,
+            altitude: position.coords.altitude,
+            altitudeAccuracy: position.coords.altitudeAccuracy,
+            heading: fusedHeading,
+            speed: rawSpeedMPS
+        }
+    };
+
+    // Force update at high speed so map keeps up
+    const forceUpdate = rawSpeedMPS > 10;
+    updateUserLocation(enhancedPosition, forceUpdate);
+}
         
 /* ──────────────────────────────────────────────
    VISIBILITY CHANGE HANDLER
@@ -4033,11 +4043,12 @@ function _handleInactivityReset() {
     const pos   = window.lastPosition;
     const speed = pos ? pos.speedMPS * 2.23694 : 0;
 
-    if (pos && speed < 0.5 && map && userMarker) {
-        // Re-enable following BEFORE panning so the GPS loop picks it up immediately
-        window.followUser       = true;
-        window.isMapInteracting = false;
+    // Always release the lock — 30 seconds of no map interaction means
+    // the user wants tracking back, regardless of current speed.
+    window.followUser       = true;
+    window.isMapInteracting = false;
 
+    if (pos && speed < 0.5 && map && userMarker) {
         map.panTo([pos.lat, pos.lng], {
             animate:       true,
             duration:      1.0,
