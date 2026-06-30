@@ -1811,8 +1811,8 @@ class EnterpriseBackgroundSync {
     const CFG = {
         MIN_DT_MS:            16,
         MIN_SPEED_MPS:        0.05,
-        MAX_PREDICT_HORIZON:  2.8,
-        LOW_SPEED_CUTOFF_MPS: 0.4,   
+        MAX_PREDICT_HORIZON:  3.2,    // was 2.8 — modest increase
+        LOW_SPEED_CUTOFF_MPS: 0.15,   // was 0.4 — engages DR closer to actual walking pace
         HEADING_CHANGE_CAP:   25.0,
         INTERACTION_FADE_MS:  250,
         CENTERED_DEADBAND_M:  0.25,
@@ -1842,7 +1842,7 @@ class EnterpriseBackgroundSync {
     let _centeredLat = null;
     let _centeredLng = null;
 
-    // NEW: Grace period tracking. When DR starts via pre-arm, we stay alive
+    // Grace period tracking. When DR starts via pre-arm, we stay alive
     // for PRE_ARM_GRACE_MS even at zero speed. This eliminates the cold-start
     // lag when a stationary user begins walking.
     let _preArmExpiry = 0;
@@ -1861,20 +1861,28 @@ class EnterpriseBackgroundSync {
                   (ModeManager.isCentered?.() || ModeManager.isPendingCentered?.()));
     }
 
+    // Predict-horizon table. Values raised ~25-30% from the originals to
+    // close the gap between GPS update cadence (~1s) and how far DR
+    // extrapolates at city/highway speeds, without overshooting far
+    // enough to create visible snapback on turns. If real-world testing
+    // (esp. turns/lane changes at 25-35mph) shows residual choppiness,
+    // raise these incrementally — small steps, re-test each time, rather
+    // than jumping straight to multi-second horizons.
     function _getPredictHorizon(speedMPS, headingChangeDegPerSec) {
         let h;
-        if      (speedMPS < 0.5)  h = 0.0;
-        else if (speedMPS < 1.5)  h = 0.2;   
-        else if (speedMPS < 3.0)  h = 0.9;
-        else if (speedMPS < 8.0)  h = 1.4;
-        else if (speedMPS < 15.0) h = 1.8;
-        else if (speedMPS < 25.0) h = 2.5;
-        else                      h = 2.8;
-    
+        if      (speedMPS < 0.5)  h = 0.0;   // stationary: no prediction
+        else if (speedMPS < 1.5)  h = 0.35;  // slow walk (was 0.2)
+        else if (speedMPS < 3.0)  h = 1.1;   // brisk walk (was 0.9)
+        else if (speedMPS < 8.0)  h = 1.8;   // jog/bike (was 1.4)
+        else if (speedMPS < 15.0) h = 2.2;   // city driving (was 1.8)
+        else if (speedMPS < 25.0) h = 2.8;   // highway (was 2.5)
+        else                      h = 3.2;   // fast highway (was 2.8)
+
         const turnFactor = Math.min(1.0, headingChangeDegPerSec / CFG.HEADING_CHANGE_CAP);
         h *= (1.0 - turnFactor * 0.6);
-    
-        const safetyCap = speedMPS > 20 ? 200 / speedMPS : (speedMPS > 0 ? 150 / speedMPS : CFG.MAX_PREDICT_HORIZON);
+
+        // Safety cap raised proportionally with the horizon bump above.
+        const safetyCap = speedMPS > 20 ? 250 / speedMPS : (speedMPS > 0 ? 200 / speedMPS : CFG.MAX_PREDICT_HORIZON);
         return Math.max(0, Math.min(h, safetyCap, CFG.MAX_PREDICT_HORIZON));
     }
 
@@ -1889,10 +1897,6 @@ class EnterpriseBackgroundSync {
 
     function _setMarkerPosition(lat, lng) {
         if (typeof userMarker === 'undefined' || !userMarker) return;
-        // DR runs inside its own rAF frame already — call scheduleMarkerUpdate
-        // so GPS and DR writes are coalesced through the same pending slot.
-        // The _drOwnsMarker flag tells scheduleMarkerUpdate to accept this write
-        // unconditionally and causes GPS writes to be dropped until DR releases.
         window._drOwnsMarker = true;
         if (typeof scheduleMarkerUpdate === 'function') {
             scheduleMarkerUpdate(lat, lng);
@@ -1958,16 +1962,8 @@ class EnterpriseBackgroundSync {
         const stationary = _isStationary();
         const centered   = _isCenteredMode();
 
-        // FIXED: Grace-period check replaces the broken preArmed flag check.
-        // The pre-arm flag is consumed in start(), so we track its effect via
-        // _preArmExpiry. This keeps DR alive for PRE_ARM_GRACE_MS after a
-        // pre-armed start, even if the user is stationary. Once the user moves
-        // or the grace expires, normal stationary rules apply.
         const inGrace = now < _preArmExpiry;
 
-        // Shutdown: only if not centered, actually stationary, below min speed,
-        // AND not in the pre-arm grace period. The grace period ensures DR is
-        // already warm when a stationary user begins walking.
         if (!centered && stationary && speedMPS < CFG.MIN_SPEED_MPS && !inGrace) {
             _active = false;
             return;
@@ -2051,9 +2047,6 @@ class EnterpriseBackgroundSync {
             _preArmExpiry = _now() + CFG.PRE_ARM_GRACE_MS;
         }
     
-        // If restarting after a long gap (background tab, screen off), the last
-        // predicted position is stale. Invalidate it so the first frame uses the
-        // fresh GPS position instead of snapping to where DR left off.
         const gapMs = _now() - _lastFrameTime;
         if (gapMs > 5000) {
             _lastPredictedPos = null;
@@ -2068,8 +2061,6 @@ class EnterpriseBackgroundSync {
     window.deadReckoning = {
         start() {
             _start();
-            // Consume the pre-arm flag so it only applies once. The grace
-            // period is already captured in _preArmExpiry inside _start().
             if (window._drPreArmed) window._drPreArmed = false;
         },
 
@@ -2081,23 +2072,19 @@ class EnterpriseBackgroundSync {
             _centeredLat = null;
             _centeredLng = null;
             _preArmExpiry = 0;
-            window._drOwnsMarker = false;   // ← release marker back to GPS
+            window._drOwnsMarker = false;
             const el = _getMarkerEl();
             if (el) { el.style.willChange = ''; el.style.transition = ''; _markerTransSet = false; }
         },
 
         isActive() { return _active; },
 
-        // Called by the GPS pipeline when movement is detected after a gap.
-        // Ensures DR is running if it had shut down during a long stationary period.
         onMovementResumed: _start,
 
         getPredictedPosition()  { return _lastPredictedPos; },
         invalidateMarkerCache() { _markerEl = null; _markerTransSet = false; }
     };
 
-    // Auto-start on load if conditions allow. This catches the case where the
-    // user is already moving when the script loads.
     _start();
 
     if (typeof memoryManager !== 'undefined' && memoryManager?.registerCleanupTask) {
@@ -3320,44 +3307,64 @@ function updateAccuracyIndicator(accuracy) {
 /* ──────────────────────────────────────────────
    VISIBILITY CHANGE HANDLER
    ────────────────────────────────────────────── */
-    function handleVisibilityChange() {
+   function handleVisibilityChange() {
         if (document.hidden) {
             // Tab/app going to background
             window.lastHiddenTime = Date.now();
             lastKnownPosition = userMarker?.getLatLng() ?? null;
             resetInactivityTimer(false);
-    
-            disposeMapLoop();
+
             window.isReWaking = false;
-    
+
             if (window.visibilityDebounceTimer) {
                 clearTimeout(window.visibilityDebounceTimer);
                 window.visibilityDebounceTimer = null;
             }
+
+            // Don't dispose immediately — a quick tab switch shouldn't
+            // tear down the map loop. Instead, schedule disposal for
+            // 2 minutes out; if the user returns before then, this
+            // timer gets cancelled in the foreground branch below.
+            if (window._disposeMapLoopTimer) {
+                clearTimeout(window._disposeMapLoopTimer);
+                window._disposeMapLoopTimer = null;
+            }
+            window._disposeMapLoopTimer = createTrackedTimeout(() => {
+                window._disposeMapLoopTimer = null;
+                disposeMapLoop();
+            }, 120000);
+
         } else {
             // Tab/app returning to foreground
+
+            // Cancel pending disposal — we're back before it fired
+            if (window._disposeMapLoopTimer) {
+                clearTimeout(window._disposeMapLoopTimer);
+                window._disposeMapLoopTimer = null;
+            }
+
             const awayMs = Date.now() - (window.lastHiddenTime || 0);
             const threshold = CONFIG?.BACKGROUND_THRESHOLD ?? 30_000;
-    
+
             // Cancel any pending debounce
             if (window.visibilityDebounceTimer) {
                 clearTimeout(window.visibilityDebounceTimer);
                 window.visibilityDebounceTimer = null;
             }
-    
+
             if (awayMs > threshold) {
                 // Debounce to handle rapid tab switches
                 window.visibilityDebounceTimer = createTrackedTimeout(() => {
                     window.visibilityDebounceTimer = null;
-    
+
                     // Recalculate time away to ensure freshness
                     const currentAwayMs = Date.now() - (window.lastHiddenTime || 0);
                     if (currentAwayMs <= threshold) return;
-    
+
                     if (window.isReWaking) return;
-    
+
                     window.isReWaking = true;
-    
+
                     Promise.resolve(updateLocationAfterBackground())
                         .catch((error) => {
                             console.error("Background location update failed:", error);
@@ -3376,17 +3383,16 @@ function updateAccuracyIndicator(accuracy) {
             resetInactivityTimer(true);
         }
     }
-
 /* ──────────────────────────────────────────────
    BACKGROUND LOCATION UPDATE
    ────────────────────────────────────────────── */
-    let geolocationRequestPending = false;
+   let geolocationRequestPending = false;
     let warmupWatchId = null;
     let _backgroundUpdateTimeout = null;
-    
+
     function updateLocationAfterBackground() {
         window.lastHiddenTime = window.lastHiddenTime || Date.now();
-    
+
         // Don't refresh if we recently got a background update
         const timeSinceLastBg = Date.now() - (window._lastBackgroundUpdate || 0);
         if (timeSinceLastBg < 30_000 && window.lastPosition) {
@@ -3396,45 +3402,51 @@ function updateAccuracyIndicator(accuracy) {
             }
             return;
         }
-    
+
         if (window._isLocationUpdateInProgress) return;
-    
+
         if (!("geolocation" in navigator)) return;
-    
+
         window._isLocationUpdateInProgress = true;
-    
-        // Only dispose map loop if away longer than 30s
+
+        // Only dispose map loop if away longer than 2 minutes (was 30s).
+        // Short backgrounding (e.g. quick app-switch) shouldn't tear down
+        // the render loop — that's what was causing part of the resume lag.
         const awayMs = Date.now() - (window.lastHiddenTime || 0);
-        if (awayMs > 30000) {
+        if (awayMs > 120000) {
             disposeMapLoop();
         }
-    
-        // Reset stale speed averages after long background absence
+
+        // Reset stale speed averages after a long background absence.
+        // Kalman filter itself is only hard-reset past 300s, matching
+        // _handleGPSGap's own gap threshold — for gaps under that,
+        // _handleGPSGap will seed velocity from the position delta on
+        // the next fix instead of starting the filter from scratch.
         if (awayMs > 10000) {
             window._modeSpeedEMA = undefined;
             window._visualSpeedEMA = undefined;
             window._proxSpeedEMA = null;
-            if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
+            if (awayMs > 300000 && window.sensorFusion && window.sensorFusion._kalmanFilter) {
                 window.sensorFusion._kalmanFilter.reset();
             }
         }
-    
+
         // Clean up any existing watch
         if (warmupWatchId !== null) {
             navigator.geolocation.clearWatch(warmupWatchId);
             warmupWatchId = null;
         }
-    
+
         // Clear any existing timeout
         if (_backgroundUpdateTimeout) {
             clearTimeout(_backgroundUpdateTimeout);
             _backgroundUpdateTimeout = null;
         }
-    
+
         geolocationRequestPending = true;
         const startTime = Date.now();
         const MAX_DURATION = 30000;
-    
+
         const cleanup = () => {
             geolocationRequestPending = false;
             if (warmupWatchId !== null) {
@@ -3447,29 +3459,29 @@ function updateAccuracyIndicator(accuracy) {
             }
             window._isLocationUpdateInProgress = false;
         };
-    
+
         // ── Retry Modal (CSS-driven) ──
         const showRetryModal = () => {
             if (document.getElementById('geolocation-retry-modal')) return;
-    
+
             const overlay = document.createElement('div');
             overlay.id = 'geolocation-retry-modal';
             overlay.className = 'geo-retry-overlay';
             overlay.setAttribute('role', 'dialog');
             overlay.setAttribute('aria-modal', 'true');
             overlay.setAttribute('aria-label', 'Location retry');
-    
+
             const card = document.createElement('div');
             card.className = 'geo-retry-card';
-    
+
             const title = document.createElement('div');
             title.className = 'geo-retry-title';
             title.textContent = 'Location Needed';
-    
+
             const text = document.createElement('p');
             text.className = 'geo-retry-text';
             text.innerHTML = 'We\'re still locating your device.<br>Please ensure location services are enabled, and try again.';
-    
+
             const retryBtn = document.createElement('button');
             retryBtn.className = 'geo-retry-btn';
             retryBtn.textContent = '↻ Try Again';
@@ -3477,16 +3489,16 @@ function updateAccuracyIndicator(accuracy) {
                 overlay.remove();
                 updateLocationAfterBackground();
             });
-    
+
             const closeBtn = document.createElement('button');
             closeBtn.className = 'geo-retry-cancel';
             closeBtn.textContent = 'Cancel';
             closeBtn.addEventListener('click', () => { overlay.remove(); });
-    
+
             overlay.addEventListener('click', (e) => {
                 if (e.target === overlay) overlay.remove();
             });
-    
+
             card.appendChild(title);
             card.appendChild(text);
             card.appendChild(retryBtn);
@@ -3494,12 +3506,12 @@ function updateAccuracyIndicator(accuracy) {
             overlay.appendChild(card);
             document.body.appendChild(overlay);
         };
-    
+
         const safeToShowModal = () => {
             const speedMPH = (window.lastPosition?.speedMPS || 0) * 2.23694;
             return speedMPH < 5;
         };
-    
+
         // ── Handle successful position acquisition
         const onPositionSuccess = (position) => {
             const coords = position?.coords;
@@ -3510,19 +3522,19 @@ function updateAccuracyIndicator(accuracy) {
                 coords.accuracy <= 0) {
                 return;
             }
-    
+
             if (Date.now() - position.timestamp > 30000) return;
-    
+
             // Cleanup immediately on success — this clears the timeout too
             cleanup();
-    
+
             window._lastBackgroundUpdate = Date.now();
-    
+
             const { latitude, longitude } = coords;
-    
+
             const currentCenter = map.getCenter();
             const distanceMoved = currentCenter.distanceTo([latitude, longitude]);
-    
+
             if (distanceMoved < 5) {
                 // Small movement — just update
                 updateUserLocation(position, true);
@@ -3533,12 +3545,12 @@ function updateAccuracyIndicator(accuracy) {
                 }
                 return;
             }
-    
+
             // Significant movement — full reset
             requestAnimationFrame(() => {
                 try {
                     const currentZoom = map.getZoom();
-    
+
                     window.lastPosition = null;
                     if (window.positionBuffer) window.positionBuffer.length = 0;
                     if (window.lastVelocity) window.lastVelocity = { lat: 0, lng: 0 };
@@ -3546,14 +3558,14 @@ function updateAccuracyIndicator(accuracy) {
                     window.stationaryStartTime = null;
                     window.stationaryCount = 0;
                     window.lastUpdateTime = Date.now();
-    
+
                     updateUserLocation(position, true);
                     map.setView([latitude, longitude], currentZoom, {
                         animate: false,
                         duration: 0,
                         noMoveStart: true
                     });
-    
+
                     if (typeof isSignificantMovement === 'function' &&
                         isSignificantMovement({ lat: latitude, lng: longitude })) {
                         if (typeof resetInactivityTimer === 'function') resetInactivityTimer(false);
@@ -3564,23 +3576,64 @@ function updateAccuracyIndicator(accuracy) {
                 }
             });
         };
-    
+
         const onPositionError = (error) => {
             console.warn("Geolocation error:", error.message, "Code:", error.code);
             // Don't cleanup here — let the timeout handle it
         };
-    
-        // Start watching for position
-        warmupWatchId = navigator.geolocation.watchPosition(
-            onPositionSuccess,
-            onPositionError,
+
+        // Helper to start the continuous watch (Phase 2). Defined as a
+        // named function so both the getCurrentPosition success path and
+        // its error path can fall through to the same watch setup.
+        const startWatch = () => {
+            if (warmupWatchId !== null) {
+                navigator.geolocation.clearWatch(warmupWatchId);
+            }
+            warmupWatchId = navigator.geolocation.watchPosition(
+                onPositionSuccess,
+                onPositionError,
+                {
+                    enableHighAccuracy: true,
+                    timeout: 25000,
+                    maximumAge: 10000
+                }
+            );
+        };
+
+        // ── PHASE 1: try to get an immediate fix, accepting a cache up
+        // to 30s old. This is what eliminates the multi-second blank
+        // window on resume — if the OS/browser has a recent fix handy,
+        // it returns near-instantly instead of waiting for a fresh
+        // watchPosition tick.
+        //
+        // NOTE: maximumAge here is intentionally 30000, not 60000 — at
+        // driving speeds a 60s-old cached fix can be 500m+ stale and
+        // would visibly snap. 30s caps that to a more tolerable error
+        // and still gets most of the latency win.
+        navigator.geolocation.getCurrentPosition(
+            (position) => {
+                onPositionSuccess(position);
+                // onPositionSuccess calls cleanup(), which clears
+                // geolocationRequestPending and any pending watch.
+                // Start Phase 2 regardless so we keep getting fresh
+                // fixes after displaying the cached one.
+                window._isLocationUpdateInProgress = true;
+                geolocationRequestPending = true;
+                startWatch();
+            },
+            (error) => {
+                // No cached fix available / failed — fall back to the
+                // watch-only path exactly as before.
+                console.warn('[Background] getCurrentPosition failed, falling back to watch:', error.message);
+                startWatch();
+            },
             {
                 enableHighAccuracy: true,
-                timeout: 25000,
-                maximumAge: 10000
+                timeout: 5000,
+                maximumAge: 30000
             }
         );
-    
+
         // Timeout handler — tracked so it's cleaned up on page unload
         _backgroundUpdateTimeout = createTrackedTimeout(() => {
             if (geolocationRequestPending) {
