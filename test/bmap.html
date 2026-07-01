@@ -1399,7 +1399,12 @@ class EnterpriseBackgroundSync {
         }
     
         getCurrentStateAgeMs() {
-            const lastTime = this._lastKalmanTimestamp || this._rawTimestamp || 0;
+            // _lastKalmanTimestamp is already in performance.now() space, but
+            // _rawTimestamp is a wall-clock (Date.now()-based) timestamp from the
+            // Geolocation API and must be converted before comparing against
+            // performance.now() — otherwise this mixes two different epochs and
+            // returns a nonsense (usually hugely negative) value.
+            const lastTime = this._lastKalmanTimestamp || (this._rawTimestamp ? this._toPerfNow(this._rawTimestamp) : 0);
             return lastTime ? (performance.now() - lastTime) : 0;
         }
     
@@ -1712,6 +1717,12 @@ class EnterpriseBackgroundSync {
             if (isStationary && this._stationaryPosition) {
                 resultLat = this._stationaryPosition.lat; resultLng = this._stationaryPosition.lng;
                 resultVNorth = 0; resultVEast = 0; resultSpeed = 0; blendFactor = 1.0;
+                // Keep the externally-visible filtered speed consistent with the
+                // frozen/stationary result — otherwise getFilteredSpeedMPS() can
+                // keep reporting a lingering nonzero Kalman speed estimate while
+                // the position itself is frozen, which callers (e.g. the dead
+                // reckoning loop) use as a signal that we're still moving.
+                this._filteredSpeedMPS = 0;
             } else if (this._convergenceStage === 0) {
                 resultLat = rawLat; resultLng = rawLng;
                 const cosLatRaw = Math.cos(rawLat * Math.PI / 180);
@@ -1865,6 +1876,21 @@ const CFG = {
                   (ModeManager.isCentered?.() || ModeManager.isPendingCentered?.()));
     }
 
+    // Primes the "last good velocity" cache from the current sensor reading whenever
+    // dead reckoning (re)starts. Without this, the very first predicted frame after a
+    // resume (or the first frame ever, on page load) has no fallback to lean on if
+    // the smoothed velocity from sensorFusion happens to be zero/degenerate for a tick,
+    // which is what _runFrame's fallback logic below relies on.
+    function _seedVelocityOnResume() {
+        const vel = _getVelocity();
+        const speedMPS = _getSpeedMPS();
+        const vm = Math.sqrt(vel.lat * vel.lat + vel.lng * vel.lng);
+        if (vm > 0.001) {
+            _lastGoodVelocity = { lat: vel.lat, lng: vel.lng };
+            _lastGoodSpeedMPS = speedMPS;
+        }
+    }
+
     function _getPredictHorizon(speedMPS, headingChangeDegPerSec) {
         let h;
         if      (speedMPS < 0.5)  h = 0.0;
@@ -2005,7 +2031,19 @@ const CFG = {
 
         const vel = _getVelocity();
         const vm = Math.sqrt(vel.lat*vel.lat + vel.lng*vel.lng);
-        if (vm > 0.001) { _lastGoodVelocity = { lat: vel.lat, lng: vel.lng }; _lastGoodSpeedMPS = speedMPS; }
+
+        // Track the last known-good velocity, and fall back to it if this frame's
+        // reading is degenerate (e.g. a momentary sensorFusion glitch) while the
+        // device is still clearly moving. Previously this cache was written but
+        // never read, so a single bad reading would snap the predicted position
+        // back to the raw GPS point instead of continuing the smooth extrapolation.
+        let useVel = vel;
+        if (vm > 0.001) {
+            _lastGoodVelocity = { lat: vel.lat, lng: vel.lng };
+            _lastGoodSpeedMPS = speedMPS;
+        } else if (speedMPS >= CFG.LOW_SPEED_CUTOFF_MPS) {
+            useVel = _lastGoodVelocity;
+        }
 
         let pLat, pLng;
         const rawAge = Math.max(0, (now - oTs) / 1000);
@@ -2015,8 +2053,8 @@ const CFG = {
         if (pDt <= 0 || speedMPS < CFG.LOW_SPEED_CUTOFF_MPS || stationary) {
             pLat = oLat; pLng = oLng;
         } else {
-            pLat = oLat + vel.lat * pDt;
-            pLng = oLng + vel.lng * pDt;
+            pLat = oLat + useVel.lat * pDt;
+            pLng = oLng + useVel.lng * pDt;
             const jN = Math.abs(pLat - oLat) * 111111;
             const jE = Math.abs(pLng - oLng) * 111111 * Math.cos(oLat * Math.PI / 180);
             if (jN > 150 || jE > 150) { pLat = oLat; pLng = oLng; }
@@ -4766,37 +4804,39 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
 /**
  * Schedules a single coalesced requestAnimationFrame to pan the map.
  */
-     function _scheduleMapUpdate() {
-        window._mapUpdateGeneration = (window._mapUpdateGeneration || 0) + 1;
-        const myGeneration = window._mapUpdateGeneration;
-    
-        if (window._nextLocationUpdateRAF != null) return;
-    
-        window._nextLocationUpdateRAF = requestAnimationFrame(function executeMapUpdate() {
-            window._nextLocationUpdateRAF = null;
-    
-            const state = window._currentMapState;
-            if (!state) {
-                window.lastMapUpdateTime = performance.now();
-                return;
-            }
-    
-            let renderFailed = false;
-            try {
-                _executeRender(state);
-            } catch (err) {
-                console.warn('[_scheduleMapUpdate] render failed:', err);
-                // Reset generation so the next GPS update gets a clean slate
-                // instead of immediately re-queuing a frame that will also throw.
-                window._mapUpdateGeneration = myGeneration;
-                renderFailed = true;
-            }
-    
-            if (!renderFailed && window._mapUpdateGeneration !== myGeneration) {
-                window._nextLocationUpdateRAF = requestAnimationFrame(executeMapUpdate);
-            }
-        });
-    }
+   function _scheduleMapUpdate() {
+    window._mapUpdateGeneration = (window._mapUpdateGeneration || 0) + 1;
+
+    if (window._nextLocationUpdateRAF != null) return;
+
+    window._nextLocationUpdateRAF = requestAnimationFrame(function executeMapUpdate() {
+        window._nextLocationUpdateRAF = null;
+        // Snapshot fresh each time this callback actually runs — not the value
+        // captured back when _scheduleMapUpdate() was first invoked. Otherwise
+        // this comparison stays permanently "stale" after any coalescing race
+        // and the function reschedules itself forever, once per frame.
+        const generationAtStart = window._mapUpdateGeneration;
+
+        const state = window._currentMapState;
+        if (!state) {
+            window.lastMapUpdateTime = performance.now();
+            return;
+        }
+
+        let renderFailed = false;
+        try {
+            _executeRender(state);
+        } catch (err) {
+            console.warn('[_scheduleMapUpdate] render failed:', err);
+            window._mapUpdateGeneration = generationAtStart;
+            renderFailed = true;
+        }
+
+        if (!renderFailed && window._mapUpdateGeneration !== generationAtStart) {
+            window._nextLocationUpdateRAF = requestAnimationFrame(executeMapUpdate);
+        }
+    });
+}
 
 /* ═══════════════════════════════════════════════════════════════
    updateUserLocation  
