@@ -1709,6 +1709,7 @@ class SensorFusionManager {
 
 window.sensorFusion = new SensorFusionManager().init();
 
+
 /* ═══════════════════════════════════════════════════════════════
    DEAD RECKONING LOOP
    ═══════════════════════════════════════════════════════════════ */
@@ -2169,6 +2170,244 @@ window.sensorFusion = new SensorFusionManager().init();
 /* ═══════════════════════════════════════════════════════════════
    DEAD RECKONING LOOP
    ═══════════════════════════════════════════════════════════════ */
+;(function initDeadReckoning() {
+    'use strict';
+
+    const CFG = {
+        MIN_DT_MS:            16,
+        MIN_SPEED_MPS:        0.15,
+        MAX_PREDICT_HORIZON:  2.8,
+        LOW_SPEED_CUTOFF_MPS: 0.3,
+        HEADING_CHANGE_CAP:   25.0,
+        INTERACTION_FADE_MS:  250,
+        CENTERED_DEADBAND_M:  0.25,
+        DRIFT_THRESHOLD_LOW:  2.0,
+        DRIFT_THRESHOLD_HIGH: 10.0,
+        PAN_DURATION_BASE:    0.22,
+        PAN_DURATION_FAST:    0.10,
+        FREE_MIN_PAN_M:       4.0,
+    };
+
+    let _rafId             = null;
+    let _active            = false;
+    let _lastFrameTime     = 0;
+    let _lastGoodVelocity  = { lat: 0, lng: 0 };
+    let _lastGoodSpeedMPS  = 0;
+    let _lastHeadingDeg    = null;
+    let _headingChangeRate = 0;
+    let _interactionEndTime = 0;
+    let _markerEl          = null;
+    let _markerTransSet    = false;
+    let _lastPredictedPos  = null;
+
+    let _panPending = false;
+    let _panTarget  = null;
+
+    let _panAnimStart      = 0;
+    let _panAnimDuration   = 0;
+    let _panAnimTargetLat  = null;
+    let _panAnimTargetLng  = null;
+
+    let _centeredLat = null;
+    let _centeredLng = null;
+
+    const _now = () => performance.now();
+
+    const _getSpeedMPS  = () => window.sensorFusion?.getFilteredSpeedMPS()          ?? (window.lastPosition?.speedMPS || 0);
+    const _getVelocity  = () => window.sensorFusion?.getSmoothedVelocityDegPerSec() ?? (window.smoothedVelocity || { lat: 0, lng: 0 });
+    const _getHeading   = () => window.sensorFusion?.getFilteredHeading()            ?? (window.lastPosition?.headingDeg || null);
+    const _getKalmanPos = () => window.sensorFusion?.getLastKalmanPosition()         ?? null;
+    const _getRawPos    = () => window.sensorFusion?.getLastRawPosition()            ?? (window.lastPosition || null);
+    const _isStationary = () => window.sensorFusion?._lastStationaryState            ?? window.isStationary;
+
+    function _isCenteredMode() {
+        return !!(window.followUser && typeof ModeManager !== 'undefined' && ModeManager.shouldTrackCentered?.());
+    }
+
+    function _getPredictHorizon(speedMPS, headingChangeDegPerSec) {
+        let h;
+        if      (speedMPS < 0.5)  h = 0.0;
+        else if (speedMPS < 1.5)  h = 0.5;
+        else if (speedMPS < 3.0)  h = 0.9;
+        else if (speedMPS < 8.0)  h = 1.4;
+        else if (speedMPS < 15.0) h = 1.8;
+        else if (speedMPS < 25.0) h = 2.5;
+        else                      h = 2.8;
+
+        const turnFactor = Math.min(1.0, headingChangeDegPerSec / CFG.HEADING_CHANGE_CAP);
+        h *= (1.0 - turnFactor * 0.6);
+
+        const safetyCap = speedMPS > 20 ? 200 / speedMPS : (speedMPS > 0 ? 150 / speedMPS : CFG.MAX_PREDICT_HORIZON);
+        return Math.max(0, Math.min(h, safetyCap, CFG.MAX_PREDICT_HORIZON));
+    }
+
+    function _getMarkerEl() {
+        if (_markerEl) return _markerEl;
+        if (typeof userMarker !== 'undefined' && userMarker) {
+            _markerEl = userMarker.getElement();
+            if (_markerEl && !_markerTransSet) { _markerEl.style.willChange = 'transform'; _markerTransSet = true; }
+        }
+        return _markerEl;
+    }
+
+    function _setMarkerPosition(lat, lng) {
+        if (typeof userMarker !== 'undefined' && userMarker) userMarker.setLatLng([lat, lng]);
+    }
+
+    function _getDriftThreshold(s) {
+        if (s < 0.3)  return CFG.DRIFT_THRESHOLD_LOW;
+        if (s < 1.5)  return 3.0;
+        if (s < 5.0)  return 5.0;
+        if (s < 15.0) return 7.0;
+        return CFG.DRIFT_THRESHOLD_HIGH;
+    }
+
+    function _getPanDuration(s) {
+        return s < 0.5 ? CFG.PAN_DURATION_BASE : s < 5.0 ? 0.18 : CFG.PAN_DURATION_FAST;
+    }
+
+    function _queueFreePan(lat, lng, duration) {
+        _panTarget = { lat, lng, duration };
+        if (!_panPending) { _panPending = true; requestAnimationFrame(_flushPan); }
+    }
+
+    function _flushPan() {
+        _panPending = false;
+        if (!_panTarget || !map) return;
+        const t = _panTarget;
+        _panTarget = null;
+
+        const dist = map.distance([map.getCenter().lat, map.getCenter().lng], [t.lat, t.lng]);
+        if (dist <= CFG.FREE_MIN_PAN_M) return;
+
+        const now = performance.now();
+        const animInProgress = map._panAnim && map._panAnim._inProgress;
+
+        if (animInProgress && _panAnimTargetLat !== null) {
+            const elapsedMs   = now - _panAnimStart;
+            const stillEasing = elapsedMs < _panAnimDuration * 1000 * 0.7;
+            const divergence  = map.distance([_panAnimTargetLat, _panAnimTargetLng], [t.lat, t.lng]);
+
+            if (stillEasing && divergence < CFG.FREE_MIN_PAN_M * 2) {
+                return;
+            }
+            try { map.stop(); } catch (_) {}
+        }
+
+        map.panTo([t.lat, t.lng], { animate: true, duration: t.duration, easeLinearity: 0.35, noMoveStart: true });
+        _panAnimStart     = now;
+        _panAnimDuration  = t.duration;
+        _panAnimTargetLat = t.lat;
+        _panAnimTargetLng = t.lng;
+    }
+
+    function _snapViewport(lat, lng) {
+        if (!map) return;
+        if (_centeredLat !== null) {
+            const dN = (lat - _centeredLat) * 111111;
+            const dE = (lng - _centeredLng) * 111111 * Math.cos(lat * Math.PI / 180);
+            if (Math.sqrt(dN*dN + dE*dE) < CFG.CENTERED_DEADBAND_M) return;
+        }
+        _centeredLat = lat; _centeredLng = lng;
+        map.setView([lat, lng], map.getZoom(), { animate: false, reset: false, pan: { noMoveStart: true } });
+    }
+
+    function _seedVelocityOnResume() {
+        if (!window.sensorFusion || !_lastGoodSpeedMPS || _lastHeadingDeg == null) return;
+        const kf = window.sensorFusion._kalmanFilter;
+        if (!kf || kf.x === null || _lastGoodSpeedMPS < 0.3) return;
+        const rad = _lastHeadingDeg * Math.PI / 180;
+        kf.seedVelocity(_lastGoodSpeedMPS * Math.cos(rad), _lastGoodSpeedMPS * Math.sin(rad), 2.0);
+    }
+
+    function frame(now) {
+        _rafId = null;
+
+        const lastPos = window.lastPosition;
+        if (!lastPos || window.isLocationHuntVisible) { _active = false; return; }
+
+        const speedMPS   = _getSpeedMPS();
+        const stationary = _isStationary();
+        const centered   = _isCenteredMode();
+
+        if (!centered && stationary && speedMPS < CFG.MIN_SPEED_MPS) { _active = false; return; }
+
+        const isInteracting = window.isMapInteracting || window._isProximityZoomAnimating || window._gpsCenteredPanJustOccurred;
+        if (isInteracting) {
+            _interactionEndTime = now + CFG.INTERACTION_FADE_MS;
+            _lastFrameTime = now;
+            _rafId = requestAnimationFrame(frame);
+            return;
+        }
+        if (now < _interactionEndTime) { _lastFrameTime = now; _rafId = requestAnimationFrame(frame); return; }
+
+        const dtMs = now - _lastFrameTime;
+        if (dtMs < CFG.MIN_DT_MS) { _rafId = requestAnimationFrame(frame); return; }
+        _lastFrameTime = now;
+
+        const kp = _getKalmanPos(), rp = _getRawPos();
+        let oLat, oLng, oTs;
+        if      (kp?.timestamp != null) { oLat = kp.lat; oLng = kp.lng; oTs = kp.timestamp; }
+        else if (rp?.timestamp != null) { oLat = rp.lat; oLng = rp.lng; oTs = rp.timestamp; }
+        else                            { oLat = lastPos.lat; oLng = lastPos.lng; oTs = window.lastUpdateTimestamp || now; }
+
+        const hdg = _getHeading();
+        if (_lastHeadingDeg != null && hdg != null) {
+            let d = hdg - _lastHeadingDeg;
+            if (d >  180) d -= 360;
+            if (d < -180) d += 360;
+            _headingChangeRate = _headingChangeRate * 0.85 + (Math.abs(d) / (Math.max(dtMs, 16) / 1000)) * 0.15;
+        }
+        if (hdg != null) _lastHeadingDeg = hdg;
+
+        const vel = _getVelocity();
+        const vm = Math.sqrt(vel.lat*vel.lat + vel.lng*vel.lng);
+        if (vm > 0.001) { _lastGoodVelocity = { lat: vel.lat, lng: vel.lng }; _lastGoodSpeedMPS = speedMPS; }
+
+        let pLat, pLng;
+        const rawAge = Math.max(0, (now - oTs) / 1000);
+        const hor    = _getPredictHorizon(speedMPS, _headingChangeRate);
+        const pDt    = Math.min(rawAge, hor);
+
+        if (pDt <= 0 || speedMPS < CFG.LOW_SPEED_CUTOFF_MPS || stationary) {
+            pLat = oLat; pLng = oLng;
+        } else {
+            pLat = oLat + vel.lat * pDt;
+            pLng = oLng + vel.lng * pDt;
+            const jN = Math.abs(pLat - oLat) * 111111;
+            const jE = Math.abs(pLng - oLng) * 111111 * Math.cos(oLat * Math.PI / 180);
+            if (jN > 150 || jE > 150) { pLat = oLat; pLng = oLng; }
+        }
+
+        _lastPredictedPos = { lat: pLat, lng: pLng };
+        _setMarkerPosition(pLat, pLng);
+
+        if (!map || window._isProximityZoomAnimating) { _rafId = requestAnimationFrame(frame); return; }
+
+        if (centered) {
+            _snapViewport(pLat, pLng);
+        } else if (window.followUser) {
+            const cc  = map.getCenter();
+            const tPx = map.latLngToContainerPoint([pLat, pLng]);
+            const cPx = map.latLngToContainerPoint(cc);
+            if (Math.hypot(tPx.x - cPx.x, tPx.y - cPx.y) > _getDriftThreshold(speedMPS)) {
+                _queueFreePan(pLat, pLng, _getPanDuration(speedMPS));
+            }
+        }
+
+        _rafId = requestAnimationFrame(frame);
+    }
+
+    function _start() {
+        if (_active || window.isLocationHuntVisible) return;
+        const speedMPS = _getSpeedMPS(), centered = _isCenteredMode();
+        if (!centered && speedMPS < CFG.MIN_SPEED_MPS) return;
+        if (!centered && window.isStationary && speedMPS < 0.8) return;
+        if (speedMPS >= CFG.MIN_SPEED_MPS) _seedVelocityOnResume();
+        _active = true; _lastFrameTime = _now(); _interactionEndTime = 0;
+        _rafId = requestAnimationFrame(frame);
+    }
+
     window.deadReckoning = {
         start() { _start(); },
 
@@ -2184,15 +2423,9 @@ window.sensorFusion = new SensorFusionManager().init();
 
         onMovementResumed: _start,
 
-        // Called by the GPS update path when a new fix arrives.
-        // Does NOT reset _centeredLat/Lng — that was the rubber-band source.
-        // The next frame will naturally pick up the new Kalman position and
-        // either pass the deadband check or write the new viewport position.
         forceUpdate() {
             if (!_active) { _start(); return; }
-            // Don't touch _interactionEndTime — a fresh fix should apply on the
-            // very next frame, not wait out the interaction fade.
-            _lastFrameTime = 0; // bypass MIN_DT_MS throttle so next frame applies immediately
+            _lastFrameTime = 0;
             if (_rafId == null) _rafId = requestAnimationFrame(frame);
         },
 
@@ -2205,7 +2438,7 @@ window.sensorFusion = new SensorFusionManager().init();
     if (typeof memoryManager !== 'undefined' && memoryManager?.registerCleanupTask) {
         memoryManager.registerCleanupTask(() => window.deadReckoning.stop());
     }
-)();
+})();
 
 /* ──────────────────────────────────────────────
    ENTERPRISE INIT
