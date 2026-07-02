@@ -1172,17 +1172,27 @@ class PositionKalmanFilter {
 
     _initialize(lat, lng, R, timestampPerfNow) {
         this.refLat = lat; this.refLng = lng;
-        this.x = [0, 0, 0, 0];
-        this.accelNoise = this._baseAccelNoise;
-        this._currentSpeedMPS = 0;
-        this._isFrozen = false; this._frozenPosition = null;
-        const R2 = R * R;
+     
         const hasVelocityHint = this._pendingSeedVelocity &&
             (Math.abs(this._pendingSeedVelocity.vNorth) > 0.1 || Math.abs(this._pendingSeedVelocity.vEast) > 0.1);
+     
+        this.x = hasVelocityHint
+            ? [0, 0, this._pendingSeedVelocity.vNorth, this._pendingSeedVelocity.vEast]
+            : [0, 0, 0, 0];
+     
+        this.accelNoise = this._baseAccelNoise;
+        this._currentSpeedMPS = hasVelocityHint
+            ? Math.sqrt(this._pendingSeedVelocity.vNorth ** 2 + this._pendingSeedVelocity.vEast ** 2)
+            : 0;
+        this._isFrozen = false; this._frozenPosition = null;
+     
+        const R2 = R * R;
         const v0 = hasVelocityHint ? 2.25 : (this._lastGPSSpeedMPS > 0.3 ? 0.5 : 225.0);
         this.P = [[R2,0,0,0],[0,R2,0,0],[0,0,v0,0],[0,0,0,v0]];
         this.lastTimestamp = timestampPerfNow;
         this._justInitialized = true;
+     
+        this._pendingSeedVelocity = null; // consumed here, not left for the next update() cycle
     }
 
     _updateAccelNoise() {
@@ -2769,13 +2779,19 @@ function initializeUserLocation(position) {
    GPS POWER MODE — shared utility
    ────────────────────────────────────────────── */
 function getWatchOptions() {
-    const speedMPH = (window.lastPosition?.speedMPS ?? 0) * 2.23694;
+    const speedMPH   = (window.lastPosition?.speedMPS ?? 0) * 2.23694;
     const stationary = window.isStationary || speedMPH < 0.3;
-    const driving = speedMPH >= 5 || (!window.isStationary && speedMPH >= 4);
-
+    const driving    = speedMPH >= 5 || (!window.isStationary && speedMPH >= 4);
+    const highSpeed  = speedMPH >= 45;
+ 
+    const maximumAge = stationary ? 2000
+                      : highSpeed  ? 0
+                      : driving    ? 250
+                      :              1000; // walking / low-speed transitional
+ 
     return {
         enableHighAccuracy: true,
-        maximumAge: driving ? 1000 : 2000,
+        maximumAge,
         timeout: stationary ? 20000 : driving ? 10000 : 15000,
     };
 }
@@ -4460,13 +4476,13 @@ function _runSensorFusion(fix, lastPos, timeDelta, forceUpdate) {
             vNorth: 0, vEast: 0
         };
     }
- 
+
     var kf = window.sensorFusion._kalmanFilter;
- 
+
     if (lastPos && !forceUpdate) {
         var jumpDist = calculateDistance(lastPos, fix);
         var dynamicThreshold = Math.max(50, fix.speedMPS * 3, fix.accuracy * 2.5);
- 
+
         if (jumpDist > dynamicThreshold) {
             if (kf) kf.reset();
             window.sensorFusion.smoothPosition(fix.lat, fix.lng, fix.accuracy,
@@ -4482,27 +4498,47 @@ function _runSensorFusion(fix, lastPos, timeDelta, forceUpdate) {
             };
         }
     }
- 
+
     var result = window.sensorFusion.smoothPosition(
         fix.lat, fix.lng, fix.accuracy,
         fix.timestamp, fix.speedMPS, fix.heading
     );
- 
+
+    // Guard against implausible speed jumps from measurement noise.
+    //
+    // Previously this branch returned null outright, which skipped
+    // _controlDeadReckoning entirely for that fix and left window.lastPosition
+    // / the marker un-updated. The threshold is TIGHTEST at low speed
+    // (accel > 25 under 3mph) — exactly the acceleration profile of pulling
+    // away from a stop — so the freeze was most likely at the one moment
+    // motion just started, and DR could miss its start trigger too, since
+    // _controlDeadReckoning(fusionResult) was never reached.
+    //
+    // Now: clamp the reported speed to the max plausible acceleration for
+    // this speed band instead of discarding the fix. The pipeline keeps
+    // moving every cycle — a genuinely noisy reading shows up as a bounded
+    // speed correction instead of an invisible stall.
     if (!result.isConverged && lastPos && timeDelta > 0 && timeDelta < 8) {
         var lastSpeed = (lastPos.speedMPS || 0);
         var accel = Math.abs(result.speedMPS - lastSpeed) / timeDelta;
         var speedMPH = result.speedMPS * 2.23694;
- 
-        if ((speedMPH < 3 && accel > 25) ||
-            (speedMPH < 8 && accel > 22) ||
-            (speedMPH < 15 && accel > 18) ||
-            (speedMPH < 45 && accel > 15) ||
-            (speedMPH < 80 && accel > 12) ||
-            (speedMPH >= 80 && accel > 10)) {
-            return null;
+
+        var maxAccel =
+            speedMPH < 3  ? 25 :
+            speedMPH < 8  ? 22 :
+            speedMPH < 15 ? 18 :
+            speedMPH < 45 ? 15 :
+            speedMPH < 80 ? 12 : 10;
+
+        if (accel > maxAccel) {
+            var maxDelta  = maxAccel * timeDelta;
+            var direction = result.speedMPS >= lastSpeed ? 1 : -1;
+            result = Object.assign({}, result, {
+                speedMPS: lastSpeed + direction * maxDelta
+            });
         }
     }
- 
+
     return result;
 }
  
