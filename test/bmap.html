@@ -1974,8 +1974,11 @@ function _getPredictHorizon(speedMPS, headingChangeDegPerSec) {
     
         const speedMPS   = _getSpeedMPS();
         const stationary = _isStationary();
-
-        if (stationary && speedMPS < CFG.MIN_SPEED_MPS) { _active = false; return; }
+        const centered   = _isCenteredMode();
+    
+        // Centered mode still keeps the loop alive while stationary, to hold
+        // the viewport lock. Roaming has no reason to keep running stationary.
+        if (!centered && stationary && speedMPS < CFG.MIN_SPEED_MPS) { _active = false; return; }
     
         const isInteracting = window.isMapInteracting || window._isProximityZoomAnimating || window._gpsCenteredPanJustOccurred;
         if (isInteracting) {
@@ -2033,7 +2036,7 @@ function _getPredictHorizon(speedMPS, headingChangeDegPerSec) {
             return;
         }
     
-        if (window.followUser && window.modeManager?.current === 'centered') {
+        if (window.followUser && centered) {
             // CENTERED MODE — the goal: marker hard-locked to the viewport
             // center, world slides underneath it.
             //
@@ -2066,26 +2069,15 @@ function _getPredictHorizon(speedMPS, headingChangeDegPerSec) {
 
     function _start() {
         if (_active || window.isLocationHuntVisible) return;
-        
-        const speedMPS = _getSpeedMPS();
-        const stationary = _isStationary();
-        
-        // ── MODE-INDEPENDENT START CONDITIONS ──
-        // Exact mirror of frame()'s exit condition. 
-        // If frame() is going to kill the loop on tick 1, don't even start it.
-        if (stationary && speedMPS < CFG.MIN_SPEED_MPS) return;
-        
-        // Seed velocity for smooth initial prediction
-        _seedVelocityOnResume();
-        
-        _active = true;
-        _lastFrameTime = performance.now(); // Use performance.now() to perfectly match RAF's `now` timestamp
-        _interactionEndTime = 0;
+        const speedMPS = _getSpeedMPS(), centered = _isCenteredMode();
+        if (!centered && speedMPS < CFG.MIN_SPEED_MPS) return;
+        if (!centered && window.isStationary && speedMPS < 0.8) return;
+        if (speedMPS >= CFG.MIN_SPEED_MPS) _seedVelocityOnResume();
+        _active = true; _lastFrameTime = _now(); _interactionEndTime = 0;
         _rafId = requestAnimationFrame(frame);
     }
 
-    
- window.deadReckoning = {
+    window.deadReckoning = {
         start() { _start(); },
 
         stop() {
@@ -2100,13 +2092,10 @@ function _getPredictHorizon(speedMPS, headingChangeDegPerSec) {
 
         onMovementResumed: _start,
 
-        // Called by the GPS update path when a new fix arrives.
-        // Does NOT reset _centeredLat/Lng — that was the rubber-band source.
-        // The next frame will naturally pick up the new Kalman position and
-        // either pass the deadband check or write the new viewport position.
         forceUpdate() {
-            _interactionEndTime = _now() + CFG.INTERACTION_FADE_MS;
-            if (!_active) _start();
+            if (!_active) { _start(); return; }
+            _lastFrameTime = 0;
+            if (_rafId == null) _rafId = requestAnimationFrame(frame);
         },
 
         getPredictedPosition()  { return _lastPredictedPos; },
@@ -4773,6 +4762,9 @@ function _scheduleUnifiedRender(renderState) {
     });
 }
 
+/* ──────────────────────────────────────────────
+   Unified Render Executor
+   ────────────────────────────────────────────── */
 function _executeRender(state) {
     if (!state) return;
 
@@ -4839,6 +4831,85 @@ function _executeRender(state) {
 
     window.lastMapUpdateTime = Date.now();
 }
+
+/* ──────────────────────────────────────────────
+  Dead Reckoning Control
+   ────────────────────────────────────────────── */
+function _controlDeadReckoning(fusionResult) {
+    if (!window.deadReckoning) return;
+
+    // Freeze / location-hunt overlay are unconditional stops.
+    if (fusionResult.isFrozen || window.isLocationHuntVisible) {
+        if (window.deadReckoning.isActive()) window.deadReckoning.stop();
+        return;
+    }
+
+    // No speed check here — _start()/frame() already know the difference
+    // between "stop when roaming+stationary" and "keep running when
+    // centered to hold the viewport lock." Duplicating that check here
+    // with different criteria is what stopped DR out from under centered
+    // mode.
+    if (!window.deadReckoning.isActive()) {
+        window.deadReckoning.start();
+    }
+}
+
+/* ──────────────────────────────────────────────
+   HELPER: Speed Tier Computation
+   ────────────────────────────────────────────── */
+function _computeSpeedTier(speedMPH, rawAccuracy) {
+    var panDuration, easeLinearity, mapUpdateInterval, mapUpdateDistance,
+        maxAccuracy, minDistThreshold, maxSpeedThreshold;
+
+    if (speedMPH >= 65) {
+        panDuration = 0.08; easeLinearity = 0.28; mapUpdateInterval = 80;
+        mapUpdateDistance = 12.0; maxAccuracy = 18; minDistThreshold = 2.0; maxSpeedThreshold = 160;
+    } else if (speedMPH >= 30) {
+        panDuration = 0.10; easeLinearity = 0.25; mapUpdateInterval = 110;
+        mapUpdateDistance = 8.0; maxAccuracy = 20; minDistThreshold = 1.2; maxSpeedThreshold = 100;
+    } else if (speedMPH >= 15) {
+        panDuration = 0.12; easeLinearity = 0.22; mapUpdateInterval = 150;
+        mapUpdateDistance = 6.5; maxAccuracy = 20; minDistThreshold = 0.85; maxSpeedThreshold = 60;
+    } else if (speedMPH >= 8) {
+        panDuration = 0.25; easeLinearity = 0.18; mapUpdateInterval = 400;
+        mapUpdateDistance = 4.0; maxAccuracy = 25; minDistThreshold = 0.5; maxSpeedThreshold = 15;
+    } else if (speedMPH >= 3) {
+        panDuration = 0.35; easeLinearity = 0.15; mapUpdateInterval = 800;
+        mapUpdateDistance = 3.0; maxAccuracy = 28; minDistThreshold = 0.35; maxSpeedThreshold = 8;
+    } else {
+        panDuration = 0.60; easeLinearity = 0.12; mapUpdateInterval = 1000;
+        mapUpdateDistance = 2.0; maxAccuracy = 32; minDistThreshold = 0.25; maxSpeedThreshold = 3;
+    }
+
+    if (rawAccuracy >= 20) {
+        var noiseScale = Math.min(3.5, 1.0 + (rawAccuracy - 20) / 30);
+        mapUpdateDistance *= noiseScale;
+        minDistThreshold *= noiseScale;
+    }
+
+    return {
+        panDuration: panDuration,
+        easeLinearity: easeLinearity,
+        mapUpdateInterval: Math.max(33, mapUpdateInterval),
+        mapUpdateDistance: mapUpdateDistance,
+        maxAccuracy: maxAccuracy,
+        minDistanceThreshold: minDistThreshold,
+        maxSpeedThreshold: maxSpeedThreshold
+    };
+}
+
+/**
+ * CENTERED MODE: Keep marker centered with look-ahead.
+ */
+
+window._panParamCache = window._panParamCache || null;
+window._centeredModeEntryTime = window._centeredModeEntryTime || null;
+
+/** Call when entering centered mode. Idempotent per entry. */
+window.notifyCenteredModeEntry = function () {
+    window._centeredModeEntryTime = performance.now();
+    window._panParamCache = null;
+};
  
 /* ──────────────────────────────────────────────
   Dead Reckoning Control 
