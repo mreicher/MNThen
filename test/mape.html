@@ -1303,6 +1303,18 @@ class PositionKalmanFilter {
 /* ═══════════════════════════════════════════════════════════════
    SENSOR FUSION MANAGER
    ═══════════════════════════════════════════════════════════════ */
+// Circular interpolation between two headings in degrees — a plain lerp
+// would take the wrong way around at the 0/360 wrap (e.g. blending 350°
+// toward 10° should pass through 0°, not swing back through 180°).
+function _blendHeadingDeg(a, b, t) {
+    let diff = b - a;
+    diff = ((diff + 180) % 360 + 360) % 360 - 180; // normalize to [-180, 180]
+    return (a + diff * t + 360) % 360;
+}
+
+const HEADING_BLEND_LOW  = 3.5; // m/s — fully compass-driven at/below this
+const HEADING_BLEND_HIGH = 6.5; // m/s — fully Kalman/GPS-driven at/above this
+
 class SensorFusionManager {
     constructor(options = {}) {
         this.deviceHeading            = null;
@@ -1590,15 +1602,23 @@ class SensorFusionManager {
         const kalmanVel = this._kalmanFilter.getVelocity();
         const kalmanSpeed = Math.sqrt(kalmanVel.vNorth*kalmanVel.vNorth + kalmanVel.vEast*kalmanVel.vEast);
         if (kalmanSpeed < 0.3) return kalmanVel;
+
+        const kalmanHeadingDeg = this._kalmanFilter.getHeading() ?? 0;
+        const compassAge   = performance.now() - this._compassTimestamp;
+        const compassFresh = this.deviceHeading != null && compassAge < 1500;
+
         let headingDeg;
-        if (speed > 5.0) {
-            headingDeg = this._kalmanFilter.getHeading() || 0;
+        if (!compassFresh) {
+            headingDeg = kalmanHeadingDeg;
+        } else if (speed <= HEADING_BLEND_LOW) {
+            headingDeg = this.deviceHeading;
+        } else if (speed >= HEADING_BLEND_HIGH) {
+            headingDeg = kalmanHeadingDeg;
         } else {
-            const compassAge = performance.now() - this._compassTimestamp;
-            headingDeg = (this.deviceHeading != null && compassAge < 1500)
-                ? this.deviceHeading
-                : (this._kalmanFilter.getHeading() || 0);
+            const t = (speed - HEADING_BLEND_LOW) / (HEADING_BLEND_HIGH - HEADING_BLEND_LOW);
+            headingDeg = _blendHeadingDeg(this.deviceHeading, kalmanHeadingDeg, t);
         }
+
         const headingRad = headingDeg * Math.PI / 180;
         return { vNorth: kalmanSpeed * Math.cos(headingRad), vEast: kalmanSpeed * Math.sin(headingRad) };
     }
@@ -1671,14 +1691,8 @@ class SensorFusionManager {
         // this tick — covers the filter's very first init AND every reset path
         // (dt<=0/dt>30 inside update(), plus external kf.reset() calls from
         // _handleGPSGap, _resetMapToPosition, and _runSensorFusion's jump
-        // guard). _convergenceStage lives outside the filter and previously
-        // only ever increased, so it kept reporting isConverged: true after
-        // any of those resets — which silently disabled the acceleration
-        // clamp in _runSensorFusion (only engages when !isConverged) right
-        // when the filter was least trustworthy.
-        if (kfResult.updateCount === 1) {
-            this._convergenceStage = 0;
-        }
+        // guard).
+        if (kfResult.updateCount === 1) { this._convergenceStage = 0; }
 
         this._filteredSpeedMPS = kf.getSpeedMPS();
         const isStationary = this._updateStationaryState(gpsSpeedMPS, this._filteredSpeedMPS, rawLat, rawLng);
@@ -1733,8 +1747,16 @@ class SensorFusionManager {
 
     getFilteredHeading() {
         const speed = this._filteredSpeedMPS || 0;
-        if (speed <= 5.0 && this.deviceHeading != null) return this.deviceHeading;
-        return this._kalmanFilter ? this._kalmanFilter.getHeading() : null;
+        const kalmanHeading = this._kalmanFilter ? this._kalmanFilter.getHeading() : null;
+
+        if (this.deviceHeading == null) return kalmanHeading;
+        if (kalmanHeading == null) return this.deviceHeading;
+
+        if (speed <= HEADING_BLEND_LOW)  return this.deviceHeading;
+        if (speed >= HEADING_BLEND_HIGH) return kalmanHeading;
+
+        const t = (speed - HEADING_BLEND_LOW) / (HEADING_BLEND_HIGH - HEADING_BLEND_LOW);
+        return _blendHeadingDeg(this.deviceHeading, kalmanHeading, t);
     }
 
     getLastKalmanPosition() {
@@ -1759,11 +1781,22 @@ class SensorFusionManager {
         return (gpsSpeedMPS || 0) > 0.5;
     }
 
+    // Same hard-cutoff bug as getFilteredHeading/_getHybridVelocity had
+    // (switched abruptly at speed > 5.0), plus speedMPS || this._filteredSpeedMPS
+    // discarded a legitimate 0 via falsy-OR. Fixed the same way: blend across
+    // the shared HEADING_BLEND_LOW/HIGH band, ?? instead of || for the 0 case.
     getHeading(gpsHeading, speedMPS) {
-        const speed = speedMPS || this._filteredSpeedMPS || 0;
-        if (speed > 5.0 && gpsHeading != null && isFinite(gpsHeading)) return gpsHeading;
-        if (this.deviceHeading != null) return this.deviceHeading;
-        return gpsHeading;
+        const speed = speedMPS ?? this._filteredSpeedMPS ?? 0;
+        const hasGpsHeading = gpsHeading != null && isFinite(gpsHeading);
+
+        if (this.deviceHeading == null) return hasGpsHeading ? gpsHeading : null;
+        if (!hasGpsHeading) return this.deviceHeading;
+
+        if (speed <= HEADING_BLEND_LOW)  return this.deviceHeading;
+        if (speed >= HEADING_BLEND_HIGH) return gpsHeading;
+
+        const t = (speed - HEADING_BLEND_LOW) / (HEADING_BLEND_HIGH - HEADING_BLEND_LOW);
+        return _blendHeadingDeg(this.deviceHeading, gpsHeading, t);
     }
 
 destroy() {
@@ -1851,22 +1884,40 @@ window.sensorFusion = new SensorFusionManager().init();
         return !!(window.followUser && typeof ModeManager !== 'undefined' && ModeManager.shouldTrackCentered?.());
     }
 
-    function _getPredictHorizon(speedMPS, headingChangeDegPerSec) {
-        let h;
-        if      (speedMPS < 0.5)  h = 0.0;
-        else if (speedMPS < 1.5)  h = 0.5;
-        else if (speedMPS < 3.0)  h = 0.9;
-        else if (speedMPS < 8.0)  h = 1.4;
-        else if (speedMPS < 15.0) h = 1.8;
-        else if (speedMPS < 25.0) h = 2.5;
-        else                      h = 2.8;
-
-        const turnFactor = Math.min(1.0, headingChangeDegPerSec / CFG.HEADING_CHANGE_CAP);
-        h *= (1.0 - turnFactor * 0.6);
-
-        const safetyCap = speedMPS > 20 ? 200 / speedMPS : (speedMPS > 0 ? 150 / speedMPS : CFG.MAX_PREDICT_HORIZON);
-        return Math.max(0, Math.min(h, safetyCap, CFG.MAX_PREDICT_HORIZON));
+const HORIZON_CURVE = [
+    { speed: 0.0,  h: 0.0 },
+    { speed: 0.5,  h: 0.0 },
+    { speed: 1.5,  h: 0.5 },
+    { speed: 3.0,  h: 0.9 },
+    { speed: 8.0,  h: 1.4 },
+    { speed: 15.0, h: 1.8 },
+    { speed: 25.0, h: 2.5 },
+    { speed: 40.0, h: 2.8 },
+];
+ 
+function _getPredictHorizon(speedMPS, headingChangeDegPerSec) {
+    let h;
+    if (speedMPS <= HORIZON_CURVE[0].speed) {
+        h = HORIZON_CURVE[0].h;
+    } else if (speedMPS >= HORIZON_CURVE[HORIZON_CURVE.length - 1].speed) {
+        h = HORIZON_CURVE[HORIZON_CURVE.length - 1].h;
+    } else {
+        for (let i = 1; i < HORIZON_CURVE.length; i++) {
+            const prev = HORIZON_CURVE[i - 1], curr = HORIZON_CURVE[i];
+            if (speedMPS <= curr.speed) {
+                const t = (speedMPS - prev.speed) / (curr.speed - prev.speed);
+                h = prev.h + t * (curr.h - prev.h);
+                break;
+            }
+        }
     }
+ 
+    const turnFactor = Math.min(1.0, headingChangeDegPerSec / CFG.HEADING_CHANGE_CAP);
+    h *= (1.0 - turnFactor * 0.6);
+ 
+    const safetyCap = speedMPS > 20 ? 200 / speedMPS : (speedMPS > 0 ? 150 / speedMPS : CFG.MAX_PREDICT_HORIZON);
+    return Math.max(0, Math.min(h, safetyCap, CFG.MAX_PREDICT_HORIZON));
+}
 
     function _getMarkerEl() {
         if (_markerEl) return _markerEl;
@@ -1887,53 +1938,6 @@ window.sensorFusion = new SensorFusionManager().init();
             }
             userMarker.setLatLng([lat, lng]);
         }
-    }
-
-    function _getDriftThreshold(s) {
-        if (s < 0.3)  return CFG.DRIFT_THRESHOLD_LOW;
-        if (s < 1.5)  return 3.0;
-        if (s < 5.0)  return 5.0;
-        if (s < 15.0) return 7.0;
-        return CFG.DRIFT_THRESHOLD_HIGH;
-    }
-
-    function _getPanDuration(s) {
-        return s < 0.5 ? CFG.PAN_DURATION_BASE : s < 5.0 ? 0.18 : CFG.PAN_DURATION_FAST;
-    }
-
-    function _queueFreePan(lat, lng, duration) {
-        _panTarget = { lat, lng, duration };
-        if (!_panPending) { _panPending = true; requestAnimationFrame(_flushPan); }
-    }
-
-    function _flushPan() {
-        _panPending = false;
-        if (!_panTarget || !map) return;
-        const t = _panTarget;
-        _panTarget = null;
-
-        const dist = map.distance([map.getCenter().lat, map.getCenter().lng], [t.lat, t.lng]);
-        if (dist <= CFG.FREE_MIN_PAN_M) return;
-
-        const now = performance.now();
-        const animInProgress = map._panAnim && map._panAnim._inProgress;
-
-        if (animInProgress && _panAnimTargetLat !== null) {
-            const elapsedMs   = now - _panAnimStart;
-            const stillEasing = elapsedMs < _panAnimDuration * 1000 * 0.7;
-            const divergence  = map.distance([_panAnimTargetLat, _panAnimTargetLng], [t.lat, t.lng]);
-
-            if (stillEasing && divergence < CFG.FREE_MIN_PAN_M * 2) {
-                return;
-            }
-            try { map.stop(); } catch (_) {}
-        }
-
-        map.panTo([t.lat, t.lng], { animate: true, duration: t.duration, easeLinearity: 0.35, noMoveStart: true });
-        _panAnimStart     = now;
-        _panAnimDuration  = t.duration;
-        _panAnimTargetLat = t.lat;
-        _panAnimTargetLng = t.lng;
     }
 
     function _snapViewport(lat, lng) {
@@ -1957,16 +1961,17 @@ window.sensorFusion = new SensorFusionManager().init();
 
     function frame(now) {
         _rafId = null;
-
         const lastPos = window.lastPosition;
         if (!lastPos || window.isLocationHuntVisible) { _active = false; return; }
-
+    
         const speedMPS   = _getSpeedMPS();
         const stationary = _isStationary();
         const centered   = _isCenteredMode();
-
+    
+        // Centered mode still keeps the loop alive while stationary, to hold
+        // the viewport lock. Roaming has no reason to keep running stationary.
         if (!centered && stationary && speedMPS < CFG.MIN_SPEED_MPS) { _active = false; return; }
-
+    
         const isInteracting = window.isMapInteracting || window._isProximityZoomAnimating || window._gpsCenteredPanJustOccurred;
         if (isInteracting) {
             _interactionEndTime = now + CFG.INTERACTION_FADE_MS;
@@ -1975,17 +1980,17 @@ window.sensorFusion = new SensorFusionManager().init();
             return;
         }
         if (now < _interactionEndTime) { _lastFrameTime = now; _rafId = requestAnimationFrame(frame); return; }
-
+    
         const dtMs = now - _lastFrameTime;
         if (dtMs < CFG.MIN_DT_MS) { _rafId = requestAnimationFrame(frame); return; }
         _lastFrameTime = now;
-
+    
         const kp = _getKalmanPos(), rp = _getRawPos();
         let oLat, oLng, oTs;
         if      (kp?.timestamp != null) { oLat = kp.lat; oLng = kp.lng; oTs = kp.timestamp; }
         else if (rp?.timestamp != null) { oLat = rp.lat; oLng = rp.lng; oTs = rp.timestamp; }
         else                            { oLat = lastPos.lat; oLng = lastPos.lng; oTs = window.lastUpdateTimestamp || now; }
-
+    
         const hdg = _getHeading();
         if (_lastHeadingDeg != null && hdg != null) {
             let d = hdg - _lastHeadingDeg;
@@ -1994,16 +1999,16 @@ window.sensorFusion = new SensorFusionManager().init();
             _headingChangeRate = _headingChangeRate * 0.85 + (Math.abs(d) / (Math.max(dtMs, 16) / 1000)) * 0.15;
         }
         if (hdg != null) _lastHeadingDeg = hdg;
-
+    
         const vel = _getVelocity();
         const vm = Math.sqrt(vel.lat*vel.lat + vel.lng*vel.lng);
         if (vm > 0.001) { _lastGoodVelocity = { lat: vel.lat, lng: vel.lng }; _lastGoodSpeedMPS = speedMPS; }
-
+    
         let pLat, pLng;
         const rawAge = Math.max(0, (now - oTs) / 1000);
         const hor    = _getPredictHorizon(speedMPS, _headingChangeRate);
         const pDt    = Math.min(rawAge, hor);
-
+    
         if (pDt <= 0 || speedMPS < CFG.LOW_SPEED_CUTOFF_MPS || stationary) {
             pLat = oLat; pLng = oLng;
         } else {
@@ -2013,23 +2018,20 @@ window.sensorFusion = new SensorFusionManager().init();
             const jE = Math.abs(pLng - oLng) * 111111 * Math.cos(oLat * Math.PI / 180);
             if (jN > 150 || jE > 150) { pLat = oLat; pLng = oLng; }
         }
-
+    
         _lastPredictedPos = { lat: pLat, lng: pLng };
         _setMarkerPosition(pLat, pLng);
-
+    
         if (!map || window._isProximityZoomAnimating) { _rafId = requestAnimationFrame(frame); return; }
-
-        if (centered) {
+    
+        // Panning is no longer conditional on centered vs. roaming — both cases
+        // now use the same instant, tightly-deadbanded snap. The drift-threshold
+        // + eased-panTo free-roam path is gone; that was the source of the
+        // "map slides to catch up" feel below the old centered-mode threshold.
+        if (window.followUser) {
             _snapViewport(pLat, pLng);
-        } else if (window.followUser) {
-            const cc  = map.getCenter();
-            const tPx = map.latLngToContainerPoint([pLat, pLng]);
-            const cPx = map.latLngToContainerPoint(cc);
-            if (Math.hypot(tPx.x - cPx.x, tPx.y - cPx.y) > _getDriftThreshold(speedMPS)) {
-                _queueFreePan(pLat, pLng, _getPanDuration(speedMPS));
-            }
         }
-
+    
         _rafId = requestAnimationFrame(frame);
     }
 
@@ -3882,7 +3884,7 @@ function handleProximityAndAutoOpen(newPosition, currentTime, closestLocation, c
     // ── Dispatch to zone handlers ─────────────────────────────────────────────
     if (currentZone === 'TRIGGER') {
         _handlePrefetchZone(closestLocation, distanceFeet, now);
-        _handleTriggerZone(closestLocation, distanceFeet, now, false);
+        _handleTriggerZone(closestLocation, distanceFeet, now, isOnCooldown);
     } else if (currentZone === 'PREFETCH') {
         _handlePrefetchZone(closestLocation, distanceFeet, now);
     } else {
@@ -3987,9 +3989,12 @@ function _handleTriggerZone(location, distanceFeet, now, isOnCooldown) {
     const locationToOpen = window.preloadedLocation || location;
 
     // ── Gate 3: Cooldown check BEFORE stamping debounce ──
+    // Previously re-queried cooldownManager.checkCooldown() here even though
+    // the caller (handleProximityAndAutoOpen) already computed this same
+    // tick's cooldown status. Now trusts the caller-provided isOnCooldown —
+    // one cooldown check per tick instead of two.
     if (window.cooldownManager) {
-        const status = window.cooldownManager.checkCooldown(locationToOpen.id);
-        if (status.isOnCooldown) {
+        if (isOnCooldown) {
             // On cooldown: show UI but do NOT stamp trigger debounce
             // so it opens instantly when cooldown expires
             console.log(`[Proximity] Location ${locationId} on cooldown. Skipping debounce stamp.`);
@@ -6608,7 +6613,6 @@ window._openLocationPage = function(location) {
   if (!location?.id) return;
   
   if (window.cooldownManager) {
-    const status = window.cooldownManager.checkCooldown(location.id);
     
     if (status.isOnCooldown) {
       window.cooldownManager.notifyUserWithCountdown(location.id, status.remainingSeconds);
