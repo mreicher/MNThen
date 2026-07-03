@@ -1974,11 +1974,8 @@ function _getPredictHorizon(speedMPS, headingChangeDegPerSec) {
     
         const speedMPS   = _getSpeedMPS();
         const stationary = _isStationary();
-        const centered   = _isCenteredMode();
-    
-        // Centered mode still keeps the loop alive while stationary, to hold
-        // the viewport lock. Roaming has no reason to keep running stationary.
-        if (!centered && stationary && speedMPS < CFG.MIN_SPEED_MPS) { _active = false; return; }
+
+        if (stationary && speedMPS < CFG.MIN_SPEED_MPS) { _active = false; return; }
     
         const isInteracting = window.isMapInteracting || window._isProximityZoomAnimating || window._gpsCenteredPanJustOccurred;
         if (isInteracting) {
@@ -2069,43 +2066,22 @@ function _getPredictHorizon(speedMPS, headingChangeDegPerSec) {
 
     function _start() {
         if (_active || window.isLocationHuntVisible) return;
-        const speedMPS = _getSpeedMPS(), centered = _isCenteredMode();
-        if (!centered && speedMPS < CFG.MIN_SPEED_MPS) return;
-        if (!centered && window.isStationary && speedMPS < 0.8) return;
-        if (speedMPS >= CFG.MIN_SPEED_MPS) _seedVelocityOnResume();
-        _active = true; _lastFrameTime = _now(); _interactionEndTime = 0;
+        
+        const speedMPS = _getSpeedMPS();
+        const stationary = _isStationary();
+        
+        // ── MODE-INDEPENDENT START CONDITIONS ──
+        // Exact mirror of frame()'s exit condition. 
+        // If frame() is going to kill the loop on tick 1, don't even start it.
+        if (stationary && speedMPS < CFG.MIN_SPEED_MPS) return;
+        
+        // Seed velocity for smooth initial prediction
+        _seedVelocityOnResume();
+        
+        _active = true;
+        _lastFrameTime = performance.now(); // Use performance.now() to perfectly match RAF's `now` timestamp
+        _interactionEndTime = 0;
         _rafId = requestAnimationFrame(frame);
-    }
-
-    window.deadReckoning = {
-        start() { _start(); },
-
-        stop() {
-            if (_rafId != null) { cancelAnimationFrame(_rafId); _rafId = null; }
-            _active = false; _panPending = false; _panTarget = null;
-            _centeredLat = null; _centeredLng = null;
-            const el = _getMarkerEl();
-            if (el) { el.style.willChange = ''; el.style.transition = ''; _markerTransSet = false; }
-        },
-
-        isActive() { return _active; },
-
-        onMovementResumed: _start,
-
-        forceUpdate() {
-            if (!_active) { _start(); return; }
-            _lastFrameTime = 0;
-            if (_rafId == null) _rafId = requestAnimationFrame(frame);
-        },
-
-        getPredictedPosition()  { return _lastPredictedPos; },
-        invalidateMarkerCache() { _markerEl = null; _markerTransSet = false; }
-    };
-
-    _start();
-
-    if (typeof memoryManager !== 'undefined' && memoryManager?.registerCleanupTask) {
-        memoryManager.registerCleanupTask(() => window.deadReckoning.stop());
     }
 })();
 
@@ -3116,7 +3092,7 @@ let _backgroundUpdateTimeout = null;
 
 function updateLocationAfterBackground() {
     window.lastHiddenTime = window.lastHiddenTime || Date.now();
- 
+
     // Don't refresh if we recently got a background update
     const timeSinceLastBg = Date.now() - (window._lastBackgroundUpdate || 0);
     if (timeSinceLastBg < 30_000 && window.lastPosition) {
@@ -3126,19 +3102,19 @@ function updateLocationAfterBackground() {
         }
         return;
     }
- 
+
     if (window._isLocationUpdateInProgress) return;
- 
+
     if (!("geolocation" in navigator)) return;
- 
+
     window._isLocationUpdateInProgress = true;
- 
+
     // Only dispose map loop if away longer than 30s
     const awayMs = Date.now() - (window.lastHiddenTime || 0);
     if (awayMs > 30000) {
         disposeMapLoop();
     }
- 
+
     // Reset stale speed averages after long background absence
     if (awayMs > 10000) {
         window._modeSpeedEMA = undefined;
@@ -3148,32 +3124,43 @@ function updateLocationAfterBackground() {
             window.sensorFusion._kalmanFilter.reset();
         }
     }
- 
+
     // Clean up any existing warmup watch
     if (warmupWatchId !== null) {
         navigator.geolocation.clearWatch(warmupWatchId);
         warmupWatchId = null;
     }
- 
+
     // Clear any existing timeout
     if (_backgroundUpdateTimeout) {
         clearTimeout(_backgroundUpdateTimeout);
         _backgroundUpdateTimeout = null;
     }
- 
-    // Pause the main watch so it can't fire concurrently with the catch-up
-    // watch below. Remembered so cleanup() can restart it.
-    let _mainWatchWasRunning = false;
+
+    // PRIORITY ONE: get continuous tracking running again immediately.
+    // Briefly clear then restart the main watch so it picks up fresh state
+    // cleanly, but do NOT gate this on the warmup watch below succeeding —
+    // that was the mechanism that could leave the app with zero location
+    // updates for up to MAX_DURATION if the warmup fix was slow or failed.
+    // startPositionUpdates() clears any existing watch itself before
+    // starting a new one, so this is safe to call unconditionally even if
+    // positionWatchId was already null.
     if (window.positionWatchId != null) {
         navigator.geolocation.clearWatch(window.positionWatchId);
         window.positionWatchId = null;
-        _mainWatchWasRunning = true;
     }
- 
+    if (typeof startPositionUpdates === 'function') {
+        startPositionUpdates();
+    }
+
     geolocationRequestPending = true;
-    const startTime = Date.now();
-    const MAX_DURATION = 30000;
- 
+
+    // Shrunk from the old 30s. This watch is now purely an opportunistic
+    // fast snap for the UI (recenter, distance box, clear retry state) —
+    // the main watch above already owns getting tracking running again,
+    // so this no longer needs to be sized as the last-resort fallback.
+    const MAX_DURATION = 10000;
+
     const cleanup = () => {
         geolocationRequestPending = false;
         if (warmupWatchId !== null) {
@@ -3185,37 +3172,30 @@ function updateLocationAfterBackground() {
             _backgroundUpdateTimeout = null;
         }
         window._isLocationUpdateInProgress = false;
- 
-        // Restart the main watch now that the catch-up watch is done,
-        // so exactly one watch is ever live again.
-        if (_mainWatchWasRunning && window.positionWatchId == null &&
-            typeof startPositionUpdates === 'function') {
-            startPositionUpdates();
-        }
     };
- 
+
     // ── Retry Modal (CSS-driven) ──
     const showRetryModal = () => {
         if (document.getElementById('geolocation-retry-modal')) return;
- 
+
         const overlay = document.createElement('div');
         overlay.id = 'geolocation-retry-modal';
         overlay.className = 'geo-retry-overlay';
         overlay.setAttribute('role', 'dialog');
         overlay.setAttribute('aria-modal', 'true');
         overlay.setAttribute('aria-label', 'Location retry');
- 
+
         const card = document.createElement('div');
         card.className = 'geo-retry-card';
- 
+
         const title = document.createElement('div');
         title.className = 'geo-retry-title';
         title.textContent = 'Location Needed';
- 
+
         const text = document.createElement('p');
         text.className = 'geo-retry-text';
         text.innerHTML = 'We\'re still locating your device.<br>Please ensure location services are enabled, and try again.';
- 
+
         const retryBtn = document.createElement('button');
         retryBtn.className = 'geo-retry-btn';
         retryBtn.textContent = '↻ Try Again';
@@ -3223,16 +3203,16 @@ function updateLocationAfterBackground() {
             overlay.remove();
             updateLocationAfterBackground();
         });
- 
+
         const closeBtn = document.createElement('button');
         closeBtn.className = 'geo-retry-cancel';
         closeBtn.textContent = 'Cancel';
         closeBtn.addEventListener('click', () => { overlay.remove(); });
- 
+
         overlay.addEventListener('click', (e) => {
             if (e.target === overlay) overlay.remove();
         });
- 
+
         card.appendChild(title);
         card.appendChild(text);
         card.appendChild(retryBtn);
@@ -3240,13 +3220,13 @@ function updateLocationAfterBackground() {
         overlay.appendChild(card);
         document.body.appendChild(overlay);
     };
- 
+
     const safeToShowModal = () => {
         const speedMPH = (window.lastPosition?.speedMPS || 0) * 2.23694;
         return speedMPH < 5;
     };
- 
-    // ── Handle successful position acquisition
+
+    // ── Handle successful position acquisition (fast opportunistic snap) ──
     const onPositionSuccess = (position) => {
         const coords = position?.coords;
         if (!coords ||
@@ -3256,20 +3236,21 @@ function updateLocationAfterBackground() {
             coords.accuracy <= 0) {
             return;
         }
- 
+
         if (Date.now() - position.timestamp > 30000) return;
- 
-        // Cleanup immediately on success — this clears the timeout too
-        // and restarts the main watch.
+
+        // Cleanup immediately on success — this clears the timeout too.
+        // The main watch is already running independently (started above),
+        // so there's nothing left to restart here.
         cleanup();
- 
+
         window._lastBackgroundUpdate = Date.now();
- 
+
         const { latitude, longitude } = coords;
- 
+
         const currentCenter = map.getCenter();
         const distanceMoved = currentCenter.distanceTo([latitude, longitude]);
- 
+
         if (distanceMoved < 5) {
             // Small movement — just update
             updateUserLocation(position, true);
@@ -3280,12 +3261,12 @@ function updateLocationAfterBackground() {
             }
             return;
         }
- 
+
         // Significant movement — full reset
         requestAnimationFrame(() => {
             try {
                 const currentZoom = map.getZoom();
- 
+
                 window.lastPosition = null;
                 if (window.positionBuffer) window.positionBuffer.length = 0;
                 if (window.lastVelocity) window.lastVelocity = { lat: 0, lng: 0 };
@@ -3293,14 +3274,14 @@ function updateLocationAfterBackground() {
                 window.stationaryStartTime = null;
                 window.stationaryCount = 0;
                 window.lastUpdateTime = Date.now();
- 
+
                 updateUserLocation(position, true);
                 map.setView([latitude, longitude], currentZoom, {
                     animate: false,
                     duration: 0,
                     noMoveStart: true
                 });
- 
+
                 if (typeof isSignificantMovement === 'function' &&
                     isSignificantMovement({ lat: latitude, lng: longitude })) {
                     if (typeof resetInactivityTimer === 'function') resetInactivityTimer(false);
@@ -3311,23 +3292,27 @@ function updateLocationAfterBackground() {
             }
         });
     };
- 
+
     const onPositionError = (error) => {
         console.warn("Geolocation error:", error.message, "Code:", error.code);
-        // Don't cleanup here — let the timeout handle it
+        // Don't cleanup here — let the timeout handle it. This is now safe:
+        // the main watch is already running independently, so a slow or
+        // failed warmup fix no longer leaves tracking dead in the meantime.
     };
- 
-    // Start watching for position (main watch is paused above for the duration)
+
+    // Start watching for position — opportunistic fast snap only. The main
+    // watch above already covers continuous tracking regardless of how
+    // this one resolves.
     warmupWatchId = navigator.geolocation.watchPosition(
         onPositionSuccess,
         onPositionError,
         {
             enableHighAccuracy: true,
-            timeout: 25000,
+            timeout: 8000,
             maximumAge: 10000
         }
     );
- 
+
     // Timeout handler — tracked so it's cleaned up on page unload
     _backgroundUpdateTimeout = createTrackedTimeout(() => {
         if (geolocationRequestPending) {
@@ -3399,7 +3384,8 @@ function seedPositionBuffer(seedPosition, count) {
         lng: kalmanPos.lng,
         accuracy: seedPosition.accuracy,
         timestamp: bufferTimestamp,
-        // Same fix as updatePositionBuffer — ?? preserves a legitimate 0 heading.
+        // Use ?? instead of || to preserve a valid heading of 0 (due north) —
+        // 0 || seedPosition.heading would silently discard a legitimate 0 heading.
         heading: window.sensorFusion.getFilteredHeading() ?? seedPosition.heading,
         speedMPS: window.sensorFusion.getFilteredSpeedMPS()
     } : {
@@ -3410,8 +3396,22 @@ function seedPositionBuffer(seedPosition, count) {
         heading: seedPosition.heading,
         speedMPS: seedPosition.speedMPS
     };
+
+    // count defaults to 1 — existing single-arg callers (e.g.
+    // _resetMapToPosition's seedPositionBuffer(newPosition)) keep their
+    // original behavior unchanged. _restoreFullTracking's
+    // seedPositionBuffer(seedPosition, 5) previously had this argument
+    // silently ignored; only one entry was ever pushed regardless of count.
+    const n = Number.isFinite(count) && count > 0 ? Math.floor(count) : 1;
+
     window.positionBuffer.length = 0;
-    window.positionBuffer.push(seed);
+    for (let i = 0; i < n; i++) {
+        // Identical copies, not a fabricated trajectory — this represents
+        // "no real motion history yet," so any consumer diffing consecutive
+        // entries correctly sees zero movement instead of us inventing
+        // fake motion between synthetic entries.
+        window.positionBuffer.push({ ...seed });
+    }
 }
 
 /* ──────────────────────────────────────────────
@@ -4274,81 +4274,7 @@ function _prefetchMapTiles(location, now) {
         _pendingLat = _pendingLng = null;
         _applyMarkerPosition(lat, lng);
     }
-
-    /**
-     * Schedule a marker position update.
-     * Normally coalesced to the next animation frame — intermediate positions
-     * between two frames are intentionally dropped since nothing can render
-     * faster than the display refresh anyway.
-     *
-     * Pass { immediate: true } to bypass coalescing entirely (e.g. DR handoff,
-     * first fix after a gap) and apply the position synchronously this tick.
-     */
-    function scheduleMarkerUpdate(lat, lng, options) {
-        const immediate = !!(options && options.immediate);
-
-        if (immediate) {
-            // Cancel anything queued for next frame — this update wins now.
-            if (_rafId !== null) {
-                cancelAnimationFrame(_rafId);
-                _rafId = null;
-            }
-            _pendingLat = _pendingLng = null;
-            _ensureWillChange();
-            _applyMarkerPosition(lat, lng);
-            return;
-        }
-
-        _pendingLat = lat;
-        _pendingLng = lng;
-
-        // Promote ahead of paint, not after the fact.
-        _ensureWillChange();
-
-        if (_rafId !== null) return; // already queued; will pick up new coords
-        _rafId = requestAnimationFrame(_commitMarkerUpdate);
-    }
-
-    function cancelMarkerUpdate() {
-        if (_rafId !== null) {
-            cancelAnimationFrame(_rafId);
-            _rafId = null;
-        }
-        if (_resetTimer !== null) {
-            clearTimeout(_resetTimer);
-            _resetTimer = null;
-        }
-        _pendingLat = _pendingLng = null;
-
-        // Note: intentionally NOT resetting willChange/transition here.
-        // A cancel mid-tracking (e.g. brief pause) shouldn't force the next
-        // update to re-pay the compositor-promotion cost. The idle timer
-        // above still releases the layer if things actually go quiet.
-    }
-
-    function _cleanupMarkerStyles() {
-        cancelMarkerUpdate();
-        _willChangeOn = false;
-        _transitionOff = false;
-        const el = _getMarkerEl();
-        if (el) {
-            el.style.willChange = 'auto';
-            el.style.transition = 'none';
-        }
-    }
-
-    window.scheduleMarkerUpdate = scheduleMarkerUpdate;
-    window.cancelMarkerUpdate   = cancelMarkerUpdate;
-    window._cleanupMarkerStyles = _cleanupMarkerStyles;
-
-    if (typeof memoryManager !== 'undefined' && memoryManager?.registerCleanupTask) {
-        // Full teardown (incl. style reset) belongs on page unload; a plain
-        // cancel mid-session should stay cheap, see note above.
-        memoryManager.registerCleanupTask(_cleanupMarkerStyles);
-    }
-
-})();
-
+  
 /**
  * Finds the closest game location to newPosition and optionally feeds the
  * enterprise cache. Writes window.proximityState, window._lastClosestDistance.
