@@ -12,7 +12,7 @@ const locations = [
         audio: "/audio/exhibit/wildwood.mp3", 
         tours: "history",
         summary: "Wildwood Amusement Park on White Bear Lake thrilled Twin Cities crowds with rides and lakeside fun until 1932.",
-        today: "Southeast corner of White Bear Lake",
+        today: "SE corner of White Bear Lake",
         link: "https://mnthen.com/blog/place/wildwood.html",
         imageSource: "Image of the slide at Wildwood Park c. 1905 via MPRNews",
         additionalInfo: "Visitors didn’t just arrive by streetcar — some came by steamboat across White Bear Lake to spend the day swimming, dancing, and riding Wildwood’s coaster.",
