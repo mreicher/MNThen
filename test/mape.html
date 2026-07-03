@@ -1104,7 +1104,7 @@ class PositionKalmanFilter {
         const convergenceThreshold = speedMPS > 15 ? 2 : 4;
         const isConverged = this._updateCount >= convergenceThreshold && this.P && this.P[0][0] < 200;
         const blendFactor = Math.min(1.0, this._updateCount / convergenceThreshold);
-        
+
         return this._makeResult(pos.lat, pos.lng, { isConverged, blendFactor, updateCount: this._updateCount });
     }
 
@@ -1172,26 +1172,34 @@ class PositionKalmanFilter {
 
   _initialize(lat, lng, R, timestampPerfNow) {
     this.refLat = lat; this.refLng = lng;
- 
+
     const hasVelocityHint = this._pendingSeedVelocity &&
         (Math.abs(this._pendingSeedVelocity.vNorth) > 0.1 || Math.abs(this._pendingSeedVelocity.vEast) > 0.1);
- 
+
     this.x = hasVelocityHint
         ? [0, 0, this._pendingSeedVelocity.vNorth, this._pendingSeedVelocity.vEast]
         : [0, 0, 0, 0];
- 
+
     this.accelNoise = this._baseAccelNoise;
     this._currentSpeedMPS = hasVelocityHint
         ? Math.sqrt(this._pendingSeedVelocity.vNorth ** 2 + this._pendingSeedVelocity.vEast ** 2)
         : 0;
     this._isFrozen = false; this._frozenPosition = null;
- 
+
     const R2 = R * R;
-    const v0 = hasVelocityHint ? 2.25 : (this._lastGPSSpeedMPS > 0.3 ? 0.5 : 225.0);
+    // Initial velocity-covariance seed. The variance must reflect how well we
+    // actually know the initial velocity (which is seeded to [0,0] when there is
+    // no directional hint):
+    //   - hint present  -> moderate variance, trust the seeded velocity.
+    //   - GPS moving, no hint -> LARGE variance: we know we are moving but not the
+    //     direction, so let the first fixes snap velocity to the truth (no lag).
+    //   - stationary -> SMALL variance: pin velocity near zero so GPS scatter
+    //     cannot manufacture phantom motion (no jitter while standing still).
+    const v0 = hasVelocityHint ? 2.25 : (this._lastGPSSpeedMPS > 0.3 ? 225.0 : 0.5);
     this.P = [[R2,0,0,0],[0,R2,0,0],[0,0,v0,0],[0,0,0,v0]];
     this.lastTimestamp = timestampPerfNow;
     this._justInitialized = true;
- 
+
     this._pendingSeedVelocity = null; // consumed here, not left for the next update() cycle
 }
 
@@ -1299,7 +1307,7 @@ class PositionKalmanFilter {
         };
     }
 }
-
+        
 /* ═══════════════════════════════════════════════════════════════
    SENSOR FUSION MANAGER
    ═══════════════════════════════════════════════════════════════ */
@@ -2020,16 +2028,40 @@ function _getPredictHorizon(speedMPS, headingChangeDegPerSec) {
         }
     
         _lastPredictedPos = { lat: pLat, lng: pLng };
-        _setMarkerPosition(pLat, pLng);
     
-        if (!map || window._isProximityZoomAnimating) { _rafId = requestAnimationFrame(frame); return; }
+        if (!map || window._isProximityZoomAnimating) {
+            // No map to scroll — fall back to legacy geo-space marker placement.
+            _setMarkerPosition(pLat, pLng);
+            _rafId = requestAnimationFrame(frame);
+            return;
+        }
     
-        // Panning is no longer conditional on centered vs. roaming — both cases
-        // now use the same instant, tightly-deadbanded snap. The drift-threshold
-        // + eased-panTo free-roam path is gone; that was the source of the
-        // "map slides to catch up" feel below the old centered-mode threshold.
-        if (window.followUser) {
+        if (window.followUser && centered) {
+            // CENTERED MODE — the goal: marker hard-locked to the viewport
+            // center, world slides underneath it.
+            //
+            // 1) The prediction drives the MAP (the world scroll), so movement
+            //    stays lag-free and silky.
+            // 2) The marker is then pinned to `map.getCenter()` — NOT the raw
+            //    predicted coords. Because its lat/lng equals the map's own
+            //    center by definition, the marker is provably at the exact
+            //    viewport center every frame. This removes:
+            //      - the old deadband desync (marker moving while the map
+            //        skipped its sub-deadband recenter), and
+            //      - the two-transform sub-pixel jitter (marker + map were
+            //        rounded independently toward the "same" coord).
+            //    Even when _snapViewport skips a tiny move via the deadband,
+            //    map.getCenter() is unchanged, so the marker stays centered.
             _snapViewport(pLat, pLng);
+            const c = map.getCenter();
+            _setMarkerPosition(c.lat, c.lng);
+        } else if (window.followUser) {
+            // Legacy roaming follow path — unchanged behavior.
+            _setMarkerPosition(pLat, pLng);
+            _snapViewport(pLat, pLng);
+        } else {
+            // Not following — marker tracks its geo position as before.
+            _setMarkerPosition(pLat, pLng);
         }
     
         _rafId = requestAnimationFrame(frame);
@@ -4380,7 +4412,7 @@ function updateUserLocation(position, forceUpdate) {
     if (forceUpdate === undefined) forceUpdate = false;
 
     var now = performance.now();
-    
+
     // Re-entry guard. Android fused provider can fire duplicate
     // callbacks in the same millisecond. 8ms catches duplicates without
     // dropping legitimate fast updates.
@@ -4448,9 +4480,13 @@ function updateUserLocation(position, forceUpdate) {
     }
 
     // ── STEP 3: Sensor fusion ─────────────────────────────────────
+    // On a rejected fix we return WITHOUT advancing lastUpdateTime, so the
+    // next accepted fix predicts over the full elapsed span (including this
+    // rejected interval). Advancing the clock here would discard the
+    // displacement over the rejected span and make the next timeDelta too
+    // short, under-predicting motion → position lag + catch-up snap.
     var fusionResult = _runSensorFusion(fix, lastPos, timeDelta, forceUpdate);
     if (!fusionResult) {
-        window.lastUpdateTime = fix.timestamp;
         return;
     }
 
@@ -4600,15 +4636,23 @@ function _runSensorFusion(fix, lastPos, timeDelta, forceUpdate) {
     // Previously this branch returned null outright, which skipped
     // _controlDeadReckoning entirely for that fix and left window.lastPosition
     // / the marker un-updated. The threshold is TIGHTEST at low speed
-    // (accel > 25 under 3mph) — exactly the acceleration profile of pulling
-    // away from a stop — so the freeze was most likely at the one moment
+    // (accel > 25 under 3mph) -- exactly the acceleration profile of pulling
+    // away from a stop -- so the freeze was most likely at the one moment
     // motion just started, and DR could miss its start trigger too, since
     // _controlDeadReckoning(fusionResult) was never reached.
     //
-    // Now: clamp the reported speed to the max plausible acceleration for
-    // this speed band instead of discarding the fix. The pipeline keeps
-    // moving every cycle — a genuinely noisy reading shows up as a bounded
-    // speed correction instead of an invisible stall.
+    // Now: clamp the ENTIRE kinematic state (position + velocity vector +
+    // scalar speed) consistently instead of discarding the fix OR clamping
+    // only the scalar speed. Clamping speedMPS alone left lat/lng and
+    // vNorth/vEast at their raw, noisy pre-convergence values -- so the
+    // marker still snapped to noise and dead reckoning still extrapolated
+    // along an un-clamped velocity vector, while speedMPS silently
+    // disagreed with sqrt(vNorth^2 + vEast^2). Here we scale the velocity
+    // vector to the clamped magnitude (preserving heading) and re-derive
+    // the reported position by propagating the last good position along
+    // that clamped velocity over timeDelta. Result: marker glides from the
+    // last good point along a physically plausible path, DR extrapolates
+    // from a matching vector, and speedMPS === |v| by construction.
     if (!result.isConverged && lastPos && timeDelta > 0 && timeDelta < 8) {
         var lastSpeed = (lastPos.speedMPS || 0);
         var accel = Math.abs(result.speedMPS - lastSpeed) / timeDelta;
@@ -4622,10 +4666,36 @@ function _runSensorFusion(fix, lastPos, timeDelta, forceUpdate) {
             speedMPH < 80 ? 12 : 10;
 
         if (accel > maxAccel) {
-            var maxDelta  = maxAccel * timeDelta;
-            var direction = result.speedMPS >= lastSpeed ? 1 : -1;
+            var maxDelta   = maxAccel * timeDelta;
+            var direction  = result.speedMPS >= lastSpeed ? 1 : -1;
+            var clampSpeed = Math.max(0, lastSpeed + direction * maxDelta);
+
+            // Scale the velocity vector to the clamped magnitude, keeping its
+            // direction. Fall back to reported heading if the vector is ~zero.
+            var mag = Math.sqrt(result.vNorth * result.vNorth + result.vEast * result.vEast);
+            var vN, vE;
+            if (mag > 1e-6) {
+                var scale = clampSpeed / mag;
+                vN = result.vNorth * scale;
+                vE = result.vEast  * scale;
+            } else {
+                var hdgRad = (result.heading || 0) * Math.PI / 180;
+                vN = clampSpeed * Math.cos(hdgRad);
+                vE = clampSpeed * Math.sin(hdgRad);
+            }
+
+            // Re-derive position by propagating the last good position along
+            // the clamped velocity -- do NOT trust the noisy fused lat/lng
+            // while the filter is still pre-convergence.
+            var dLat = (vN * timeDelta) / 111320;
+            var dLng = (vE * timeDelta) / (111320 * Math.cos(lastPos.lat * Math.PI / 180));
+
             result = Object.assign({}, result, {
-                speedMPS: lastSpeed + direction * maxDelta
+                speedMPS: clampSpeed,
+                vNorth:   vN,
+                vEast:    vE,
+                lat:      lastPos.lat + dLat,
+                lng:      lastPos.lng + dLng
             });
         }
     }
@@ -4753,11 +4823,25 @@ function _executeRender(state) {
         return;
     }
 
+    // Does dead reckoning currently own the marker + viewport (center)?
+    // In centered-follow mode DR calls map.setView(...) every frame and
+    // pins the marker to map.getCenter(), so NOTHING else may move the
+    // map center or the marker tears off-center and rubber-bands.
+    var drOwnsViewport = !!(
+        window.deadReckoning &&
+        typeof window.deadReckoning.isActive === 'function' &&
+        window.deadReckoning.isActive()
+    );
+
     // ── ZOOM ONLY (walking proximity, never conflicts with DR) ─────
+    // setZoom preserves center (safe with DR). fitBounds moves BOTH
+    // zoom AND center, so it is only allowed when DR is NOT holding
+    // the viewport; otherwise we fall through to a center-preserving
+    // zoom so the centered lock is never broken.
     var zoomResult = getSpeedBasedZoom(state.speedMPS, state.closestDistance);
 
     if (zoomResult !== null && map && !window._isFittingBounds) {
-        if (zoomResult.fitBounds && state.closestLocation) {
+        if (zoomResult.fitBounds && state.closestLocation && !drOwnsViewport) {
             var userLatLng   = [state.position.lat, state.position.lng];
             var targetLatLng = [state.closestLocation.lat, state.closestLocation.lng];
 
@@ -4779,7 +4863,11 @@ function _executeRender(state) {
     // ── MARKER & VIEWPORT: DR owns both exclusively ───────────────
     // GPS path never touches the marker element or map viewport.
     // It only feeds fresh fused state into the pipeline and nudges DR.
-    if (window.deadReckoning && typeof window.deadReckoning.forceUpdate === 'function') {
+    // Skip the nudge while a fitBounds animation is in flight so the
+    // GPS-driven recenter can't fight the proximity animation.
+    if (!window._isFittingBounds &&
+        window.deadReckoning &&
+        typeof window.deadReckoning.forceUpdate === 'function') {
         window.deadReckoning.forceUpdate();
     }
 
@@ -4814,7 +4902,7 @@ function _controlDeadReckoning(fusionResult) {
 function _computeSpeedTier(speedMPH, rawAccuracy) {
     var panDuration, easeLinearity, mapUpdateInterval, mapUpdateDistance,
         maxAccuracy, minDistThreshold, maxSpeedThreshold;
- 
+
     if (speedMPH >= 65) {
         panDuration = 0.08; easeLinearity = 0.28; mapUpdateInterval = 80;
         mapUpdateDistance = 12.0; maxAccuracy = 18; minDistThreshold = 2.0; maxSpeedThreshold = 160;
@@ -4834,13 +4922,13 @@ function _computeSpeedTier(speedMPH, rawAccuracy) {
         panDuration = 0.60; easeLinearity = 0.12; mapUpdateInterval = 1000;
         mapUpdateDistance = 2.0; maxAccuracy = 32; minDistThreshold = 0.25; maxSpeedThreshold = 3;
     }
- 
+
     if (rawAccuracy >= 20) {
         var noiseScale = Math.min(3.5, 1.0 + (rawAccuracy - 20) / 30);
         mapUpdateDistance *= noiseScale;
         minDistThreshold *= noiseScale;
     }
- 
+
     return {
         panDuration: panDuration,
         easeLinearity: easeLinearity,
@@ -4851,7 +4939,7 @@ function _computeSpeedTier(speedMPH, rawAccuracy) {
         maxSpeedThreshold: maxSpeedThreshold
     };
 }
-          
+
 /**
  * CENTERED MODE: Keep marker centered with look-ahead.
  */
