@@ -854,177 +854,243 @@ class EnterpriseBackgroundSync {
 /* ──────────────────────────────────────────────
    MEMORY MANAGEMENT
    ────────────────────────────────────────────── */
-
-function setupMemoryManagement() {
-    const timerRegistry = new Map();
-
-    const timerSubsystem = {
-        createTimeout(cb, delay, ...args) {
-            const id = setTimeout(() => {
-                timerRegistry.delete(id);
-                cb(...args);
-            }, delay);
-            timerRegistry.set(id, { type: 'timeout', id });
-            return id;
-        },
-        createInterval(cb, interval) {
-            const id = setInterval(cb, interval);
-            timerRegistry.set(id, { type: 'interval', id });
-            return id;
-        },
-        clear(id) {
-            const entry = timerRegistry.get(id);
-            if (!entry) return;
-            if (entry.type === 'timeout') clearTimeout(id);
-            else clearInterval(id);
-            timerRegistry.delete(id);
-        },
-        dispose() {
-            const count = timerRegistry.size;
-            for (const [id, entry] of timerRegistry) {
+        
+    function setupMemoryManagement() {
+        const timerRegistry = new Map();
+    
+        const timerSubsystem = {
+            createTimeout(cb, delay, ...args) {
+                const id = setTimeout(() => {
+                    timerRegistry.delete(id);
+                    cb(...args);
+                }, delay);
+                timerRegistry.set(id, { type: 'timeout', id });
+                return id;
+            },
+            createInterval(cb, interval) {
+                const id = setInterval(cb, interval);
+                timerRegistry.set(id, { type: 'interval', id });
+                return id;
+            },
+            clear(id) {
+                const entry = timerRegistry.get(id);
+                if (!entry) return;
                 if (entry.type === 'timeout') clearTimeout(id);
                 else clearInterval(id);
+                timerRegistry.delete(id);
+            },
+            dispose() {
+                const count = timerRegistry.size;
+                for (const [id, entry] of timerRegistry) {
+                    if (entry.type === 'timeout') clearTimeout(id);
+                    else clearInterval(id);
+                }
+                timerRegistry.clear();
+                return { subsystem: 'timers', cleared: count };
             }
-            timerRegistry.clear();
-            return { subsystem: 'timers', cleared: count };
+        };
+    
+        const listenerRegistry = [];
+    
+        // addEventListener's third argument can be a boolean or an options
+        // object, and two different object literals with identical fields are
+        // not === to each other. Normalizing lets dedup treat `true` and
+        // `{capture: true}` as the same thing, and compare object literals by
+        // value instead of by reference.
+        function normalizeListenerOptions(options) {
+            if (typeof options === 'boolean') {
+                return { capture: options, passive: false, once: false };
+            }
+            if (options && typeof options === 'object') {
+                return {
+                    capture: !!options.capture,
+                    passive: !!options.passive,
+                    once:    !!options.once
+                };
+            }
+            return { capture: false, passive: false, once: false };
         }
-    };
-
-    const listenerRegistry = [];
-
-    const listenerSubsystem = {
-        track(element, event, handler, options = false) {
-            if (!element || typeof element.addEventListener !== 'function') {
-                console.warn('[Memory] Invalid element for listener:', element);
-                return null;
-            }
-            element.addEventListener(event, handler, options);
-            const entry = { element, event, handler, options, active: true };
-            listenerRegistry.push(entry);
-            return entry;
-        },
-        dispose() {
-            const count = listenerRegistry.length;
-            for (const entry of listenerRegistry) {
-                if (!entry.active) continue;
+    
+        function listenerOptionsEqual(a, b) {
+            const na = normalizeListenerOptions(a);
+            const nb = normalizeListenerOptions(b);
+            return na.capture === nb.capture && na.passive === nb.passive && na.once === nb.once;
+        }
+    
+        const listenerSubsystem = {
+            track(element, event, handler, options = false) {
+                if (!element || typeof element.addEventListener !== 'function') {
+                    console.warn('[Memory] Invalid element for listener:', element);
+                    return null;
+                }
+    
+                // Dedup: if this exact element+event+handler+options combo is
+                // already tracked and active, return the existing entry instead
+                // of attaching a second DOM listener and growing the registry
+                // further. Without this, any code path that re-registers "the
+                // same" listener over a long session (reconnect loops, repeated
+                // setup calls) leaked both a duplicate listener AND a duplicate
+                // registry entry indefinitely — the registry only ever grew,
+                // never shrank, until full page-unload disposal.
+                const existing = listenerRegistry.find(e =>
+                    e.active &&
+                    e.element === element &&
+                    e.event === event &&
+                    e.handler === handler &&
+                    listenerOptionsEqual(e.options, options)
+                );
+                if (existing) return existing;
+    
+                element.addEventListener(event, handler, options);
+                const entry = { element, event, handler, options, active: true };
+                listenerRegistry.push(entry);
+                return entry;
+            },
+    
+            // NEW — remove a single tracked listener before full disposal.
+            // Purely additive: existing callers that never call this are
+            // unaffected, and dispose() still works exactly as before for
+            // whatever's left in the registry at teardown time.
+            untrack(entry) {
+                if (!entry || !entry.active) return false;
                 try {
                     entry.element.removeEventListener(entry.event, entry.handler, entry.options);
                 } catch (e) {
                     console.warn('[Memory] Listener removal failed:', entry.event, e.message);
                 }
                 entry.active = false;
-            }
-            listenerRegistry.length = 0;
-            return { subsystem: 'listeners', cleared: count };
-        }
-    };
-
-    const audioSubsystem = {
-        dispose() {
-            const audios = document.querySelectorAll('audio');
-            let paused = 0;
-            for (const audio of audios) {
-                try {
-                    if (!audio.paused) { audio.pause(); paused++; }
-                    if (!isNaN(audio.currentTime) && audio.currentTime > 0) {
-                        try { localStorage.setItem('audioPosition', audio.currentTime.toString()); }
-                        catch (storageErr) { console.debug('[Memory] Could not save audio position:', storageErr.message); }
+                const idx = listenerRegistry.indexOf(entry);
+                if (idx !== -1) listenerRegistry.splice(idx, 1);
+                return true;
+            },
+    
+            dispose() {
+                const count = listenerRegistry.length;
+                for (const entry of listenerRegistry) {
+                    if (!entry.active) continue;
+                    try {
+                        entry.element.removeEventListener(entry.event, entry.handler, entry.options);
+                    } catch (e) {
+                        console.warn('[Memory] Listener removal failed:', entry.event, e.message);
                     }
-                    audio.removeAttribute('src');
-                } catch (e) { console.warn('[Memory] Audio cleanup failed for element:', e.message); }
+                    entry.active = false;
+                }
+                listenerRegistry.length = 0;
+                return { subsystem: 'listeners', cleared: count };
             }
-            return { subsystem: 'audio', paused };
-        }
-    };
-
-    const mapSubsystem = {
-        dispose() {
-            const results = { markerClusters: 0, animationFrames: 0, timeouts: 0 };
-            if (typeof markerClusterGroup !== 'undefined' &&
-                markerClusterGroup && typeof markerClusterGroup.clearLayers === 'function') {
-                try { markerClusterGroup.clearLayers(); results.markerClusters = 1; }
-                catch (e) { console.warn('[Memory] Marker cluster cleanup failed:', e.message); }
+        };
+    
+        const audioSubsystem = {
+            dispose() {
+                const audios = document.querySelectorAll('audio');
+                let paused = 0;
+                for (const audio of audios) {
+                    try {
+                        if (!audio.paused) { audio.pause(); paused++; }
+                        if (!isNaN(audio.currentTime) && audio.currentTime > 0) {
+                            try { localStorage.setItem('audioPosition', audio.currentTime.toString()); }
+                            catch (storageErr) { console.debug('[Memory] Could not save audio position:', storageErr.message); }
+                        }
+                        audio.removeAttribute('src');
+                    } catch (e) { console.warn('[Memory] Audio cleanup failed for element:', e.message); }
+                }
+                return { subsystem: 'audio', paused };
             }
-            if (window.animationFrameId != null) {
-                cancelAnimationFrame(window.animationFrameId);
-                window.animationFrameId = null;
-                results.animationFrames = 1;
+        };
+    
+        const mapSubsystem = {
+            dispose() {
+                const results = { markerClusters: 0, animationFrames: 0, timeouts: 0 };
+                if (typeof markerClusterGroup !== 'undefined' &&
+                    markerClusterGroup && typeof markerClusterGroup.clearLayers === 'function') {
+                    try { markerClusterGroup.clearLayers(); results.markerClusters = 1; }
+                    catch (e) { console.warn('[Memory] Marker cluster cleanup failed:', e.message); }
+                }
+                if (window.animationFrameId != null) {
+                    cancelAnimationFrame(window.animationFrameId);
+                    window.animationFrameId = null;
+                    results.animationFrames = 1;
+                }
+                if (window.stationaryCheckTimeout) { clearTimeout(window.stationaryCheckTimeout); window.stationaryCheckTimeout = null; results.timeouts++; }
+                if (window.inactivityTimer)        { clearTimeout(window.inactivityTimer);        window.inactivityTimer = null;        results.timeouts++; }
+                if (window.positionWatchId != null) {
+                    try { navigator.geolocation.clearWatch(window.positionWatchId); window.positionWatchId = null; }
+                    catch (e) { console.warn('[Memory] GPS watch cleanup failed:', e.message); }
+                }
+                return { subsystem: 'map', ...results };
             }
-            if (window.stationaryCheckTimeout) { clearTimeout(window.stationaryCheckTimeout); window.stationaryCheckTimeout = null; results.timeouts++; }
-            if (window.inactivityTimer)        { clearTimeout(window.inactivityTimer);        window.inactivityTimer = null;        results.timeouts++; }
-            if (window.positionWatchId != null) {
-                try { navigator.geolocation.clearWatch(window.positionWatchId); window.positionWatchId = null; }
-                catch (e) { console.warn('[Memory] GPS watch cleanup failed:', e.message); }
+        };
+    
+        const domSubsystem = {
+            dispose() {
+                let removed = 0;
+                const selectors = '[data-tracked="true"], .popup-overlay, .modal, .navigation-tips-overlay, .source-info-content';
+                for (const el of document.querySelectorAll(selectors)) { el.remove(); removed++; }
+                if (Array.isArray(window.gameLocations))  window.gameLocations.length = 0;
+                if (Array.isArray(window.positionBuffer)) window.positionBuffer.length = 0;
+                if (window.activePopups) window.activePopups.clear();
+                return { subsystem: 'dom', removed };
             }
-            return { subsystem: 'map', ...results };
-        }
-    };
-
-    const domSubsystem = {
-        dispose() {
-            let removed = 0;
-            const selectors = '[data-tracked="true"], .popup-overlay, .modal, .navigation-tips-overlay, .source-info-content';
-            for (const el of document.querySelectorAll(selectors)) { el.remove(); removed++; }
-            if (Array.isArray(window.gameLocations))  window.gameLocations.length = 0;
-            if (Array.isArray(window.positionBuffer)) window.positionBuffer.length = 0;
-            if (window.activePopups) window.activePopups.clear();
-            return { subsystem: 'dom', removed };
-        }
-    };
-
-    const subsystems  = [timerSubsystem, listenerSubsystem, audioSubsystem, mapSubsystem, domSubsystem];
-    const customTasks = [];
-
-    const manager = {
-        isDisposed: false,
-        createTrackedTimeout:  timerSubsystem.createTimeout.bind(timerSubsystem),
-        createTrackedInterval: timerSubsystem.createInterval.bind(timerSubsystem),
-        clearTrackedTimer:     timerSubsystem.clear.bind(timerSubsystem),
-        trackEventListener:    listenerSubsystem.track.bind(listenerSubsystem),
-
-        registerCleanupTask(fn) {
-            if (typeof fn !== 'function') { console.warn('[Memory] Ignoring non-function cleanup task:', fn); return; }
-            customTasks.push(fn);
-        },
-
-        executeCleanup() {
-            if (this.isDisposed) return [];
-            const report = [];
-            while (customTasks.length > 0) {
-                try { customTasks.shift()(); } catch (e) { console.error('[Memory] Custom cleanup task failed:', e); }
+        };
+    
+        const subsystems  = [timerSubsystem, listenerSubsystem, audioSubsystem, mapSubsystem, domSubsystem];
+        const customTasks = [];
+    
+        const manager = {
+            isDisposed: false,
+            createTrackedTimeout:  timerSubsystem.createTimeout.bind(timerSubsystem),
+            createTrackedInterval: timerSubsystem.createInterval.bind(timerSubsystem),
+            clearTrackedTimer:     timerSubsystem.clear.bind(timerSubsystem),
+            trackEventListener:    listenerSubsystem.track.bind(listenerSubsystem),
+    
+            // NEW — companion to trackEventListener. Pass the entry it returned
+            // to remove that one listener early instead of waiting for full
+            // disposal. Additive; nothing existing needs to change to keep working.
+            untrackEventListener: listenerSubsystem.untrack.bind(listenerSubsystem),
+    
+            registerCleanupTask(fn) {
+                if (typeof fn !== 'function') { console.warn('[Memory] Ignoring non-function cleanup task:', fn); return; }
+                customTasks.push(fn);
+            },
+    
+            executeCleanup() {
+                if (this.isDisposed) return [];
+                const report = [];
+                while (customTasks.length > 0) {
+                    try { customTasks.shift()(); } catch (e) { console.error('[Memory] Custom cleanup task failed:', e); }
+                }
+                for (const sys of subsystems) {
+                    try { report.push(sys.dispose()); }
+                    catch (e) { console.error('[Memory] Subsystem cleanup failed:', sys, e); report.push({ subsystem: sys.name || 'unknown', error: e.message }); }
+                }
+                this.isDisposed = true;
+                console.log('[Memory] Cleanup cycles complete.');
+                return report;
+            },
+    
+            shutdown() {
+                this.executeCleanup();
+                if (window.performCleanup === this.executeCleanup) delete window.performCleanup;
+                console.log('[Memory] Manager shutdown complete');
             }
-            for (const sys of subsystems) {
-                try { report.push(sys.dispose()); }
-                catch (e) { console.error('[Memory] Subsystem cleanup failed:', sys, e); report.push({ subsystem: sys.name || 'unknown', error: e.message }); }
+        };
+    
+        listenerSubsystem.track(document, 'visibilitychange', () => {
+            if (document.hidden) {
+                const audio = document.getElementById('locationAudio');
+                if (audio && !isNaN(audio.currentTime) && audio.currentTime > 0) {
+                    try { localStorage.setItem('audioPosition', audio.currentTime.toString()); } catch (_) {}
+                }
             }
-            this.isDisposed = true;
-            console.log('[Memory] Cleanup cycles complete.');
-            return report;
-        },
-
-        shutdown() {
-            this.executeCleanup();
-            if (window.performCleanup === this.executeCleanup) delete window.performCleanup;
-            console.log('[Memory] Manager shutdown complete');
-        }
-    };
-
-    listenerSubsystem.track(document, 'visibilitychange', () => {
-        if (document.hidden) {
-            const audio = document.getElementById('locationAudio');
-            if (audio && !isNaN(audio.currentTime) && audio.currentTime > 0) {
-                try { localStorage.setItem('audioPosition', audio.currentTime.toString()); } catch (_) {}
-            }
-        }
-    });
-
-    listenerSubsystem.track(window, 'beforeunload', () => manager.executeCleanup());
-
-    return manager;
-}
-
-const memoryManager = setupMemoryManagement();
-
+        });
+    
+        listenerSubsystem.track(window, 'beforeunload', () => manager.executeCleanup());
+    
+        return manager;
+    }
+    
+    const memoryManager = setupMemoryManagement();
+        
 /* ═══════════════════════════════════════════════════════════════
    POSITION KALMAN FILTER
    ═══════════════════════════════════════════════════════════════ */
@@ -4984,202 +5050,7 @@ if (typeof window !== 'undefined') {
         }
     });
 }
-        
-/**
- * Centered mode: Keeps marker within tolerance of exact center. Uses setView at high speed for sub-frame correction.
- */
-function _enforceCenteredMode(markerPos, map, marker) {
-    // ─── DEAD RECKONING GUARD ───────────────────────────────────────
-    // The DR loop handles centered mode natively via requestAnimationFrame.
-    if (window.deadReckoning && typeof window.deadReckoning.isActive === 'function' && window.deadReckoning.isActive()) {
-        return; 
-    }
-
-    var mapSize = map.getSize();
-    if (!mapSize || mapSize.x <= 0 || mapSize.y <= 0) return;
-
-    var markerPixel = map.latLngToContainerPoint(markerPos);
-    if (!markerPixel || !isFinite(markerPixel.x) || !isFinite(markerPixel.y)) return;
-
-    var dx = markerPixel.x - mapSize.x / 2;
-    var dy = markerPixel.y - mapSize.y / 2;
-    var distanceFromCenter = Math.sqrt(dx * dx + dy * dy);
-
-    var speedMPS = window.lastPosition?.speedMPS || 0;
-    // Tolerance widens when stationary to absorb GPS noise
-    var tolerance = speedMPS > 2 ? 8 : speedMPS > 0.5 ? 14 : 20;
-
-    if (distanceFromCenter <= tolerance) return;
-    if (window._centeredPanInProgress)  return;
-
-    var currentCenterPx   = map.latLngToContainerPoint(map.getCenter());
-    var correctedCenterPx = { x: currentCenterPx.x + dx, y: currentCenterPx.y + dy };
-    var correctedCenter   = map.containerPointToLatLng(correctedCenterPx);
-
-    if (!correctedCenter || !isFinite(correctedCenter.lat) || !isFinite(correctedCenter.lng)) {
-        correctedCenter = markerPos;
-    }
-
-    var speedMPH = speedMPS * 2.23694;
-
-    if (speedMPH >= 15) {
-        // At high speed, instant correction
-        window._gpsCenteredPanJustOccurred = true;
-        map.setView([correctedCenter.lat, correctedCenter.lng], map.getZoom(), {
-            animate: false, noMoveStart: true, noMoveEnd: true
-        });
-    } else {
-        var panDuration = speedMPS > 2 ? 0.08 : 0.15;
-        window._centeredPanInProgress = true;
-        map.panTo([correctedCenter.lat, correctedCenter.lng], {
-            animate: true, duration: panDuration, easeLinearity: 0.3, noMoveStart: true
-        });
-        
-        // Backwards compatible timeout clearing
-        if (typeof createTrackedTimeout === 'function') {
-            createTrackedTimeout(function () { window._centeredPanInProgress = false; }, panDuration * 1000 + 50);
-        } else {
-            setTimeout(function () { window._centeredPanInProgress = false; }, panDuration * 1000 + 50);
-        }
-    }
-}
-
-/**
- * Roaming mode: Keeps marker inside viewport with speed-scaled margins. Pans smoothly without jumping ahead.
- */
-function _enforceRoamingMode(markerPos, map, marker, speedMPH) {
-    // ─── DEAD RECKONING GUARD ───────────────────────────────────────
-    // If DR is active and the user hasn't explicitly disabled DR roaming, let DR handle it.
-    if (window.deadReckoning && typeof window.deadReckoning.isActive === 'function' && window.deadReckoning.isActive() && !window.DISABLE_DR_ROAMING) {
-        return; 
-    }
-
-    if (!map || !marker)             return;
-    if (window.isMapInteracting)     return;
-    if (window.followUser === false) return;
-
-    const mapSize = map.getSize();
-    if (!mapSize || mapSize.x <= 0 || mapSize.y <= 0) return;
-
-    const pixel = map.latLngToContainerPoint(markerPos);
-    if (!pixel || !isFinite(pixel.x) || !isFinite(pixel.y)) return;
-
-    // Speed normalised to 0–1 over 0–15 mph
-    const MAX_ROAM_SPEED_MPH = 15;
-    const safeSpeed  = (isFinite(speedMPH) && speedMPH > 0) ? Math.min(speedMPH, MAX_ROAM_SPEED_MPH) : 0;
-    const speedFrac  = safeSpeed / MAX_ROAM_SPEED_MPH;
-
-    // Off-screen: small overshoot → animated recovery; large → instant snap
-    const offscreenThreshold = Math.min(mapSize.x, mapSize.y) * 0.15;
-    const offX   = pixel.x < 0 ? -pixel.x : pixel.x > mapSize.x ? pixel.x - mapSize.x : 0;
-    const offY   = pixel.y < 0 ? -pixel.y : pixel.y > mapSize.y ? pixel.y - mapSize.y : 0;
-    const offDist = Math.max(offX, offY);
-
-    if (offDist > 0) {
-        window._lastRoamingPanTime       = performance.now();
-        window._roamingPanAnimationEndMs = performance.now();
-        if (offDist > offscreenThreshold) {
-            map.setView([markerPos.lat, markerPos.lng], map.getZoom(), {
-                animate: false, noMoveStart: true, noMoveEnd: true
-            });
-        } else {
-            map.panTo([markerPos.lat, markerPos.lng], {
-                animate: true, duration: 0.25, easeLinearity: 0.3, noMoveStart: true
-            });
-        }
-        return;
-    }
-
-    // Edge margin: 20% of smaller dimension, clamped 55–160px
-    const margin     = Math.max(55, Math.min(160, Math.min(mapSize.x, mapSize.y) * 0.20));
-    const nearLeft   = pixel.x < margin;
-    const nearRight  = pixel.x > mapSize.x - margin;
-    const nearTop    = pixel.y < margin;
-    const nearBottom = pixel.y > mapSize.y - margin;
-
-    if (!nearLeft && !nearRight && !nearTop && !nearBottom) return;
-
-    // Penetration depth per axis (0 = just entered margin, 1 = at raw edge)
-    let penetrationX = 0, penetrationY = 0;
-    if (nearLeft)   penetrationX = 1 - (pixel.x / margin);
-    if (nearRight)  penetrationX = 1 - ((mapSize.x - pixel.x) / margin);
-    if (nearTop)    penetrationY = 1 - (pixel.y / margin);
-    if (nearBottom) penetrationY = 1 - ((mapSize.y - pixel.y) / margin);
-
-    // Hypotenuse so corner approaches register as more urgent
-    const penetration = Math.min(1, Math.sqrt(penetrationX ** 2 + penetrationY ** 2));
-
-    // Urgency: smooth 0→1 blend of depth and speed
-    const urgency = Math.min(1, penetration * 0.65 + speedFrac * 0.45);
-
-    // Pan throttle — overlapping pans fight each other at low urgency
-    const now          = performance.now();
-    const animRunning  = now < (window._roamingPanAnimationEndMs || 0);
-    if (animRunning && urgency < 0.7) return;
-
-    const timeSinceLastPan = now - (window._lastRoamingPanTime || 0);
-    const throttleMs       = Math.max(0, 350 * (1 - urgency));
-    if (urgency < 0.7 && timeSinceLastPan < throttleMs) return;
-
-    // Pull factor: how far toward center to drag (0.38 low urgency → 0.72 high)
-    const basePull   = 0.38 + urgency * 0.24;
-    const pullFactor = Math.min(0.72, basePull + speedFrac * 0.10);
-
-    // Look-ahead: nudge pan target in direction of travel
-    const LA_SECS = 1.2;
-    let laLat = 0, laLng = 0;
-    const sv = window.smoothedVelocity;
-    if (sv?.lat != null && sv?.lng != null && isFinite(sv.lat) && isFinite(sv.lng)) {
-        laLat = sv.lat * LA_SECS * speedFrac;
-        laLng = sv.lng * LA_SECS * speedFrac;
-    }
-
-    // Build pan target
-    const centerX     = mapSize.x / 2;
-    const centerY     = mapSize.y / 2;
-    const offsetX     = (centerX - pixel.x) * pullFactor;
-    const offsetY     = (centerY - pixel.y) * pullFactor;
-    const centerPx    = map.latLngToContainerPoint(map.getCenter());
-    const newCenterPx = { x: centerPx.x + offsetX, y: centerPx.y + offsetY };
-    let   newCenter   = map.containerPointToLatLng(newCenterPx);
-
-    if (!newCenter || !isFinite(newCenter.lat) || !isFinite(newCenter.lng)) {
-        newCenter = markerPos;
-    } else {
-        newCenter = { lat: newCenter.lat + laLat, lng: newCenter.lng + laLng };
-    }
-
-    window._lastRoamingPanTime = now;
-
-    if (urgency >= 0.92) {
-        // Extremely deep in margin at speed — hard snap
-        window._roamingPanAnimationEndMs = now;
-        map.setView([newCenter.lat, newCenter.lng], map.getZoom(), {
-            animate: false, noMoveStart: true, noMoveEnd: true
-        });
-    } else {
-        const panDuration   = Math.max(0.12, 0.45 - urgency * 0.28 - speedFrac * 0.05);
-        const easeLinearity = Math.min(0.5,  0.18 + speedFrac * 0.20 + urgency * 0.08);
-
-        window._roamingPanAnimationEndMs = now + panDuration * 1000;
-        map.panTo([newCenter.lat, newCenter.lng], {
-            animate: true, duration: panDuration, easeLinearity, noMoveStart: true
-        });
-    }
-
-    if (window.DEBUG_PANNING) {
-        console.debug(
-            '[Roaming] speed=' + safeSpeed.toFixed(1) + 'mph' +
-            ' urgency='        + urgency.toFixed(2) +
-            ' penetration='    + penetration.toFixed(2) +
-            ' pull='           + pullFactor.toFixed(2) +
-            ' dur='            + (window._roamingPanAnimationEndMs > now
-                                    ? (window._roamingPanAnimationEndMs - now).toFixed(0) + 'ms'
-                                    : 'snap')
-        );
-    }
-}
-        
+                
 function updateDistanceBox(forceUpdate = false, precalcUserPos = null, precalcClosestLocation = null, precalcClosestDistance = Infinity) {
     const distanceBox = cachedElements.distanceBox || document.getElementById('distanceBox');
     if (!distanceBox) return;
