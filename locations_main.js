@@ -324,11 +324,11 @@ const locations = [
         additionalInfo: "The Barker-Karpis gang brought in a strategist from Al Capone's Chicago syndicate to help plan Hamm Jr.'s kidnapping.",
         difficulty: 1
     },
-/*
+
     {
         id: "1030",
-        lat: 44.987154491771946,
-        lng: -93.25850396437934,
+        lat: 45.143206769588836, -
+        lng: 93.00476115417781,
         name: "Nye's Polonaise Room (1950 - 2016)",
         title: "Nye's Polonaise Room",
         image: "https://mnthen.com/images/nyes.webp",
@@ -343,7 +343,7 @@ const locations = [
         additionalInfo: "Guy Fieri featured Nye's on Season 13 of Food Network’s \"Diners, Drive-Ins and Dives,\" praising their pierogi and prime rib sandwich.",
         difficulty: 1
     },
-*/
+
     {
         id: "1031",
         lat: 45.20298779768933,
