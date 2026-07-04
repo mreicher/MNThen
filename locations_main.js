@@ -324,7 +324,7 @@ const locations = [
         additionalInfo: "The Barker-Karpis gang brought in a strategist from Al Capone's Chicago syndicate to help plan Hamm Jr.'s kidnapping.",
         difficulty: 1
     },
-
+/*
     {
         id: "1030",
         lat: 45.143206769588836, 
@@ -343,7 +343,7 @@ const locations = [
         additionalInfo: "Guy Fieri featured Nye's on Season 13 of Food Network’s \"Diners, Drive-Ins and Dives,\" praising their pierogi and prime rib sandwich.",
         difficulty: 1
     },
-
+*/
     {
         id: "1031",
         lat: 45.20298779768933,
