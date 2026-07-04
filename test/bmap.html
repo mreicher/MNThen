@@ -1635,15 +1635,15 @@ class SensorFusionManager {
         if (!isFinite(rawLat) || !isFinite(rawLng) || !this._kalmanFilter) {
             return { lat: rawLat || 0, lng: rawLng || 0, vNorth: 0, vEast: 0, speedMPS: 0 };
         }
-
+     
         const kf = this._kalmanFilter;
         const perfNow = this._toPerfNow(timestampMs);
-
+     
         // Snapshot previous raw state BEFORE overwriting (fixes velocity-seed dt=0 bug)
         const prevRawLat       = this._rawLat;
         const prevRawLng       = this._rawLng;
         const prevRawTimestamp = this._rawTimestamp;
-
+     
         const gpsVel = this._computeGPSVelocity(rawLat, rawLng, timestampMs);
         this._gpsVelocityDegPerSec = gpsVel;
         this._rawLat        = rawLat;
@@ -1651,8 +1651,32 @@ class SensorFusionManager {
         this._rawSpeedMPS   = gpsSpeedMPS;
         this._rawHeadingDeg = gpsHeadingDeg;
         this._rawTimestamp  = timestampMs;
-
-        // Seed velocity BEFORE first update so Kalman learns from frame one.
+     
+        // Gap recovery: seed velocity from position delta after long pause.
+        // Runs BEFORE kf.update() so it reads kf.lastTimestamp before this
+        // tick's update() advances it — the gap-length check needs the
+        // pre-update timestamp to detect the gap in the first place.
+        if (kf.lastTimestamp != null && kf.x != null) {
+            const dtMs = perfNow - kf.lastTimestamp;
+            if (dtMs > 10000 && window.lastPosition?.lat != null && window.lastPosition?.lng != null) {
+                const dtSec = dtMs / 1000, cosLat = Math.cos(rawLat * Math.PI / 180);
+                kf.scheduleVelocitySeed(
+                    ((rawLat - window.lastPosition.lat) / dtSec) * 111111,
+                    ((rawLng - window.lastPosition.lng) / dtSec) * 111111 * cosLat
+                );
+            }
+        }
+     
+        const kfResult = kf.update(rawLat, rawLng, accuracyMeters, perfNow, gpsSpeedMPS);
+     
+        // kfResult.updateCount === 1 means kf.update() just called _initialize()
+        // this tick — covers the filter's very first init AND every reset path
+        // (dt<=0/dt>30 inside update(), plus external kf.reset() calls from
+        // _handleGPSGap, _resetMapToPosition, and _runSensorFusion's jump
+        // guard).
+        if (kfResult.updateCount === 1) { this._convergenceStage = 0; }
+     
+        // Seed consumption moved here — AFTER kf.update(), not before.
         if (kf._justInitialized) {
             let seeded = false;
             if (gpsSpeedMPS != null && gpsSpeedMPS > 0.3 && gpsHeadingDeg != null && isFinite(gpsHeadingDeg)) {
@@ -1680,38 +1704,17 @@ class SensorFusionManager {
             }
             kf._justInitialized = false;
         }
-
-        // Gap recovery: seed velocity from position delta after long pause.
-        if (kf.lastTimestamp != null && kf.x != null) {
-            const dtMs = perfNow - kf.lastTimestamp;
-            if (dtMs > 10000 && window.lastPosition?.lat != null && window.lastPosition?.lng != null) {
-                const dtSec = dtMs / 1000, cosLat = Math.cos(rawLat * Math.PI / 180);
-                kf.scheduleVelocitySeed(
-                    ((rawLat - window.lastPosition.lat) / dtSec) * 111111,
-                    ((rawLng - window.lastPosition.lng) / dtSec) * 111111 * cosLat
-                );
-            }
-        }
-
-        const kfResult = kf.update(rawLat, rawLng, accuracyMeters, perfNow, gpsSpeedMPS);
-
-        // kfResult.updateCount === 1 means kf.update() just called _initialize()
-        // this tick — covers the filter's very first init AND every reset path
-        // (dt<=0/dt>30 inside update(), plus external kf.reset() calls from
-        // _handleGPSGap, _resetMapToPosition, and _runSensorFusion's jump
-        // guard).
-        if (kfResult.updateCount === 1) { this._convergenceStage = 0; }
-
+     
         this._filteredSpeedMPS = kf.getSpeedMPS();
         const isStationary = this._updateStationaryState(gpsSpeedMPS, this._filteredSpeedMPS, rawLat, rawLng);
-
+     
         if      (kfResult.isConverged && this._convergenceStage < 2)      { this._convergenceStage = 2; }
         else if (kfResult.updateCount >= 3 && this._convergenceStage < 1) { this._convergenceStage = 1; }
         if (gpsSpeedMPS > 1.0 && kfResult.updateCount >= 2) { this._convergenceStage = Math.max(this._convergenceStage, 1); }
-
+     
         let resultLat, resultLng, resultVNorth, resultVEast, resultSpeed;
         let blendFactor = kfResult.blendFactor;
-
+     
         if (isStationary && this._stationaryPosition) {
             resultLat = this._stationaryPosition.lat; resultLng = this._stationaryPosition.lng;
             resultVNorth = 0; resultVEast = 0; resultSpeed = 0; blendFactor = 1.0;
@@ -1730,10 +1733,10 @@ class SensorFusionManager {
             resultLat = kfResult.lat; resultLng = kfResult.lng;
             resultVNorth = kfResult.vNorth; resultVEast = kfResult.vEast; resultSpeed = kfResult.speedMPS;
         }
-
+     
         this._lastKalmanLat = resultLat; this._lastKalmanLng = resultLng;
         this._lastKalmanTimestamp = perfNow; this._rawVelocity = gpsVel;
-
+     
         return {
             lat: resultLat, lng: resultLng,
             vNorth: resultVNorth, vEast: resultVEast, speedMPS: resultSpeed,
@@ -1967,182 +1970,173 @@ window.sensorFusion = new SensorFusionManager().init();
             kf.seedVelocity(_lastGoodSpeedMPS * Math.cos(rad), _lastGoodSpeedMPS * Math.sin(rad), 2.0);
         }
 
-    function frame(now) {
-        _rafId = null;
-        const lastPos = window.lastPosition;
-        if (!lastPos || window.isLocationHuntVisible) { _active = false; return; }
-
-        const speedMPS   = _getSpeedMPS();
-        const stationary = _isStationary();
-
-        // MODE-INDEPENDENT EXIT: unchanged
-        if (stationary && speedMPS < CFG.MIN_SPEED_MPS) { _active = false; return; }
-
-        const isInteracting = window.isMapInteracting || window._isProximityZoomAnimating || window._gpsCenteredPanJustOccurred;
-        if (isInteracting) {
-            _interactionEndTime = now + CFG.INTERACTION_FADE_MS;
+        function frame(now) {
+            _rafId = null;
+            const lastPos = window.lastPosition;
+            if (!lastPos || window.isLocationHuntVisible) { _active = false; return; }
+        
+            const speedMPS   = _getSpeedMPS();
+            const stationary = _isStationary();
+        
+            // MODE-INDEPENDENT EXIT — unchanged, confirmed correct.
+            if (stationary && speedMPS < CFG.MIN_SPEED_MPS) { _active = false; return; }
+        
+            const isInteracting = window.isMapInteracting || window._isProximityZoomAnimating || window._gpsCenteredPanJustOccurred;
+            if (isInteracting) {
+                _interactionEndTime = now + CFG.INTERACTION_FADE_MS;
+                _lastFrameTime = now;
+                _rafId = requestAnimationFrame(frame);
+                return;
+            }
+            if (now < _interactionEndTime) { _lastFrameTime = now; _rafId = requestAnimationFrame(frame); return; }
+        
+            const dtMs = now - _lastFrameTime;
+            if (dtMs < CFG.MIN_DT_MS) { _rafId = requestAnimationFrame(frame); return; }
             _lastFrameTime = now;
-            _rafId = requestAnimationFrame(frame);
-            return;
-        }
-        if (now < _interactionEndTime) { _lastFrameTime = now; _rafId = requestAnimationFrame(frame); return; }
-
-        const dtMs = now - _lastFrameTime;
-        if (dtMs < CFG.MIN_DT_MS) { _rafId = requestAnimationFrame(frame); return; }
-        _lastFrameTime = now;
-
-        const kp = _getKalmanPos(), rp = _getRawPos();
-        let oLat, oLng, oTs;
-        if      (kp?.timestamp != null) { oLat = kp.lat; oLng = kp.lng; oTs = kp.timestamp; }
-        else if (rp?.timestamp != null) { oLat = rp.lat; oLng = rp.lng; oTs = rp.timestamp; }
-        else                            { oLat = lastPos.lat; oLng = lastPos.lng; oTs = window.lastUpdateTimestamp || now; }
-
-        const hdg = _getHeading();
-        if (_lastHeadingDeg != null && hdg != null) {
-            let d = hdg - _lastHeadingDeg;
-            if (d >  180) d -= 360;
-            if (d < -180) d += 360;
-            _headingChangeRate = _headingChangeRate * 0.85 + (Math.abs(d) / (Math.max(dtMs, 16) / 1000)) * 0.15;
-        }
-        if (hdg != null) _lastHeadingDeg = hdg;
-
-        const vel = _getVelocity();
-        const vm = Math.sqrt(vel.lat*vel.lat + vel.lng*vel.lng);
-        if (vm > 0.001) { _lastGoodVelocity = { lat: vel.lat, lng: vel.lng }; _lastGoodSpeedMPS = speedMPS; }
-
-        let pLat, pLng;
-        const rawAge = Math.max(0, (now - oTs) / 1000);
-        const hor    = _getPredictHorizon(speedMPS, _headingChangeRate);
-        const pDt    = Math.min(rawAge, hor);
-
-        if (pDt <= 0 || speedMPS < CFG.LOW_SPEED_CUTOFF_MPS || stationary) {
-            pLat = oLat; pLng = oLng;
-        } else {
-            pLat = oLat + vel.lat * pDt;
-            pLng = oLng + vel.lng * pDt;
-            const jN = Math.abs(pLat - oLat) * 111111;
-            const jE = Math.abs(pLng - oLng) * 111111 * Math.cos(oLat * Math.PI / 180);
-            if (jN > 150 || jE > 150) { pLat = oLat; pLng = oLng; }
-        }
-
-        // Keep external semantics identical: _lastPredictedPos is the raw prediction.
-        _lastPredictedPos = { lat: pLat, lng: pLng };
-
-        /* ── RENDER-SIDE SMOOTHER (the only new behavior) ────────────────────*/
-        const SM_TAU_LOW    = 0.32;  // s  — smoothing time constant near standstill
-        const SM_TAU_HIGH   = 0.05;  // s  — smoothing time constant at/above SM_SPEED_HIGH
-        const SM_SPEED_LOW  = 0.5;   // m/s — at/below this, use SM_TAU_LOW
-        const SM_SPEED_HIGH = 3.0;   // m/s — at/above this, use SM_TAU_HIGH
-        const SM_SNAP_M     = 8.0;   // m  — errors larger than this snap instantly
-        const SM_DEADBAND_M = 0.6;   // m  — below this (at low speed) hold position
-        const SM_STALE_MS   = 400;   // ms — gap this large ⇒ loop restarted ⇒ snap
-
-        let sLat, sLng;
-        const prev = window.__drRender;
-        const cosLat = Math.cos(pLat * Math.PI / 180);
-        const errN = (pLat - (prev ? prev.lat : pLat)) * 111111;
-        const errE = (pLng - (prev ? prev.lng : pLng)) * 111111 * cosLat;
-        const errDist = Math.sqrt(errN * errN + errE * errE);
-        const stale = !prev || (now - prev.ts) > SM_STALE_MS;
-
-        if (stale || errDist > SM_SNAP_M) {
-            // Init / restart / real correction / teleport → snap, no smoothing.
-            sLat = pLat; sLng = pLng;
-        } else if (speedMPS < CFG.MIN_SPEED_MPS && errDist < SM_DEADBAND_M) {
-            // Near standstill and only jitter-sized error → hold (kills shuffle).
-            sLat = prev.lat; sLng = prev.lng;
-        } else {
-            // Critically-damped, frame-rate-independent low-pass toward target.
-            const tS   = Math.max(0, Math.min(1, (speedMPS - SM_SPEED_LOW) / (SM_SPEED_HIGH - SM_SPEED_LOW)));
-            const tau  = SM_TAU_LOW + (SM_TAU_HIGH - SM_TAU_LOW) * tS;
-            const a    = 1 - Math.exp(-(dtMs / 1000) / Math.max(tau, 0.001));
-            sLat = prev.lat + (pLat - prev.lat) * a;
-            sLng = prev.lng + (pLng - prev.lng) * a;
-        }
-        window.__drRender = { lat: sLat, lng: sLng, ts: now };
-        /* ──────────────────────────────────────────────────────────────────── */
-
-        if (!map || window._isProximityZoomAnimating) {
-            _setMarkerPosition(sLat, sLng);
-            _rafId = requestAnimationFrame(frame);
-            return;
-        }
-
-        // BACKWARDS COMPATIBLE: identical mode branching, using smoothed position.
-        if (window.followUser && _isCenteredMode()) {
-            _snapViewport(sLat, sLng);
-            const c = map.getCenter();
-            _setMarkerPosition(c.lat, c.lng);
-        } else if (window.followUser) {
-            _setMarkerPosition(sLat, sLng);
-            _snapViewport(sLat, sLng);
-        } else {
-            _setMarkerPosition(sLat, sLng);
-        }
-
-        _rafId = requestAnimationFrame(frame);
-    }
-    
-    function _start() {
-        if (_active || window.isLocationHuntVisible) return;
-        const speedMPS = _getSpeedMPS(), stationary = _isStationary();
         
-        // MODE-INDEPENDENT START: mirror of frame() exit
-        if (stationary && speedMPS < CFG.MIN_SPEED_MPS) return;
+            const kp = _getKalmanPos(), rp = _getRawPos();
+            let oLat, oLng, oTs;
+            if      (kp?.timestamp != null) { oLat = kp.lat; oLng = kp.lng; oTs = kp.timestamp; }
+            else if (rp?.timestamp != null) { oLat = rp.lat; oLng = rp.lng; oTs = rp.timestamp; }
+            else                            { oLat = lastPos.lat; oLng = lastPos.lng; oTs = window.lastUpdateTimestamp || now; }
         
-        _seedVelocityOnResume();
-        _active = true;
-        _lastFrameTime = performance.now();
-        _interactionEndTime = 0;
-        _rafId = requestAnimationFrame(frame);
-    }
-    
-    window.deadReckoning = {
-        start() { _start(); },
-    
-        stop() {
-            if (_rafId != null) { cancelAnimationFrame(_rafId); _rafId = null; }
-            _active = false; _panPending = false; _panTarget = null;
-            _centeredLat = null; _centeredLng = null;
-            const el = _getMarkerEl();
-            if (el) { el.style.willChange = ''; el.style.transition = ''; _markerTransSet = false; }
-        },
-    
-        isActive() { return _active; },
-    
-        onMovementResumed: _start,
-    
-        // CORRECT forceUpdate: from Doc 25 — no _interactionEndTime re-arm
-        forceUpdate() {
-            if (!_active) { _start(); return; }
-            _lastFrameTime = 0;
-            if (_rafId == null) _rafId = requestAnimationFrame(frame);
-        },
-    
-        getPredictedPosition()  { return _lastPredictedPos; },
-        invalidateMarkerCache() { _markerEl = null; _markerTransSet = false; }
-    };
-    
-    _start();
-    
-    if (typeof memoryManager !== 'undefined' && memoryManager?.registerCleanupTask) {
-        memoryManager.registerCleanupTask(() => window.deadReckoning.stop());
-    }
-    })();
+            const hdg = _getHeading();
+            if (_lastHeadingDeg != null && hdg != null) {
+                let d = hdg - _lastHeadingDeg;
+                if (d >  180) d -= 360;
+                if (d < -180) d += 360;
+                _headingChangeRate = _headingChangeRate * 0.85 + (Math.abs(d) / (Math.max(dtMs, 16) / 1000)) * 0.15;
+            }
+            if (hdg != null) _lastHeadingDeg = hdg;
+        
+            const vel = _getVelocity();
+            const vm = Math.sqrt(vel.lat*vel.lat + vel.lng*vel.lng);
+            if (vm > 0.001) { _lastGoodVelocity = { lat: vel.lat, lng: vel.lng }; _lastGoodSpeedMPS = speedMPS; }
+        
+            let pLat, pLng;
+            const rawAge = Math.max(0, (now - oTs) / 1000);
+            const hor    = _getPredictHorizon(speedMPS, _headingChangeRate);
+            const pDt    = Math.min(rawAge, hor);
+        
+            if (pDt <= 0 || speedMPS < CFG.LOW_SPEED_CUTOFF_MPS || stationary) {
+                pLat = oLat; pLng = oLng;
+            } else {
+                pLat = oLat + vel.lat * pDt;
+                pLng = oLng + vel.lng * pDt;
+                const jN = Math.abs(pLat - oLat) * 111111;
+                const jE = Math.abs(pLng - oLng) * 111111 * Math.cos(oLat * Math.PI / 180);
+                if (jN > 150 || jE > 150) { pLat = oLat; pLng = oLng; }
+            }
+        
+            _lastPredictedPos = { lat: pLat, lng: pLng };
+        
+            /* ── NEAR-STOP JITTER HOLD (zero added latency for real motion) ──────────
+             * Below 0.5 m/s, DR isn't extrapolating at all (_getPredictHorizon
+             * returns ~0 there) — pLat/pLng are just passed through from oLat/oLng,
+             * the fused Kalman/raw position. Shuffle in that band is upstream noise
+             * in that fused position, not a DR problem. This hold suppresses only
+             * jitter-sized moves while near-stop — it does NOT delay or blend real
+             * motion, so it costs nothing at any speed above this band.
+             */
+            const HOLD_SPEED_MPS = CFG.MIN_SPEED_MPS; // near-stop band, same gate as the exit check above
+            const HOLD_DEADBAND_M = 0.6;              // meters — errors below this are jitter, not movement
+        
+            const prevHeld = window.__drHeld;
+            let hLat = pLat, hLng = pLng;
+        
+            if (speedMPS < HOLD_SPEED_MPS && prevHeld) {
+                const cosLat = Math.cos(pLat * Math.PI / 180);
+                const errN = (pLat - prevHeld.lat) * 111111;
+                const errE = (pLng - prevHeld.lng) * 111111 * cosLat;
+                const errDist = Math.sqrt(errN * errN + errE * errE);
+                if (errDist < HOLD_DEADBAND_M) {
+                    hLat = prevHeld.lat;
+                    hLng = prevHeld.lng;
+                }
+            }
+            window.__drHeld = { lat: hLat, lng: hLng };
+            /* ─────────────────────────────────────────────────────────────────────── */
+        
+            if (!map || window._isProximityZoomAnimating) {
+                _setMarkerPosition(hLat, hLng);
+                _rafId = requestAnimationFrame(frame);
+                return;
+            }
+        
+            // Unified — pan first, then pin the marker to the map's own center, in
+            // all follow cases. Not mode-dependent: guarantees marker/viewport can
+            // never disagree, including in roaming, at no extra cost.
+            if (window.followUser) {
+                _snapViewport(hLat, hLng);
+                const c = map.getCenter();
+                _setMarkerPosition(c.lat, c.lng);
+            } else {
+                _setMarkerPosition(hLat, hLng);
+            }
+        
+            _rafId = requestAnimationFrame(frame);
+        }
+        
+        function _start() {
+            if (_active || window.isLocationHuntVisible) return;
+            const speedMPS = _getSpeedMPS(), stationary = _isStationary();
+        
+            // MODE-INDEPENDENT START — mirror of frame() exit, unchanged.
+            if (stationary && speedMPS < CFG.MIN_SPEED_MPS) return;
+        
+            _seedVelocityOnResume();
+            _active = true;
+            _lastFrameTime = performance.now();
+            _interactionEndTime = 0;
+            _rafId = requestAnimationFrame(frame);
+        }
+        
+        window.deadReckoning = {
+            start() { _start(); },
+        
+            stop() {
+                if (_rafId != null) { cancelAnimationFrame(_rafId); _rafId = null; }
+                _active = false; _panPending = false; _panTarget = null;
+                _centeredLat = null; _centeredLng = null;
+                window.__drHeld = null;
+                const el = _getMarkerEl();
+                if (el) { el.style.willChange = ''; el.style.transition = ''; _markerTransSet = false; }
+            },
+        
+            isActive() { return _active; },
+        
+            onMovementResumed: _start,
+        
+            forceUpdate() {
+                if (!_active) { _start(); return; }
+                _lastFrameTime = 0;
+                if (_rafId == null) _rafId = requestAnimationFrame(frame);
+            },
+        
+            getPredictedPosition()  { return _lastPredictedPos; },
+            invalidateMarkerCache() { _markerEl = null; _markerTransSet = false; }
+        };
+        
+        _start();
+        
+        if (typeof memoryManager !== 'undefined' && memoryManager?.registerCleanupTask) {
+            memoryManager.registerCleanupTask(() => window.deadReckoning.stop());
+        }
+                })();
         
 /* ──────────────────────────────────────────────
    ENTERPRISE INIT
    ────────────────────────────────────────────── */
-    const enterpriseCacheManager = new EnterpriseCacheManager();
-    const enterpriseSecurityManager = new EnterpriseSecurityManager();
-    const enterprisePerformanceMonitor = new EnterprisePerformanceMonitor();
-    const enterpriseBackgroundSync = new EnterpriseBackgroundSync();
-    
-    document.addEventListener('DOMContentLoaded', () => {
-      enterpriseCacheManager.init();
-      enterpriseSecurityManager.init();
-      enterprisePerformanceMonitor.startMonitoring();
-    });
+        const enterpriseCacheManager = new EnterpriseCacheManager();
+        const enterpriseSecurityManager = new EnterpriseSecurityManager();
+        const enterprisePerformanceMonitor = new EnterprisePerformanceMonitor();
+        const enterpriseBackgroundSync = new EnterpriseBackgroundSync();
+        
+        document.addEventListener('DOMContentLoaded', () => {
+          enterpriseCacheManager.init();
+          enterpriseSecurityManager.init();
+          enterprisePerformanceMonitor.startMonitoring();
+        });
 
 /* ──────────────────────────────────────────────
    CONFIG — GPS & proximity tuning
@@ -2163,33 +2157,33 @@ window.sensorFusion = new SensorFusionManager().init();
 /* ──────────────────────────────────────────────
    STATE
    ────────────────────────────────────────────── */
-let map, userMarker, markerClusterGroup;
-let gameLocations = [];
-let cachedElements = {};
-let lastFunctionCall = 0;
-let lastVisitedLocationId = null;
-let lastKnownPosition = null;
-let retryCount = 0;
-let inactivityTimer;
-let loadingMessageMinDisplayTime = 0;
-let lastSignificantMovement = Date.now();
-let lastPositionForJitter = null;
-
-window.followUser = true;
-window.isMapInteracting = false;
-window.lastPosition = null;
-window.positionBuffer = [];
-window.lastVelocity = { lat: 0, lng: 0 };
-window.isStationary = false;
-window.stationaryStartTime = null;
-window.stationaryCheckTimeout = null;
-window.lastUpdateTime = null;
-window.animationFrameId = null;
-window._driftHysteresisCounter = window._driftHysteresisCounter || 0;
-
-let accessibilityState = {
-    lastAnnouncement: ''
-};
+    let map, userMarker, markerClusterGroup;
+    let gameLocations = [];
+    let cachedElements = {};
+    let lastFunctionCall = 0;
+    let lastVisitedLocationId = null;
+    let lastKnownPosition = null;
+    let retryCount = 0;
+    let inactivityTimer;
+    let loadingMessageMinDisplayTime = 0;
+    let lastSignificantMovement = Date.now();
+    let lastPositionForJitter = null;
+    
+    window.followUser = true;
+    window.isMapInteracting = false;
+    window.lastPosition = null;
+    window.positionBuffer = [];
+    window.lastVelocity = { lat: 0, lng: 0 };
+    window.isStationary = false;
+    window.stationaryStartTime = null;
+    window.stationaryCheckTimeout = null;
+    window.lastUpdateTime = null;
+    window.animationFrameId = null;
+    window._driftHysteresisCounter = window._driftHysteresisCounter || 0;
+    
+    let accessibilityState = {
+        lastAnnouncement: ''
+    };
 
 /* ──────────────────────────────────────────────
    DOM CACHE & ACCESSIBILITY
@@ -2226,692 +2220,692 @@ function announceToScreenReader(message, priority = 'polite') {
 /* ──────────────────────────────────────────────
    TRACKED TIMEOUTS
    ────────────────────────────────────────────── */
-const trackedTimeouts = new Set();
-
-function createTrackedTimeout(callback, delay) {
-    let id;
-    const wrappedCallback = () => { trackedTimeouts.delete(id); callback(); };
-    id = setTimeout(wrappedCallback, delay);
-    trackedTimeouts.add(id);
-    return id;
-}
-
-function clearAllTrackedTimeouts() {
-    trackedTimeouts.forEach(clearTimeout);
-    trackedTimeouts.clear();
-}
-
-function isValidPosition(pos) {
-    return pos && typeof pos.lat === 'number' && typeof pos.lng === 'number' && !isNaN(pos.lat) && !isNaN(pos.lng);
-}
+    const trackedTimeouts = new Set();
+    
+    function createTrackedTimeout(callback, delay) {
+        let id;
+        const wrappedCallback = () => { trackedTimeouts.delete(id); callback(); };
+        id = setTimeout(wrappedCallback, delay);
+        trackedTimeouts.add(id);
+        return id;
+    }
+    
+    function clearAllTrackedTimeouts() {
+        trackedTimeouts.forEach(clearTimeout);
+        trackedTimeouts.clear();
+    }
+    
+    function isValidPosition(pos) {
+        return pos && typeof pos.lat === 'number' && typeof pos.lng === 'number' && !isNaN(pos.lat) && !isNaN(pos.lng);
+    }
 
 /* ──────────────────────────────────────────────
    MAP INITIALIZATION
    ────────────────────────────────────────────── */
-function initMap() {
-    // ── Guard: full Leaflet teardown if re-initializing ──
-    if (typeof disposeMapLoop === 'function') disposeMapLoop();
-    if (map) {
-        try { map.remove(); } catch (e) { console.warn('[Map] Remove failed:', e.message); }
-        map = null;
-    }
-    if (markerClusterGroup) {
-        try { markerClusterGroup.clearLayers(); } catch (e) {}
-        markerClusterGroup = null;
-    }
-
-    // ── Storage cleanup ──
-    ['lastKnownPos', 'routeHistory'].forEach(k => {
-        try { localStorage.removeItem(k); sessionStorage.removeItem(k); } catch (_) {}
-    });
-
-    // ── Map creation ──
-    map = L.map('map', {
-        zoomControl: false,
-        attributionControl: false,
-        zoomSnap: 0.1,
-        zoomDelta: 0.5,
-        wheelDebounceTime: 100,
-        tapTolerance: 15,
-        bounceAtZoomLimits: false,
-        renderer: L.canvas(),
-        fadeAnimation: false,
-        zoomAnimationThreshold: 4,
-        markerZoomAnimation: false
-    }).setView([46.392410, -94.636230], 9);
-
-    // ── Tile layer with required OSM attribution ──
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        minZoom: 7,
-        maxZoom: 19,
-        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>',
-        updateWhenIdle: true,
-        updateWhenZooming: false,
-        keepBuffer: 2,
-        className: 'map-tiles'
-    }).addTo(map);
-
-    // ── Marker cluster ──
-    markerClusterGroup = L.markerClusterGroup({
-        showCoverageOnHover: false,
-        zoomToBoundsOnClick: true,
-        spiderfyOnMaxZoom: true,
-        animate: false,
-        chunkedLoading: true,
-        chunkProgress: updateLoadingStatus,
-        maxClusterRadius: z => z > 16 ? 40 : 80,
-        iconCreateFunction: c => L.divIcon({
-            html: `<div><span>${c.getChildCount()}</span></div>`,
-            className: 'marker-cluster-custom',
-            iconSize: [40, 40]
-        })
-    }).addTo(map);
-
-    // ── User marker ──
-    userMarker = L.marker([0, 0], {
-        icon: L.divIcon({
-            className: 'user-marker',
-            html: '<div class="user-marker-icon"></div>',
-            iconSize: [20, 20],
-            iconAnchor: [10, 10]
-        }),
-        zIndexOffset: 1000
-    }).addTo(map);
-
-    showLoadingMessage();
-
-    // ── Geolocation with escalated fallback ──
-    if ('geolocation' in navigator) {
-        const opts = { enableHighAccuracy: true, timeout: 45000, maximumAge: 5000 };
-        
-        const onFirstError = (err) => {
-            // iOS often denies first prompt due to timing; retry with relaxed constraints
-            const isTimeout = err?.code === 3;
-            const retryOpts = isTimeout
-                ? { enableHighAccuracy: true, timeout: 60000, maximumAge: 10000 }
-                : opts;
+    function initMap() {
+        // ── Guard: full Leaflet teardown if re-initializing ──
+        if (typeof disposeMapLoop === 'function') disposeMapLoop();
+        if (map) {
+            try { map.remove(); } catch (e) { console.warn('[Map] Remove failed:', e.message); }
+            map = null;
+        }
+        if (markerClusterGroup) {
+            try { markerClusterGroup.clearLayers(); } catch (e) {}
+            markerClusterGroup = null;
+        }
+    
+        // ── Storage cleanup ──
+        ['lastKnownPos', 'routeHistory'].forEach(k => {
+            try { localStorage.removeItem(k); sessionStorage.removeItem(k); } catch (_) {}
+        });
+    
+        // ── Map creation ──
+        map = L.map('map', {
+            zoomControl: false,
+            attributionControl: false,
+            zoomSnap: 0.1,
+            zoomDelta: 0.5,
+            wheelDebounceTime: 100,
+            tapTolerance: 15,
+            bounceAtZoomLimits: false,
+            renderer: L.canvas(),
+            fadeAnimation: false,
+            zoomAnimationThreshold: 4,
+            markerZoomAnimation: false
+        }).setView([46.392410, -94.636230], 9);
+    
+        // ── Tile layer with required OSM attribution ──
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            minZoom: 7,
+            maxZoom: 19,
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>',
+            updateWhenIdle: true,
+            updateWhenZooming: false,
+            keepBuffer: 2,
+            className: 'map-tiles'
+        }).addTo(map);
+    
+        // ── Marker cluster ──
+        markerClusterGroup = L.markerClusterGroup({
+            showCoverageOnHover: false,
+            zoomToBoundsOnClick: true,
+            spiderfyOnMaxZoom: true,
+            animate: false,
+            chunkedLoading: true,
+            chunkProgress: updateLoadingStatus,
+            maxClusterRadius: z => z > 16 ? 40 : 80,
+            iconCreateFunction: c => L.divIcon({
+                html: `<div><span>${c.getChildCount()}</span></div>`,
+                className: 'marker-cluster-custom',
+                iconSize: [40, 40]
+            })
+        }).addTo(map);
+    
+        // ── User marker ──
+        userMarker = L.marker([0, 0], {
+            icon: L.divIcon({
+                className: 'user-marker',
+                html: '<div class="user-marker-icon"></div>',
+                iconSize: [20, 20],
+                iconAnchor: [10, 10]
+            }),
+            zIndexOffset: 1000
+        }).addTo(map);
+    
+        showLoadingMessage();
+    
+        // ── Geolocation with escalated fallback ──
+        if ('geolocation' in navigator) {
+            const opts = { enableHighAccuracy: true, timeout: 45000, maximumAge: 5000 };
             
+            const onFirstError = (err) => {
+                // iOS often denies first prompt due to timing; retry with relaxed constraints
+                const isTimeout = err?.code === 3;
+                const retryOpts = isTimeout
+                    ? { enableHighAccuracy: true, timeout: 60000, maximumAge: 10000 }
+                    : opts;
+                
+                navigator.geolocation.getCurrentPosition(
+                    initializeUserLocation,
+                    handleLocationError,
+                    retryOpts
+                );
+            };
+    
             navigator.geolocation.getCurrentPosition(
                 initializeUserLocation,
-                handleLocationError,
-                retryOpts
+                onFirstError,
+                opts
             );
-        };
-
-        navigator.geolocation.getCurrentPosition(
-            initializeUserLocation,
-            onFirstError,
-            opts
-        );
-    } else {
-        showPopup('Geolocation Error', 'Geolocation is not supported');
-        map.setView([44.9778, -93.2650], 17, { animate: false });
-        hideLoadingMessage();
+        } else {
+            showPopup('Geolocation Error', 'Geolocation is not supported');
+            map.setView([44.9778, -93.2650], 17, { animate: false });
+            hideLoadingMessage();
+        }
     }
-}
 
 /* ──────────────────────────────────────────────
    GPS SEARCHING STATE — CSS-driven
    ────────────────────────────────────────────── */
-function showGPSSearchingState() {
-    document.body.classList.add('gps-searching');
-}
-
-function hideGPSSearchingState() {
-    document.body.classList.remove('gps-searching');
-}
+    function showGPSSearchingState() {
+        document.body.classList.add('gps-searching');
+    }
+    
+    function hideGPSSearchingState() {
+        document.body.classList.remove('gps-searching');
+    }
 
 /* ──────────────────────────────────────────────
    IDLE PROXIMITY CHECK
    ────────────────────────────────────────────── */
-let _idleProximityCheckInterval;
-
-function startIdleProximityCheck() {
-    if (_idleProximityCheckInterval) return;
-
-    _idleProximityCheckInterval = setInterval(() => {
-        try {
-            if (!window.map || !window.gameLocations?.length || !window.userMarker) return;
-            updateDistanceBox();
-        } catch (err) {
-            console.warn('Idle proximity check error:', err);
+    let _idleProximityCheckInterval;
+    
+    function startIdleProximityCheck() {
+        if (_idleProximityCheckInterval) return;
+    
+        _idleProximityCheckInterval = setInterval(() => {
+            try {
+                if (!window.map || !window.gameLocations?.length || !window.userMarker) return;
+                updateDistanceBox();
+            } catch (err) {
+                console.warn('Idle proximity check error:', err);
+            }
+        }, 10000);
+    
+        if (memoryManager?.registerCleanupTask) {
+            memoryManager.registerCleanupTask(stopIdleProximityCheck);
         }
-    }, 10000);
-
-    if (memoryManager?.registerCleanupTask) {
-        memoryManager.registerCleanupTask(stopIdleProximityCheck);
     }
-}
-
-function stopIdleProximityCheck() {
-    if (_idleProximityCheckInterval) {
-        clearInterval(_idleProximityCheckInterval);
-        _idleProximityCheckInterval = null;
+    
+    function stopIdleProximityCheck() {
+        if (_idleProximityCheckInterval) {
+            clearInterval(_idleProximityCheckInterval);
+            _idleProximityCheckInterval = null;
+        }
     }
-}
-
-function updateLoadingStatus(processed, total, elapsed) {
-    if (processed === total) {
-        console.log(`Loaded ${processed} markers in ${elapsed.toFixed(2)}ms`);
+    
+    function updateLoadingStatus(processed, total, elapsed) {
+        if (processed === total) {
+            console.log(`Loaded ${processed} markers in ${elapsed.toFixed(2)}ms`);
+        }
     }
-}
 
 /* ──────────────────────────────────────────────
    PWA INSTALL BANNER
    ────────────────────────────────────────────── */
-let deferredPrompt;
-let pwaInstallBanner, closePwaBanner, cancelPwaBanner, installPwaButton;
-
-function getDeviceType() {
-    const ua = navigator.userAgent || navigator.vendor || window.opera;
-    if (/iPad|iPhone|iPod/.test(ua) && !window.MSStream) return 'ios';
-    if (/android/i.test(ua)) return 'android';
-    return 'desktop';
-}
-
-function isRunningAsPWA() {
-    if (window.matchMedia('(display-mode: standalone)').matches) return true;
-    if (window.navigator.standalone === true) return true;
-    if (document.referrer.includes('android-app://')) return true;
-    const urlParams = new URLSearchParams(window.location.search);
-    if (urlParams.get('utm_source') === 'pwa' || urlParams.get('source') === 'pwa') return true;
-    return false;
-}
-
-function canInstallPWA() {
-    const deviceType = getDeviceType();
-    if (deviceType === 'android') return 'beforeinstallprompt' in window || /Chrome/.test(navigator.userAgent);
-    if (deviceType === 'ios') {
-        const isIOS13OrLater = /OS 1[3-9]_|OS [2-9][0-9]_/.test(navigator.userAgent);
-        const isSafari = /Safari/.test(navigator.userAgent) && !/CriOS|FxiOS|EdgiOS/.test(navigator.userAgent);
-        return isIOS13OrLater && isSafari;
+    let deferredPrompt;
+    let pwaInstallBanner, closePwaBanner, cancelPwaBanner, installPwaButton;
+    
+    function getDeviceType() {
+        const ua = navigator.userAgent || navigator.vendor || window.opera;
+        if (/iPad|iPhone|iPod/.test(ua) && !window.MSStream) return 'ios';
+        if (/android/i.test(ua)) return 'android';
+        return 'desktop';
     }
-    if (deviceType === 'desktop') return 'beforeinstallprompt' in window;
-    return false;
-}
-
-async function isAppInstalled() {
-    if (isRunningAsPWA()) return true;
-
-    // getInstalledRelatedApps API (limited support)
-    if ('getInstalledRelatedApps' in navigator) {
-        try {
-            const relatedApps = await navigator.getInstalledRelatedApps();
-            if (relatedApps.length > 0) return true;
-        } catch (_) {}
+    
+    function isRunningAsPWA() {
+        if (window.matchMedia('(display-mode: standalone)').matches) return true;
+        if (window.navigator.standalone === true) return true;
+        if (document.referrer.includes('android-app://')) return true;
+        const urlParams = new URLSearchParams(window.location.search);
+        if (urlParams.get('utm_source') === 'pwa' || urlParams.get('source') === 'pwa') return true;
+        return false;
     }
-
-    // iOS: check localStorage flag from previous standalone session
-    if (getDeviceType() === 'ios' && localStorage.getItem('pwa-ios-installed') === 'true') {
-        return true;
-    }
-
-    // NOTE: Do NOT check service worker scope here. Having a SW is a
-    // prerequisite for PWA, not evidence of installation. The old check
-    // matched every visitor after their first page load, preventing the
-    // banner from ever showing.
-    return false;
-}
-
-function updateBannerContent() {
-    if (!pwaInstallBanner) return;
-
-    const deviceType = getDeviceType();
-    const titleEl = pwaInstallBanner.querySelector('h3');
-    const instructionsEl = pwaInstallBanner.querySelector('.banner-content p');
-
-    if (titleEl) titleEl.textContent = 'Install App';
-
-    if (instructionsEl) {
+    
+    function canInstallPWA() {
+        const deviceType = getDeviceType();
+        if (deviceType === 'android') return 'beforeinstallprompt' in window || /Chrome/.test(navigator.userAgent);
         if (deviceType === 'ios') {
-            instructionsEl.innerHTML = 'Tap the Share button <span aria-hidden="true">⬆️</span> then "Add to Home Screen"';
-        } else if (deferredPrompt) {
-            instructionsEl.textContent = deviceType === 'desktop'
-                ? 'Click "Install" to add this app to your desktop'
-                : 'Tap "Install" to add this app to your home screen';
-        } else {
-            instructionsEl.textContent = 'Use your browser menu to "Add to Home Screen"';
+            const isIOS13OrLater = /OS 1[3-9]_|OS [2-9][0-9]_/.test(navigator.userAgent);
+            const isSafari = /Safari/.test(navigator.userAgent) && !/CriOS|FxiOS|EdgiOS/.test(navigator.userAgent);
+            return isIOS13OrLater && isSafari;
+        }
+        if (deviceType === 'desktop') return 'beforeinstallprompt' in window;
+        return false;
+    }
+    
+    async function isAppInstalled() {
+        if (isRunningAsPWA()) return true;
+    
+        // getInstalledRelatedApps API (limited support)
+        if ('getInstalledRelatedApps' in navigator) {
+            try {
+                const relatedApps = await navigator.getInstalledRelatedApps();
+                if (relatedApps.length > 0) return true;
+            } catch (_) {}
+        }
+    
+        // iOS: check localStorage flag from previous standalone session
+        if (getDeviceType() === 'ios' && localStorage.getItem('pwa-ios-installed') === 'true') {
+            return true;
+        }
+    
+        // NOTE: Do NOT check service worker scope here. Having a SW is a
+        // prerequisite for PWA, not evidence of installation. The old check
+        // matched every visitor after their first page load, preventing the
+        // banner from ever showing.
+        return false;
+    }
+    
+    function updateBannerContent() {
+        if (!pwaInstallBanner) return;
+    
+        const deviceType = getDeviceType();
+        const titleEl = pwaInstallBanner.querySelector('h3');
+        const instructionsEl = pwaInstallBanner.querySelector('.banner-content p');
+    
+        if (titleEl) titleEl.textContent = 'Install App';
+    
+        if (instructionsEl) {
+            if (deviceType === 'ios') {
+                instructionsEl.innerHTML = 'Tap the Share button <span aria-hidden="true">⬆️</span> then "Add to Home Screen"';
+            } else if (deferredPrompt) {
+                instructionsEl.textContent = deviceType === 'desktop'
+                    ? 'Click "Install" to add this app to your desktop'
+                    : 'Tap "Install" to add this app to your home screen';
+            } else {
+                instructionsEl.textContent = 'Use your browser menu to "Add to Home Screen"';
+            }
+        }
+    
+        // Show/hide install button — native prompt only on Android/desktop
+        if (installPwaButton) {
+            const canShowButton = deviceType !== 'ios' && !!deferredPrompt;
+            installPwaButton.style.display = canShowButton ? '' : 'none';
         }
     }
-
-    // Show/hide install button — native prompt only on Android/desktop
-    if (installPwaButton) {
-        const canShowButton = deviceType !== 'ios' && !!deferredPrompt;
-        installPwaButton.style.display = canShowButton ? '' : 'none';
-    }
-}
-
-async function initPWABanner() {
-    if (await isAppInstalled()) return;
-    if (!canInstallPWA()) return;
-
-    const deviceType = getDeviceType();
-
-    // Android/desktop: wait for the native prompt event
-    if ((deviceType === 'android' || deviceType === 'desktop') && !deferredPrompt) return;
-
-    // iOS: delay prompt until second visit
-    if (deviceType === 'ios') {
-        const visits = parseInt(localStorage.getItem('pwaVisitCount') || '0', 10);
-        localStorage.setItem('pwaVisitCount', String(visits + 1));
-        if (visits < 1) return;
-    }
-
-    pwaInstallBanner = document.getElementById('pwaInstallBanner');
-    closePwaBanner = document.getElementById('closePwaBanner');
-    cancelPwaBanner = document.getElementById('cancelPwaBanner');
-    installPwaButton = document.getElementById('installPwaButton');
-
-    if (!pwaInstallBanner) return;
-
-    const dismissBanner = () => {
-        pwaInstallBanner.classList.remove('show');
-        try { sessionStorage.setItem('pwaBannerDismissed', 'true'); } catch (_) {}
-    };
-
-    const hideBanner = () => {
-        pwaInstallBanner.classList.remove('show');
-    };
-
-    if (closePwaBanner) closePwaBanner.addEventListener('click', dismissBanner);
-    if (cancelPwaBanner) cancelPwaBanner.addEventListener('click', dismissBanner);
-
-    updateBannerContent();
-
-    createTrackedTimeout(() => {
-        try { if (sessionStorage.getItem('pwaBannerDismissed') === 'true') return; } catch (_) {}
-        pwaInstallBanner.classList.add('show');
-    }, 2000);
-
-    if (installPwaButton) {
-        installPwaButton.addEventListener('click', async () => {
-            if (deviceType === 'android' || deviceType === 'desktop') {
-                if (!deferredPrompt) {
-                    alert('Please use your browser menu to "Add to Home Screen" or "Install App"');
-                    hideBanner();
-                    return;
-                }
-
-                deferredPrompt.prompt();
-                const { outcome } = await deferredPrompt.userChoice;
-
-                if (outcome === 'accepted') {
-                    try {
-                        sessionStorage.setItem('appJustInstalled', 'true');
-                        localStorage.setItem('pwa-installed', 'true');
-                        sessionStorage.setItem('pwaBannerDismissed', 'true');
-                    } catch (_) {}
-
-                    const notice = document.getElementById('pwaPostInstallNotice');
-                    if (notice) {
-                        notice.setAttribute('aria-hidden', 'false');
-                        notice.classList.add('show');
-                        const dismissBtn = document.getElementById('dismissPostInstall');
-                        const hideNotice = () => {
-                            notice.classList.remove('show');
-                            notice.setAttribute('aria-hidden', 'true');
-                        };
-                        if (dismissBtn) dismissBtn.onclick = hideNotice;
-                        createTrackedTimeout(hideNotice, 12000);
+    
+    async function initPWABanner() {
+        if (await isAppInstalled()) return;
+        if (!canInstallPWA()) return;
+    
+        const deviceType = getDeviceType();
+    
+        // Android/desktop: wait for the native prompt event
+        if ((deviceType === 'android' || deviceType === 'desktop') && !deferredPrompt) return;
+    
+        // iOS: delay prompt until second visit
+        if (deviceType === 'ios') {
+            const visits = parseInt(localStorage.getItem('pwaVisitCount') || '0', 10);
+            localStorage.setItem('pwaVisitCount', String(visits + 1));
+            if (visits < 1) return;
+        }
+    
+        pwaInstallBanner = document.getElementById('pwaInstallBanner');
+        closePwaBanner = document.getElementById('closePwaBanner');
+        cancelPwaBanner = document.getElementById('cancelPwaBanner');
+        installPwaButton = document.getElementById('installPwaButton');
+    
+        if (!pwaInstallBanner) return;
+    
+        const dismissBanner = () => {
+            pwaInstallBanner.classList.remove('show');
+            try { sessionStorage.setItem('pwaBannerDismissed', 'true'); } catch (_) {}
+        };
+    
+        const hideBanner = () => {
+            pwaInstallBanner.classList.remove('show');
+        };
+    
+        if (closePwaBanner) closePwaBanner.addEventListener('click', dismissBanner);
+        if (cancelPwaBanner) cancelPwaBanner.addEventListener('click', dismissBanner);
+    
+        updateBannerContent();
+    
+        createTrackedTimeout(() => {
+            try { if (sessionStorage.getItem('pwaBannerDismissed') === 'true') return; } catch (_) {}
+            pwaInstallBanner.classList.add('show');
+        }, 2000);
+    
+        if (installPwaButton) {
+            installPwaButton.addEventListener('click', async () => {
+                if (deviceType === 'android' || deviceType === 'desktop') {
+                    if (!deferredPrompt) {
+                        alert('Please use your browser menu to "Add to Home Screen" or "Install App"');
+                        hideBanner();
+                        return;
                     }
-                } else {
-                    try { sessionStorage.setItem('pwaBannerDismissed', 'true'); } catch (_) {}
+    
+                    deferredPrompt.prompt();
+                    const { outcome } = await deferredPrompt.userChoice;
+    
+                    if (outcome === 'accepted') {
+                        try {
+                            sessionStorage.setItem('appJustInstalled', 'true');
+                            localStorage.setItem('pwa-installed', 'true');
+                            sessionStorage.setItem('pwaBannerDismissed', 'true');
+                        } catch (_) {}
+    
+                        const notice = document.getElementById('pwaPostInstallNotice');
+                        if (notice) {
+                            notice.setAttribute('aria-hidden', 'false');
+                            notice.classList.add('show');
+                            const dismissBtn = document.getElementById('dismissPostInstall');
+                            const hideNotice = () => {
+                                notice.classList.remove('show');
+                                notice.setAttribute('aria-hidden', 'true');
+                            };
+                            if (dismissBtn) dismissBtn.onclick = hideNotice;
+                            createTrackedTimeout(hideNotice, 12000);
+                        }
+                    } else {
+                        try { sessionStorage.setItem('pwaBannerDismissed', 'true'); } catch (_) {}
+                    }
+    
+                    deferredPrompt = null;
+                    hideBanner();
+    
+                } else if (deviceType === 'ios') {
+                    installPwaButton.style.display = 'none';
+                    const instructionsEl = pwaInstallBanner.querySelector('.banner-content p');
+                    if (instructionsEl) {
+                        instructionsEl.innerHTML = 'Tap the Share button <span aria-hidden="true">⬆️</span> at the bottom of your screen, then select "Add to Home Screen"';
+                        instructionsEl.classList.add('pwa-ios-instructions');
+                    }
+                    createTrackedTimeout(hideBanner, 6000);
                 }
-
-                deferredPrompt = null;
-                hideBanner();
-
-            } else if (deviceType === 'ios') {
-                installPwaButton.style.display = 'none';
-                const instructionsEl = pwaInstallBanner.querySelector('.banner-content p');
-                if (instructionsEl) {
-                    instructionsEl.innerHTML = 'Tap the Share button <span aria-hidden="true">⬆️</span> at the bottom of your screen, then select "Add to Home Screen"';
-                    instructionsEl.classList.add('pwa-ios-instructions');
-                }
-                createTrackedTimeout(hideBanner, 6000);
-            }
-        });
+            });
+        }
     }
-}
-
-window.addEventListener('beforeinstallprompt', (e) => {
-    e.preventDefault();
-    deferredPrompt = e;
-    if (pwaInstallBanner) updateBannerContent();
-});
-
-window.addEventListener('appinstalled', () => {
-    try {
-        localStorage.setItem('pwa-installed', 'true');
-        sessionStorage.setItem('appJustInstalled', 'true');
-    } catch (_) {}
-    if (pwaInstallBanner?.classList.contains('show')) {
-        pwaInstallBanner.classList.remove('show');
-    }
-});
-
-// iOS: flag when running in standalone mode
-if (getDeviceType() === 'ios') {
-    if (window.navigator.standalone) {
-        try { localStorage.setItem('pwa-ios-installed', 'true'); } catch (_) {}
-    }
-    document.addEventListener('visibilitychange', () => {
+    
+    window.addEventListener('beforeinstallprompt', (e) => {
+        e.preventDefault();
+        deferredPrompt = e;
+        if (pwaInstallBanner) updateBannerContent();
+    });
+    
+    window.addEventListener('appinstalled', () => {
+        try {
+            localStorage.setItem('pwa-installed', 'true');
+            sessionStorage.setItem('appJustInstalled', 'true');
+        } catch (_) {}
+        if (pwaInstallBanner?.classList.contains('show')) {
+            pwaInstallBanner.classList.remove('show');
+        }
+    });
+    
+    // iOS: flag when running in standalone mode
+    if (getDeviceType() === 'ios') {
         if (window.navigator.standalone) {
             try { localStorage.setItem('pwa-ios-installed', 'true'); } catch (_) {}
         }
+        document.addEventListener('visibilitychange', () => {
+            if (window.navigator.standalone) {
+                try { localStorage.setItem('pwa-ios-installed', 'true'); } catch (_) {}
+            }
+        });
+    }
+    
+    document.addEventListener('DOMContentLoaded', async function() {
+        try {
+            if (sessionStorage.getItem('appJustInstalled') === 'true') return;
+            if (sessionStorage.getItem('pwaBannerDismissed') === 'true') return;
+        } catch (_) {}
+    
+        if (await isAppInstalled()) return;
+        await initPWABanner();
     });
-}
-
-document.addEventListener('DOMContentLoaded', async function() {
-    try {
-        if (sessionStorage.getItem('appJustInstalled') === 'true') return;
-        if (sessionStorage.getItem('pwaBannerDismissed') === 'true') return;
-    } catch (_) {}
-
-    if (await isAppInstalled()) return;
-    await initPWABanner();
-});
 
 /* ──────────────────────────────────────────────
    LOADING MESSAGE — CSS-driven styles
    ────────────────────────────────────────────── */
-let _loadingProgressInterval;
-
-function showLoadingMessage() {
-    if (document.getElementById('loadingMessage')) return;
-
-    loadingMessageMinDisplayTime = Date.now() + 6000;
-
-    const loadingMessage = document.createElement('div');
-    loadingMessage.id = 'loadingMessage';
-
-    const card = document.createElement('div');
-    card.className = 'loading-card';
-
-    const logo = document.createElement('img');
-    logo.className = 'loading-logo';
-    logo.src = 'https://mnthen.com/images/logo.webp';
-    logo.alt = 'Minnesota Then Logo';
-
-    const title = document.createElement('h1');
-    title.className = 'loading-title';
-    title.textContent = 'The Museum Without Walls';
-
-    const subtitle = document.createElement('h2');
-    subtitle.className = 'loading-subtitle';
-    subtitle.textContent = 'Where Every Step Tells a Story';
-
-    const statusContainer = document.createElement('div');
-    statusContainer.className = 'loading-status';
-    const statusText = document.createElement('p');
-    statusText.id = 'loadingStatusText';
-    statusText.textContent = 'Location found, proceeding to stabilization...';
-    statusContainer.appendChild(statusText);
-
-    const progressTrack = document.createElement('div');
-    progressTrack.className = 'loading-progress-track';
-    const progressBar = document.createElement('div');
-    progressBar.className = 'loading-progress-bar';
-    progressBar.id = 'loadingProgressBar';
-    progressTrack.appendChild(progressBar);
-
-    const noteContainer = document.createElement('div');
-    noteContainer.className = 'loading-note';
-    const noteText = document.createElement('p');
-    noteText.textContent = 'Preparing your experience.';
-    noteContainer.appendChild(noteText);
-
-    card.appendChild(logo);
-    card.appendChild(title);
-    card.appendChild(subtitle);
-    card.appendChild(statusContainer);
-    card.appendChild(progressTrack);
-    card.appendChild(noteContainer);
-    loadingMessage.appendChild(card);
-    document.body.appendChild(loadingMessage);
-
-    // Progress animation
-    const totalDuration = 6000;
-    const updateMs = 100;
-    const steps = totalDuration / updateMs;
-    let progress = 0;
-
-    const animations = [
-    "Loading the map...",                     // Leaflet is initializing tiles
-    "Finding your location...",               // navigator.geolocation is pinging
-    "Connecting to GPS satellites...",         // Waiting for high-accuracy fix
-    "Looking for nearby history...",           // Proximity math is running
-    "Almost ready..."                         // Final DOM renders
-];
-
-    _loadingProgressInterval = setInterval(() => {
-        progress += (100 / steps);
-        if (progressBar) progressBar.style.width = `${Math.min(progress, 100)}%`;
-        if (statusText) {
-            const idx = Math.min(Math.floor(progress / (100 / animations.length)), animations.length - 1);
-            statusText.textContent = animations[idx];
-        }
-        if (progress >= 100) {
-            clearInterval(_loadingProgressInterval);
-            _loadingProgressInterval = null;
-            tryHideLoadingMessage();
-        }
-    }, updateMs);
-
-    // Register cleanup so interval doesn't survive page unload
-    if (memoryManager?.registerCleanupTask) {
-        memoryManager.registerCleanupTask(() => {
-            if (_loadingProgressInterval) {
+    let _loadingProgressInterval;
+    
+    function showLoadingMessage() {
+        if (document.getElementById('loadingMessage')) return;
+    
+        loadingMessageMinDisplayTime = Date.now() + 6000;
+    
+        const loadingMessage = document.createElement('div');
+        loadingMessage.id = 'loadingMessage';
+    
+        const card = document.createElement('div');
+        card.className = 'loading-card';
+    
+        const logo = document.createElement('img');
+        logo.className = 'loading-logo';
+        logo.src = 'https://mnthen.com/images/logo.webp';
+        logo.alt = 'Minnesota Then Logo';
+    
+        const title = document.createElement('h1');
+        title.className = 'loading-title';
+        title.textContent = 'The Museum Without Walls';
+    
+        const subtitle = document.createElement('h2');
+        subtitle.className = 'loading-subtitle';
+        subtitle.textContent = 'Where Every Step Tells a Story';
+    
+        const statusContainer = document.createElement('div');
+        statusContainer.className = 'loading-status';
+        const statusText = document.createElement('p');
+        statusText.id = 'loadingStatusText';
+        statusText.textContent = 'Location found, proceeding to stabilization...';
+        statusContainer.appendChild(statusText);
+    
+        const progressTrack = document.createElement('div');
+        progressTrack.className = 'loading-progress-track';
+        const progressBar = document.createElement('div');
+        progressBar.className = 'loading-progress-bar';
+        progressBar.id = 'loadingProgressBar';
+        progressTrack.appendChild(progressBar);
+    
+        const noteContainer = document.createElement('div');
+        noteContainer.className = 'loading-note';
+        const noteText = document.createElement('p');
+        noteText.textContent = 'Preparing your experience.';
+        noteContainer.appendChild(noteText);
+    
+        card.appendChild(logo);
+        card.appendChild(title);
+        card.appendChild(subtitle);
+        card.appendChild(statusContainer);
+        card.appendChild(progressTrack);
+        card.appendChild(noteContainer);
+        loadingMessage.appendChild(card);
+        document.body.appendChild(loadingMessage);
+    
+        // Progress animation
+        const totalDuration = 6000;
+        const updateMs = 100;
+        const steps = totalDuration / updateMs;
+        let progress = 0;
+    
+        const animations = [
+        "Loading the map...",                     // Leaflet is initializing tiles
+        "Finding your location...",               // navigator.geolocation is pinging
+        "Connecting to GPS satellites...",         // Waiting for high-accuracy fix
+        "Looking for nearby history...",           // Proximity math is running
+        "Almost ready..."                         // Final DOM renders
+    ];
+    
+        _loadingProgressInterval = setInterval(() => {
+            progress += (100 / steps);
+            if (progressBar) progressBar.style.width = `${Math.min(progress, 100)}%`;
+            if (statusText) {
+                const idx = Math.min(Math.floor(progress / (100 / animations.length)), animations.length - 1);
+                statusText.textContent = animations[idx];
+            }
+            if (progress >= 100) {
                 clearInterval(_loadingProgressInterval);
                 _loadingProgressInterval = null;
+                tryHideLoadingMessage();
             }
-        });
+        }, updateMs);
+    
+        // Register cleanup so interval doesn't survive page unload
+        if (memoryManager?.registerCleanupTask) {
+            memoryManager.registerCleanupTask(() => {
+                if (_loadingProgressInterval) {
+                    clearInterval(_loadingProgressInterval);
+                    _loadingProgressInterval = null;
+                }
+            });
+        }
     }
-}
-
-function tryHideLoadingMessage() {
-    if (Date.now() >= loadingMessageMinDisplayTime) {
-        fadeOutLoadingMessage();
-    } else {
-        const timeRemaining = loadingMessageMinDisplayTime - Date.now();
-        createTrackedTimeout(fadeOutLoadingMessage, timeRemaining);
+    
+    function tryHideLoadingMessage() {
+        if (Date.now() >= loadingMessageMinDisplayTime) {
+            fadeOutLoadingMessage();
+        } else {
+            const timeRemaining = loadingMessageMinDisplayTime - Date.now();
+            createTrackedTimeout(fadeOutLoadingMessage, timeRemaining);
+        }
     }
-}
-
-function fadeOutLoadingMessage() {
-    const loadingMessage = document.getElementById('loadingMessage');
-    if (!loadingMessage) return;
-
-    if (_loadingProgressInterval) {
-        clearInterval(_loadingProgressInterval);
-        _loadingProgressInterval = null;
+    
+    function fadeOutLoadingMessage() {
+        const loadingMessage = document.getElementById('loadingMessage');
+        if (!loadingMessage) return;
+    
+        if (_loadingProgressInterval) {
+            clearInterval(_loadingProgressInterval);
+            _loadingProgressInterval = null;
+        }
+    
+        const progressBar = document.getElementById('loadingProgressBar');
+        if (progressBar) progressBar.style.width = '100%';
+    
+        const distanceBox = cachedElements.distanceBox || document.getElementById('distanceBox');
+        if (distanceBox) distanceBox.classList.add('show');
+    
+        loadingMessage.style.opacity = '0';
+        createTrackedTimeout(() => { loadingMessage.remove(); }, 500);
     }
-
-    const progressBar = document.getElementById('loadingProgressBar');
-    if (progressBar) progressBar.style.width = '100%';
-
-    const distanceBox = cachedElements.distanceBox || document.getElementById('distanceBox');
-    if (distanceBox) distanceBox.classList.add('show');
-
-    loadingMessage.style.opacity = '0';
-    createTrackedTimeout(() => { loadingMessage.remove(); }, 500);
-}
-
-function hideLoadingMessage() {
-    tryHideLoadingMessage();
-}
+    
+    function hideLoadingMessage() {
+        tryHideLoadingMessage();
+    }
 
 /* ──────────────────────────────────────────────
    ACCURACY INDICATOR — CSS-driven
    ────────────────────────────────────────────── */
-function updateAccuracyIndicator(accuracy) {
-    const indicator = document.getElementById('accuracyIndicator');
-    if (!indicator) return;
-
-    indicator.classList.remove('accuracy-high', 'accuracy-medium', 'accuracy-low');
-    if (accuracy < 20) indicator.classList.add('accuracy-high');
-    else if (accuracy < 50) indicator.classList.add('accuracy-medium');
-    else indicator.classList.add('accuracy-low');
-}
+    function updateAccuracyIndicator(accuracy) {
+        const indicator = document.getElementById('accuracyIndicator');
+        if (!indicator) return;
+    
+        indicator.classList.remove('accuracy-high', 'accuracy-medium', 'accuracy-low');
+        if (accuracy < 20) indicator.classList.add('accuracy-high');
+        else if (accuracy < 50) indicator.classList.add('accuracy-medium');
+        else indicator.classList.add('accuracy-low');
+    }
 
 /* ──────────────────────────────────────────────
    USER LOCATION INITIALIZATION
    ────────────────────────────────────────────── */
-function initializeUserLocation(position) {
-    // ── Consume warm-start fix if it's better than what we were handed ──
-    position = window._consumeWarmupPosition?.(position) ?? position;
-
-    // ── Validate ──────────────────────────────────────────────────────────
-    if (!position?.coords) {
-        handleLocationError(new Error('Invalid initial position'));
-        return;
-    }
-
-    const { latitude: lat, longitude: lng, accuracy, heading, speed } = position.coords;
-
-    if (isNaN(lat) || isNaN(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
-        handleLocationError(new Error('Invalid coordinates'));
-        return;
-    }
-
-    // Already initialized — just sync the marker.
-    if (window._initializationComplete) {
-        userMarker?.setLatLng([lat, lng]);
-        map?.panTo([lat, lng], { animate: false });
-        return;
-    }
-
-    // Defer if another init is in flight.
-    if (window._initializationInProgress) {
-        window._pendingInitPosition = position;
-        return;
-    }
-    window._initializationInProgress = true;
-
-    // ── Accessibility announcement ────────────────────────────────────────
-    if (typeof announceToScreenReader === 'function') {
-        const msg = accuracy > 100
-            ? `Location acquired with ${accuracy.toFixed(0)} meter accuracy. Map loading.`
-            : 'Location acquired. Map ready for navigation.';
-        announceToScreenReader(msg);
-    }
-
-    try {
-        // Marker may not be ready yet — retry up to 3 times with backoff.
-        if (!userMarker) {
-            window._markerRetryCount = (window._markerRetryCount || 0) + 1;
-
-            if (window._markerRetryCount <= 3) {
-                window._initializationInProgress = false;
-                createTrackedTimeout(() => {
-                    const pos = window._pendingInitPosition || position;
-                    window._pendingInitPosition = null;
-                    initializeUserLocation(pos);
-                }, 100 * window._markerRetryCount);
-                return;
-            }
-
-            window._initializationInProgress = false;
-            window._markerRetryCount = 0;
-            handleLocationError(new Error('Map marker initialization failed'));
+    function initializeUserLocation(position) {
+        // ── Consume warm-start fix if it's better than what we were handed ──
+        position = window._consumeWarmupPosition?.(position) ?? position;
+    
+        // ── Validate ──────────────────────────────────────────────────────────
+        if (!position?.coords) {
+            handleLocationError(new Error('Invalid initial position'));
             return;
         }
-
-        window._markerRetryCount = 0;
-        userMarker.setLatLng([lat, lng]);
-
-        if (!map) throw new Error('Map not initialized');
-        map.setView([lat, lng], 17, { animate: false });
-
-        // Seed position buffer with a single entry for a clean Kalman baseline.
-        seedPositionBuffer?.({
-            lat, lng, accuracy,
-            timestamp: position.timestamp || Date.now(),
-            heading: heading ?? null,
-            speedMPS: speed || 0,
-        });
-
-        // Seed Kalman velocity if GPS already reports motion, skipping cold-start lag.
-        const kf = window.sensorFusion?._kalmanFilter;
-        if (kf) {
-            if (speed > 0.3 && heading != null && isFinite(heading)) {
-                const rad = heading * Math.PI / 180;
-                kf.seedVelocity(speed * Math.cos(rad), speed * Math.sin(rad), 10.0);
-            } else if (speed > 0.3) {
-                kf.seedVelocity(0, 0, 50.0); // Speed known, heading unknown — high variance
-            }
-            // speed ≤ 0.3 m/s: zero-velocity init is correct, do nothing.
+    
+        const { latitude: lat, longitude: lng, accuracy, heading, speed } = position.coords;
+    
+        if (isNaN(lat) || isNaN(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+            handleLocationError(new Error('Invalid coordinates'));
+            return;
         }
-
-        hideLoadingMessage?.();
-
-        if (typeof startHunt === 'function' && !window._huntStarted) {
-            window._huntStarted = true;
-            startHunt();
+    
+        // Already initialized — just sync the marker.
+        if (window._initializationComplete) {
+            userMarker?.setLatLng([lat, lng]);
+            map?.panTo([lat, lng], { animate: false });
+            return;
         }
-
-        if (typeof startIdleProximityCheck === 'function' && !window._proximityCheckStarted) {
-            window._proximityCheckStarted = true;
-            startIdleProximityCheck();
+    
+        // Defer if another init is in flight.
+        if (window._initializationInProgress) {
+            window._pendingInitPosition = position;
+            return;
         }
-
-        window._initializationComplete  = true;
-        window._initializationInProgress = false;
-        window._lastSuccessfulInit       = Date.now();
-        window._initRecoveryAttempts     = 0;
-
-        // Start GPS watch; retry once if it fails to attach.
-        const watchId = startPositionUpdates();
-        if (watchId === null) {
-            createTrackedTimeout(() => {
-                if (!window.positionWatchId) startPositionUpdates();
-            }, 3000);
+        window._initializationInProgress = true;
+    
+        // ── Accessibility announcement ────────────────────────────────────────
+        if (typeof announceToScreenReader === 'function') {
+            const msg = accuracy > 100
+                ? `Location acquired with ${accuracy.toFixed(0)} meter accuracy. Map loading.`
+                : 'Location acquired. Map ready for navigation.';
+            announceToScreenReader(msg);
         }
-
-        // Apply any position that queued while init was in flight.
-        const pending = window._pendingInitPosition;
-        if (pending) {
-            window._pendingInitPosition = null;
-            const pLat = pending?.coords?.latitude;
-            const pLng = pending?.coords?.longitude;
-            if (userMarker && pLat != null && pLng != null && !isNaN(pLat) && !isNaN(pLng)) {
-                userMarker.setLatLng([pLat, pLng]);
-            }
-        }
-
-    } catch (err) {
-        console.error('Location initialization error:', err);
-        window._initializationInProgress = false;
-
-        if (!window._initializationComplete) {
-            window._huntStarted           = false;
-            window._proximityCheckStarted = false;
-        }
-
-        handleLocationError(err);
-
-        window._initRecoveryAttempts = (window._initRecoveryAttempts || 0) + 1;
-
-        if (window._initRecoveryAttempts <= 3) {
-            const backoffMs = Math.min(15000, Math.pow(2, window._initRecoveryAttempts) * 1000);
-            createTrackedTimeout(() => {
-                if (navigator.geolocation && !window._initializationComplete) {
-                    navigator.geolocation.getCurrentPosition(
-                        initializeUserLocation,
-                        handleLocationError,
-                        { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
-                    );
+    
+        try {
+            // Marker may not be ready yet — retry up to 3 times with backoff.
+            if (!userMarker) {
+                window._markerRetryCount = (window._markerRetryCount || 0) + 1;
+    
+                if (window._markerRetryCount <= 3) {
+                    window._initializationInProgress = false;
+                    createTrackedTimeout(() => {
+                        const pos = window._pendingInitPosition || position;
+                        window._pendingInitPosition = null;
+                        initializeUserLocation(pos);
+                    }, 100 * window._markerRetryCount);
+                    return;
                 }
-            }, backoffMs);
-        } else {
-            showPopup?.(
-                'Location Error',
-                'Unable to get your location after multiple attempts. Please check your GPS settings and refresh the page.',
-                'error'
-            );
+    
+                window._initializationInProgress = false;
+                window._markerRetryCount = 0;
+                handleLocationError(new Error('Map marker initialization failed'));
+                return;
+            }
+    
+            window._markerRetryCount = 0;
+            userMarker.setLatLng([lat, lng]);
+    
+            if (!map) throw new Error('Map not initialized');
+            map.setView([lat, lng], 17, { animate: false });
+    
+            // Seed position buffer with a single entry for a clean Kalman baseline.
+            seedPositionBuffer?.({
+                lat, lng, accuracy,
+                timestamp: position.timestamp || Date.now(),
+                heading: heading ?? null,
+                speedMPS: speed || 0,
+            });
+    
+            // Seed Kalman velocity if GPS already reports motion, skipping cold-start lag.
+            const kf = window.sensorFusion?._kalmanFilter;
+            if (kf) {
+                if (speed > 0.3 && heading != null && isFinite(heading)) {
+                    const rad = heading * Math.PI / 180;
+                    kf.seedVelocity(speed * Math.cos(rad), speed * Math.sin(rad), 10.0);
+                } else if (speed > 0.3) {
+                    kf.seedVelocity(0, 0, 50.0); // Speed known, heading unknown — high variance
+                }
+                // speed ≤ 0.3 m/s: zero-velocity init is correct, do nothing.
+            }
+    
+            hideLoadingMessage?.();
+    
+            if (typeof startHunt === 'function' && !window._huntStarted) {
+                window._huntStarted = true;
+                startHunt();
+            }
+    
+            if (typeof startIdleProximityCheck === 'function' && !window._proximityCheckStarted) {
+                window._proximityCheckStarted = true;
+                startIdleProximityCheck();
+            }
+    
+            window._initializationComplete  = true;
+            window._initializationInProgress = false;
+            window._lastSuccessfulInit       = Date.now();
+            window._initRecoveryAttempts     = 0;
+    
+            // Start GPS watch; retry once if it fails to attach.
+            const watchId = startPositionUpdates();
+            if (watchId === null) {
+                createTrackedTimeout(() => {
+                    if (!window.positionWatchId) startPositionUpdates();
+                }, 3000);
+            }
+    
+            // Apply any position that queued while init was in flight.
+            const pending = window._pendingInitPosition;
+            if (pending) {
+                window._pendingInitPosition = null;
+                const pLat = pending?.coords?.latitude;
+                const pLng = pending?.coords?.longitude;
+                if (userMarker && pLat != null && pLng != null && !isNaN(pLat) && !isNaN(pLng)) {
+                    userMarker.setLatLng([pLat, pLng]);
+                }
+            }
+    
+        } catch (err) {
+            console.error('Location initialization error:', err);
+            window._initializationInProgress = false;
+    
+            if (!window._initializationComplete) {
+                window._huntStarted           = false;
+                window._proximityCheckStarted = false;
+            }
+    
+            handleLocationError(err);
+    
+            window._initRecoveryAttempts = (window._initRecoveryAttempts || 0) + 1;
+    
+            if (window._initRecoveryAttempts <= 3) {
+                const backoffMs = Math.min(15000, Math.pow(2, window._initRecoveryAttempts) * 1000);
+                createTrackedTimeout(() => {
+                    if (navigator.geolocation && !window._initializationComplete) {
+                        navigator.geolocation.getCurrentPosition(
+                            initializeUserLocation,
+                            handleLocationError,
+                            { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+                        );
+                    }
+                }, backoffMs);
+            } else {
+                showPopup?.(
+                    'Location Error',
+                    'Unable to get your location after multiple attempts. Please check your GPS settings and refresh the page.',
+                    'error'
+                );
+            }
         }
     }
-}
         
 /* ──────────────────────────────────────────────
    GPS POWER MODE — shared utility
@@ -4766,280 +4760,172 @@ function _buildRenderState(fusionResult, fix, lastPos, timeDelta) {
    In roaming mode we still do a single panTo per GPS fix; the RAF loop
    handles the between-fix smoothing without stacking more pans.
    ────────────────────────────────────────────── */
-function _scheduleUnifiedRender(renderState) {
-    window._currentRenderState = renderState;
-    window._currentSpeedTier   = renderState.tier;
-    window._currentMapState    = renderState.mapState;
-
-    if (window._mapUpdateScheduled) return;
-    window._mapUpdateScheduled = true;
-
-    window._nextLocationUpdateRAF = requestAnimationFrame(function() {
-        try {
-            _executeRender(window._currentRenderState);
-        } finally {
-            window._mapUpdateScheduled    = false;
-            window._nextLocationUpdateRAF = null;
-        }
-    });
-}
+    function _scheduleUnifiedRender(renderState) {
+        window._currentRenderState = renderState;
+        window._currentSpeedTier   = renderState.tier;
+        window._currentMapState    = renderState.mapState;
+    
+        if (window._mapUpdateScheduled) return;
+        window._mapUpdateScheduled = true;
+    
+        window._nextLocationUpdateRAF = requestAnimationFrame(function() {
+            try {
+                _executeRender(window._currentRenderState);
+            } finally {
+                window._mapUpdateScheduled    = false;
+                window._nextLocationUpdateRAF = null;
+            }
+        });
+    }
 
 /* ──────────────────────────────────────────────
    Unified Render Executor
    ────────────────────────────────────────────── */
-function _executeRender(state) {
-    if (!state) return;
-
-    var tier     = state.tier;
-    var mapState = state.mapState;
-
-    if (!tier || !mapState) {
-        window.lastMapUpdateTime = Date.now();
-        return;
-    }
-
-    if (window.isMapInteracting) {
-        window.lastMapUpdateTime = Date.now();
-        return;
-    }
-
-    // Does dead reckoning currently own the marker + viewport (center)?
-    // In centered-follow mode DR calls map.setView(...) every frame and
-    // pins the marker to map.getCenter(), so NOTHING else may move the
-    // map center or the marker tears off-center and rubber-bands.
-    var drOwnsViewport = !!(
-        window.deadReckoning &&
-        typeof window.deadReckoning.isActive === 'function' &&
-        window.deadReckoning.isActive()
-    );
-
-    // ── ZOOM ONLY (walking proximity, never conflicts with DR) ─────
-    // setZoom preserves center (safe with DR). fitBounds moves BOTH
-    // zoom AND center, so it is only allowed when DR is NOT holding
-    // the viewport; otherwise we fall through to a center-preserving
-    // zoom so the centered lock is never broken.
-    var zoomResult = getSpeedBasedZoom(state.speedMPS, state.closestDistance);
-
-    if (zoomResult !== null && map && !window._isFittingBounds) {
-        if (zoomResult.fitBounds && state.closestLocation && !drOwnsViewport) {
-            var userLatLng   = [state.position.lat, state.position.lng];
-            var targetLatLng = [state.closestLocation.lat, state.closestLocation.lng];
-
-            window._isFittingBounds = true;
-            map.fitBounds(L.latLngBounds([userLatLng, targetLatLng]), {
-                padding:  [60, 60],
-                maxZoom:  19,
-                animate:  true,
-                duration: 0.3
-            });
-            map.once('moveend zoomend', function () {
-                window._isFittingBounds = false;
-            });
-        } else if (zoomResult.zoom !== null && map.getZoom() !== zoomResult.zoom) {
-            map.setZoom(zoomResult.zoom, { animate: true, duration: 0.25 });
+    function _executeRender(state) {
+        if (!state) return;
+    
+        var tier     = state.tier;
+        var mapState = state.mapState;
+    
+        if (!tier || !mapState) {
+            window.lastMapUpdateTime = Date.now();
+            return;
         }
+    
+        if (window.isMapInteracting) {
+            window.lastMapUpdateTime = Date.now();
+            return;
+        }
+    
+        // Does dead reckoning currently own the marker + viewport (center)?
+        // In centered-follow mode DR calls map.setView(...) every frame and
+        // pins the marker to map.getCenter(), so NOTHING else may move the
+        // map center or the marker tears off-center and rubber-bands.
+        var drOwnsViewport = !!(
+            window.deadReckoning &&
+            typeof window.deadReckoning.isActive === 'function' &&
+            window.deadReckoning.isActive()
+        );
+    
+        // ── ZOOM ONLY (walking proximity, never conflicts with DR) ─────
+        // setZoom preserves center (safe with DR). fitBounds moves BOTH
+        // zoom AND center, so it is only allowed when DR is NOT holding
+        // the viewport; otherwise we fall through to a center-preserving
+        // zoom so the centered lock is never broken.
+        var zoomResult = getSpeedBasedZoom(state.speedMPS, state.closestDistance);
+    
+        if (zoomResult !== null && map && !window._isFittingBounds) {
+            if (zoomResult.fitBounds && state.closestLocation && !drOwnsViewport) {
+                var userLatLng   = [state.position.lat, state.position.lng];
+                var targetLatLng = [state.closestLocation.lat, state.closestLocation.lng];
+    
+                window._isFittingBounds = true;
+                map.fitBounds(L.latLngBounds([userLatLng, targetLatLng]), {
+                    padding:  [60, 60],
+                    maxZoom:  19,
+                    animate:  true,
+                    duration: 0.3
+                });
+                map.once('moveend zoomend', function () {
+                    window._isFittingBounds = false;
+                });
+            } else if (zoomResult.zoom !== null && map.getZoom() !== zoomResult.zoom) {
+                map.setZoom(zoomResult.zoom, { animate: true, duration: 0.25 });
+            }
+        }
+    
+        // ── MARKER & VIEWPORT: DR owns both exclusively ───────────────
+        // GPS path never touches the marker element or map viewport.
+        // It only feeds fresh fused state into the pipeline and nudges DR.
+        // Skip the nudge while a fitBounds animation is in flight so the
+        // GPS-driven recenter can't fight the proximity animation.
+        if (!window._isFittingBounds &&
+            window.deadReckoning &&
+            typeof window.deadReckoning.forceUpdate === 'function') {
+            window.deadReckoning.forceUpdate();
+        }
+    
+        window.lastMapUpdateTime = Date.now();
     }
-
-    // ── MARKER & VIEWPORT: DR owns both exclusively ───────────────
-    // GPS path never touches the marker element or map viewport.
-    // It only feeds fresh fused state into the pipeline and nudges DR.
-    // Skip the nudge while a fitBounds animation is in flight so the
-    // GPS-driven recenter can't fight the proximity animation.
-    if (!window._isFittingBounds &&
-        window.deadReckoning &&
-        typeof window.deadReckoning.forceUpdate === 'function') {
-        window.deadReckoning.forceUpdate();
-    }
-
-    window.lastMapUpdateTime = Date.now();
-}
 
 /* ──────────────────────────────────────────────
   Dead Reckoning Control 
    ────────────────────────────────────────────── */
-function _controlDeadReckoning(fusionResult) {
-    if (!window.deadReckoning) return;
-
-    // Freeze / location-hunt overlay are unconditional stops.
-    if (fusionResult.isFrozen || window.isLocationHuntVisible) {
-        if (window.deadReckoning.isActive()) window.deadReckoning.stop();
-        return;
+    function _controlDeadReckoning(fusionResult) {
+        if (!window.deadReckoning) return;
+    
+        // Freeze / location-hunt overlay are unconditional stops.
+        if (fusionResult.isFrozen || window.isLocationHuntVisible) {
+            if (window.deadReckoning.isActive()) window.deadReckoning.stop();
+            return;
+        }
+    
+        // No speed check here — _start()/frame() already know the difference
+        // between "stop when roaming+stationary" and "keep running when
+        // centered to hold the viewport lock." Duplicating that check here
+        // with different criteria is what stopped DR out from under centered
+        // mode.
+        if (!window.deadReckoning.isActive()) {
+            window.deadReckoning.start();
+        }
     }
-
-    // No speed check here — _start()/frame() already know the difference
-    // between "stop when roaming+stationary" and "keep running when
-    // centered to hold the viewport lock." Duplicating that check here
-    // with different criteria is what stopped DR out from under centered
-    // mode.
-    if (!window.deadReckoning.isActive()) {
-        window.deadReckoning.start();
-    }
-}
  
 /* ──────────────────────────────────────────────
    HELPER: Speed Tier Computation 
    ────────────────────────────────────────────── */
-function _computeSpeedTier(speedMPH, rawAccuracy) {
-    var panDuration, easeLinearity, mapUpdateInterval, mapUpdateDistance,
-        maxAccuracy, minDistThreshold, maxSpeedThreshold;
-
-    if (speedMPH >= 65) {
-        panDuration = 0.08; easeLinearity = 0.28; mapUpdateInterval = 80;
-        mapUpdateDistance = 12.0; maxAccuracy = 18; minDistThreshold = 2.0; maxSpeedThreshold = 160;
-    } else if (speedMPH >= 30) {
-        panDuration = 0.10; easeLinearity = 0.25; mapUpdateInterval = 110;
-        mapUpdateDistance = 8.0; maxAccuracy = 20; minDistThreshold = 1.2; maxSpeedThreshold = 100;
-    } else if (speedMPH >= 15) {
-        panDuration = 0.12; easeLinearity = 0.22; mapUpdateInterval = 150;
-        mapUpdateDistance = 6.5; maxAccuracy = 20; minDistThreshold = 0.85; maxSpeedThreshold = 60;
-    } else if (speedMPH >= 8) {
-        panDuration = 0.25; easeLinearity = 0.18; mapUpdateInterval = 400;
-        mapUpdateDistance = 4.0; maxAccuracy = 25; minDistThreshold = 0.5; maxSpeedThreshold = 15;
-    } else if (speedMPH >= 3) {
-        panDuration = 0.35; easeLinearity = 0.15; mapUpdateInterval = 800;
-        mapUpdateDistance = 3.0; maxAccuracy = 28; minDistThreshold = 0.35; maxSpeedThreshold = 8;
-    } else {
-        panDuration = 0.60; easeLinearity = 0.12; mapUpdateInterval = 1000;
-        mapUpdateDistance = 2.0; maxAccuracy = 32; minDistThreshold = 0.25; maxSpeedThreshold = 3;
+    function _computeSpeedTier(speedMPH, rawAccuracy) {
+        var panDuration, easeLinearity, mapUpdateInterval, mapUpdateDistance,
+            maxAccuracy, minDistThreshold, maxSpeedThreshold;
+    
+        if (speedMPH >= 65) {
+            panDuration = 0.08; easeLinearity = 0.28; mapUpdateInterval = 80;
+            mapUpdateDistance = 12.0; maxAccuracy = 18; minDistThreshold = 2.0; maxSpeedThreshold = 160;
+        } else if (speedMPH >= 30) {
+            panDuration = 0.10; easeLinearity = 0.25; mapUpdateInterval = 110;
+            mapUpdateDistance = 8.0; maxAccuracy = 20; minDistThreshold = 1.2; maxSpeedThreshold = 100;
+        } else if (speedMPH >= 15) {
+            panDuration = 0.12; easeLinearity = 0.22; mapUpdateInterval = 150;
+            mapUpdateDistance = 6.5; maxAccuracy = 20; minDistThreshold = 0.85; maxSpeedThreshold = 60;
+        } else if (speedMPH >= 8) {
+            panDuration = 0.25; easeLinearity = 0.18; mapUpdateInterval = 400;
+            mapUpdateDistance = 4.0; maxAccuracy = 25; minDistThreshold = 0.5; maxSpeedThreshold = 15;
+        } else if (speedMPH >= 3) {
+            panDuration = 0.35; easeLinearity = 0.15; mapUpdateInterval = 800;
+            mapUpdateDistance = 3.0; maxAccuracy = 28; minDistThreshold = 0.35; maxSpeedThreshold = 8;
+        } else {
+            panDuration = 0.60; easeLinearity = 0.12; mapUpdateInterval = 1000;
+            mapUpdateDistance = 2.0; maxAccuracy = 32; minDistThreshold = 0.25; maxSpeedThreshold = 3;
+        }
+    
+        if (rawAccuracy >= 20) {
+            var noiseScale = Math.min(3.5, 1.0 + (rawAccuracy - 20) / 30);
+            mapUpdateDistance *= noiseScale;
+            minDistThreshold *= noiseScale;
+        }
+    
+        return {
+            panDuration: panDuration,
+            easeLinearity: easeLinearity,
+            mapUpdateInterval: Math.max(33, mapUpdateInterval),
+            mapUpdateDistance: mapUpdateDistance,
+            maxAccuracy: maxAccuracy,
+            minDistanceThreshold: minDistThreshold,
+            maxSpeedThreshold: maxSpeedThreshold
+        };
     }
-
-    if (rawAccuracy >= 20) {
-        var noiseScale = Math.min(3.5, 1.0 + (rawAccuracy - 20) / 30);
-        mapUpdateDistance *= noiseScale;
-        minDistThreshold *= noiseScale;
-    }
-
-    return {
-        panDuration: panDuration,
-        easeLinearity: easeLinearity,
-        mapUpdateInterval: Math.max(33, mapUpdateInterval),
-        mapUpdateDistance: mapUpdateDistance,
-        maxAccuracy: maxAccuracy,
-        minDistanceThreshold: minDistThreshold,
-        maxSpeedThreshold: maxSpeedThreshold
+    
+    /**
+     * CENTERED MODE: Keep marker centered with look-ahead.
+     */
+    
+    window._panParamCache = window._panParamCache || null;
+    window._centeredModeEntryTime = window._centeredModeEntryTime || null;
+    
+    /** Call when entering centered mode. Idempotent per entry. */
+    window.notifyCenteredModeEntry = function () {
+        window._centeredModeEntryTime = performance.now();
+        window._panParamCache = null;
     };
-}
-
-/**
- * CENTERED MODE: Keep marker centered with look-ahead.
- */
-
-window._panParamCache = window._panParamCache || null;
-window._centeredModeEntryTime = window._centeredModeEntryTime || null;
-
-/** Call when entering centered mode. Idempotent per entry. */
-window.notifyCenteredModeEntry = function () {
-    window._centeredModeEntryTime = performance.now();
-    window._panParamCache = null;
-};
-
-function _executeCenteredModePan(target, speedTier, directionChangeFactor, eastWestMovement, speedMPH, lookAheadFactor) {
-    if (!map) return;
-
-    // DR loop owns the viewport in centered mode; don't fight it.
-    if (window.deadReckoning?.isActive?.()) {
-        if (window.DEBUG_PANNING) {
-            console.debug('[Centered] Pan skipped: DR loop active.');
-        }
-        return;
-    }
-
-    const ENTRY_SETTLE_MS = 800;
-    const LERP_ALPHA = 0.18;
-    const SNAP_SPEED_MPH = 45;
-    const HIGH_SPEED_MPH = SPEED_THRESHOLDS?.HIGH_SPEED || 15;
-
-    const safeSpeed = isFinite(speedMPH) && speedMPH > 0 ? speedMPH : 0;
-    const factor = directionChangeFactor ?? 1.0;
-
-    // Apply look-ahead.
-    let centerLat = target.lat;
-    let centerLng = target.lng;
-
-    const laSec = lookAheadFactor || 0;
-    if (laSec > 0 && window.smoothedVelocity) {
-        const { lat: svLat, lng: svLng } = window.smoothedVelocity;
-        if (svLat != null && svLng != null && isFinite(svLat) && isFinite(svLng)) {
-            const lngMul = eastWestMovement ? 1.12 : 1.0;
-            centerLat += svLat * laSec;
-            centerLng += svLng * laSec * lngMul;
-        }
-    }
-
-    // Entry softening: gentle params for 800ms after mode entry.
-    const entryElapsed = window._centeredModeEntryTime != null
-        ? performance.now() - window._centeredModeEntryTime
-        : Infinity;
-    const isSettling = entryElapsed < ENTRY_SETTLE_MS;
-
-    const baseDur = speedTier?.panDuration ?? 0.2;
-    const baseEase = speedTier?.easeLinearity ?? 0.15;
-
-    let targetDur, targetEase;
-
-    if (isSettling) {
-        const p = entryElapsed / ENTRY_SETTLE_MS;
-        targetDur = 0.7 + (baseDur * factor - 0.7) * p;
-        targetEase = 0.08 + (baseEase - 0.08) * p;
-    } else {
-        targetDur = baseDur * factor;
-        if (safeSpeed >= 30) targetDur *= 0.70;
-        else if (safeSpeed >= 20) targetDur *= 0.80;
-        else if (safeSpeed >= HIGH_SPEED_MPH) targetDur *= 0.90;
-        if (eastWestMovement) targetDur *= 0.90;
-
-        targetEase = baseEase;
-        if (safeSpeed >= 20) targetEase = Math.min(0.25, targetEase * 1.4);
-        else if (safeSpeed >= HIGH_SPEED_MPH) targetEase = Math.min(0.20, targetEase * 1.2);
-    }
-
-    targetDur = Math.max(0.05, Math.min(0.8, targetDur));
-    targetEase = Math.max(0.10, Math.min(0.5, targetEase));
-
-    // Smooth param convergence.
-    if (window._panParamCache == null) {
-        window._panParamCache = { duration: targetDur, easing: targetEase };
-    } else {
-        window._panParamCache.duration += (targetDur - window._panParamCache.duration) * LERP_ALPHA;
-        window._panParamCache.easing += (targetEase - window._panParamCache.easing) * LERP_ALPHA;
-    }
-
-    const panDur = window._panParamCache.duration;
-    const panEase = window._panParamCache.easing;
-
-    // Snap at very high speed; pan otherwise.
-    if (safeSpeed >= SNAP_SPEED_MPH && window.deadReckoning?.isActive()) {
-        window._gpsCenteredPanJustOccurred = true;
-        requestAnimationFrame(() => {
-            requestAnimationFrame(() => { window._gpsCenteredPanJustOccurred = false; });
-        });
-
-        map.setView([centerLat, centerLng], map.getZoom(), {
-            animate: false,
-            noMoveStart: true,
-            noMoveEnd: true
-        });
-    } else {
-        map.panTo([centerLat, centerLng], {
-            animate: true,
-            duration: panDur,
-            easeLinearity: panEase,
-            noMoveStart: true
-        });
-    }
-
-    if (window.DEBUG_PANNING) {
-        console.debug(
-            '[Centered] speed=' + safeSpeed.toFixed(1) + 'mph' +
-            ', dur=' + (panDur * 1000).toFixed(0) + 'ms' +
-            ', ease=' + panEase.toFixed(3) +
-            ', settling=' + isSettling +
-            (isSettling ? ' (' + entryElapsed.toFixed(0) + 'ms)' : '') +
-            ', targetDur=' + (targetDur * 1000).toFixed(0) + 'ms' +
-            ', EW=' + !!eastWestMovement
-        );
-    }
-}
         
 /**
  * Cancels every outstanding timer and animation-frame handle that the map
