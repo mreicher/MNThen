@@ -327,7 +327,7 @@ const locations = [
 
     {
         id: "1030",
-        lat: 45.143206769588836, -
+        lat: 45.143206769588836, 
         lng: 93.00476115417781,
         name: "Nye's Polonaise Room (1950 - 2016)",
         title: "Nye's Polonaise Room",
