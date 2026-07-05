@@ -1594,13 +1594,12 @@ window.sensorFusion = new SensorFusionManager().init();
             LOW_SPEED_CUTOFF_MPS: 0.0,
             HEADING_CHANGE_CAP:   25.0,
             INTERACTION_FADE_MS:  250,
-            CENTERED_DEADBAND_M:  0.25,
+            CENTERED_DEADBAND_PX: 1.5, // Pixel-based to prevent zoom wobble
             DRIFT_THRESHOLD_LOW:  2.0,
             DRIFT_THRESHOLD_HIGH: 10.0,
             PAN_DURATION_BASE:    0.22,
             PAN_DURATION_FAST:    0.10,
-            FREE_MIN_PAN_M:       4.0,
-            CENTERED_DEADBAND_PX: 1.5
+            FREE_MIN_PAN_M:       4.0
         };
     
         let _rafId             = null;
@@ -1635,41 +1634,56 @@ window.sensorFusion = new SensorFusionManager().init();
         const _getRawPos    = () => window.sensorFusion?.getLastRawPosition()            ?? (window.lastPosition || null);
         const _isStationary = () => window.sensorFusion?._lastStationaryState            ?? window.isStationary;
     
+        function _isCenteredMode() {
+            return !!(window.followUser && typeof ModeManager !== 'undefined' && ModeManager.shouldTrackCentered?.());
+        }
     
+        // --- FINAL HORIZON CURVE (Plateaus + Gentle Startup) ---
         const HORIZON_CURVE = [
             { speed: 0.0,  h: 0.0 },
-            { speed: 0.3,  h: 1.2 },
-            { speed: 1.0,  h: 1.6 },
-            { speed: 1.5,  h: 1.9 },
-            { speed: 3.0,  h: 2.2 },
-            { speed: 8.0,  h: 2.5 },
-            { speed: 15.0, h: 2.8 },
-            { speed: 40.0, h: 2.8 },
+            { speed: 0.5,  h: 0.0 },
+            { speed: 0.7,  h: 0.15 },  // Eases noisy startup GPS
+            { speed: 1.0,  h: 0.4 },   
+            { speed: 1.5,  h: 0.5 },
+            { speed: 2.5,  h: 0.9 },   // Start plateau
+            { speed: 8.0,  h: 0.9 },   // End plateau (steady for walking/jogging)
+            { speed: 10.0, h: 1.4 },   
+            { speed: 15.0, h: 1.8 },
+            { speed: 20.0, h: 2.5 },   // Start plateau
+            { speed: 25.0, h: 2.5 },   // End plateau (steady for city driving)
+            { speed: 40.0, h: 2.8 },   // Max anchor
         ];
      
-    function _getPredictHorizon(speedMPS, headingChangeDegPerSec) {
-        let h;
-        if (speedMPS <= HORIZON_CURVE[0].speed) {
-            h = HORIZON_CURVE[0].h;
-        } else if (speedMPS >= HORIZON_CURVE[HORIZON_CURVE.length - 1].speed) {
-            h = HORIZON_CURVE[HORIZON_CURVE.length - 1].h;
-        } else {
-            for (let i = 1; i < HORIZON_CURVE.length; i++) {
-                const prev = HORIZON_CURVE[i - 1], curr = HORIZON_CURVE[i];
-                if (speedMPS <= curr.speed) {
-                    const t = (speedMPS - prev.speed) / (curr.speed - prev.speed);
-                    h = prev.h + t * (curr.h - prev.h);
-                    break;
+        function _getPredictHorizon(speedMPS, headingChangeDegPerSec) {
+            let h;
+            if (speedMPS <= HORIZON_CURVE[0].speed) {
+                h = HORIZON_CURVE[0].h;
+            } else if (speedMPS >= HORIZON_CURVE[HORIZON_CURVE.length - 1].speed) {
+                h = HORIZON_CURVE[HORIZON_CURVE.length - 1].h;
+            } else {
+                for (let i = 1; i < HORIZON_CURVE.length; i++) {
+                    const prev = HORIZON_CURVE[i - 1], curr = HORIZON_CURVE[i];
+                    if (speedMPS <= curr.speed) {
+                        const t = (speedMPS - prev.speed) / (curr.speed - prev.speed);
+                        h = prev.h + t * (curr.h - prev.h);
+                        break;
+                    }
                 }
             }
+     
+            // --- FINAL TURN PENALTY (Safe, with noise gate) ---
+            const TURN_NOISE_FLOOR = 2.0; 
+            const TURN_PENALTY = 0.35;     
+            const maxTurn = CFG.HEADING_CHANGE_CAP - TURN_NOISE_FLOOR;
+            
+            if (maxTurn > 0) {
+                const effectiveHeadingChange = Math.max(0, headingChangeDegPerSec - TURN_NOISE_FLOOR);
+                const turnFactor = Math.min(1.0, effectiveHeadingChange / maxTurn);
+                h *= (1.0 - turnFactor * TURN_PENALTY);
+            }
+     
+            return Math.max(0, Math.min(h, CFG.MAX_PREDICT_HORIZON));
         }
-     
-        const turnFactor = Math.min(1.0, headingChangeDegPerSec / CFG.HEADING_CHANGE_CAP);
-        h *= (1.0 - turnFactor * 0.6);
-     
-        const safetyCap = speedMPS > 20 ? 200 / speedMPS : (speedMPS > 0 ? 150 / speedMPS : CFG.MAX_PREDICT_HORIZON);
-        return Math.max(0, Math.min(h, safetyCap, CFG.MAX_PREDICT_HORIZON));
-    }
     
         function _getMarkerEl() {
             if (_markerEl) return _markerEl;
@@ -1692,19 +1706,15 @@ window.sensorFusion = new SensorFusionManager().init();
             }
         }
     
-       function _snapViewport(lat, lng) {
+        function _snapViewport(lat, lng) {
             if (!map) return;
-        
             if (_centeredLat !== null) {
-                // Pixel-space deadband, not fixed meters — the same real-world GPS/
-                // Kalman jitter looks like more on-screen movement at high zoom
-                // (fewer meters-per-pixel), which is what caused the zoom-19 wobble.
+                // Pixel-space deadband prevents zoom-level wobble
                 const prevPx = map.latLngToContainerPoint([_centeredLat, _centeredLng]);
                 const nextPx = map.latLngToContainerPoint([lat, lng]);
                 const pxDist = Math.hypot(nextPx.x - prevPx.x, nextPx.y - prevPx.y);
                 if (pxDist < CFG.CENTERED_DEADBAND_PX) return;
             }
-        
             _centeredLat = lat; _centeredLng = lng;
             map.setView([lat, lng], map.getZoom(), { animate: false, reset: false, pan: { noMoveStart: true } });
         }
@@ -1716,7 +1726,7 @@ window.sensorFusion = new SensorFusionManager().init();
             const rad = _lastHeadingDeg * Math.PI / 180;
             kf.seedVelocity(_lastGoodSpeedMPS * Math.cos(rad), _lastGoodSpeedMPS * Math.sin(rad), 2.0);
         }
-
+    
         function frame(now) {
             _rafId = null;
             const lastPos = window.lastPosition;
@@ -1724,9 +1734,9 @@ window.sensorFusion = new SensorFusionManager().init();
         
             const speedMPS   = _getSpeedMPS();
             const stationary = _isStationary();
+            const centered   = _isCenteredMode();
         
-            // MODE-INDEPENDENT EXIT — unchanged, confirmed correct.
-            if (stationary && speedMPS < CFG.MIN_SPEED_MPS) { _active = false; return; }
+            if (!centered && stationary && speedMPS < CFG.MIN_SPEED_MPS) { _active = false; return; }
         
             const isInteracting = window.isMapInteracting || window._isProximityZoomAnimating || window._gpsCenteredPanJustOccurred;
             if (isInteracting) {
@@ -1748,11 +1758,13 @@ window.sensorFusion = new SensorFusionManager().init();
             else                            { oLat = lastPos.lat; oLng = lastPos.lng; oTs = window.lastUpdateTimestamp || now; }
         
             const hdg = _getHeading();
+            
+            // --- FASTER HEADING RESPONSE (0.7/0.3 instead of 0.85/0.15) ---
             if (_lastHeadingDeg != null && hdg != null) {
                 let d = hdg - _lastHeadingDeg;
                 if (d >  180) d -= 360;
                 if (d < -180) d += 360;
-                _headingChangeRate = _headingChangeRate * 0.85 + (Math.abs(d) / (Math.max(dtMs, 16) / 1000)) * 0.15;
+                _headingChangeRate = _headingChangeRate * 0.7 + (Math.abs(d) / (Math.max(dtMs, 16) / 1000)) * 0.3;
             }
             if (hdg != null) _lastHeadingDeg = hdg;
         
@@ -1777,17 +1789,10 @@ window.sensorFusion = new SensorFusionManager().init();
         
             _lastPredictedPos = { lat: pLat, lng: pLng };
         
-            /* ── NEAR-STOP JITTER HOLD (zero added latency for real motion) ──────────
-             * Below 0.5 m/s, DR isn't extrapolating at all (_getPredictHorizon
-             * returns ~0 there) — pLat/pLng are just passed through from oLat/oLng,
-             * the fused Kalman/raw position. Shuffle in that band is upstream noise
-             * in that fused position, not a DR problem. This hold suppresses only
-             * jitter-sized moves while near-stop — it does NOT delay or blend real
-             * motion, so it costs nothing at any speed above this band.
-             */
-            const HOLD_SPEED_MPS = CFG.MIN_SPEED_MPS; // near-stop band, same gate as the exit check above
-            const HOLD_DEADBAND_M = 0.6;              // meters — errors below this are jitter, not movement
-        
+            // --- NEAR-STOP JITTER HOLD ---
+            const HOLD_SPEED_MPS = CFG.MIN_SPEED_MPS; 
+            const HOLD_DEADBAND_M = 0.15; // Tightened from 0.6 to prevent stick-slip
+            
             const prevHeld = window.__drHeld;
             let hLat = pLat, hLng = pLng;
         
@@ -1802,7 +1807,7 @@ window.sensorFusion = new SensorFusionManager().init();
                 }
             }
             window.__drHeld = { lat: hLat, lng: hLng };
-            /* ─────────────────────────────────────────────────────────────────────── */
+            // --- END JITTER HOLD ---
         
             if (!map || window._isProximityZoomAnimating) {
                 _setMarkerPosition(hLat, hLng);
@@ -1810,66 +1815,62 @@ window.sensorFusion = new SensorFusionManager().init();
                 return;
             }
         
-            // Unified — pan first, then pin the marker to the map's own center, in
-            // all follow cases. Not mode-dependent: guarantees marker/viewport can
-            // never disagree, including in roaming, at no extra cost.
-            if (window.followUser) {
+            if (window.followUser && centered) {
                 _snapViewport(hLat, hLng);
                 const c = map.getCenter();
                 _setMarkerPosition(c.lat, c.lng);
+            } else if (window.followUser) {
+                _setMarkerPosition(hLat, hLng);
+                _snapViewport(hLat, hLng);
             } else {
                 _setMarkerPosition(hLat, hLng);
             }
         
             _rafId = requestAnimationFrame(frame);
         }
-        
+    
         function _start() {
             if (_active || window.isLocationHuntVisible) return;
-            const speedMPS = _getSpeedMPS(), stationary = _isStationary();
-        
-            // MODE-INDEPENDENT START — mirror of frame() exit, unchanged.
-            if (stationary && speedMPS < CFG.MIN_SPEED_MPS) return;
-        
-            _seedVelocityOnResume();
-            _active = true;
-            _lastFrameTime = performance.now();
-            _interactionEndTime = 0;
+            const speedMPS = _getSpeedMPS(), centered = _isCenteredMode();
+            if (!centered && speedMPS < CFG.MIN_SPEED_MPS) return;
+            if (!centered && window.isStationary && speedMPS < 0.8) return;
+            if (speedMPS >= CFG.MIN_SPEED_MPS) _seedVelocityOnResume();
+            _active = true; _lastFrameTime = _now(); _interactionEndTime = 0;
             _rafId = requestAnimationFrame(frame);
         }
-        
+    
         window.deadReckoning = {
             start() { _start(); },
-        
+    
             stop() {
                 if (_rafId != null) { cancelAnimationFrame(_rafId); _rafId = null; }
                 _active = false; _panPending = false; _panTarget = null;
                 _centeredLat = null; _centeredLng = null;
-                window.__drHeld = null;
+                window.__drHeld = null; // Clear hold state on stop
                 const el = _getMarkerEl();
                 if (el) { el.style.willChange = ''; el.style.transition = ''; _markerTransSet = false; }
             },
-        
+    
             isActive() { return _active; },
-        
+    
             onMovementResumed: _start,
-        
+    
             forceUpdate() {
                 if (!_active) { _start(); return; }
                 _lastFrameTime = 0;
                 if (_rafId == null) _rafId = requestAnimationFrame(frame);
             },
-        
+    
             getPredictedPosition()  { return _lastPredictedPos; },
             invalidateMarkerCache() { _markerEl = null; _markerTransSet = false; }
         };
-        
+    
         _start();
-        
+    
         if (typeof memoryManager !== 'undefined' && memoryManager?.registerCleanupTask) {
             memoryManager.registerCleanupTask(() => window.deadReckoning.stop());
         }
-                })();
+    })();
         
 /* ──────────────────────────────────────────────
    CONFIG — GPS & proximity tuning
