@@ -225,7 +225,7 @@ const blogArticles = [
     "icon": "fa-user",
     "author": "Matt Reicher",
     "date": "February 25, 2025",
-    "image": "https://mnthen.com/images/molter.jpg",
+    "image": "https://mnthen.com/images/exhibit/molter.jpg",
     "url": "https://mnthen.com/blog/people/molter.html",
     "keywords": ["root beer", "BWCA", "Northwoods", "Boundary Waters", "Root Beer Lady", "person", "all"]
   },
@@ -285,7 +285,7 @@ const blogArticles = [
     "icon": "fa-calendar", 
     "author": "Matt Reicher",
     "date": "November 13, 2024",  
-    "image": "https://mnthen.com/images/northfield.jpg", 
+    "image": "https://mnthen.com/images/exhibit/northfield.jpg", 
     "url": "https://mnthen.com/blog/event/northfield.html", 
     "keywords": ["northfield", "bank", "raid", "James", "Younger", "event", "all"]
   },
