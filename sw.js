@@ -1,6 +1,5 @@
 // sw.js – Minnesota Then Service Worker
-// Version: 4.6.5 (fixes locations_main.js 503 fallback, GEOLOCATION hardening,
-//                 PREFETCH_AUDIO handler, and staleWhileRevalidate)
+// Version: 4.6.5 
 
 const CACHE_NAME    = 'mnthen-v4-ios-6';
 const SHELL_CACHE   = 'mnthen-shell-v6';
