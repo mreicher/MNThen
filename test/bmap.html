@@ -1975,8 +1975,18 @@ function announceToScreenReader(message, priority = 'polite') {
    MAP INITIALIZATION
    ────────────────────────────────────────────── */
     function initMap() {
-        // ── Guard: full Leaflet teardown if re-initializing ──
+        // ── Guard: full teardown if re-initializing ──
+        // disposeMapLoop() only clears window-scoped RAF/timeout/interval handles
+        // (see its rafHandles/timeoutHandles/intervalHandles lists) — it does NOT
+        // stop dead reckoning, whose animation-frame id is a closure-private
+        // variable inside deadReckoning and is never exposed on window. Without
+        // this explicit stop, DR keeps extrapolating and writing to `userMarker`
+        // and `map` straight through the teardown/recreate below.
         if (typeof disposeMapLoop === 'function') disposeMapLoop();
+        if (window.deadReckoning && typeof window.deadReckoning.stop === 'function') {
+            window.deadReckoning.stop();   // also clears _drOwnsMarker / _drLastOwnsTime
+        }
+
         if (map) {
             try { map.remove(); } catch (e) { console.warn('[Map] Remove failed:', e.message); }
             map = null;
@@ -1985,10 +1995,33 @@ function announceToScreenReader(message, priority = 'polite') {
             try { markerClusterGroup.clearLayers(); } catch (e) {}
             markerClusterGroup = null;
         }
+        // userMarker wasn't being torn down like the layers above — it was left
+        // pointing at the old (now-detached) marker instance until reassigned
+        // further down. Every marker-write path (dead reckoning's
+        // _setMarkerPosition, scheduleMarkerUpdate) gates on
+        // `typeof userMarker !== 'undefined' && userMarker` being truthy, so a
+        // stale-but-truthy reference here means those gates pass when they
+        // shouldn't, during the window before the new marker exists.
+        if (userMarker) {
+            try { userMarker.remove(); } catch (e) {}
+            userMarker = null;
+        }
+
+        // Render-state globals consumed by the GPS render scheduler
+        // (_scheduleMapUpdate / _executeRender). disposeMapLoop cancels the
+        // pending RAF but leaves this state pointing at the old map/position —
+        // clear it so nothing can act on stale state if it's read before the
+        // next real GPS update arrives.
+        window._currentMapState    = null;
+        window._currentRenderState = null;
+        window._currentSpeedTier   = null;
     
         // ── Storage cleanup ──
         ['lastKnownPos', 'routeHistory'].forEach(k => {
-            try { localStorage.removeItem(k); sessionStorage.removeItem(k); } catch (_) {}
+            // Separate try/catch per call so a quota/security error on one
+            // storage backend can't prevent cleanup of the other.
+            try { localStorage.removeItem(k); } catch (_) {}
+            try { sessionStorage.removeItem(k); } catch (_) {}
         });
     
         // ── Map creation ──
@@ -2051,11 +2084,16 @@ function announceToScreenReader(message, priority = 'polite') {
             const opts = { enableHighAccuracy: true, timeout: 45000, maximumAge: 5000 };
             
             const onFirstError = (err) => {
-                // iOS often denies first prompt due to timing; retry with relaxed constraints
+                // iOS often denies first prompt due to timing; retry with relaxed constraints.
+                // Only retry on timeout (code 3) — retrying PERMISSION_DENIED (1) or
+                // POSITION_UNAVAILABLE (2) with the exact same options can't produce a
+                // different outcome, it just delays the user seeing the real error.
                 const isTimeout = err?.code === 3;
-                const retryOpts = isTimeout
-                    ? { enableHighAccuracy: true, timeout: 60000, maximumAge: 10000 }
-                    : opts;
+                if (!isTimeout) {
+                    handleLocationError(err);
+                    return;
+                }
+                const retryOpts = { enableHighAccuracy: true, timeout: 60000, maximumAge: 10000 };
                 
                 navigator.geolocation.getCurrentPosition(
                     initializeUserLocation,
@@ -2090,12 +2128,15 @@ function announceToScreenReader(message, priority = 'polite') {
 /* ──────────────────────────────────────────────
    IDLE PROXIMITY CHECK
    ────────────────────────────────────────────── */
-    let _idleProximityCheckInterval;
+   function startIdleProximityCheck() {
+        // Stored on window (not a local/closure variable) because
+        // disposeMapLoop()'s intervalHandles list already targets
+        // window._idleProximityCheckInterval by name. Keeping the id local
+        // meant that cleanup call was always clearing an id that was never
+        // set, so this interval survived every map re-init indefinitely.
+        if (window._idleProximityCheckInterval) return;
     
-    function startIdleProximityCheck() {
-        if (_idleProximityCheckInterval) return;
-    
-        _idleProximityCheckInterval = setInterval(() => {
+        window._idleProximityCheckInterval = setInterval(() => {
             try {
                 if (!window.map || !window.gameLocations?.length || !window.userMarker) return;
                 updateDistanceBox();
@@ -2110,9 +2151,9 @@ function announceToScreenReader(message, priority = 'polite') {
     }
     
     function stopIdleProximityCheck() {
-        if (_idleProximityCheckInterval) {
-            clearInterval(_idleProximityCheckInterval);
-            _idleProximityCheckInterval = null;
+        if (window._idleProximityCheckInterval) {
+            clearInterval(window._idleProximityCheckInterval);
+            window._idleProximityCheckInterval = null;
         }
     }
     
@@ -2483,7 +2524,7 @@ function announceToScreenReader(message, priority = 'polite') {
 /* ──────────────────────────────────────────────
    USER LOCATION INITIALIZATION
    ────────────────────────────────────────────── */
-    function initializeUserLocation(position) {
+   function initializeUserLocation(position) {
         // ── Consume warm-start fix if it's better than what we were handed ──
         position = window._consumeWarmupPosition?.(position) ?? position;
     
@@ -2595,13 +2636,30 @@ function announceToScreenReader(message, priority = 'polite') {
             }
     
             // Apply any position that queued while init was in flight.
+            // Previously this only moved the marker — it skipped the same range
+            // validation the primary position gets above, and never touched
+            // sensorFusion/Kalman state, so the marker could visually jump to a
+            // coordinate that the rest of the app (dead reckoning, distance
+            // checks) didn't know about, causing a jump-then-snap-back glitch
+            // on the next real update. Route it through the normal ongoing
+            // update pipeline if one exists, so displayed position and internal
+            // state stay in sync; fall back to the original marker-only move
+            // (now with matching validation) if that pipeline isn't available.
             const pending = window._pendingInitPosition;
             if (pending) {
                 window._pendingInitPosition = null;
                 const pLat = pending?.coords?.latitude;
                 const pLng = pending?.coords?.longitude;
-                if (userMarker && pLat != null && pLng != null && !isNaN(pLat) && !isNaN(pLng)) {
-                    userMarker.setLatLng([pLat, pLng]);
+                const pendingValid = pLat != null && pLng != null &&
+                    !isNaN(pLat) && !isNaN(pLng) &&
+                    Math.abs(pLat) <= 90 && Math.abs(pLng) <= 180;
+
+                if (pendingValid) {
+                    if (typeof updateUserLocation === 'function') {
+                        updateUserLocation(pending);
+                    } else if (userMarker) {
+                        userMarker.setLatLng([pLat, pLng]);
+                    }
                 }
             }
     
@@ -2640,12 +2698,21 @@ function announceToScreenReader(message, priority = 'polite') {
     }
         
 /* ──────────────────────────────────────────────
-   GPS POWER MODE — shared utility
+   GPS POWER MODE 
    ────────────────────────────────────────────── */
     function getWatchOptions() {
-        const speedMPH   = (window.lastPosition?.speedMPS ?? 0) * 2.23694;
-        const stationary = window.isStationary || speedMPH < 0.3;
-        const driving    = speedMPH >= 5 || (!window.isStationary && speedMPH >= 4);
+        const speedMPH = (window.lastPosition?.speedMPS ?? 0) * 2.23694;
+
+        // Match the authoritative stationary signal used elsewhere (see
+        // deadReckoning's _isStationary()) instead of window.isStationary alone.
+        // Nothing in the app assigns window.isStationary directly — the real
+        // value lives on sensorFusion._lastStationaryState — so reading it by
+        // itself here meant this was always `undefined`, which silently
+        // collapsed the driving hysteresis below into just `speedMPH >= 4`.
+        const isStationaryFlag = window.sensorFusion?._lastStationaryState ?? window.isStationary;
+
+        const stationary = isStationaryFlag || speedMPH < 0.3;
+        const driving    = speedMPH >= 5 || (!isStationaryFlag && speedMPH >= 4);
         const highSpeed  = speedMPH >= 45;
      
         const maximumAge = stationary ? 5000
@@ -2663,141 +2730,135 @@ function announceToScreenReader(message, priority = 'polite') {
 /* ──────────────────────────────────────────────
    POSITION UPDATES — GPS watch + power manager
    ────────────────────────────────────────────── */
-function startPositionUpdates() {
-    try {
-        if (window.positionWatchId != null) {
-            navigator.geolocation.clearWatch(window.positionWatchId);
-            window.positionWatchId = null;
-        }
-
-        const opts = getWatchOptions();
-        
-        window.positionWatchId = navigator.geolocation.watchPosition(
-            handlePositionUpdate,
-            handleLocationError,
-            opts
-        );
-
-        if (!window._positionUpdatesListenersSetup) {
-            window._positionUpdatesListenersSetup = true;
-
-            const onlineHandler = () => {
-                if (window.onlineRestartTimeout) clearTimeout(window.onlineRestartTimeout);
-                window.onlineRestartTimeout = createTrackedTimeout(() => {
-                    if (window.positionWatchId == null) {
-                        const restartOpts = getWatchOptions();
-                        window.positionWatchId = navigator.geolocation.watchPosition(
-                            handlePositionUpdate,
-                            handleLocationError,
-                            restartOpts
-                        );
-                    }
-                    window.onlineRestartTimeout = null;
-                }, 500);
-            };
-
-            const offlineHandler = () => {
-                if (window.onlineRestartTimeout) {
-                    clearTimeout(window.onlineRestartTimeout);
-                    window.onlineRestartTimeout = null;
-                }
-            };
-
-            window.addEventListener('online', onlineHandler);
-            window.addEventListener('offline', offlineHandler);
-
-            if (typeof memoryManager?.trackEventListener === 'function') {
-                memoryManager.trackEventListener(window, 'online', onlineHandler);
-                memoryManager.trackEventListener(window, 'offline', offlineHandler);
+    function startPositionUpdates() {
+        try {
+            if (window.positionWatchId != null) {
+                navigator.geolocation.clearWatch(window.positionWatchId);
+                window.positionWatchId = null;
             }
+            const opts = getWatchOptions();
+            
+            window.positionWatchId = navigator.geolocation.watchPosition(
+                handlePositionUpdate,
+                handleLocationError,
+                opts
+            );
+            if (!window._positionUpdatesListenersSetup) {
+                window._positionUpdatesListenersSetup = true;
+                const onlineHandler = () => {
+                    if (window.onlineRestartTimeout) clearTimeout(window.onlineRestartTimeout);
+                    window.onlineRestartTimeout = createTrackedTimeout(() => {
+                        window.onlineRestartTimeout = null;
+                        // Delegate to startPositionUpdates() rather than duplicating
+                        // the watch/options setup inline — it already no-ops safely
+                        // when a watch exists, and it already routes failures
+                        // through handleLocationError, which this inline version
+                        // didn't.
+                        if (window.positionWatchId == null) {
+                            startPositionUpdates();
+                        }
+                    }, 500);
+                };
+                const offlineHandler = () => {
+                    if (window.onlineRestartTimeout) {
+                        clearTimeout(window.onlineRestartTimeout);
+                        window.onlineRestartTimeout = null;
+                    }
+                };
+                window.addEventListener('online', onlineHandler);
+                window.addEventListener('offline', offlineHandler);
+                if (typeof memoryManager?.trackEventListener === 'function') {
+                    memoryManager.trackEventListener(window, 'online', onlineHandler);
+                    memoryManager.trackEventListener(window, 'offline', offlineHandler);
+                }
+            }
+            return window.positionWatchId;
+        } catch (err) {
+            console.error('Geolocation unavailable:', err);
+            handleLocationError({ code: 0, message: 'Geolocation unavailable' });
+            return null;
         }
-
-        return window.positionWatchId;
-
-    } catch (err) {
-        console.error('Geolocation unavailable:', err);
-        handleLocationError({ code: 0, message: 'Geolocation unavailable' });
-        return null;
     }
-}
         
 /* ──────────────────────────────────────────────
    POSITION UPDATE HANDLER
    ────────────────────────────────────────────── */
-function handlePositionUpdate(position) {
-    if (!position?.coords ||
-        isNaN(position.coords.latitude) ||
-        isNaN(position.coords.longitude)) {
-        return;
-    }
- 
-    const positionTimestamp = position.timestamp || Date.now();
-    const currentTime = Date.now();
- 
-    // Discard stale fixes (> 30 seconds old)
-    if (currentTime - positionTimestamp > 30_000) return;
- 
-    // Background throttle: one fix per 30s when tab is hidden
-    if (document.hidden) {
-        if (!window._lastBackgroundUpdate || currentTime - window._lastBackgroundUpdate > 30_000) {
-            window._lastBackgroundUpdate = currentTime;
-        } else {
+    function handlePositionUpdate(position) {
+        if (!position?.coords ||
+            isNaN(position.coords.latitude) ||
+            isNaN(position.coords.longitude) ||
+            Math.abs(position.coords.latitude) > 90 ||
+            Math.abs(position.coords.longitude) > 180) {
             return;
         }
-    }
- 
-    const rawLat       = position.coords.latitude;
-    const rawLng       = position.coords.longitude;
-    const rawAccuracy  = position.coords.accuracy || 20;
-    const rawSpeedMPS  = position.coords.speed || 0;
-    const rawHeading   = position.coords.heading ?? null;
-    const isMovingRaw  = rawSpeedMPS > 0.5;
- 
-    // Kept for backward compatibility — anything reading these globals
-    // elsewhere still sees them populated, just from raw data now instead
-    // of data that was silently pre-fused here.
-    window.lastPositionAccuracy = rawAccuracy;
-    window.lastValidPosition = {
-        lat:       rawLat,
-        lng:       rawLng,
-        timestamp: positionTimestamp,
-        accuracy:  rawAccuracy,
-        speedMPS:  rawSpeedMPS,
-        heading:   rawHeading,
-        isMoving:  isMovingRaw
-    };
- 
-    // Display-only timing info — does NOT touch window.lastUpdateTime,
-    // which updateUserLocation owns exclusively.
-    if (window.lastUpdateTime) {
-        window.timeSinceLastUpdate = currentTime - window.lastUpdateTime;
-    }
- 
-    // Raw passthrough — no pre-fusion here. updateUserLocation's own
-    // pipeline (_extractGPSFix → _runSensorFusion) is the single place
-    // fusion happens.
-    const rawPosition = {
-        timestamp: positionTimestamp,
-        coords: {
-            latitude:         rawLat,
-            longitude:        rawLng,
-            accuracy:         rawAccuracy,
-            altitude:         position.coords.altitude,
-            altitudeAccuracy: position.coords.altitudeAccuracy,
-            heading:          rawHeading,
-            speed:            rawSpeedMPS
+     
+        const positionTimestamp = position.timestamp || Date.now();
+        const currentTime = Date.now();
+     
+        // Discard stale fixes (> 30 seconds old)
+        if (currentTime - positionTimestamp > 30_000) return;
+     
+        // Background throttle: one fix per 30s when tab is hidden
+        if (document.hidden) {
+            if (!window._lastBackgroundUpdate || currentTime - window._lastBackgroundUpdate > 30_000) {
+                window._lastBackgroundUpdate = currentTime;
+            } else {
+                return;
+            }
         }
-    };
- 
-    // Force update at high speed so map keeps up
-    const forceUpdate = rawSpeedMPS > 10;
-    updateUserLocation(rawPosition, forceUpdate);
-}
+     
+        const rawLat       = position.coords.latitude;
+        const rawLng       = position.coords.longitude;
+        const rawAccuracy  = position.coords.accuracy || 20;
+        const rawSpeedMPS  = position.coords.speed || 0;
+        const rawHeading   = position.coords.heading ?? null;
+        const isMovingRaw  = rawSpeedMPS > 0.5;
+     
+        // Kept for backward compatibility — anything reading these globals
+        // elsewhere still sees them populated, just from raw data now instead
+        // of data that was silently pre-fused here.
+        window.lastPositionAccuracy = rawAccuracy;
+        window.lastValidPosition = {
+            lat:       rawLat,
+            lng:       rawLng,
+            timestamp: positionTimestamp,
+            accuracy:  rawAccuracy,
+            speedMPS:  rawSpeedMPS,
+            heading:   rawHeading,
+            isMoving:  isMovingRaw
+        };
+     
+        // Display-only timing info — does NOT touch window.lastUpdateTime,
+        // which updateUserLocation owns exclusively.
+        if (window.lastUpdateTime) {
+            window.timeSinceLastUpdate = currentTime - window.lastUpdateTime;
+        }
+     
+        // Raw passthrough — no pre-fusion here. updateUserLocation's own
+        // pipeline (_extractGPSFix → _runSensorFusion) is the single place
+        // fusion happens.
+        const rawPosition = {
+            timestamp: positionTimestamp,
+            coords: {
+                latitude:         rawLat,
+                longitude:        rawLng,
+                accuracy:         rawAccuracy,
+                altitude:         position.coords.altitude,
+                altitudeAccuracy: position.coords.altitudeAccuracy,
+                heading:          rawHeading,
+                speed:            rawSpeedMPS
+            }
+        };
+     
+        // Force update at high speed so map keeps up
+        const forceUpdate = rawSpeedMPS > 10;
+        updateUserLocation(rawPosition, forceUpdate);
+    }
         
 /* ──────────────────────────────────────────────
    VISIBILITY CHANGE HANDLER
    ────────────────────────────────────────────── */
-    function handleVisibilityChange() {
+   function handleVisibilityChange() {
         if (document.hidden) {
             // Tab/app going to background
             window.lastHiddenTime = Date.now();
@@ -2805,6 +2866,13 @@ function handlePositionUpdate(position) {
             resetInactivityTimer(false);
     
             disposeMapLoop();
+            // disposeMapLoop() only reaches window-scoped RAF/timeout/interval
+            // handles — dead reckoning's animation loop is a closure-private id
+            // that's never exposed on window (same gap we found in initMap()),
+            // so without this it keeps running, invisibly, while backgrounded.
+            if (window.deadReckoning && typeof window.deadReckoning.stop === 'function') {
+                window.deadReckoning.stop();
+            }
             window.isReWaking = false;
     
             if (window.visibilityDebounceTimer) {
@@ -2820,6 +2888,19 @@ function handlePositionUpdate(position) {
             if (window.visibilityDebounceTimer) {
                 clearTimeout(window.visibilityDebounceTimer);
                 window.visibilityDebounceTimer = null;
+            }
+    
+            // disposeMapLoop() runs unconditionally on every hide, regardless of
+            // how long the absence turns out to be, and it clears
+            // _idleProximityCheckInterval along with everything else. The only
+            // place that normally (re)starts it — initializeUserLocation — is
+            // gated by a one-shot `_proximityCheckStarted` latch that's never
+            // reset, so without this call idle proximity checking would die
+            // permanently after the very first tab switch, short or long.
+            // startIdleProximityCheck() has its own idempotent guard
+            // (no-ops if already running), so it's always safe to call here.
+            if (typeof startIdleProximityCheck === 'function') {
+                startIdleProximityCheck();
             }
     
             if (awayMs > threshold) {
