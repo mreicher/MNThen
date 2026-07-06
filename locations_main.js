@@ -153,17 +153,17 @@ const locations = [
         additionalInfo: "In 1976, Swede Hollow was transformed into a nature sanctuary with trails and signs commemorating the communities that once lived there.",
         difficulty: 2
     },
-/*
+
     {
         id: "1018",
-        lat: 44.956571587648774,
-        lng: -93.10028134083977,
+        lat: 44.95656826495145,
+        lng:  -93.10346918072817,
         name: "William R. Merriam Mansion (1882 - 1896)",
         title: "William R. Merriam Mansion",
         image: "https://mnthen.com/images/merriam_house.jpg",
         creator: "Matt Reicher",
         city: "St. Paul",
-        audio: "/audio/exhibit/merriam_mansion.mp3",
+        audio: "/audio/exhibit/swede_hollow.mp3",
         tours: "history",
         summary: "In 1880, William R. Merriam built a grand Queen Anne mansion in St. Paul. A social hub, it was tragically destroyed by fire in 1896.",
         today: "Cass Gilbert Park",
@@ -172,7 +172,7 @@ const locations = [
         additionalInfo: "After serving as Minnesota's governor, Merriam was appointed by President McKinley to direct the U.S. Census Bureau in 1899.",
         difficulty: 1
     },
-*/
+
     {
         id: "1019",
         lat: 45.08421675605315,
