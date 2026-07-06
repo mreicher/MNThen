@@ -3265,85 +3265,73 @@ const trackedTimeouts = new Set();
     }
 }
         
-function getSpeedBasedZoom(speedMPS, closestDistance) {
+function getSpeedBasedZoom(closestDistance) {
     if (closestDistance === undefined) closestDistance = Infinity;
-    var speedMPH     = speedMPS * 2.23694;
     var distanceFeet = closestDistance * 3.28084;
-    var handsOff     = speedMPH > 5; // driving/cycling — suppress map commands, but keep tracking zone state
 
-    // ── Zone 1: Very close (≤45ft) → zoom in once ───────────────────────────
+    // ── Zone 1: Very close (≤45ft) → zoom in once ──
     if (distanceFeet <= 45) {
-        if (handsOff) return null; // don't zoom-in while moving fast
-        if (getSpeedBasedZoom._lastAction !== 'zoomed-in') {
-            getSpeedBasedZoom._lastAction = 'zoomed-in';
-            getSpeedBasedZoom._zoomOutOwed = false;
-            return { zoom: 19, fitBounds: false };
+        if (!getSpeedBasedZoom._isZoomedIn) {
+            getSpeedBasedZoom._isZoomedIn = true;
+            // Return standard object so your existing POI centering code can handle the pan
+            return { zoom: 19, fitBounds: false }; 
         }
-        return null; // already zoomed in, hold position
+        return null; // already zoomed in
     }
 
-    // ── Zone 2: Deadband (45–60ft) → hold, no action ────────────────────────
+    // ── Zone 2: Deadband (45–60ft) → hold ──
     if (distanceFeet <= 60) {
         return null;
     }
 
-    // ── Zone 3: Outside (>60ft) ──────────────────────────────────────────────
-    // Re-arm the "am I in a visit" flag immediately regardless of speed, so a
-    // fast exit sample can never block the next POI's zoom-in. But only
-    // actually deliver the zoom-out (and the recenter that goes with it) once
-    // speed allows it.
-    if (getSpeedBasedZoom._lastAction === 'zoomed-in') {
-        getSpeedBasedZoom._lastAction = 'idle';
-        getSpeedBasedZoom._zoomOutOwed = true;
+    // ── Zone 3: Outside (>60ft) → zoom out once ──
+    if (getSpeedBasedZoom._isZoomedIn) {
+        getSpeedBasedZoom._isZoomedIn = false;
+
+        // 1. Guard against Leaflet event listeners thinking the user touched the screen
+        window._isProgrammaticMove = true;
+
+        // 2. Explicitly hand control back to the Dead Reckoning engine
+        window.blockSpeedZoom = false;
+        window.zoomedInState = false;
+        window._lastCenteredMode = false;
+        window._viewportSafetyEnforced = false;
+        window.followUser = true;
+
+        // 3. Force the map to recenter on the user and zoom to 17 simultaneously
+        try {
+            var pos = window.lastPosition;
+            if (map && pos && typeof pos.lat === 'number' && !isNaN(pos.lat)) {
+                map.setView([pos.lat, pos.lng], 17, { animate: true, duration: 0.25 });
+                
+                if (typeof userMarker !== 'undefined' && userMarker && typeof userMarker.setLatLng === 'function') {
+                    userMarker.setLatLng([pos.lat, pos.lng]);
+                }
+            } else if (map) {
+                map.setZoom(17, { animate: true });
+            }
+        } catch (e) {
+            console.warn('[Zoom] Recenter error:', e);
+        }
+
+        // 4. Clear the guard flag after Leaflet finishes firing its internal events
+        setTimeout(function() {
+            window._isProgrammaticMove = false;
+        }, 50);
+
+        // Return null because we already executed the zoom out via setView internally
+        return null; 
     }
 
-    if (getSpeedBasedZoom._zoomOutOwed && !handsOff) {
-        getSpeedBasedZoom._zoomOutOwed = false;
-        getSpeedBasedZoom._recenterAfterZoomOut();
-        return { zoom: 17, fitBounds: false };
-    }
-
-    return null; // already idle/zoomed-out, or zoom-out still owed pending slower speed
+    return null; // already zoomed out
 }
 
-// Three states:
-//   null  → first render ever, identical behaviour to 'idle'
-//   'idle'      → between POIs, after app open, after pinch zoom reset
-//   'zoomed-in' → currently inside a POI visit, zoom 19 was applied
-getSpeedBasedZoom._lastAction = null;
-// True from the moment we cross back out past 60ft (at any speed) until the
-// zoom-17 + recenter has actually been delivered to the map.
-getSpeedBasedZoom._zoomOutOwed = false;
+// State
+getSpeedBasedZoom._isZoomedIn = false;
 
-// Fires exactly once, at the same moment zoom-17 is returned. Clears the
-// parallel centering flags (so nothing else mistakenly thinks we're still
-// mid-visit/off-center) and recenters the map + marker on the last known
-// position — mirroring what _resetMapToPosition('init') does on manual recenter.
-getSpeedBasedZoom._recenterAfterZoomOut = function () {
-    window.blockSpeedZoom = false;
-    window.zoomedInState = false;
-    window._lastCenteredMode = false;
-    window._viewportSafetyEnforced = false;
-    window.followUser = true;
-
-    try {
-        var pos = window.lastPosition;
-        if (map && pos &&
-            typeof pos.lat === 'number' && typeof pos.lng === 'number' &&
-            !isNaN(pos.lat) && !isNaN(pos.lng)) {
-            map.panTo([pos.lat, pos.lng], { animate: true, duration: 0.25 });
-            if (userMarker && typeof userMarker.setLatLng === 'function') {
-                userMarker.setLatLng([pos.lat, pos.lng]);
-            }
-        }
-    } catch (e) {
-        console.warn('[Zoom] Recenter error:', e);
-    }
-};
-
-getSpeedBasedZoom.reset = function () {
-    getSpeedBasedZoom._lastAction = null;
-    getSpeedBasedZoom._zoomOutOwed = false;
+// Reset (use this if user manually pinches/drags the map)
+getSpeedBasedZoom.reset = function() {
+    getSpeedBasedZoom._isZoomedIn = false;
 };
         
 /* ──────────────────────────────────────────────
@@ -3360,10 +3348,13 @@ function setupMapInteractionHandlers() {
     const STATIONARY_SPEED_MPH = 1.0;
 
     const onInteractionStart = () => {
-        if (window._programmaticFlyInProgress) {
-            window._programmaticFlyInProgress = false;
-            return;
-        }
+        // 1. Ignore if getSpeedBasedZoom is forcing a recenter
+        if (window._isProgrammaticMove) return;
+        
+        // 2. Ignore if another part of your app is flying to a location
+        if (window._programmaticFlyInProgress) return;
+
+        // 3. If we get here, it's a REAL human touch
         window.isMapInteracting = true;
         _clearInactivityTimer();
     };
@@ -3378,13 +3369,12 @@ function setupMapInteractionHandlers() {
             // Moving and following but DR died during interaction — restart it
             window.deadReckoning.start();
         }
-        // else: driving with DR already running → nothing to do
     };
 
     map.on('movestart zoomstart', onInteractionStart);
     map.on('moveend zoomend',     onInteractionEnd);
 }
-
+        
 function _clearInactivityTimer() {
     if (window.inactivityTimer) {
         clearTimeout(window.inactivityTimer);
