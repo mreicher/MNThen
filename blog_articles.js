@@ -1,7 +1,7 @@
 const blogArticles = [
   {
   "headline": "Lexington Park",
-  "blurb": "From Charles Comiskey's 1897 ballpark built for Sunday baseball to grandstand fires and a steel rebuild: how Lexington Park anchored the St. Paul Saints through six decades of fire, relocations, and rivalries, before being demolished in 1956.",
+  "blurb": "Edward Smith built Lexington Park in 1897 so Charles Comiskey's Saints could finally play legal Sunday baseball; two grandstand fires and a steel rebuild later, it anchored the team for six decades before demolition in 1956 made way for a Red Owl grocery store.",
   "icon": "fa-building",
   "author": "Matt Reicher",
   "date": "July 7, 2026",
