@@ -1,5 +1,15 @@
 const blogArticles = [
   {
+  "headline": "Lexington Park",
+  "blurb": "From Charles Comiskey's 1897 ballpark built for Sunday baseball to grandstand fires and a steel rebuild: how Lexington Park anchored the St. Paul Saints through six decades of fire, relocations, and rivalries, before being demolished in 1956.",
+  "icon": "fa-building",
+  "author": "Matt Reicher",
+  "date": "July 7, 2026",
+  "image": "https://www.mnthen.com/images/exhibit/lex_park.jpg",
+  "url": "https://www.mnthen.com/blog/place/lexington_park.html",
+  "keywords": ["lexington park", "st. paul saints", "charles comiskey", "george lennon", "western league", "american association", "midway stadium", "sunday baseball", "minneapolis millers", "red owl grocery", "place", "all"]
+},
+  {
   "headline": "Harriet Island",
   "blurb": "From sacred Dakota land Wakan Wita to Dr. Justus Ohage's 1900 public health vision: how Harriet Island evolved from spiritual crossroads to polluted riverfront, then to St. Paul's premier event space through Wigington's pavilion and 21st-century redevelopment.",
   "icon": "fa-building",
