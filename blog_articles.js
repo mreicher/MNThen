@@ -1,6 +1,6 @@
 const blogArticles = [
   {
-  "headline": "Lexington Park",
+  "headline": "Lexington Park (1897-1956)",
   "blurb": "Edward Smith built Lexington Park in 1897 so Charles Comiskey's Saints could finally play legal Sunday baseball; two grandstand fires and a steel rebuild later, it anchored the team for six decades before demolition in 1956 made way for a Red Owl grocery store.",
   "icon": "fa-building",
   "author": "Matt Reicher",
@@ -20,7 +20,7 @@ const blogArticles = [
   "keywords": ["harriet island", "wakan wita", "justus ohage", "dakota sacred sites", "st. paul parks", "wigington pavilion", "mississippi river", "sacred island", "devils island", "harriet bishop", "clarence wigington", "ohage great lawn", "riverfront redevelopment", "fort snelling", "treaty of 1837", "place", "all"]
 },
   {
-  "headline": "Willmar 8 Bank Strike",
+  "headline": "Willmar 8 Bank Strike (1977-1979)",
   "blurb": "In 1977, eight women walked out of Citizens National Bank in Willmar, Minnesota, to fight for equal pay. Their 22-month strike through two brutal winters helped reshape Minnesota's pay equity laws.",
   "icon": "fa-calendar",
   "author": "Matt Reicher",
