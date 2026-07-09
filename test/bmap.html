@@ -3009,6 +3009,13 @@ function initializeUserLocation(position) {
     let geolocationRequestPending = false;
     let warmupWatchId = null;
     let _backgroundUpdateTimeout = null;
+    let _fastFixInFlight = false; // guards the new opportunistic getCurrentPosition call
+    
+    // How long the app can be backgrounded before we consider prior velocity/
+    // heading state stale enough to discard entirely. Below this, we keep the
+    // motion model alive so the first fresh fix blends in instead of forcing
+    // a visible "relearn speed" catch-up.
+    const VELOCITY_RESET_THRESHOLD_MS = 60000;
     
     function updateLocationAfterBackground() {
         window.lastHiddenTime = window.lastHiddenTime || Date.now();
@@ -3029,20 +3036,26 @@ function initializeUserLocation(position) {
     
         window._isLocationUpdateInProgress = true;
     
-        // Only dispose map loop if away longer than 30s
         const awayMs = Date.now() - (window.lastHiddenTime || 0);
+    
+        // Only dispose map loop if away longer than 30s
         if (awayMs > 30000) {
             disposeMapLoop();
         }
     
-        // Reset stale speed averages after long background absence
-        if (awayMs > 10000) {
+        // Reset stale speed/heading state only after a long absence. Short and
+        // medium gaps keep their priors — inflating uncertainty (if the fusion
+        // module supports it) rather than wiping state lets the filter snap to
+        // the next fix quickly without a visible cold-start catch-up.
+        if (awayMs > VELOCITY_RESET_THRESHOLD_MS) {
             window._modeSpeedEMA = undefined;
             window._visualSpeedEMA = undefined;
             window._proxSpeedEMA = null;
             if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
                 window.sensorFusion._kalmanFilter.reset();
             }
+        } else if (awayMs > 10000 && window.sensorFusion?._kalmanFilter?.inflateUncertainty) {
+            window.sensorFusion._kalmanFilter.inflateUncertainty(awayMs);
         }
     
         // Clean up any existing warmup watch
@@ -3057,14 +3070,9 @@ function initializeUserLocation(position) {
             _backgroundUpdateTimeout = null;
         }
     
-        // PRIORITY ONE: get continuous tracking running again immediately.
-        // Briefly clear then restart the main watch so it picks up fresh state
-        // cleanly, but do NOT gate this on the warmup watch below succeeding —
-        // that was the mechanism that could leave the app with zero location
-        // updates for up to MAX_DURATION if the warmup fix was slow or failed.
+        // Get continuous tracking running again immediately.
         // startPositionUpdates() clears any existing watch itself before
-        // starting a new one, so this is safe to call unconditionally even if
-        // positionWatchId was already null.
+        // starting a new one, so this is safe to call unconditionally.
         if (window.positionWatchId != null) {
             navigator.geolocation.clearWatch(window.positionWatchId);
             window.positionWatchId = null;
@@ -3075,9 +3083,36 @@ function initializeUserLocation(position) {
     
         geolocationRequestPending = true;
     
-        // This watch is purely an opportunistic fast snap for the UI 
-        // (recenter, distance box, clear retry state) — the main watch above already owns getting tracking running again,
-        // so this no longer needs to be sized as the last-resort fallback.
+        // Opportunistic cheap fix. High-accuracy GPS is often
+        // suspended/throttled in the background and takes time to warm back up,
+        // so in parallel we ask for whatever cached fix the OS already has —
+        // this typically resolves in well under a second and gives the user a
+        // visually-close marker while the authoritative fix is still in flight.
+        // Best-effort only: never touches fusion state, never calls cleanup(),
+        // and backs off silently if the real fix already landed.
+        if (!_fastFixInFlight) {
+            _fastFixInFlight = true;
+            navigator.geolocation.getCurrentPosition(
+                (fastPosition) => {
+                    _fastFixInFlight = false;
+                    if (!geolocationRequestPending) return; // real fix already won
+                    const c = fastPosition?.coords;
+                    if (!c || isNaN(c.latitude) || isNaN(c.longitude) || !(c.accuracy > 0)) return;
+                    if (Date.now() - fastPosition.timestamp > 30000) return;
+                    if (map && userMarker) {
+                        userMarker.setLatLng([c.latitude, c.longitude]);
+                        map.panTo([c.latitude, c.longitude], { animate: false });
+                    }
+                },
+                () => { _fastFixInFlight = false; }, // silent — real watch below handles failure/modal
+                { enableHighAccuracy: false, timeout: 3000, maximumAge: 20000 }
+            );
+        }
+    
+        // This watch is the opportunistic fast/authoritative snap for the UI
+        // (recenter, distance box, clear retry state) — the main watch above
+        // already owns getting continuous tracking running again, so this
+        // doesn't need to be sized as a last-resort fallback.
         const MAX_DURATION = 10000;
     
         const cleanup = () => {
@@ -3180,7 +3215,10 @@ function initializeUserLocation(position) {
                 return;
             }
     
-            // Significant movement — full reset
+            // Significant movement — full reset, animated rather than a hard
+            // cut. Now that the fast fix (above) and the preserved motion model
+            // have already put the marker in the right neighborhood, this is a
+            // short glide instead of a jarring snap.
             requestAnimationFrame(() => {
                 try {
                     const currentZoom = map.getZoom();
@@ -3195,8 +3233,8 @@ function initializeUserLocation(position) {
     
                     updateUserLocation(position, true);
                     map.setView([latitude, longitude], currentZoom, {
-                        animate: false,
-                        duration: 0,
+                        animate: true,
+                        duration: 0.4,
                         noMoveStart: true
                     });
     
@@ -3213,9 +3251,9 @@ function initializeUserLocation(position) {
     
         const onPositionError = (error) => {
             console.warn("Geolocation error:", error.message, "Code:", error.code);
-            // Don't cleanup here — let the timeout handle it. This is now safe:
-            // the main watch is already running independently, so a slow or
-            // failed warmup fix no longer leaves tracking dead in the meantime.
+            // Don't cleanup here — let the timeout handle it. The main watch is
+            // already running independently, so a slow or failed warmup fix no
+            // longer leaves tracking dead in the meantime.
         };
     
         // Start watching for position — opportunistic fast snap only. The main
