@@ -761,6 +761,9 @@
 /* ═══════════════════════════════════════════════════════════════
    POSITION KALMAN FILTER
    ═══════════════════════════════════════════════════════════════ */
+   /* ═══════════════════════════════════════════════════════════════
+   POSITION KALMAN FILTER
+   ═══════════════════════════════════════════════════════════════ */
     class PositionKalmanFilter {
         constructor(options = {}) {
             this._baseAccelNoise    = options.accelNoise       ?? 2.5;
@@ -784,6 +787,12 @@
             this._pendingSeedVelocity = null;
             this._lastSeedVelocity    = null;
             this._nugget              = 1e-12;
+            // Maneuver-adaptive process noise: tracks sustained disagreement
+            // between prediction and fixes (turns, braking) separately from
+            // one-off outliers, and softens/gates single bad fixes so a
+            // multipath glitch doesn't show up as a snap-then-snap-back.
+            this._innovationEMA = 0;
+            this._maneuverBoost = 1.0;
         }
     
         update(lat, lng, accuracyMeters, timestampPerfNow, gpsSpeedMPS) {
@@ -836,7 +845,39 @@
     
             this._predict(dt);
             const local = this._toLocal(lat, lng);
-            this._update(local.north, local.east, R);
+    
+            // ── Innovation check ──
+            // A normalized (chi-square-style) innovation tells us how far this
+            // fix is from what the filter expected, relative to how uncertain
+            // the filter currently is. Two different things can produce a big
+            // number here, and they need different responses:
+            //   - A single spike (multipath/urban canyon glitch): soften it by
+            //     inflating the effective R for just this update, so the gain
+            //     drops and the marker eases toward it instead of snapping and
+            //     snapping back on the next good fix.
+            //   - A sustained run of moderately elevated innovation (a real
+            //     turn or acceleration): that's the constant-velocity model
+            //     falling behind reality, not noise — briefly widen process
+            //     noise so the filter can track the maneuver instead of lagging.
+            const y0 = local.north - this.x[0];
+            const y1 = local.east  - this.x[1];
+            const R2raw = R * R;
+            const S00 = this.P[0][0] + R2raw;
+            const S11 = this.P[1][1] + R2raw;
+            const normInnov = (y0 * y0) / Math.max(S00, 1e-6) + (y1 * y1) / Math.max(S11, 1e-6);
+    
+            const GATE_THRESHOLD = 30; // generous — real turns should pass under this
+            let effectiveR = R;
+            if (normInnov > GATE_THRESHOLD) {
+                effectiveR = R * Math.min(4, normInnov / GATE_THRESHOLD);
+            }
+    
+            const INNOV_EMA_ALPHA = 0.3;
+            this._innovationEMA = this._innovationEMA * (1 - INNOV_EMA_ALPHA)
+                + Math.min(normInnov, 60) * INNOV_EMA_ALPHA; // capped so one spike can't dominate the average
+            this._maneuverBoost = 1 + Math.min(2.5, Math.max(0, (this._innovationEMA - 8) / 10));
+    
+            this._update(local.north, local.east, effectiveR);
     
             const pos = this._toGlobal(this.x[0], this.x[1]);
             this._pendingSeedVelocity = null;
@@ -845,10 +886,58 @@
     
             const speedMPS = this.x ? Math.sqrt(this.x[2]*this.x[2] + this.x[3]*this.x[3]) : 0;
             const convergenceThreshold = speedMPS > 15 ? 2 : 4;
-            const isConverged = this._updateCount >= convergenceThreshold && this.P && this.P[0][0] < 200;
+            const isConverged = this._updateCount >= convergenceThreshold && this.P &&
+                Math.max(this.P[0][0], this.P[1][1]) < 200;
             const blendFactor = Math.min(1.0, this._updateCount / convergenceThreshold);
     
             return this._makeResult(pos.lat, pos.lng, { isConverged, blendFactor, updateCount: this._updateCount });
+        }
+    
+        // ── Peek forward without mutating state. ──
+        // The filter only produces a new estimate on update(), i.e. once per
+        // GPS fix. Rendering directly from that means the marker hops once per
+        // fix instead of moving continuously. A render loop should call this
+        // every animation frame between fixes and set the marker to the
+        // result — it dead-reckons from the current velocity without touching
+        // x/P/lastTimestamp, so it's safe to call as often as you like and
+        // the next real update() is unaffected.
+        predictTo(timestampPerfNow) {
+            if (!this.x || this.lastTimestamp == null) return null;
+            if (this._isFrozen && this._frozenPosition) {
+                return { lat: this._frozenPosition.lat, lng: this._frozenPosition.lng, vNorth: 0, vEast: 0, speedMPS: 0 };
+            }
+            const dt = (timestampPerfNow - this.lastTimestamp) / 1000;
+            if (!isFinite(dt) || dt <= 0) {
+                const pos = this._toGlobal(this.x[0], this.x[1]);
+                return { lat: pos.lat, lng: pos.lng, vNorth: this.x[2], vEast: this.x[3], speedMPS: this.getSpeedMPS() };
+            }
+            // Cap extrapolation — past a couple seconds without a real fix, a
+            // stale velocity estimate is more likely to be wrong than right,
+            // so stop leading rather than run the marker away from the truth.
+            const cappedDt = Math.min(dt, 3.0);
+            const north = this.x[0] + this.x[2] * cappedDt;
+            const east  = this.x[1] + this.x[3] * cappedDt;
+            const pos = this._toGlobal(north, east);
+            return { lat: pos.lat, lng: pos.lng, vNorth: this.x[2], vEast: this.x[3], speedMPS: this.getSpeedMPS() };
+        }
+    
+        // ── Soften state after a gap without discarding it. ──
+        // reset() throws away velocity/heading entirely, forcing a cold-start
+        // ramp on the next several fixes. This instead grows the covariance
+        // (so the next fix is trusted quickly) and pulls the velocity estimate
+        // partway toward rest (since "still moving the same way" is the
+        // assumption most likely to be wrong after a real gap), while keeping
+        // enough of the prior state that the filter doesn't start from zero.
+        inflateUncertainty(gapMs) {
+            if (!this.x || !this.P) return;
+            const gapSec = Math.max(0, gapMs) / 1000;
+            const growth = 1 + Math.min(gapSec / 20, 4); // up to 5x at 100s+
+            this.P[0][0] *= growth; this.P[1][1] *= growth;
+            this.P[2][2] *= growth; this.P[3][3] *= growth;
+            this.P[0][2] = this.P[2][0] = 0;
+            this.P[1][3] = this.P[3][1] = 0;
+            const decay = Math.max(0.3, 1 - gapSec / 60);
+            this.x[2] *= decay; this.x[3] *= decay;
         }
     
         scheduleVelocitySeed(vNorth, vEast) {
@@ -886,6 +975,7 @@
             this._justInitialized = false;
             this._pendingSeedVelocity = null; this._lastSeedVelocity = null;
             this._updateCount = 0; this._isFrozen = false; this._frozenPosition = null;
+            this._innovationEMA = 0; this._maneuverBoost = 1.0;
         }
     
         freeze(lat, lng) { this._isFrozen = true;  this._frozenPosition = { lat, lng }; }
@@ -907,10 +997,10 @@
         _measurementNoiseFromAccuracy(accuracyMeters) {
             const acc = accuracyMeters > 0 ? accuracyMeters : this.measurementNoise;
             const hasConverged = this.P && this.P[0][0] < 100;
-            if (acc <= 5)  return hasConverged ? Math.max(2, acc) : Math.max(4, acc);
-            if (acc <= 12) return hasConverged ? Math.max(4, acc) : Math.max(6, acc);
-            if (acc <= 25) return Math.max(10, acc);
-            return Math.max(20, acc);
+            // Continuous in acc — no bucket edges, so trust never jumps
+            // discontinuously right at a threshold like 5m or 12m.
+            const floor = hasConverged ? 2 : 4;
+            return Math.max(floor, acc * (hasConverged ? 0.85 : 1.0));
         }
     
       _initialize(lat, lng, R, timestampPerfNow) {
@@ -928,22 +1018,15 @@
             ? Math.sqrt(this._pendingSeedVelocity.vNorth ** 2 + this._pendingSeedVelocity.vEast ** 2)
             : 0;
         this._isFrozen = false; this._frozenPosition = null;
+        this._innovationEMA = 0; this._maneuverBoost = 1.0;
     
         const R2 = R * R;
-        // Initial velocity-covariance seed. The variance must reflect how well we
-        // actually know the initial velocity (which is seeded to [0,0] when there is
-        // no directional hint):
-        //   - hint present  -> moderate variance, trust the seeded velocity.
-        //   - GPS moving, no hint -> LARGE variance: we know we are moving but not the
-        //     direction, so let the first fixes snap velocity to the truth (no lag).
-        //   - stationary -> SMALL variance: pin velocity near zero so GPS scatter
-        //     cannot manufacture phantom motion (no jitter while standing still).
         const v0 = hasVelocityHint ? 2.25 : (this._lastGPSSpeedMPS > 0.3 ? 225.0 : 0.5);
         this.P = [[R2,0,0,0],[0,R2,0,0],[0,0,v0,0],[0,0,0,v0]];
         this.lastTimestamp = timestampPerfNow;
         this._justInitialized = true;
     
-        this._pendingSeedVelocity = null; // consumed here, not left for the next update() cycle
+        this._pendingSeedVelocity = null;
     }
     
         _updateAccelNoise() {
@@ -951,12 +1034,18 @@
             const kalmanSpeed = Math.sqrt(this.x[2]*this.x[2] + this.x[3]*this.x[3]);
             const speed = Math.max(kalmanSpeed, (this._lastGPSSpeedMPS || 0) * 0.9);
             this._currentSpeedMPS = speed;
-            if      (speed < 0.1)  { this.accelNoise = 0.5; return; }
-            if      (speed >= 15)  { this.accelNoise = 8.0; }
-            else if (speed >= 8)   { this.accelNoise = 3.0 + (speed - 8) * (5.0 / 7); }
-            else if (speed >= 2)   { this.accelNoise = 3.0; }
-            else if (speed >= 0.5) { this.accelNoise = 1.0 + (speed - 0.5) * (2.0 / 1.5); }
-            else                   { this.accelNoise = 1.0; }
+            let base;
+            if      (speed < 0.1)  { base = 0.5; this.accelNoise = base; return; }
+            else if (speed >= 15)  { base = 8.0; }
+            else if (speed >= 8)   { base = 3.0 + (speed - 8) * (5.0 / 7); }
+            else if (speed >= 2)   { base = 3.0; }
+            else if (speed >= 0.5) { base = 1.0 + (speed - 0.5) * (2.0 / 1.5); }
+            else                   { base = 1.0; }
+            // Maneuver boost widens process noise on top of the speed-based
+            // baseline when recent fixes have sustained higher-than-expected
+            // innovation (turning, accelerating, braking) — decays back to 1x
+            // automatically as innovations settle back down.
+            this.accelNoise = base * this._maneuverBoost;
         }
     
         _predict(dt) {
@@ -1399,16 +1488,30 @@ class SensorFusionManager {
         // Runs BEFORE kf.update() so it reads kf.lastTimestamp before this
         // tick's update() advances it — the gap-length check needs the
         // pre-update timestamp to detect the gap in the first place.
-        if (kf.lastTimestamp != null && kf.x != null) {
-            const dtMs = perfNow - kf.lastTimestamp;
-            if (dtMs > 10000 && window.lastPosition?.lat != null && window.lastPosition?.lng != null) {
-                const dtSec = dtMs / 1000, cosLat = Math.cos(rawLat * Math.PI / 180);
-                kf.scheduleVelocitySeed(
-                    ((rawLat - window.lastPosition.lat) / dtSec) * 111111,
-                    ((rawLng - window.lastPosition.lng) / dtSec) * 111111 * cosLat
-                );
-            }
+       if (kf.lastTimestamp != null && kf.x != null) {
+    const dtMs = perfNow - kf.lastTimestamp;
+    if (dtMs > 10000 && window.lastPosition?.lat != null && window.lastPosition?.lng != null) {
+        const dtSec = dtMs / 1000, cosLat = Math.cos(rawLat * Math.PI / 180);
+        const vNorth = ((rawLat - window.lastPosition.lat) / dtSec) * 111111;
+        const vEast  = ((rawLng - window.lastPosition.lng) / dtSec) * 111111 * cosLat;
+
+        if (dtMs <= 30000) {
+            // kf.update() below takes the normal predict/update path for gaps
+            // this short — it clears _pendingSeedVelocity unconsumed at the
+            // end of that path, so scheduleVelocitySeed() here would silently
+            // do nothing. Seed the velocity state directly instead, so the
+            // _predict() inside this same update() call already uses the
+            // gap-derived velocity rather than whatever was true before the
+            // app was backgrounded.
+            kf.seedVelocity(vNorth, vEast, 4.0);
+        } else {
+            // dt > 30s makes kf.update() take the _initialize() path, which
+            // is the one path that actually reads _pendingSeedVelocity — keep
+            // using scheduleVelocitySeed() here.
+            kf.scheduleVelocitySeed(vNorth, vEast);
         }
+    }
+}
      
         const kfResult = kf.update(rawLat, rawLng, accuracyMeters, perfNow, gpsSpeedMPS);
      
@@ -1859,7 +1962,7 @@ window.sensorFusion = new SensorFusionManager().init();
         _rafId = requestAnimationFrame(frame);
     }
 
-    // --- CHANGED: now returns true/false so callers know whether the
+    // --- Returns true/false so callers know whether the
     // continuous predictive loop actually launched. ---
     function _start() {
         if (_active) return true;
