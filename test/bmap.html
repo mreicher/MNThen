@@ -1580,6 +1580,29 @@ class SensorFusionManager {
         return _blendHeadingDeg(this.deviceHeading, gpsHeading, t);
     }
 
+resetState() {
+        this._lastKalmanLat = null;
+        this._lastKalmanLng = null;
+        this._lastKalmanTimestamp = null;
+        this._smoothedHeading = null;
+        this._rawLat = null;
+        this._rawLng = null;
+        this._rawSpeedMPS = null;
+        this._rawHeadingDeg = null;
+        this._rawTimestamp = null;
+        this._rawVelocity = { lat: 0, lng: 0 };
+        this._convergenceStage = 0;
+        this._stationaryCounter = 0;
+        this._unfreezeCounter = 0;
+        this._lastStationaryState = false;
+        this._stationaryPosition = null;
+        this._stationarySamples = [];
+        this._gpsVelocityDegPerSec = { lat: 0, lng: 0 };
+        this._filteredSpeedMPS = 0;
+        this._clockOffset = null;
+        this._clockSyncTime = 0;
+    }
+
 destroy() {
     this._clearOrientationTestTimer();
     if (this._graceTimerId) { clearTimeout(this._graceTimerId); this._graceTimerId = null; }
@@ -2087,43 +2110,38 @@ const trackedTimeouts = new Set();
 /* ──────────────────────────────────────────────
    MAP INITIALIZATION
    ────────────────────────────────────────────── */
-   function initMap() {
+ function initMap() {
     // Guard: block GPS callbacks during teardown to prevent zombie state access
     window._mapReinitializing = true;
-
+    window._mapSession = (window._mapSession || 0) + 1;
     // Clear the main GPS watch BEFORE touching map or markers
     if (window.positionWatchId != null) {
         navigator.geolocation.clearWatch(window.positionWatchId);
         window.positionWatchId = null;
     }
-
     if (typeof disposeMapLoop === 'function') disposeMapLoop();
     if (window.deadReckoning && typeof window.deadReckoning.stop === 'function') {
         window.deadReckoning.stop();
     }
-
     if (map) {
         try { map.remove(); } catch (e) { console.warn('[Map] Remove failed:', e.message); }
         map = null;
     }
     if (markerClusterGroup) {
-        try { markerClusterGroup.clearLayers(); } catch (e) {}
+        try { markerClusterGroup.clearLayers(); } catch (e) { console.warn('[Map] Cluster clear failed:', e.message); }
         markerClusterGroup = null;
     }
     if (userMarker) {
-        try { userMarker.remove(); } catch (e) {}
+        try { userMarker.remove(); } catch (e) { console.warn('[Map] Marker remove failed:', e.message); }
         userMarker = null;
     }
-
     window._currentMapState    = null;
     window._currentRenderState = null;
     window._currentSpeedTier   = null;
-
     ['lastKnownPos', 'routeHistory'].forEach(k => {
         try { localStorage.removeItem(k); } catch (_) {}
         try { sessionStorage.removeItem(k); } catch (_) {}
     });
-
     map = L.map('map', {
         zoomControl: false,
         doubleClickZoom: false,
@@ -2138,7 +2156,6 @@ const trackedTimeouts = new Set();
         zoomAnimationThreshold: 4,
         markerZoomAnimation: false
     }).setView([46.392410, -94.636230], 9);
-
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         minZoom: 7,
         maxZoom: 19,
@@ -2148,7 +2165,6 @@ const trackedTimeouts = new Set();
         keepBuffer: 2,
         className: 'map-tiles'
     }).addTo(map);
-
     markerClusterGroup = L.markerClusterGroup({
         showCoverageOnHover: false,
         zoomToBoundsOnClick: true,
@@ -2163,7 +2179,6 @@ const trackedTimeouts = new Set();
             iconSize: [40, 40]
         })
     }).addTo(map);
-
     userMarker = L.marker([0, 0], {
         icon: L.divIcon({
             className: 'user-marker',
@@ -2173,33 +2188,30 @@ const trackedTimeouts = new Set();
         }),
         zIndexOffset: 1000
     }).addTo(map);
-
     showLoadingMessage();
-
     if ('geolocation' in navigator) {
         const opts = { enableHighAccuracy: true, timeout: 45000, maximumAge: 5000 };
-
         const onFirstError = (err) => {
             const isTimeout = err?.code === 3;
             if (!isTimeout) {
+                finishMapReinit();
                 handleLocationError(err);
                 return;
             }
             const retryOpts = { enableHighAccuracy: true, timeout: 60000, maximumAge: 10000 };
-
             navigator.geolocation.getCurrentPosition(
                 initializeUserLocation,
-                handleLocationError,
+                (retryErr) => { finishMapReinit(); handleLocationError(retryErr); },
                 retryOpts
             );
         };
-
         navigator.geolocation.getCurrentPosition(
             initializeUserLocation,
             onFirstError,
             opts
         );
     } else {
+        finishMapReinit();
         showPopup('Geolocation Error', 'Geolocation is not supported');
         map.setView([44.9778, -93.2650], 17, { animate: false });
         hideLoadingMessage();
@@ -2625,10 +2637,14 @@ const trackedTimeouts = new Set();
 /* ──────────────────────────────────────────────
    USER LOCATION INITIALIZATION
    ────────────────────────────────────────────── */
-  function initializeUserLocation(position) {
+ function initializeUserLocation(position) {
+    const session = window._mapSession || 0;
+    const isStale = () => (window._mapSession || 0) !== session;
+
     position = window._consumeWarmupPosition?.(position) ?? position;
 
     if (!position?.coords) {
+        finishMapReinit();
         handleLocationError(new Error('Invalid initial position'));
         return;
     }
@@ -2636,6 +2652,7 @@ const trackedTimeouts = new Set();
     const { latitude: lat, longitude: lng, accuracy, heading, speed } = position.coords;
 
     if (isNaN(lat) || isNaN(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+        finishMapReinit();
         handleLocationError(new Error('Invalid coordinates'));
         return;
     }
@@ -2667,6 +2684,7 @@ const trackedTimeouts = new Set();
             if (window._markerRetryCount <= 3) {
                 window._initializationInProgress = false;
                 createTrackedTimeout(() => {
+                    if (isStale()) return; // a newer initMap() has since run
                     const pos = window._pendingInitPosition || position;
                     window._pendingInitPosition = null;
                     initializeUserLocation(pos);
@@ -2675,6 +2693,7 @@ const trackedTimeouts = new Set();
             }
             window._initializationInProgress = false;
             window._markerRetryCount = 0;
+            finishMapReinit();
             handleLocationError(new Error('Map marker initialization failed'));
             return;
         }
@@ -2716,20 +2735,20 @@ const trackedTimeouts = new Set();
 
         window._initializationComplete = true;
         window._initializationInProgress = false;
-        window._mapReinitializing = false;
+        finishMapReinit();
         window._lastSuccessfulInit = Date.now();
         window._initRecoveryAttempts = 0;
 
         const watchId = startPositionUpdates();
         if (watchId === null) {
             createTrackedTimeout(() => {
+                if (isStale()) return;
                 if (!window.positionWatchId) startPositionUpdates();
             }, 3000);
         }
 
         // Flush any position that arrived during init. Route through the normal
-        // update pipeline so marker + Kalman + DR stay in sync — don't just move
-        // the marker, which causes a jump-then-snap-back on the next real fix.
+        // update pipeline so marker + Kalman + DR stay in sync.
         const pending = window._pendingInitPosition;
         if (pending) {
             window._pendingInitPosition = null;
@@ -2763,15 +2782,17 @@ const trackedTimeouts = new Set();
         if (window._initRecoveryAttempts <= 3) {
             const backoffMs = Math.min(15000, Math.pow(2, window._initRecoveryAttempts) * 1000);
             createTrackedTimeout(() => {
+                if (isStale()) return;
                 if (navigator.geolocation && !window._initializationComplete) {
                     navigator.geolocation.getCurrentPosition(
-                        initializeUserLocation,
+                        (pos) => { if (!isStale()) initializeUserLocation(pos); },
                         handleLocationError,
                         { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
                     );
                 }
             }, backoffMs);
         } else {
+            finishMapReinit();
             showPopup?.(
                 'Location Error',
                 'Unable to get your location after multiple attempts. Please check your GPS settings and refresh the page.',
@@ -3920,6 +3941,11 @@ function _prefetchMapTiles(location, now) {
         _pendingLat = _pendingLng = null;
         _applyMarkerPosition(lat, lng);
     }
+
+    // Expose the two entry points updateUserLocation() actually calls.
+    // Everything else in this module stays private to the closure.
+    window._ensureWillChange = _ensureWillChange;
+    window._scheduleWillChangeReset = _scheduleWillChangeReset;
     })();
 
 /**
@@ -4676,11 +4702,11 @@ function _publishFusionState(fusionResult, fix) {
     var currentZoom = map.getZoom();
 
     if (resetType === 'init') {
-        var intelligentZoom = (typeof getSpeedBasedZoom === 'function')
+        var speedZoomResult = (typeof getSpeedBasedZoom === 'function')
             ? getSpeedBasedZoom(newPosition.speedMPS)
-            : -1;
-        targetZoom = (typeof intelligentZoom === 'number' && intelligentZoom > 0)
-            ? intelligentZoom
+            : null;
+        targetZoom = (speedZoomResult && typeof speedZoomResult.zoom === 'number' && speedZoomResult.zoom > 0)
+            ? speedZoomResult.zoom
             : 17;
     } else {
         targetZoom = currentZoom;
@@ -5095,18 +5121,22 @@ function getGeolocationOptions(speedMPS = 0) {
     };
 }
 
+function finishMapReinit() {
+    window._mapReinitializing = false;
+}
+
 /* ──────────────────────────────────────────────
    handleLocationError — retry with exponential
    backoff, fast-fail on permission denied.
    ────────────────────────────────────────────── */
-  function handleLocationError(error) {
+function handleLocationError(error) {
     console.warn("Error getting user location:", error);
+    const session = window._mapSession || 0;
 
-    // Scoped retry state per error instance to prevent cross-talk
     var localRetryCount = error._retryCount || 0;
 
     if (error?.code === 1) {
-        retryCount = 0; // Reset global for future errors
+        retryCount = 0;
         if (typeof hideLoadingMessage === 'function') hideLoadingMessage();
         showPopup("Location Error", "Please allow access to your location to use this feature.");
         if (typeof onLocationFailure === 'function') {
@@ -5124,7 +5154,8 @@ function getGeolocationOptions(speedMPS = 0) {
 
         console.log(`Retrying to get location (Attempt ${nextRetryCount} of ${maxRetries} in ${backoffMs}ms)`);
 
-        setTimeout(() => {
+        createTrackedTimeout(() => {
+            if ((window._mapSession || 0) !== session) return; // map was re-initialized; abandon this retry
             if (!navigator.geolocation) {
                 console.warn('Geolocation API not available');
                 return;
@@ -5132,12 +5163,12 @@ function getGeolocationOptions(speedMPS = 0) {
 
             navigator.geolocation.getCurrentPosition(
                 (position) => {
+                    if ((window._mapSession || 0) !== session) return;
                     console.log("Location retrieved successfully after retry");
                     if (typeof hideLoadingMessage === 'function') hideLoadingMessage();
                     updateUserLocation(position, true);
-                    retryCount = 0; // Reset global on success
+                    retryCount = 0;
 
-                    // Restart continuous tracking if it was stopped
                     if (typeof startPositionUpdates === 'function' && !window.positionWatchId) {
                         startPositionUpdates();
                     }
@@ -5159,18 +5190,10 @@ function getGeolocationOptions(speedMPS = 0) {
     let errorMessage = "An error occurred while getting your location.";
     if (error?.code !== undefined) {
         switch (error.code) {
-            case 1:
-                errorMessage = "Please allow access to your location to use this feature.";
-                break;
-            case 2:
-                errorMessage = "Your location is currently unavailable. Please try again later.";
-                break;
-            case 3:
-                errorMessage = "Getting your location took too long. Please try again.";
-                break;
-            case 0:
-                errorMessage = "Unable to determine your location. Please check your device settings and try again.";
-                break;
+            case 1: errorMessage = "Please allow access to your location to use this feature."; break;
+            case 2: errorMessage = "Your location is currently unavailable. Please try again later."; break;
+            case 3: errorMessage = "Getting your location took too long. Please try again."; break;
+            case 0: errorMessage = "Unable to determine your location. Please check your device settings and try again."; break;
         }
     }
 
@@ -5488,12 +5511,13 @@ class LocationCooldownManager {
     }, MAP_RESET_CHECK_INTERVAL_MS);
   }
 
-  checkAndResetMap() {
+ checkAndResetMap() {
     const now = Date.now();
     let shouldReset = false;
     let resetReason = null;
 
-    if (typeof window.currentSpeed === 'number' && window.currentSpeed > 6) {
+    const speedMPH = (window.lastPosition?.speedMPS || 0) * 2.23694;
+    if (speedMPH > 6) {
       if (!this.wasOverSpeedThreshold) {
         shouldReset = true;
         resetReason = 'speed_threshold';
@@ -5508,7 +5532,6 @@ class LocationCooldownManager {
       if (cooldownIds.length > 0) {
         for (const id of cooldownIds) {
           if (this.resetCooldownIds.has(id)) continue;
-
           const status = this.checkCooldown(id);
           if (!status.isOnCooldown && this.isWithinThreshold(id)) {
             shouldReset = true;
