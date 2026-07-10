@@ -904,13 +904,19 @@
             this._lastSeedVelocity = { vNorth, vEast };
         }
     
-        _measurementNoiseFromAccuracy(accuracyMeters) {
+       _measurementNoiseFromAccuracy(accuracyMeters) {
             const acc = accuracyMeters > 0 ? accuracyMeters : this.measurementNoise;
-            const hasConverged = this.P && this.P[0][0] < 100;
-            if (acc <= 5)  return hasConverged ? Math.max(2, acc) : Math.max(4, acc);
-            if (acc <= 12) return hasConverged ? Math.max(4, acc) : Math.max(6, acc);
-            if (acc <= 25) return Math.max(10, acc);
-            return Math.max(20, acc);
+            
+            // Soft convergence factor: 0→1 as P[0][0] goes from 200→50
+            // instead of hard step at 100. Makes the transition from "exploring"
+            // to "tracking" mode gradual rather than a single-fix snap.
+            const p00 = this.P?.[0]?.[0] ?? 999;
+            const convergenceFactor = Math.max(0, Math.min(1, (200 - p00) / 150));
+            
+            const floor = 4 - 2 * convergenceFactor;        // 4 → 2
+            const scale = 1.0 - 0.15 * convergenceFactor;   // 1.0 → 0.85
+            
+            return Math.max(floor, acc * scale);
         }
     
       _initialize(lat, lng, R, timestampPerfNow) {
@@ -3142,7 +3148,7 @@ const trackedTimeouts = new Set();
             window.positionWatchId = navigator.geolocation.watchPosition(
                 handlePositionUpdate,
                 handleLocationError,
-                o pts
+                opts
             );
             if (!window._positionUpdatesListenersSetup) {
                 window._positionUpdatesListenersSetup = true;
@@ -3184,24 +3190,28 @@ const trackedTimeouts = new Set();
         }
     }
         
-      function handlePositionUpdate(position) {
-        // 1. Validation & Stale Data Guard
-        if (!position?.coords || isNaN(position.coords.latitude) || isNaN(position.coords.longitude)) return;
+     function handlePositionUpdate(position) {
+        if (!position?.coords || isNaN(position.coords.latitude) || isNaN(position.coords.longitude)) {
+            return;
+        }
         
         const positionTimestamp = position.timestamp || Date.now();
-        const currentTime = Date.now();
-        if (currentTime - positionTimestamp > 30_000) return;
+        const wallClockNow = Date.now();
+        
+        // Reject fixes older than 30s (stale GPS cache)
+        if (wallClockNow - positionTimestamp > 30_000) return;
     
-        // 2. Background Throttling
+        // Background: throttle to one update per 30s
         if (document.hidden) {
-            if (window._lastBackgroundUpdate && currentTime - window._lastBackgroundUpdate < 30_000) return;
-            window._lastBackgroundUpdate = currentTime;
+            if (window._lastBackgroundUpdate && wallClockNow - window._lastBackgroundUpdate < 30_000) {
+                return;
+            }
+            window._lastBackgroundUpdate = wallClockNow;
         }
     
-        // 3. Extract Raw Data
         const rawLat = position.coords.latitude;
         const rawLng = position.coords.longitude;
-        const rawSpeedMPS = position.coords.speed || 0;
+        const rawSpeedMPS = Math.max(0, position.coords.speed || 0);
         
         window.lastValidPosition = {
             lat: rawLat,
@@ -3212,9 +3222,12 @@ const trackedTimeouts = new Set();
             isMoving: rawSpeedMPS > 0.5
         };
     
-        // 4. Let updateUserLocation handle everything
-        // It will call _scheduleUnifiedRender -> _executeRender
-        // which will apply the zoom via getSpeedBasedZoom
+        // Force update on first fix or after 2s gap — skips 8ms debounce and
+        // ensures gap-recovery velocity seeding runs immediately.
+        const lastFixTime = window.lastUpdateTimestamp || 0;
+        const gapMs = lastFixTime ? (positionTimestamp - lastFixTime) : Infinity;
+        const forceUpdate = !lastFixTime || gapMs > 2000;
+    
         updateUserLocation({
             timestamp: positionTimestamp,
             coords: {
@@ -3225,7 +3238,7 @@ const trackedTimeouts = new Set();
                 heading: position.coords.heading,
                 speed: rawSpeedMPS
             }
-        }, rawSpeedMPS > 10);
+        }, forceUpdate);
     }
         
 /* ──────────────────────────────────────────────
@@ -3311,8 +3324,8 @@ const trackedTimeouts = new Set();
 /* ──────────────────────────────────────────────
    POSITION BUFFER
    ────────────────────────────────────────────── */
-        function seedPositionBuffer(seedPosition, count) {
-        if (!seedPosition || typeof seedPosition.lat !== 'number' || typeof seedPosition.lng !== 'number') return;
+    function seedPositionBuffer(seedPosition, count) {
+        if (!seedPosition || !Number.isFinite(seedPosition.lat) || !Number.isFinite(seedPosition.lng)) return;
         
         if (!Array.isArray(window.positionBuffer)) {
             window.positionBuffer = [];
@@ -3320,16 +3333,17 @@ const trackedTimeouts = new Set();
         
         const bufferTimestamp = seedPosition.timestamp || Date.now();
         
-        const heading = window.sensorFusion?.getFilteredHeading() ?? seedPosition.heading ?? null;
-        const speedMPS = window.sensorFusion?.getFilteredSpeedMPS() ?? seedPosition.speedMPS ?? 0;
+        // During init/reset, Kalman hasn't converged — always use seed values
+        const heading = seedPosition.heading ?? null;
+        const speedMPS = seedPosition.speedMPS ?? 0;
         
         const seed = {
             lat: seedPosition.lat,
             lng: seedPosition.lng,
             accuracy: seedPosition.accuracy,
             timestamp: bufferTimestamp,
-            heading: typeof heading === 'number' ? heading : null,
-            speedMPS: typeof speedMPS === 'number' && speedMPS >= 0 ? speedMPS : 0
+            heading: Number.isFinite(heading) ? heading : null,
+            speedMPS: Number.isFinite(speedMPS) && speedMPS >= 0 ? speedMPS : 0
         };
     
         const n = Number.isFinite(count) && count > 0 ? Math.floor(count) : 1;
