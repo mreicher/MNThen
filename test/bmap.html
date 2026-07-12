@@ -1937,17 +1937,27 @@ window.sensorFusion = new SensorFusionManager().init();
     window.deadReckoning = {
         start() { _start(); },
 
-        stop() {
+       stop() {
             if (_rafId != null) { cancelAnimationFrame(_rafId); _rafId = null; }
             _active = false; _panPending = false; _panTarget = null;
             _centeredLat = null; _centeredLng = null;
             window.__drHeld = null;
             const el = _getMarkerEl();
-            if (el) { el.style.willChange = ''; el.style.transition = ''; _markerTransSet = false; }
+            if (el) { el.style.transition = ''; }
+            _markerTransSet = false;
+            // willChange is owned by the marker-update module's _willChangeOn flag —
+            // clearing the style here directly would desync that flag from the
+            // actual DOM state, causing _ensureWillChange() to skip re-promoting
+            // the marker on the next update (it thinks willChange is already on
+            // when it was just cleared out from under it). Delegate through the
+            // module's own reset path so the flag and the style stay in sync.
+            if (typeof window._forceWillChangeReset === 'function') {
+                window._forceWillChangeReset();
+            } else if (el) {
+                el.style.willChange = '';
+            }
         },
-
         isActive() { return _active; },
-
         onMovementResumed: _start,
 
         // --- If DR declines to run its
@@ -2727,14 +2737,10 @@ const trackedTimeouts = new Set();
 
         // Seed velocity to skip cold-start lag if GPS already reports motion
         const kf = window.sensorFusion?._kalmanFilter;
-        if (kf) {
-            if (speed > 0.3 && heading != null && isFinite(heading)) {
+            if (kf && speed > 0.3 && heading != null && isFinite(heading)) {
                 const rad = heading * Math.PI / 180;
-                kf.seedVelocity(speed * Math.cos(rad), speed * Math.sin(rad), 10.0);
-            } else if (speed > 0.3) {
-                kf.seedVelocity(0, 0, 50.0); // Speed known, direction unknown
+                kf.scheduleVelocitySeed(speed * Math.cos(rad), speed * Math.sin(rad));
             }
-        }
 
         hideLoadingMessage?.();
 
@@ -3209,10 +3215,10 @@ const trackedTimeouts = new Set();
     
         // Background: throttle to one update per 30s
         if (document.hidden) {
-            if (window._lastBackgroundUpdate && wallClockNow - window._lastBackgroundUpdate < 30_000) {
+            if (window._lastBackgroundGPSThrottle && wallClockNow - window._lastBackgroundGPSThrottle < 30_000) {
                 return;
             }
-            window._lastBackgroundUpdate = wallClockNow;
+            window._lastBackgroundGPSThrottle = wallClockNow;
         }
     
         const rawLat = position.coords.latitude;
@@ -3959,8 +3965,15 @@ const trackedTimeouts = new Set();
 
     // Expose the two entry points updateUserLocation() actually calls.
     // Everything else in this module stays private to the closure.
-    window._ensureWillChange = _ensureWillChange;
-    window._scheduleWillChangeReset = _scheduleWillChangeReset;
+        window._ensureWillChange = _ensureWillChange;
+        window._scheduleWillChangeReset = _scheduleWillChangeReset;
+        window._forceWillChangeReset = function() {
+            if (_resetTimer !== null) { clearTimeout(_resetTimer); _resetTimer = null; }
+            _willChangeOn = false;
+            _transitionOff = false;
+            const el = _getMarkerEl();
+            if (el) el.style.willChange = 'auto';
+        };
     })();
 
 /* ═══════════════════════════════════════════════════════════════
@@ -4301,8 +4314,8 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
             vN = clampSpeed * Math.cos(hdgRad);
             vE = clampSpeed * Math.sin(hdgRad);
         }
-        var dLat = (vN * timeDelta) / 111320;
-        var dLng = (vE * timeDelta) / (111320 * Math.cos(lastPos.lat * Math.PI / 180));
+        var dLat = (vN * timeDelta) / 111111;
+        var dLng = (vE * timeDelta) / (111111 * Math.cos(lastPos.lat * Math.PI / 180));
         return Object.assign({}, result, {
             speedMPS: clampSpeed,
             vNorth:   vN,
@@ -4344,8 +4357,8 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
             // Stationary flag kills DR loop; frozen flag just pauses prediction.
             var lastVel = window.smoothedVelocity || { lat: 0, lng: 0 };
             var cosLat = Math.cos(fusionResult.lat * Math.PI / 180);
-            var vNorthMPS = lastVel.lat * 111320;
-            var vEastMPS  = lastVel.lng * 111320 * cosLat;
+            var vNorthMPS = lastVel.lat * 111111;
+            var vEastMPS  = lastVel.lng * 111111 * cosLat;
             var lastSpeedMPS = Math.sqrt(vNorthMPS * vNorthMPS + vEastMPS * vEastMPS);
     
             // Only zero velocity if we were actually stopped before glitch
@@ -4461,7 +4474,7 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
 /* ──────────────────────────────────────────────
    Unified Render Executor
    ────────────────────────────────────────────── */
-  function _executeRender(state) {
+      function _executeRender(state) {
         if (!state || window.isMapInteracting) {
             window.lastMapUpdateTime = Date.now();
             return;
@@ -4479,30 +4492,48 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
             var zoomResult = getSpeedBasedZoom(state.speedMPS, state.closestDistance);
     
             if (zoomResult !== null && map && zoomResult.zoom !== null && map.getZoom() !== zoomResult.zoom) {
+                // Cancel any pending guard-release from a previous zoom call —
+                // without this, an in-flight animation's guard could be cleared
+                // early by a stale timer from an overlapping call.
+                if (_executeRender._zoomGuardTimeout) {
+                    clearTimeout(_executeRender._zoomGuardTimeout);
+                }
+    
                 // CRITICAL: Set guard BEFORE any map operation
                 window._programmaticFlyInProgress = true;
-                
+    
                 // Use setZoom for the animation
-                map.setZoom(zoomResult.zoom, { 
-                    animate: true, 
-                    duration: 0.25, 
-                    noMoveStart: true 
+                map.setZoom(zoomResult.zoom, {
+                    animate: true,
+                    duration: 0.25,
+                    noMoveStart: true
                 });
-                
+    
                 // IMPORTANT: Reset guard after animation completes
-                setTimeout(function() {
+                _executeRender._zoomGuardTimeout = setTimeout(function() {
                     window._programmaticFlyInProgress = false;
+                    _executeRender._zoomGuardTimeout = null;
                 }, 300);
             }
         } catch (e) {
             console.warn('[Render] Zoom error:', e);
             // Ensure guard is cleared on error
             window._programmaticFlyInProgress = false;
+            if (_executeRender._zoomGuardTimeout) {
+                clearTimeout(_executeRender._zoomGuardTimeout);
+                _executeRender._zoomGuardTimeout = null;
+            }
         }
     
-        // Force DR update — but only if position is not frozen
-        if (window.deadReckoning && typeof window.deadReckoning.forceUpdate === 'function' && !state.isFrozen) {
-            window.deadReckoning.forceUpdate();
+        // Force DR update — but only if position is not frozen.
+        // DR (deadReckoning.forceUpdate) remains the sole writer of marker/viewport
+        // state; this call only asks it to refresh, it does not write anything itself.
+        try {
+            if (window.deadReckoning && typeof window.deadReckoning.forceUpdate === 'function' && !state.isFrozen) {
+                window.deadReckoning.forceUpdate();
+            }
+        } catch (e) {
+            console.warn('[Render] DR forceUpdate error:', e);
         }
     
         window.lastMapUpdateTime = Date.now();
