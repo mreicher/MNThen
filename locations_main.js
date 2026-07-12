@@ -414,7 +414,7 @@ const locations = [
     "summary": "The St. Paul Saints' home ballpark (off and on) from 1897–1956.",
     "today": "Near Lexington and University Avenue",
     "link": "https://mnthen.com/blog/place/lexington_park.html",
-    "imageSource": "https://mnthen.com/images/exhibit/lexington_park.jpg",
+    "imageSource": "Lexington Park, home of the St. Paul Saints from 1897 to 1956. via Twin Cities Music Highlights",
     "additionalInfo": "In June 1926 the St. Paul Pioneer Press reported that only nine home runs had cleared the park's right field fence in the decade after its 1916 rebuild.",
     "difficulty": 1
 }
