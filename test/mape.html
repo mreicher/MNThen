@@ -4515,71 +4515,127 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
         });
     }
 
-/* ──────────────────────────────────────────────
+    /* ──────────────────────────────────────────────
    Unified Render Executor
+   Responsibilities:
+     1. Speed-based zoom transitions (only when safe to do so)
+     2. Trigger a DR forceUpdate to resync marker/viewport with latest fusion
+   The marker and viewport are owned by DR's RAF loop; this function never
+   writes map position directly.
    ────────────────────────────────────────────── */
-      function _executeRender(state) {
-        if (!state || window.isMapInteracting) {
-            window.lastMapUpdateTime = Date.now();
-            return;
-        }
+    function _executeRender(state) {
+        if (!state) return;
     
-        // Validate position before any render operations
-        if (typeof state.position?.lat !== 'number' || typeof state.position?.lng !== 'number' ||
-            isNaN(state.position.lat) || isNaN(state.position.lng)) {
+        // Validate position — if invalid, abort entirely; do NOT stamp
+        // lastMapUpdateTime so callers know no render was attempted.
+        if (
+            typeof state.position?.lat !== 'number' ||
+            typeof state.position?.lng !== 'number' ||
+            isNaN(state.position.lat) ||
+            isNaN(state.position.lng)
+        ) {
             console.warn('[Render] Invalid position, skipping');
-            window.lastMapUpdateTime = Date.now();
             return;
         }
     
-        try {
-            var zoomResult = getSpeedBasedZoom(state.speedMPS, state.closestDistance);
+        // ── 1. Speed-based zoom transition ──────────────────────────────────────
+        // Guard conditions checked in priority order:
+        //   a) Map not initialised
+        //   b) User is manually panning/zooming (isMapInteracting) — we must not
+        //      inject a programmatic zoom mid-gesture; it will be lost anyway since
+        //      onInteractionEnd will reset followUser state.
+        //   c) A proximity-zoom animation is already in flight — stacking a second
+        //      setZoom creates a competing animation that fights the DR RAF loop.
+        //   d) A previous guard-release timer is still running — this means we fired
+        //      a zoom but the animation has not finished; skip rather than overlap.
+        const zoomSafe =
+            map != null &&
+            !window.isMapInteracting &&
+            !window._isProximityZoomAnimating &&
+            !window._programmaticFlyInProgress;
     
-            if (zoomResult !== null && map && zoomResult.zoom !== null && map.getZoom() !== zoomResult.zoom) {
-                // Cancel any pending guard-release from a previous zoom call —
-                // without this, an in-flight animation's guard could be cleared
-                // early by a stale timer from an overlapping call.
+        if (zoomSafe) {
+            try {
+                const zoomResult = getSpeedBasedZoom(state.speedMPS, state.closestDistance);
+    
+                if (zoomResult !== null && zoomResult.zoom !== null && map.getZoom() !== zoomResult.zoom) {
+                    // Cancel any stale guard-release timer before arming a new one.
+                    if (_executeRender._zoomGuardTimeout) {
+                        clearTimeout(_executeRender._zoomGuardTimeout);
+                        _executeRender._zoomGuardTimeout = null;
+                    }
+    
+                    // Arm guard BEFORE the map call so onInteractionStart (which
+                    // fires synchronously on movestart) sees it and does not flip
+                    // followUser off.
+                    window._programmaticFlyInProgress = true;
+    
+                    // In centered/DR mode: bake the zoom into the next DR setView
+                    // instead of issuing a competing setZoom.  This keeps a single
+                    // viewport writer and eliminates the animate:true vs
+                    // animate:false race condition.
+                    const drActive = window.deadReckoning &&
+                        typeof window.deadReckoning.isActive === 'function' &&
+                        window.deadReckoning.isActive() &&
+                        window.followUser &&
+                        _isCenteredMode();
+    
+                    if (drActive) {
+                        // DR's frame() calls map.setView(animate:false) every RAF.
+                        // Store the target zoom so the next frame() picks it up —
+                        // DR already reads map.getZoom() for its setView call, so
+                        // we just need to nudge the map zoom silently (no animation).
+                        map.setZoom(zoomResult.zoom, { animate: false });
+                    } else {
+                        // Free/roaming mode: animated zoom is fine; no competing writer.
+                        map.setZoom(zoomResult.zoom, {
+                            animate: true,
+                            duration: 0.25,
+                            noMoveStart: true
+                        });
+                    }
+    
+                    // Release the guard after the animation window has elapsed.
+                    // Using createTrackedTimeout means disposeMapLoop() will cancel
+                    // this automatically on teardown — no stuck _programmaticFlyInProgress.
+                    _executeRender._zoomGuardTimeout = createTrackedTimeout(function () {
+                        window._programmaticFlyInProgress = false;
+                        _executeRender._zoomGuardTimeout = null;
+                    }, drActive ? 50 : 300);
+                }
+            } catch (e) {
+                console.warn('[Render] Zoom error:', e);
+                // Always clear the guard on error — a stuck true blocks all future
+                // user interactions from setting followUser = false.
+                window._programmaticFlyInProgress = false;
                 if (_executeRender._zoomGuardTimeout) {
                     clearTimeout(_executeRender._zoomGuardTimeout);
-                }
-    
-                // CRITICAL: Set guard BEFORE any map operation
-                window._programmaticFlyInProgress = true;
-    
-                // Use setZoom for the animation
-                map.setZoom(zoomResult.zoom, {
-                    animate: true,
-                    duration: 0.25,
-                    noMoveStart: true
-                });
-    
-                // IMPORTANT: Reset guard after animation completes
-                _executeRender._zoomGuardTimeout = createTrackedTimeout(function() {
-                    window._programmaticFlyInProgress = false;
                     _executeRender._zoomGuardTimeout = null;
-                }, 300);
-            }
-        } catch (e) {
-            console.warn('[Render] Zoom error:', e);
-            // Ensure guard is cleared on error
-            window._programmaticFlyInProgress = false;
-            if (_executeRender._zoomGuardTimeout) {
-                clearTimeout(_executeRender._zoomGuardTimeout);
-                _executeRender._zoomGuardTimeout = null;
+                }
             }
         }
     
-        // Force DR update — but only if position is not frozen.
-        // DR (deadReckoning.forceUpdate) remains the sole writer of marker/viewport
-        // state; this call only asks it to refresh, it does not write anything itself.
+        // ── 2. DR forceUpdate ───────────────────────────────────────────────────
+        // Always attempt this regardless of isMapInteracting — forceUpdate refreshes
+        // the DR position prediction and reseeds velocity; it does NOT touch the
+        // viewport.  Skipping it during a user pan means the marker prediction goes
+        // stale for the entire pan duration, causing a snap when interaction ends.
+        // DR's own isActive() is the correct gate; isFrozen is already handled by
+        // _controlDeadReckoning (called before us) which stops DR when frozen.
         try {
-            if (window.deadReckoning && typeof window.deadReckoning.forceUpdate === 'function' && !state.isFrozen) {
+            if (
+                window.deadReckoning &&
+                typeof window.deadReckoning.forceUpdate === 'function' &&
+                typeof window.deadReckoning.isActive === 'function' &&
+                window.deadReckoning.isActive()
+            ) {
                 window.deadReckoning.forceUpdate();
             }
         } catch (e) {
             console.warn('[Render] DR forceUpdate error:', e);
         }
     
+        // Stamp only on successful render completion, not on early exits.
         window.lastMapUpdateTime = Date.now();
     }
         
