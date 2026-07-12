@@ -399,7 +399,25 @@ const locations = [
         imageSource: "https://mnthen.com/images/exhibit/selby_line.jpg",
         additionalInfo: "By 1910, the tunnel allowed streetcar travel from Lake Minnetonka to the St. Croix River.",
         difficulty: 2
-    }
+    },
+{
+    "id": "1034",
+    "lat": 44.95492204149766, 
+    "lng": -93.14698233197274,
+    "name": "Lexington Park (1897 – 1956)",
+    "title": "Lexington Park (1897 – 1956)",
+    "image": "https://mnthen.com/images/lexington_park.jpg",
+    "creator": "Matt Reicher",
+    "city": "St. Paul",
+    "audio": "/audio/exhibit/lexington_park.mp3",
+    "tours": "place",
+    "summary": "The St. Paul Saints' home ballpark (off and on) from 1897–1956.",
+    "today": "Near Lexington and University Avenue",
+    "link": "https://mnthen.com/blog/place/lexington_park.html",
+    "imageSource": "https://mnthen.com/images/exhibit/lexington_park.jpg",
+    "additionalInfo": "In June 1926 the St. Paul Pioneer Press reported that only nine home runs had cleared the park's right field fence in the decade after its 1916 rebuild.",
+    "difficulty": 1
+}
 
     // Add more locations here
 ];
