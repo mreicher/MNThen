@@ -406,7 +406,7 @@ const locations = [
     "lng": -93.14698233197274,
     "name": "Lexington Park (1897 – 1956)",
     "title": "Lexington Park (1897 – 1956)",
-    "image": "https://mnthen.com/images/exhibit/lexington_park.jpg",
+    "image": "https://mnthen.com/images/exhibit/lex_park.jpg",
     "creator": "Matt Reicher",
     "city": "St. Paul",
     "audio": "/audio/exhibit/lexington_park.mp3",
