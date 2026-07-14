@@ -2849,25 +2849,30 @@ const trackedTimeouts = new Set();
 /* ──────────────────────────────────────────────
    GPS POWER MODE 
    ────────────────────────────────────────────── */
-   function getWatchOptions() {
+  function getWatchOptions() {
         const speedMPH = (window.lastPosition?.speedMPS ?? 0) * 2.23694;
         const isStationaryFlag = window.sensorFusion?._lastStationaryState ?? window.isStationary;
-        
-        // The physical sensor felt a step, so we are NOT stationary, 
-        // even if the GPS chip hasn't woken up to report speed yet!
-        const accelMoving = window.sensorFusion?._isMoving; 
     
-        // Force stationary to FALSE if the accelerometer feels movement
-        const stationary = (isStationaryFlag || speedMPH < 0.3) && !accelMoving;
-        
-        const driving    = speedMPH >= 5 || (!isStationaryFlag && speedMPH >= 4);
-        const highSpeed  = speedMPH >= 45;
-     
+        // The physical sensor felt a step, so we are NOT stationary,
+        // even if the GPS chip hasn't woken up to report speed yet!
+        const accelMoving = window.sensorFusion?._isMoving;
+    
+        const highSpeed = speedMPH >= 45;
+        const driving   = speedMPH >= 5 || (!isStationaryFlag && speedMPH >= 4);
+    
+        // Live speed takes precedence over isStationaryFlag: the flag can lag
+        // behind an actual GPS speed reading (e.g. just after accelerating from
+        // a stop on a smooth road, where there's no accelerometer jolt to catch
+        // it). Without the `!highSpeed` guard here, a stale "stationary" flag
+        // could win the maximumAge ternary below even at highway speed, letting
+        // us accept a GPS fix up to 5s stale — hundreds of feet of drift.
+        const stationary = !accelMoving && !highSpeed && (isStationaryFlag || speedMPH < 0.3);
+    
         const maximumAge = stationary ? 5000   // High age = GPS chip sleeps, battery saved
                           : highSpeed  ? 0
                           : driving    ? 250
                           :              1000; // <--- Dropped from 2000 to 1000 for faster wake-up
-     
+    
         return {
             enableHighAccuracy: true,
             maximumAge,
@@ -2878,102 +2883,135 @@ const trackedTimeouts = new Set();
 /* ──────────────────────────────────────────────
    POSITION UPDATES — GPS watch + power manager
    ────────────────────────────────────────────── */
-    function startPositionUpdates() {
-        try {
-            if (window.positionWatchId != null) {
-                navigator.geolocation.clearWatch(window.positionWatchId);
-                window.positionWatchId = null;
-            }
-            const opts = getWatchOptions();
-            
-            window.positionWatchId = navigator.geolocation.watchPosition(
-                handlePositionUpdate,
-                handleLocationError,
-                opts
-            );
-            if (!window._positionUpdatesListenersSetup) {
-                window._positionUpdatesListenersSetup = true;
-                const onlineHandler = () => {
-                    if (window.onlineRestartTimeout) clearTimeout(window.onlineRestartTimeout);
-                    window.onlineRestartTimeout = createTrackedTimeout(() => {
-                        window.onlineRestartTimeout = null;
-                        // Delegate to startPositionUpdates() rather than duplicating
-                        // the watch/options setup inline — it already no-ops safely
-                        // when a watch exists, and it already routes failures
-                        // through handleLocationError, which this inline version
-                        // didn't.
-                        if (window.positionWatchId == null) {
-                            startPositionUpdates();
-                        }
-                    }, 500);
-                };
-                const offlineHandler = () => {
-                    if (window.onlineRestartTimeout) {
-                        clearTimeout(window.onlineRestartTimeout);
-                        window.onlineRestartTimeout = null;
-                    }
-                };
-                window.addEventListener('online', onlineHandler);
-                window.addEventListener('offline', offlineHandler);
-                if (typeof memoryManager?.trackEventListener === 'function') {
-                    memoryManager.trackEventListener(window, 'online', onlineHandler);
-                    memoryManager.trackEventListener(window, 'offline', offlineHandler);
-                }
-            }
-            return window.positionWatchId;
-        } catch (err) {
-            console.error('Geolocation unavailable:', err);
-            handleLocationError({ code: 0, message: 'Geolocation unavailable' });
-            return null;
+   function startPositionUpdates() {
+    try {
+        if (window.positionWatchId != null) {
+            navigator.geolocation.clearWatch(window.positionWatchId);
+            window.positionWatchId = null;
         }
+        const opts = getWatchOptions();
+
+        // Remember which tier these options correspond to, so
+        // handlePositionUpdate can tell when a tier change means the watch
+        // needs restarting (watchPosition locks in maximumAge/timeout for
+        // its whole lifetime — it does not re-poll getWatchOptions()).
+        window._activeWatchTier = window._currentSpeedTier ?? null;
+
+        window.positionWatchId = navigator.geolocation.watchPosition(
+            handlePositionUpdate,
+            handleLocationError,
+            opts
+        );
+
+        if (!window._positionUpdatesListenersSetup) {
+            window._positionUpdatesListenersSetup = true;
+            const onlineHandler = () => {
+                if (window.onlineRestartTimeout) clearTimeout(window.onlineRestartTimeout);
+                window.onlineRestartTimeout = createTrackedTimeout(() => {
+                    window.onlineRestartTimeout = null;
+                    // Delegate to startPositionUpdates() rather than duplicating
+                    // the watch/options setup inline — it already no-ops safely
+                    // when a watch exists, and it already routes failures
+                    // through handleLocationError, which this inline version
+                    // didn't.
+                    if (window.positionWatchId == null) {
+                        startPositionUpdates();
+                    }
+                }, 500);
+            };
+            const offlineHandler = () => {
+                if (window.onlineRestartTimeout) {
+                    clearTimeout(window.onlineRestartTimeout);
+                    window.onlineRestartTimeout = null;
+                }
+            };
+            window.addEventListener('online', onlineHandler);
+            window.addEventListener('offline', offlineHandler);
+            if (typeof memoryManager?.trackEventListener === 'function') {
+                memoryManager.trackEventListener(window, 'online', onlineHandler);
+                memoryManager.trackEventListener(window, 'offline', offlineHandler);
+            }
+        }
+        return window.positionWatchId;
+    } catch (err) {
+        console.error('Geolocation unavailable:', err);
+        // Code 2 (POSITION_UNAVAILABLE) is the closest standard match for
+        // "the platform API itself failed" — there is no standard code 0.
+        // If handleLocationError branches on .code, this keeps it on a
+        // real, intentional path instead of falling through to a default
+        // case meant for unrelated failures.
+        handleLocationError({ code: 2, message: 'Geolocation unavailable' });
+        return null;
     }
+}
         
 /* ──────────────────────────────────────────────
    POSITION UPDATE HANDLER
    ────────────────────────────────────────────── */
-      function handlePositionUpdate(position) {
-        // 1. Validation & Stale Data Guard
-        if (!position?.coords || isNaN(position.coords.latitude) || isNaN(position.coords.longitude)) return;
-        
-        const positionTimestamp = position.timestamp || Date.now();
-        const currentTime = Date.now();
-        if (currentTime - positionTimestamp > 30_000) return;
-    
-        // 2. Background Throttling
-        if (document.hidden) {
-            if (window._lastBackgroundUpdate && currentTime - window._lastBackgroundUpdate < 30_000) return;
-            window._lastBackgroundUpdate = currentTime;
-        }
-    
-        // 3. Extract Raw Data
-        const rawLat = position.coords.latitude;
-        const rawLng = position.coords.longitude;
-        const rawSpeedMPS = position.coords.speed || 0;
-        
-        window.lastValidPosition = {
-            lat: rawLat,
-            lng: rawLng,
-            timestamp: positionTimestamp,
-            accuracy: position.coords.accuracy || 20,
-            speedMPS: rawSpeedMPS,
-            isMoving: rawSpeedMPS > 0.5
-        };
-    
-        // 4. Let updateUserLocation handle everything
-        // It will call _scheduleUnifiedRender -> _executeRender
-        // which will apply the zoom via getSpeedBasedZoom
-        updateUserLocation({
-            timestamp: positionTimestamp,
-            coords: {
-                latitude: rawLat,
-                longitude: rawLng,
-                accuracy: window.lastValidPosition.accuracy,
-                altitude: position.coords.altitude,
-                heading: position.coords.heading,
-                speed: rawSpeedMPS
-            }
-        }, rawSpeedMPS > 10);
+     function handlePositionUpdate(position) {
+    // 1. Validation & Stale Data Guard
+    if (!position?.coords || isNaN(position.coords.latitude) || isNaN(position.coords.longitude)) return;
+
+    const positionTimestamp = position.timestamp || Date.now();
+    const currentTime = Date.now();
+    if (currentTime - positionTimestamp > 30_000) return;
+
+    // 2. Background Throttling
+    if (document.hidden) {
+        if (window._lastBackgroundUpdate && currentTime - window._lastBackgroundUpdate < 30_000) return;
+        window._lastBackgroundUpdate = currentTime;
     }
+
+    // 3. Extract Raw Data
+    const rawLat = position.coords.latitude;
+    const rawLng = position.coords.longitude;
+    const rawSpeedMPS = position.coords.speed || 0;
+
+    window.lastValidPosition = {
+        lat: rawLat,
+        lng: rawLng,
+        timestamp: positionTimestamp,
+        accuracy: position.coords.accuracy || 20,
+        speedMPS: rawSpeedMPS,
+        isMoving: rawSpeedMPS > 0.5
+    };
+
+    // ASSUMPTION: getWatchOptions() reads window.lastPosition?.speedMPS, a
+    // different global than the one this function writes (lastValidPosition).
+    // Aliasing here so getWatchOptions() actually sees live speed instead of
+    // whatever (possibly unrelated, possibly never-set) value lastPosition
+    // held before. If window.lastPosition is intentionally a distinct value
+    // maintained elsewhere, remove this line — as written previously, it's
+    // likely getWatchOptions() was silently always seeing speedMPH = 0.
+    window.lastPosition = window.lastValidPosition;
+
+    // 4. Detect speed-tier change and restart the watch if needed.
+    // watchPosition's maximumAge/timeout are fixed for the life of the
+    // watch, so a tier shift (e.g. stopped -> driving) has no effect until
+    // we tear down and re-register with fresh getWatchOptions() output.
+    const tier = rawSpeedMPS * 2.23694 >= 45 ? 'highSpeed'
+               : rawSpeedMPS * 2.23694 >= 4  ? 'driving'
+               :                                'stationary';
+    window._currentSpeedTier = tier;
+    if (window._activeWatchTier != null && window._activeWatchTier !== tier) {
+        startPositionUpdates();
+    }
+
+    // 5. Let updateUserLocation handle everything
+    // It will call _scheduleUnifiedRender -> _executeRender
+    // which will apply the zoom via getSpeedBasedZoom
+    updateUserLocation({
+        timestamp: positionTimestamp,
+        coords: {
+            latitude: rawLat,
+            longitude: rawLng,
+            accuracy: window.lastValidPosition.accuracy,
+            altitude: position.coords.altitude,
+            heading: position.coords.heading,
+            speed: rawSpeedMPS
+        }
+    }, rawSpeedMPS > 10);
+}
         
 /* ──────────────────────────────────────────────
    VISIBILITY CHANGE HANDLER
