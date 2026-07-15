@@ -1760,106 +1760,190 @@ window.sensorFusion = new SensorFusionManager().init();
         }
     }
 
-    function frame(now) {
-        _rafId = null;
-        const lastPos = window.lastPosition;
-        if (!lastPos || window.isLocationHuntVisible) { _active = false; return; }
-    
-        const speedMPS   = _getSpeedMPS();
-        const stationary = _isStationary();
-        const centered   = _isCenteredMode();
-    
-        if (!centered && stationary && speedMPS < CFG.MIN_SPEED_MPS) { _active = false; return; }
-    
-        const isInteracting = window.isMapInteracting || window._isProximityZoomAnimating || window._gpsCenteredPanJustOccurred;
-        if (isInteracting) {
-            _interactionEndTime = now + CFG.INTERACTION_FADE_MS;
-            _lastFrameTime = now;
-            _rafId = requestAnimationFrame(frame);
-            return;
-        }
-        if (now < _interactionEndTime) { _lastFrameTime = now; _rafId = requestAnimationFrame(frame); return; }
-    
-        const dtMs = now - _lastFrameTime;
-        if (dtMs < CFG.MIN_DT_MS) { _rafId = requestAnimationFrame(frame); return; }
+function frame(now) {
+    _rafId = null;
+    const lastPos = window.lastPosition;
+    if (!lastPos || window.isLocationHuntVisible) {
+        _active = false;
+        return;
+    }
+
+    const speedMPS   = _getSpeedMPS();
+    const stationary = _isStationary();
+    const centered   = _isCenteredMode();
+
+    // Keep the RAF loop alive while sleeping. This eliminates the restart
+    // lag when transitioning from stationary -> moving.
+    const isSleeping = !centered && stationary && speedMPS < CFG.MIN_SPEED_MPS;
+
+    const isInteracting = window.isMapInteracting || window._isProximityZoomAnimating || window._gpsCenteredPanJustOccurred;
+    if (isInteracting) {
+        _interactionEndTime = now + CFG.INTERACTION_FADE_MS;
         _lastFrameTime = now;
+        _rafId = requestAnimationFrame(frame);
+        return;
+    }
+    if (now < _interactionEndTime) {
+        _lastFrameTime = now;
+        _rafId = requestAnimationFrame(frame);
+        return;
+    }
+
+    const dtMs = now - _lastFrameTime;
+    if (dtMs < CFG.MIN_DT_MS) {
+        _rafId = requestAnimationFrame(frame);
+        return;
+    }
+    _lastFrameTime = now;
+
+    // Still alive, just skipping work until we are actually moving
+    if (isSleeping) {
+        _rafId = requestAnimationFrame(frame);
+        return;
+    }
+
+    const kp = _getKalmanPos(), rp = _getRawPos();
+    let oLat, oLng, oTs;
+    if      (kp?.timestamp != null) { oLat = kp.lat; oLng = kp.lng; oTs = kp.timestamp; }
+    else if (rp?.timestamp != null) { oLat = rp.lat; oLng = rp.lng; oTs = rp.timestamp; }
+    else                            { oLat = lastPos.lat; oLng = lastPos.lng; oTs = window.lastUpdateTimestamp || now; }
+
+    const hdg = _getHeading();
     
-        const kp = _getKalmanPos(), rp = _getRawPos();
-        let oLat, oLng, oTs;
-        if      (kp?.timestamp != null) { oLat = kp.lat; oLng = kp.lng; oTs = kp.timestamp; }
-        else if (rp?.timestamp != null) { oLat = rp.lat; oLng = rp.lng; oTs = rp.timestamp; }
-        else                            { oLat = lastPos.lat; oLng = lastPos.lng; oTs = window.lastUpdateTimestamp || now; }
-    
-        const hdg = _getHeading();
-        
-        if (_lastHeadingDeg != null && hdg != null) {
+    if (_lastHeadingDeg != null && hdg != null) {
+        // Prevent heading drift from shrinking the prediction horizon while stationary/slow
+        if (speedMPS > 0.5) {
             let d = hdg - _lastHeadingDeg;
             if (d >  180) d -= 360;
             if (d < -180) d += 360;
             _headingChangeRate = _headingChangeRate * 0.7 + (Math.abs(d) / (Math.max(dtMs, 16) / 1000)) * 0.3;
         }
-        if (hdg != null) _lastHeadingDeg = hdg;
-    
-        const vel = _getVelocity();
-        const vm = Math.sqrt(vel.lat*vel.lat + vel.lng*vel.lng);
-        if (vm > 0.001) { _lastGoodVelocity = { lat: vel.lat, lng: vel.lng }; _lastGoodSpeedMPS = speedMPS; }
-    
-        let pLat, pLng;
-        const rawAge = Math.max(0, (now - oTs) / 1000);
-        const hor    = _getPredictHorizon(speedMPS, _headingChangeRate);
-        const pDt    = Math.min(rawAge, hor);
-    
-        if (pDt <= 0 || speedMPS < CFG.LOW_SPEED_CUTOFF_MPS || stationary) {
-            pLat = oLat; pLng = oLng;
-        } else {
-            pLat = oLat + vel.lat * pDt;
-            pLng = oLng + vel.lng * pDt;
-            const jN = Math.abs(pLat - oLat) * 111111;
-            const jE = Math.abs(pLng - oLng) * 111111 * Math.cos(oLat * Math.PI / 180);
-            if (jN > 150 || jE > 150) { pLat = oLat; pLng = oLng; }
-        }
-    
-        _lastPredictedPos = { lat: pLat, lng: pLng };
-    
-        const HOLD_SPEED_MPS = CFG.MIN_SPEED_MPS; 
-        const HOLD_DEADBAND_M = 0.15;
+    }
+    if (hdg != null) _lastHeadingDeg = hdg;
+
+    const vel = _getVelocity();
+    const vm = Math.sqrt(vel.lat*vel.lat + vel.lng*vel.lng);
+    if (vm > 0.001) {
+        _lastGoodVelocity = { lat: vel.lat, lng: vel.lng };
+        _lastGoodSpeedMPS = speedMPS;
+    }
+
+    let pLat, pLng;
+    const rawAge = Math.max(0, (now - oTs) / 1000);
+    const hor    = _getPredictHorizon(speedMPS, _headingChangeRate);
+    const pDt    = Math.min(rawAge, hor);
+
+    // Smooth low-speed prediction & velocity damping ---
+    if (pDt <= 0 || stationary) {
+        pLat = oLat; pLng = oLng;
+    } else {
+        let effectiveDt = pDt;
+        let projVelLat = vel.lat;
+        let projVelLng = vel.lng;
         
-        const prevHeld = window.__drHeld;
-        let hLat = pLat, hLng = pLng;
+        const cutoff = CFG.LOW_SPEED_CUTOFF_MPS;
+        if (speedMPS < cutoff) {
+            const MIN_MICRO_DT = 0.15; 
+            
+            // Smoothstep interpolation for the prediction horizon
+            // Prevents the "stuck in mud" feeling while avoiding sudden visual jumps 
+            // when crossing the LOW_SPEED_CUTOFF_MPS threshold.
+            let t = Math.max(0, speedMPS / cutoff);
+            t = t * t * (3 - 2 * t); // Smoothstep easing
+            
+            effectiveDt = MIN_MICRO_DT + (pDt - MIN_MICRO_DT) * t;
+            
+            // Dampen noisy low-speed velocity vectors to prevent jitter
+            // Blends with the last known good direction to keep the marker pointing correctly
+            if (_lastGoodVelocity && speedMPS > 0.1) {
+                const velBlend = 0.6; 
+                projVelLat = vel.lat * (1 - velBlend) + _lastGoodVelocity.lat * velBlend;
+                projVelLng = vel.lng * (1 - velBlend) + _lastGoodVelocity.lng * velBlend;
+            }
+        }
+
+        pLat = oLat + projVelLat * effectiveDt;
+        pLng = oLng + projVelLng * effectiveDt;
+
+        // Universal jump check (applied to all speeds now, not just high speeds)
+        const jN = Math.abs(pLat - oLat) * 111111;
+        const jE = Math.abs(pLng - oLng) * 111111 * Math.cos(oLat * Math.PI / 180);
+        
+        // Dynamic jump threshold: strict at low speeds (10m), lenient at high speeds (150m)
+        const maxJumpM = (speedMPS < cutoff) ? 10 : 150; 
+        
+        if (jN > maxJumpM || jE > maxJumpM) { 
+            pLat = oLat; pLng = oLng; 
+        }
+    }
+
+    _lastPredictedPos = { lat: pLat, lng: pLng };
+
+    const HOLD_SPEED_MPS = CFG.MIN_SPEED_MPS;
+    const HOLD_DEADBAND_M = 0.15;
     
-        if (speedMPS < HOLD_SPEED_MPS && prevHeld) {
+    const prevHeld = window.__drHeld;
+    let hLat = pLat, hLng = pLng;
+
+    // Uses an anchor point to prevent the shrinking deadband bug from aborting the animation early.
+    if (speedMPS < HOLD_SPEED_MPS && prevHeld) {
+        if (_holdReleaseStart && _holdReleaseAnchor) {
+            const t = Math.min(1, (now - _holdReleaseStart) / 200);
+            const ease = 1 - Math.pow(1 - t, 3); // ease-out cubic
+            
+            hLat = _holdReleaseAnchor.lat + (pLat - _holdReleaseAnchor.lat) * ease;
+            hLng = _holdReleaseAnchor.lng + (pLng - _holdReleaseAnchor.lng) * ease;
+            
+            if (t >= 1) {
+                _holdReleaseStart = 0;
+                _holdReleaseAnchor = null;
+            }
+        } else {
             const cosLat = Math.cos(pLat * Math.PI / 180);
             const errN = (pLat - prevHeld.lat) * 111111;
             const errE = (pLng - prevHeld.lng) * 111111 * cosLat;
             const errDist = Math.sqrt(errN * errN + errE * errE);
+            
             if (errDist < HOLD_DEADBAND_M) {
                 hLat = prevHeld.lat;
                 hLng = prevHeld.lng;
+                _holdReleaseStart = 0;
+                _holdReleaseAnchor = null;
+            } else {
+                _holdReleaseStart = now;
+                _holdReleaseAnchor = { lat: prevHeld.lat, lng: prevHeld.lng };
+                hLat = prevHeld.lat; // Hold position on the exact frame it breaks
+                hLng = prevHeld.lng;
             }
         }
-        window.__drHeld = { lat: hLat, lng: hLng };
-    
-        if (!map || window._isProximityZoomAnimating) {
-            _setMarkerPosition(hLat, hLng);
-            _rafId = requestAnimationFrame(frame);
-            return;
-        }
-    
-        if (window.followUser && centered) {
-            _snapViewport(hLat, hLng);
-            const c = map.getCenter();
-            _setMarkerPosition(c.lat, c.lng);
-        } else if (window.followUser) {
-            _setMarkerPosition(hLat, hLng);
-            _snapViewport(hLat, hLng);
-        } else {
-            _setMarkerPosition(hLat, hLng);
-        }
-    
-        _rafId = requestAnimationFrame(frame);
+    } else {
+        _holdReleaseStart = 0;
+        _holdReleaseAnchor = null;
     }
 
-    // --- CHANGED: now returns true/false so callers know whether the
+    window.__drHeld = { lat: hLat, lng: hLng };
+
+    if (!map || window._isProximityZoomAnimating) {
+        _setMarkerPosition(hLat, hLng);
+        _rafId = requestAnimationFrame(frame);
+        return;
+    }
+
+    if (window.followUser && centered) {
+        _snapViewport(hLat, hLng);
+        const c = map.getCenter();
+        _setMarkerPosition(c.lat, c.lng);
+    } else if (window.followUser) {
+        _setMarkerPosition(hLat, hLng);
+        _snapViewport(hLat, hLng);
+    } else {
+        _setMarkerPosition(hLat, hLng);
+    }
+
+    _rafId = requestAnimationFrame(frame);
+}
+
+    // Returns true/false so callers know whether the
     // continuous predictive loop actually launched. ---
     function _start() {
         if (_active) return true;
