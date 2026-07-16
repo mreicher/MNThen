@@ -1306,18 +1306,29 @@ class SensorFusionManager {
         return { lat: (rawLat - this._rawLat) / dtSec, lng: (rawLng - this._rawLng) / dtSec };
     }
 
-    _updateStationaryState(gpsSpeedMPS, kalmanSpeedMPS, rawLat, rawLng) {
+     _updateStationaryState(gpsSpeedMPS, kalmanSpeedMPS, rawLat, rawLng) {
         const speed = Math.max(gpsSpeedMPS || 0, kalmanSpeedMPS || 0);
-        const isMoving = speed > 0.8 || (this._accelAvailable && this._isMoving);
-
+        const accelMoving = !!(this._accelAvailable && this._isMoving);
+    
+        // Exit policy: sensor-confirmed motion unfreezes immediately — it can't
+        // be faked by GPS scatter. Without sensor confirmation (iOS), a single
+        // speed sample must clear 1.2 m/s: standstill scatter spikes past 0.8
+        // but essentially never past 1.2, while any real walk crosses it within
+        // a fix or two. Escape hatch: sub-gate motion sustained for 3 frames is
+        // real (jitter can't sustain 0.8+), so slow movers never get stuck.
+        const EXIT_SPEED_GATE     = 1.2;
+        const EXIT_SUSTAIN_FRAMES = 3;
+    
+        const isMoving = speed > 0.8 || accelMoving;
+    
         if (isMoving)         { this._stationaryCounter = Math.max(0, this._stationaryCounter - 2); }
-        else if (speed < 0.3) { this._stationaryCounter++; }
-
+         else if (speed < 0.3) { this._stationaryCounter = Math.min(6, this._stationaryCounter + 1); }
+    
         const isStationary = speed < 0.3 || this._stationaryCounter >= 5;
-
+    
         if (isStationary && !this._lastStationaryState) {
             // Transition to stationary — freeze immediately
-            this._unfreezeCounter = 0;
+            this._exitSustainCount = 0;
             const freezeLat = this._lastKalmanLat != null ? this._lastKalmanLat : rawLat;
             const freezeLng = this._lastKalmanLng != null ? this._lastKalmanLng : rawLng;
             if (this._kalmanFilter && freezeLat != null && freezeLng != null) {
@@ -1327,22 +1338,34 @@ class SensorFusionManager {
                 ? { lat: freezeLat, lng: freezeLng }
                 : null;
             this._stationarySamples = [];
-
+    
         } else if (!isStationary && this._lastStationaryState) {
-            // Transition to moving — require 2 consecutive moving frames
-            this._unfreezeCounter++;
-            if (this._unfreezeCounter >= 2) {
-                if (this._kalmanFilter) this._kalmanFilter.unfreeze();
+            // Transition to moving — unfreeze on the FIRST qualifying frame.
+            const clearsGate = accelMoving || speed > EXIT_SPEED_GATE;
+            this._exitSustainCount = isMoving ? (this._exitSustainCount || 0) + 1 : 0;
+    
+            if (clearsGate || this._exitSustainCount >= EXIT_SUSTAIN_FRAMES) {
+                if (this._kalmanFilter) {
+                    this._kalmanFilter.unfreeze();
+                    // Re-open position uncertainty: the frozen branch feeds the
+                    // filter its own freeze point with R=0.5 every fix, crushing
+                    // P[0][0]/P[1][1] toward ~0.1. Left squeezed, the first real
+                    // fix (variance ~100–225 at typical accuracy) gets a Kalman
+                    // gain of ~0 and the marker crawls off the freeze point.
+                    const P = this._kalmanFilter.P;
+                    if (P) { P[0][0] = Math.max(P[0][0], 225); P[1][1] = Math.max(P[1][1], 225); }
+                }
                 this._stationaryPosition = null;
                 this._stationarySamples  = [];
                 this._lastStationaryState = false;
-                this._unfreezeCounter = 0;
-                return false;  // ← Hysteresis satisfied, report moving
+                this._exitSustainCount = 0;
+                return false;
             }
-            return true;  // ← Still building hysteresis, report stationary
+            // Below the gate and not yet sustained — hold the freeze this frame.
+            return true;
         }
-
-        if (isStationary) this._unfreezeCounter = 0;
+    
+        if (isStationary) this._exitSustainCount = 0;
         this._lastStationaryState = isStationary;
         return isStationary;
     }
@@ -1374,19 +1397,19 @@ class SensorFusionManager {
         return { vNorth: kalmanSpeed * Math.cos(headingRad), vEast: kalmanSpeed * Math.sin(headingRad) };
     }
 
-    smoothPosition(rawLat, rawLng, accuracyMeters, timestampMs, gpsSpeedMPS, gpsHeadingDeg) {
+   smoothPosition(rawLat, rawLng, accuracyMeters, timestampMs, gpsSpeedMPS, gpsHeadingDeg) {
         if (!isFinite(rawLat) || !isFinite(rawLng) || !this._kalmanFilter) {
             return { lat: rawLat || 0, lng: rawLng || 0, vNorth: 0, vEast: 0, speedMPS: 0 };
         }
-     
+    
         const kf = this._kalmanFilter;
         const perfNow = this._toPerfNow(timestampMs);
-     
+    
         // Snapshot previous raw state BEFORE overwriting (fixes velocity-seed dt=0 bug)
         const prevRawLat       = this._rawLat;
         const prevRawLng       = this._rawLng;
         const prevRawTimestamp = this._rawTimestamp;
-     
+    
         const gpsVel = this._computeGPSVelocity(rawLat, rawLng, timestampMs);
         this._gpsVelocityDegPerSec = gpsVel;
         this._rawLat        = rawLat;
@@ -1394,7 +1417,7 @@ class SensorFusionManager {
         this._rawSpeedMPS   = gpsSpeedMPS;
         this._rawHeadingDeg = gpsHeadingDeg;
         this._rawTimestamp  = timestampMs;
-     
+    
         // Gap recovery: seed velocity from position delta after long pause.
         // Runs BEFORE kf.update() so it reads kf.lastTimestamp before this
         // tick's update() advances it — the gap-length check needs the
@@ -1409,16 +1432,30 @@ class SensorFusionManager {
                 );
             }
         }
-     
+    
+        // ── Stationary/moving decision BEFORE kf.update() ──
+        // If this fix triggers an exit from stationary, _updateStationaryState
+        // unfreezes the filter and re-inflates position covariance — and the
+        // update() below then takes the NORMAL branch with this real
+        // measurement, so the marker moves on this very fix. (Previously the
+        // exit frame was consumed by the frozen branch and the marker stayed
+        // pinned for one extra GPS period.)
+        // Passes last frame's filtered speed: it's 0 while frozen (the
+        // stationary branch below zeroes it), and one stale frame is
+        // irrelevant to the sustained thresholds used for entry.
+        const isStationary = this._updateStationaryState(
+            gpsSpeedMPS, this._filteredSpeedMPS || 0, rawLat, rawLng
+        );
+    
         const kfResult = kf.update(rawLat, rawLng, accuracyMeters, perfNow, gpsSpeedMPS);
-     
+    
         // kfResult.updateCount === 1 means kf.update() just called _initialize()
         // this tick — covers the filter's very first init AND every reset path
         // (dt<=0/dt>30 inside update(), plus external kf.reset() calls from
         // _handleGPSGap, _resetMapToPosition, and _runSensorFusion's jump
         // guard).
         if (kfResult.updateCount === 1) { this._convergenceStage = 0; }
-     
+    
         // Seed consumption moved here — AFTER kf.update(), not before.
         if (kf._justInitialized) {
             let seeded = false;
@@ -1447,17 +1484,16 @@ class SensorFusionManager {
             }
             kf._justInitialized = false;
         }
-     
+    
         this._filteredSpeedMPS = kf.getSpeedMPS();
-        const isStationary = this._updateStationaryState(gpsSpeedMPS, this._filteredSpeedMPS, rawLat, rawLng);
-     
+    
         if      (kfResult.isConverged && this._convergenceStage < 2)      { this._convergenceStage = 2; }
         else if (kfResult.updateCount >= 3 && this._convergenceStage < 1) { this._convergenceStage = 1; }
         if (gpsSpeedMPS > 1.0 && kfResult.updateCount >= 2) { this._convergenceStage = Math.max(this._convergenceStage, 1); }
-     
+    
         let resultLat, resultLng, resultVNorth, resultVEast, resultSpeed;
         let blendFactor = kfResult.blendFactor;
-     
+    
         if (isStationary && this._stationaryPosition) {
             resultLat = this._stationaryPosition.lat; resultLng = this._stationaryPosition.lng;
             resultVNorth = 0; resultVEast = 0; resultSpeed = 0; blendFactor = 1.0;
@@ -1476,10 +1512,10 @@ class SensorFusionManager {
             resultLat = kfResult.lat; resultLng = kfResult.lng;
             resultVNorth = kfResult.vNorth; resultVEast = kfResult.vEast; resultSpeed = kfResult.speedMPS;
         }
-     
+    
         this._lastKalmanLat = resultLat; this._lastKalmanLng = resultLng;
         this._lastKalmanTimestamp = perfNow; this._rawVelocity = gpsVel;
-     
+    
         return {
             lat: resultLat, lng: resultLng,
             vNorth: resultVNorth, vEast: resultVEast, speedMPS: resultSpeed,
@@ -1488,7 +1524,7 @@ class SensorFusionManager {
             isFrozen: isStationary
         };
     }
-
+    
     getSmoothedVelocityDegPerSec() {
         if (this._convergenceStage < 2) return this._rawVelocity;
         const vel = this._getHybridVelocity();
