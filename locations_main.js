@@ -153,7 +153,7 @@ const locations = [
         additionalInfo: "In 1976, Swede Hollow was transformed into a nature sanctuary with trails and signs commemorating the communities that once lived there.",
         difficulty: 2
     },
-
+/*
     {
         id: "1018",
         lat: 44.95656826495145,
@@ -172,7 +172,7 @@ const locations = [
         additionalInfo: "After serving as Minnesota's governor, Merriam was appointed by President McKinley to direct the U.S. Census Bureau in 1899.",
         difficulty: 1
     },
-
+*/
     {
         id: "1019",
         lat: 45.08421675605315,
