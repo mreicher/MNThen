@@ -2935,31 +2935,112 @@ const trackedTimeouts = new Set();
    GPS POWER MODE 
    ────────────────────────────────────────────── */
     function getWatchOptions() {
-        const speedMPH = (window.lastPosition?.speedMPS ?? 0) * 2.23694;
-
-        // Match the authoritative stationary signal used elsewhere (see
-        // deadReckoning's _isStationary()) instead of window.isStationary alone.
-        // Nothing in the app assigns window.isStationary directly — the real
-        // value lives on sensorFusion._lastStationaryState — so reading it by
-        // itself here meant this was always `undefined`, which silently
-        // collapsed the driving hysteresis below into just `speedMPH >= 4`.
-        const isStationaryFlag = window.sensorFusion?._lastStationaryState ?? window.isStationary;
-
-        const stationary = isStationaryFlag || speedMPH < 0.3;
-        const driving    = speedMPH >= 5 || (!isStationaryFlag && speedMPH >= 4);
-        const highSpeed  = speedMPH >= 45;
-     
-        const maximumAge = stationary ? 5000
-                          : highSpeed  ? 0
-                          : driving    ? 250
-                          :              2000; // walking / low-speed transitional
-     
-        return {
-            enableHighAccuracy: true,
-            maximumAge,
-            timeout: stationary ? 20000 : driving ? 10000 : 15000,
+    // ── 1. Initialise persistent state (once) ──────────────────────────────
+    if (!window._watchOptsState) {
+        window._watchOptsState = {
+            lastCall: 0,
+            sustainedState: null,   // 'stationary' | 'driving' | 'highSpeed' | 'walking'
+            stateSince: 0,          // timestamp when current sustainedState began
+            prevMaxAge: 5000,     // last maximumAge we returned
+            speedHistory: [],     // ring buffer for smoothing
         };
     }
+    const s = window._watchOptsState;
+    const now = performance.now();
+
+    // ── 2. Resolve inputs (unchanged contract, but more robust) ──────────────
+    const rawSpeedMPS = window.lastPosition?.speedMPS ?? 0;
+    const speedMPH = rawSpeedMPS * 2.23694;
+
+    // Prefer the authoritative stationary signal; fall back gracefully.
+    const isStationaryFlag = window.sensorFusion?._lastStationaryState ?? window.isStationary ?? false;
+
+    // ── 3. Smooth speed with a small ring buffer (reduces GPS jitter) ──────
+    const HISTORY_MS = 2000;
+    s.speedHistory.push({ t: now, mph: speedMPH });
+    s.speedHistory = s.speedHistory.filter(p => now - p.t <= HISTORY_MS);
+    const avgSpeed = s.speedHistory.reduce((a, p) => a + p.mph, 0) / (s.speedHistory.length || 1);
+
+    // ── 4. Determine instantaneous activity class (with dead-zones) ───────
+    // Hysteresis bands prevent flickering when hovering near a threshold.
+    let instant;
+    if (isStationaryFlag || avgSpeed < 0.2) {           // tighter than 0.3 for entry
+        instant = 'stationary';
+    } else if (avgSpeed >= 48) {                        // high-speed entry threshold
+        instant = 'highSpeed';
+    } else if (avgSpeed >= 5.5) {                       // driving entry threshold
+        instant = 'driving';
+    } else if (avgSpeed <= 3.5 && !isStationaryFlag) {  // driving exit threshold
+        instant = 'walking';
+    } else {
+        // Inside a hysteresis band — keep whatever we last thought
+        instant = s.sustainedState || 'walking';
+    }
+
+    // ── 5. Require temporal persistence before flipping sustainedState ─────
+    const PERSIST_MS = {
+        stationary: 1500,   // quick to believe we've stopped
+        driving: 3000,      // avoid "driving" during brief GPS noise spikes
+        highSpeed: 2000,
+        walking: 1500,
+    };
+
+    if (instant === s.sustainedState) {
+        s.stateSince = now; // reset the timer while we stay here
+    } else if (now - s.stateSince > PERSIST_MS[instant]) {
+        s.sustainedState = instant;
+        s.stateSince = now;
+    }
+    // If not persisted long enough, s.sustainedState stays as-is.
+
+    const state = s.sustainedState || instant;
+
+    // ── 6. Compute options with adaptive, non-jittery values ───────────────
+    // maximumAge: how stale a cached fix may be before we demand a new one.
+    // timeout: how long to wait for a fresh fix before erroring.
+    const opts = (() => {
+        switch (state) {
+            case 'highSpeed':
+                return {
+                    enableHighAccuracy: true,
+                    maximumAge: 0,          // always fresh at 45+ mph
+                    timeout: 8000,          // slightly tighter; high-speed fixes arrive fast
+                };
+            case 'driving':
+                return {
+                    enableHighAccuracy: true,
+                    maximumAge: 250,
+                    timeout: 10000,
+                };
+            case 'stationary':
+                return {
+                    enableHighAccuracy: true,
+                    maximumAge: 8000,       // relaxed: no need to hammer GPS while parked
+                    timeout: 30000,         // very patient; saves battery
+                };
+            case 'walking':
+            default:
+                return {
+                    enableHighAccuracy: true,
+                    maximumAge: 1500,       // snappier than original 2000 for UX
+                    timeout: 15000,
+                };
+        }
+    })();
+
+    // ── 7. Rate-limit maximumAge changes (prevents option-flapping) ────────
+    // If we just flipped from high-speed to stationary, we don't instantly jump
+    // to 8s maxAge; we decay gradually so Leaflet/geolocation doesn't thrash.
+    const maxAgeDelta = opts.maximumAge - s.prevMaxAge;
+    const MAX_DELTA_PER_CALL = 1500; // ms change per invocation
+    if (Math.abs(maxAgeDelta) > MAX_DELTA_PER_CALL) {
+        opts.maximumAge = s.prevMaxAge + Math.sign(maxAgeDelta) * MAX_DELTA_PER_CALL;
+    }
+    s.prevMaxAge = opts.maximumAge;
+    s.lastCall = now;
+
+    return opts;
+}
 
 /* ──────────────────────────────────────────────
    POSITION UPDATES — GPS watch + power manager
