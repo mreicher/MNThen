@@ -2730,7 +2730,18 @@ const trackedTimeouts = new Set();
 /* ──────────────────────────────────────────────
    USER LOCATION INITIALIZATION
    ────────────────────────────────────────────── */
-   function initializeUserLocation(position) {
+    const LOC_INIT_MAP_ZOOM              = 17;
+    const LOC_INIT_MARKER_RETRY_BASE_MS  = 100;
+    const MAX_MARKER_RETRIES             = 3;
+    const MAX_RECOVERY_ATTEMPTS          = 3;
+    const RECOVERY_BACKOFF_CAP_MS        = 15000;
+    const RECOVERY_WATCH_RETRY_MS        = 3000;
+    const MOTION_SPEED_THRESHOLD_MPS     = 0.3;
+    const KALMAN_VELOCITY_VARIANCE_KNOWN_HEADING   = 10.0;
+    const KALMAN_VELOCITY_VARIANCE_UNKNOWN_HEADING = 50.0;
+    const GEO_HIGH_ACCURACY_TIMEOUT_MS   = 15000;
+    
+    function initializeUserLocation(position) {
         // ── Consume warm-start fix if it's better than what we were handed ──
         position = window._consumeWarmupPosition?.(position) ?? position;
     
@@ -2754,7 +2765,9 @@ const trackedTimeouts = new Set();
             return;
         }
     
-        // Defer if another init is in flight.
+        // Defer if another init is in flight (including while we're waiting
+        // on a marker-retry timeout — see below). Only the most recent
+        // position is kept; it'll be picked up when init resumes.
         if (window._initializationInProgress) {
             window._pendingInitPosition = position;
             return;
@@ -2769,18 +2782,27 @@ const trackedTimeouts = new Set();
             announceToScreenReader(msg);
         }
     
+        // Tracks whether THIS call is the one that triggered startHunt /
+        // startIdleProximityCheck, so a later throw only rolls back flags
+        // this call actually set (see catch block).
+        let huntStartedByThisCall = false;
+        let proximityCheckStartedByThisCall = false;
+    
         try {
-            // Marker may not be ready yet — retry up to 3 times with backoff.
+            // Marker may not be ready yet — retry up to MAX_MARKER_RETRIES times
+            // with backoff. Stay "in progress" the whole time so any position
+            // that arrives meanwhile is queued via _pendingInitPosition instead
+            // of starting a concurrent init pass.
             if (!userMarker) {
                 window._markerRetryCount = (window._markerRetryCount || 0) + 1;
     
-                if (window._markerRetryCount <= 3) {
-                    window._initializationInProgress = false;
+                if (window._markerRetryCount <= MAX_MARKER_RETRIES) {
                     createTrackedTimeout(() => {
                         const pos = window._pendingInitPosition || position;
                         window._pendingInitPosition = null;
+                        window._initializationInProgress = false;
                         initializeUserLocation(pos);
-                    }, 100 * window._markerRetryCount);
+                    }, LOC_INIT_MARKER_RETRY_BASE_MS * window._markerRetryCount);
                     return;
                 }
     
@@ -2794,7 +2816,7 @@ const trackedTimeouts = new Set();
             userMarker.setLatLng([lat, lng]);
     
             if (!map) throw new Error('Map not initialized');
-            map.setView([lat, lng], 17, { animate: false });
+            map.setView([lat, lng], LOC_INIT_MAP_ZOOM, { animate: false });
     
             // Seed position buffer with a single entry for a clean Kalman baseline.
             seedPositionBuffer?.({
@@ -2807,26 +2829,35 @@ const trackedTimeouts = new Set();
             // Seed Kalman velocity if GPS already reports motion, skipping cold-start lag.
             const kf = window.sensorFusion?._kalmanFilter;
             if (kf) {
-                if (speed > 0.3 && heading != null && isFinite(heading)) {
+                if (speed > MOTION_SPEED_THRESHOLD_MPS && heading != null && isFinite(heading)) {
                     const rad = heading * Math.PI / 180;
-                    kf.seedVelocity(speed * Math.cos(rad), speed * Math.sin(rad), 10.0);
-                } else if (speed > 0.3) {
-                    kf.seedVelocity(0, 0, 50.0); // Speed known, heading unknown — high variance
+                    kf.seedVelocity(
+                        speed * Math.cos(rad),
+                        speed * Math.sin(rad),
+                        KALMAN_VELOCITY_VARIANCE_KNOWN_HEADING
+                    );
+                } else if (speed > MOTION_SPEED_THRESHOLD_MPS) {
+                    // Speed known, heading unknown — high variance
+                    kf.seedVelocity(0, 0, KALMAN_VELOCITY_VARIANCE_UNKNOWN_HEADING);
                 }
-                // speed ≤ 0.3 m/s: zero-velocity init is correct, do nothing.
+                // speed <= threshold: zero-velocity init is correct, do nothing.
             }
     
             hideLoadingMessage?.();
     
             if (typeof startHunt === 'function' && !window._huntStarted) {
-                window._huntStarted = true;
                 startHunt();
+                huntStartedByThisCall = true;
             }
     
             if (typeof startIdleProximityCheck === 'function' && !window._proximityCheckStarted) {
-                window._proximityCheckStarted = true;
                 startIdleProximityCheck();
+                proximityCheckStartedByThisCall = true;
             }
+    
+            // Commit side-effect flags only now that nothing above threw.
+            if (huntStartedByThisCall) window._huntStarted = true;
+            if (proximityCheckStartedByThisCall) window._proximityCheckStarted = true;
     
             window._initializationComplete  = true;
             window._initializationInProgress = false;
@@ -2838,19 +2869,14 @@ const trackedTimeouts = new Set();
             if (watchId === null) {
                 createTrackedTimeout(() => {
                     if (!window.positionWatchId) startPositionUpdates();
-                }, 3000);
+                }, RECOVERY_WATCH_RETRY_MS);
             }
     
             // Apply any position that queued while init was in flight.
-            // Previously this only moved the marker — it skipped the same range
-            // validation the primary position gets above, and never touched
-            // sensorFusion/Kalman state, so the marker could visually jump to a
-            // coordinate that the rest of the app (dead reckoning, distance
-            // checks) didn't know about, causing a jump-then-snap-back glitch
-            // on the next real update. Route it through the normal ongoing
-            // update pipeline if one exists, so displayed position and internal
-            // state stay in sync; fall back to the original marker-only move
-            // (now with matching validation) if that pipeline isn't available.
+            // Routed through the normal ongoing update pipeline (with the same
+            // range validation the primary position gets above) so displayed
+            // position and internal sensorFusion/Kalman state stay in sync;
+            // falls back to a marker-only move if that pipeline isn't available.
             const pending = window._pendingInitPosition;
             if (pending) {
                 window._pendingInitPosition = null;
@@ -2859,7 +2885,7 @@ const trackedTimeouts = new Set();
                 const pendingValid = pLat != null && pLng != null &&
                     !isNaN(pLat) && !isNaN(pLng) &&
                     Math.abs(pLat) <= 90 && Math.abs(pLng) <= 180;
-
+    
                 if (pendingValid) {
                     if (typeof updateUserLocation === 'function') {
                         updateUserLocation(pending);
@@ -2873,23 +2899,30 @@ const trackedTimeouts = new Set();
             console.error('Location initialization error:', err);
             window._initializationInProgress = false;
     
+            // Only roll back flags that THIS call set — if startHunt/
+            // startIdleProximityCheck already succeeded and were committed on a
+            // prior pass, a failure here must not cause them to be re-invoked
+            // on retry.
             if (!window._initializationComplete) {
-                window._huntStarted           = false;
-                window._proximityCheckStarted = false;
+                if (huntStartedByThisCall) window._huntStarted = false;
+                if (proximityCheckStartedByThisCall) window._proximityCheckStarted = false;
             }
     
             handleLocationError(err);
     
             window._initRecoveryAttempts = (window._initRecoveryAttempts || 0) + 1;
     
-            if (window._initRecoveryAttempts <= 3) {
-                const backoffMs = Math.min(15000, Math.pow(2, window._initRecoveryAttempts) * 1000);
+            if (window._initRecoveryAttempts <= MAX_RECOVERY_ATTEMPTS) {
+                const backoffMs = Math.min(
+                    RECOVERY_BACKOFF_CAP_MS,
+                    Math.pow(2, window._initRecoveryAttempts) * 1000
+                );
                 createTrackedTimeout(() => {
                     if (navigator.geolocation && !window._initializationComplete) {
                         navigator.geolocation.getCurrentPosition(
                             initializeUserLocation,
                             handleLocationError,
-                            { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+                            { enableHighAccuracy: true, timeout: GEO_HIGH_ACCURACY_TIMEOUT_MS, maximumAge: 0 }
                         );
                     }
                 }, backoffMs);
@@ -2906,9 +2939,30 @@ const trackedTimeouts = new Set();
 /* ──────────────────────────────────────────────
    GPS POWER MODE 
    ────────────────────────────────────────────── */
+  // ── Tunable thresholds (behavior-preserving except where noted below) ──────
+    const MPS_TO_MPH = 2.23694;
+    
+    const STATIONARY_SPEED_MPH_MAX   = 0.3;   // below this, treat as stationary regardless of flag
+    const DRIVING_SPEED_MPH_ENTER    = 5;     // speed needed to *enter* driving from stationary
+    const DRIVING_SPEED_MPH_SUSTAIN  = 4;     // lower speed that still counts as driving once already moving
+    const HIGH_SPEED_MPH             = 45;
+    // Sanity ceiling: if the stationary flag is stale (e.g. mid-transition) and
+    // raw speed is clearly in "high speed driving" territory, don't let the
+    // flag win — a 5s/20s cache at 45+ mph is stale enough to matter.
+    const STATIONARY_OVERRIDE_SPEED_MPH = HIGH_SPEED_MPH;
+    
+    const MAXAGE_STATIONARY_MS = 5000;
+    const MAXAGE_HIGH_SPEED_MS = 0;
+    const MAXAGE_DRIVING_MS    = 250;
+    const MAXAGE_DEFAULT_MS    = 2000; // walking / low-speed transitional
+    
+    const TIMEOUT_STATIONARY_MS = 20000;
+    const TIMEOUT_DRIVING_MS    = 10000;
+    const TIMEOUT_DEFAULT_MS    = 15000;
+    
     function getWatchOptions() {
-        const speedMPH = (window.lastPosition?.speedMPS ?? 0) * 2.23694;
-
+        const speedMPH = (window.lastPosition?.speedMPS ?? 0) * MPS_TO_MPH;
+    
         // Match the authoritative stationary signal used elsewhere (see
         // deadReckoning's _isStationary()) instead of window.isStationary alone.
         // Nothing in the app assigns window.isStationary directly — the real
@@ -2916,37 +2970,63 @@ const trackedTimeouts = new Set();
         // itself here meant this was always `undefined`, which silently
         // collapsed the driving hysteresis below into just `speedMPH >= 4`.
         const isStationaryFlag = window.sensorFusion?._lastStationaryState ?? window.isStationary;
-
-        const stationary = isStationaryFlag || speedMPH < 0.3;
-        const driving    = speedMPH >= 5 || (!isStationaryFlag && speedMPH >= 4);
-        const highSpeed  = speedMPH >= 45;
-     
-        const maximumAge = stationary ? 5000
-                          : highSpeed  ? 0
-                          : driving    ? 250
-                          :              2000; // walking / low-speed transitional
-     
+    
+        // If the flag says stationary but raw speed is clearly high-speed
+        // driving, trust the speed reading instead — a stale/lagging flag
+        // shouldn't force multi-second GPS caching while moving at highway speed.
+        const flagLooksStale = isStationaryFlag && speedMPH >= STATIONARY_OVERRIDE_SPEED_MPH;
+        const effectiveStationaryFlag = flagLooksStale ? false : isStationaryFlag;
+    
+        const stationary = effectiveStationaryFlag || speedMPH < STATIONARY_SPEED_MPH_MAX;
+        const driving     = speedMPH >= DRIVING_SPEED_MPH_ENTER ||
+            (!effectiveStationaryFlag && speedMPH >= DRIVING_SPEED_MPH_SUSTAIN);
+        const highSpeed   = speedMPH >= HIGH_SPEED_MPH;
+    
+        const maximumAge = stationary ? MAXAGE_STATIONARY_MS
+                          : highSpeed  ? MAXAGE_HIGH_SPEED_MS
+                          : driving    ? MAXAGE_DRIVING_MS
+                          :              MAXAGE_DEFAULT_MS;
+    
         return {
             enableHighAccuracy: true,
             maximumAge,
-            timeout: stationary ? 20000 : driving ? 10000 : 15000,
+            timeout: stationary ? TIMEOUT_STATIONARY_MS : driving ? TIMEOUT_DRIVING_MS : TIMEOUT_DEFAULT_MS,
         };
     }
             
 /* ──────────────────────────────────────────────
    POSITION UPDATES — GPS watch + power manager
    ────────────────────────────────────────────── */
-    function startPositionUpdates() {
+   // ── Tunable constants (behavior-preserving except where noted below) ───────
+const WATCH_TIER_POLL_INTERVAL_MS   = 250;
+const ONLINE_RESTART_DEBOUNCE_MS    = 500;
+
+// A tier change must be observed on this many consecutive polls before we
+// actually rebuild the watch, and rebuilds are further rate-limited by a
+// cooldown. Together these stop rapid watch teardown/recreate churn when
+// speed is jittering right at a tier boundary (e.g. ~45mph, ~4-5mph) —
+// churn that would itself reintroduce the staleness this mechanism exists
+// to prevent, since native GPS watches often need time to reacquire a lock
+// after being restarted.
+const WATCH_TIER_CONFIRM_POLLS      = 2;
+const WATCH_TIER_REBUILD_COOLDOWN_MS = 1000;
+
+function startPositionUpdates() {
     try {
         if (window.positionWatchId != null) {
             navigator.geolocation.clearWatch(window.positionWatchId);
             window.positionWatchId = null;
         }
         const opts = getWatchOptions();
-
         // Track which maximumAge this watch was created for, so we can detect
         // when the current motion tier no longer matches it.
         window._watchOptsMaximumAge = opts.maximumAge;
+        // A fresh watch means whatever tier drift we were tracking is moot —
+        // reset the confirmation counter so a stale pending change from
+        // before this rebuild can't immediately trigger another one.
+        window._watchTierPendingValue = undefined;
+        window._watchTierPendingCount = 0;
+        window._watchTierLastRebuildAt = Date.now();
 
         window.positionWatchId = navigator.geolocation.watchPosition(
             handlePositionUpdate,
@@ -2962,7 +3042,7 @@ const trackedTimeouts = new Set();
                     if (window.positionWatchId == null) {
                         startPositionUpdates();
                     }
-                }, 500);
+                }, ONLINE_RESTART_DEBOUNCE_MS);
             };
             const offlineHandler = () => {
                 if (window.onlineRestartTimeout) {
@@ -2977,24 +3057,41 @@ const trackedTimeouts = new Set();
                 memoryManager.trackEventListener(window, 'offline', offlineHandler);
             }
         }
-
         // GetWatchOptions()'s maximumAge is only ever read once, at watch
         // creation time, but watchPosition never re-checks it as speed changes.
         // Going stationary -> moving means the OS is still entitled to serve
         // up to 5s-stale fixes (the stationary tier's maximumAge) right when
         // fresh, tight fixes are needed — producing a lag, then a sudden
         // catch-up jump: the stutter. Poll the tier locally and rebuild the
-        // watch via startPositionUpdates() itself the moment it changes, so
-        // the browser is immediately told to tighten (or relax) maximumAge.
+        // watch via startPositionUpdates() itself once a change is confirmed
+        // over consecutive polls (and the cooldown has elapsed), so the
+        // browser is told to tighten (or relax) maximumAge without thrashing
+        // on single-sample jitter at a tier boundary.
         if (window._watchTierPollInterval == null) {
             window._watchTierPollInterval = setInterval(() => {
                 if (window.positionWatchId == null) return;
                 const currentOpts = getWatchOptions();
-                if (currentOpts.maximumAge !== window._watchOptsMaximumAge) {
+                if (currentOpts.maximumAge === window._watchOptsMaximumAge) {
+                    window._watchTierPendingValue = undefined;
+                    window._watchTierPendingCount = 0;
+                    return;
+                }
+
+                if (window._watchTierPendingValue === currentOpts.maximumAge) {
+                    window._watchTierPendingCount = (window._watchTierPendingCount || 0) + 1;
+                } else {
+                    window._watchTierPendingValue = currentOpts.maximumAge;
+                    window._watchTierPendingCount = 1;
+                }
+
+                const confirmed = window._watchTierPendingCount >= WATCH_TIER_CONFIRM_POLLS;
+                const cooldownElapsed = (Date.now() - (window._watchTierLastRebuildAt || 0))
+                    >= WATCH_TIER_REBUILD_COOLDOWN_MS;
+
+                if (confirmed && cooldownElapsed) {
                     startPositionUpdates();
                 }
-            }, 250);
-
+            }, WATCH_TIER_POLL_INTERVAL_MS);
             if (typeof memoryManager?.registerCleanupTask === 'function') {
                 memoryManager.registerCleanupTask(() => {
                     if (window._watchTierPollInterval != null) {
@@ -3004,7 +3101,6 @@ const trackedTimeouts = new Set();
                 });
             }
         }
-
         return window.positionWatchId;
     } catch (err) {
         console.error('Geolocation unavailable:', err);
@@ -3016,17 +3112,23 @@ const trackedTimeouts = new Set();
 /* ──────────────────────────────────────────────
    POSITION UPDATE HANDLER
    ────────────────────────────────────────────── */
-    function handlePositionUpdate(position) {
+ // ── Tunable constants (behavior-preserving) ─────────────────────────────────
+const STALE_POSITION_MAX_AGE_MS       = 30_000;
+const BACKGROUND_UPDATE_THROTTLE_MS   = 30_000;
+const DEFAULT_ACCURACY_M              = 20;
+const IS_MOVING_SPEED_THRESHOLD_MPS   = 0.5;
+const HIGH_SPEED_UPDATE_THRESHOLD_MPS = 10; // ~22 mph; passed through to updateUserLocation
+
+function handlePositionUpdate(position) {
     // 1. Validation & Stale Data Guard
     if (!position?.coords || isNaN(position.coords.latitude) || isNaN(position.coords.longitude)) return;
-
     const positionTimestamp = position.timestamp || Date.now();
     const currentTime = Date.now();
-    if (currentTime - positionTimestamp > 30_000) return;
+    if (currentTime - positionTimestamp > STALE_POSITION_MAX_AGE_MS) return;
 
     // 2. Background Throttling
     if (document.hidden) {
-        if (window._lastBackgroundUpdate && currentTime - window._lastBackgroundUpdate < 30_000) return;
+        if (window._lastBackgroundUpdate && currentTime - window._lastBackgroundUpdate < BACKGROUND_UPDATE_THROTTLE_MS) return;
         window._lastBackgroundUpdate = currentTime;
     }
 
@@ -3037,16 +3139,25 @@ const trackedTimeouts = new Set();
     const rawAccuracy = position.coords.accuracy;
     const accuracy = (typeof rawAccuracy === 'number' && isFinite(rawAccuracy) && rawAccuracy >= 0)
         ? rawAccuracy
-        : 20;
+        : DEFAULT_ACCURACY_M;
 
-    window.lastValidPosition = {
+    const latestPosition = {
         lat: rawLat,
         lng: rawLng,
         timestamp: positionTimestamp,
         accuracy: accuracy,
         speedMPS: rawSpeedMPS,
-        isMoving: rawSpeedMPS > 0.5
+        isMoving: rawSpeedMPS > IS_MOVING_SPEED_THRESHOLD_MPS
     };
+
+    // Keep the existing name other code may already read...
+    window.lastValidPosition = latestPosition;
+    // ...and alias it under the name getWatchOptions() actually reads.
+    // These previously diverged (this function only wrote lastValidPosition,
+    // getWatchOptions() only reads lastPosition), so window.lastPosition was
+    // always undefined and getWatchOptions() silently treated every update
+    // as stationary (speedMPH defaulted to 0), regardless of real speed.
+    window.lastPosition = latestPosition;
 
     // 4. Let updateUserLocation handle everything
     // It will call _scheduleUnifiedRender -> _executeRender
@@ -3061,88 +3172,110 @@ const trackedTimeouts = new Set();
             heading: position.coords.heading,
             speed: rawSpeedMPS
         }
-    }, rawSpeedMPS > 10);
+    }, rawSpeedMPS > HIGH_SPEED_UPDATE_THRESHOLD_MPS);
 }
         
 /* ──────────────────────────────────────────────
    VISIBILITY CHANGE HANDLER
    ────────────────────────────────────────────── */
-   function handleVisibilityChange() {
-        if (document.hidden) {
-            // Tab/app going to background
-            window.lastHiddenTime = Date.now();
-            lastKnownPosition = userMarker?.getLatLng() ?? null;
-            resetInactivityTimer(false);
-    
-            disposeMapLoop();
-            // disposeMapLoop() only reaches window-scoped RAF/timeout/interval
-            // handles — dead reckoning's animation loop is a closure-private id
-            // that's never exposed on window (same gap we found in initMap()),
-            // so without this it keeps running, invisibly, while backgrounded.
-            if (window.deadReckoning && typeof window.deadReckoning.stop === 'function') {
-                window.deadReckoning.stop();
-            }
-            window.isReWaking = false;
-    
-            if (window.visibilityDebounceTimer) {
-                clearTimeout(window.visibilityDebounceTimer);
-                window.visibilityDebounceTimer = null;
-            }
-        } else {
-            // Tab/app returning to foreground
-            const awayMs = Date.now() - (window.lastHiddenTime || 0);
-            const threshold = CONFIG?.BACKGROUND_THRESHOLD ?? 30_000;
-    
-            // Cancel any pending debounce
-            if (window.visibilityDebounceTimer) {
-                clearTimeout(window.visibilityDebounceTimer);
-                window.visibilityDebounceTimer = null;
-            }
-    
-            // disposeMapLoop() runs unconditionally on every hide, regardless of
-            // how long the absence turns out to be, and it clears
-            // _idleProximityCheckInterval along with everything else. The only
-            // place that normally (re)starts it — initializeUserLocation — is
-            // gated by a one-shot `_proximityCheckStarted` latch that's never
-            // reset, so without this call idle proximity checking would die
-            // permanently after the very first tab switch, short or long.
-            // startIdleProximityCheck() has its own idempotent guard
-            // (no-ops if already running), so it's always safe to call here.
-            if (typeof startIdleProximityCheck === 'function') {
-                startIdleProximityCheck();
-            }
-    
-            if (awayMs > threshold) {
-                // Debounce to handle rapid tab switches
-                window.visibilityDebounceTimer = createTrackedTimeout(() => {
-                    window.visibilityDebounceTimer = null;
-    
-                    // Recalculate time away to ensure freshness
-                    const currentAwayMs = Date.now() - (window.lastHiddenTime || 0);
-                    if (currentAwayMs <= threshold) return;
-    
-                    if (window.isReWaking) return;
-    
-                    window.isReWaking = true;
-    
-                    Promise.resolve(updateLocationAfterBackground())
-                        .catch((error) => {
-                            console.error("Background location update failed:", error);
-                        })
-                        .finally(() => {
-                            createTrackedTimeout(() => { window.isReWaking = false; }, 2000);
-                        });
-                }, 500);
-            } else {
-                // Short absence → immediate refresh
-                if (map && lastKnownPosition) {
-                    map.invalidateSize({ pan: false });
-                    userMarker?.setLatLng(lastKnownPosition);
-                }
-            }
-            resetInactivityTimer(true);
+ // ── Tunable constants (behavior-preserving) ─────────────────────────────────
+const DEFAULT_BACKGROUND_THRESHOLD_MS = 30_000;
+const VISIBILITY_DEBOUNCE_MS          = 500;
+const REWAKE_LOCKOUT_MS               = 2000;
+
+function handleVisibilityChange() {
+    if (document.hidden) {
+        // Tab/app going to background
+        window.lastHiddenTime = Date.now();
+        lastKnownPosition = userMarker?.getLatLng() ?? null;
+        resetInactivityTimer(false);
+
+        disposeMapLoop();
+        // disposeMapLoop() only reaches window-scoped RAF/timeout/interval
+        // handles — dead reckoning's animation loop is a closure-private id
+        // that's never exposed on window (same gap we found in initMap()),
+        // so without this it keeps running, invisibly, while backgrounded.
+        if (window.deadReckoning && typeof window.deadReckoning.stop === 'function') {
+            window.deadReckoning.stop();
         }
+        window.isReWaking = false;
+
+        if (window.visibilityDebounceTimer) {
+            clearTimeout(window.visibilityDebounceTimer);
+            window.visibilityDebounceTimer = null;
+        }
+    } else {
+        // Tab/app returning to foreground
+        const awayMs = Date.now() - (window.lastHiddenTime || 0);
+        const threshold = CONFIG?.BACKGROUND_THRESHOLD ?? DEFAULT_BACKGROUND_THRESHOLD_MS;
+
+        // Cancel any pending debounce
+        if (window.visibilityDebounceTimer) {
+            clearTimeout(window.visibilityDebounceTimer);
+            window.visibilityDebounceTimer = null;
+        }
+
+        // disposeMapLoop() and deadReckoning.stop() run unconditionally on
+        // every hide above, regardless of how long the absence turns out to
+        // be — but only the long-absence branch below calls
+        // updateLocationAfterBackground(), which is the only other place
+        // that might restart them. That left short absences (the common
+        // case: alt-tab, a notification, switching apps briefly) with the
+        // map loop and dead reckoning torn down and never restarted —
+        // permanently dead after the very first short tab switch, same
+        // failure shape as the proximity-check latch bug. Restart both here,
+        // unconditionally, before branching on duration, so every foreground
+        // transition resumes them regardless of what happens below.
+        // TODO: confirm `startMapLoop` is the actual counterpart to
+        // disposeMapLoop() in this codebase — name is inferred, not verified.
+        if (typeof startMapLoop === 'function') {
+            startMapLoop();
+        }
+        if (window.deadReckoning && typeof window.deadReckoning.start === 'function') {
+            window.deadReckoning.start();
+        }
+
+        // The only place that normally (re)starts idle proximity checking —
+        // initializeUserLocation — is gated by a one-shot `_proximityCheckStarted`
+        // latch that's never reset, so without this call idle proximity
+        // checking would die permanently after the very first tab switch,
+        // short or long. startIdleProximityCheck() has its own idempotent
+        // guard (no-ops if already running), so it's always safe to call here.
+        if (typeof startIdleProximityCheck === 'function') {
+            startIdleProximityCheck();
+        }
+
+        if (awayMs > threshold) {
+            // Debounce to handle rapid tab switches
+            window.visibilityDebounceTimer = createTrackedTimeout(() => {
+                window.visibilityDebounceTimer = null;
+
+                // Recalculate time away to ensure freshness
+                const currentAwayMs = Date.now() - (window.lastHiddenTime || 0);
+                if (currentAwayMs <= threshold) return;
+
+                if (window.isReWaking) return;
+
+                window.isReWaking = true;
+
+                Promise.resolve(updateLocationAfterBackground())
+                    .catch((error) => {
+                        console.error("Background location update failed:", error);
+                    })
+                    .finally(() => {
+                        createTrackedTimeout(() => { window.isReWaking = false; }, REWAKE_LOCKOUT_MS);
+                    });
+            }, VISIBILITY_DEBOUNCE_MS);
+        } else {
+            // Short absence → immediate refresh
+            if (map && lastKnownPosition) {
+                map.invalidateSize({ pan: false });
+                userMarker?.setLatLng(lastKnownPosition);
+            }
+        }
+        resetInactivityTimer(true);
     }
+}
 
 /* ──────────────────────────────────────────────
    BACKGROUND LOCATION UPDATE
@@ -3379,34 +3512,58 @@ const trackedTimeouts = new Set();
 /* ──────────────────────────────────────────────
    POSITION BUFFER
    ────────────────────────────────────────────── */
-        function seedPositionBuffer(seedPosition, count) {
-        if (!seedPosition || typeof seedPosition.lat !== 'number' || typeof seedPosition.lng !== 'number') return;
-        
-        if (!Array.isArray(window.positionBuffer)) {
-            window.positionBuffer = [];
-        }
-        
-        const bufferTimestamp = seedPosition.timestamp || Date.now();
-        
-        const heading = window.sensorFusion?.getFilteredHeading() ?? seedPosition.heading ?? null;
-        const speedMPS = window.sensorFusion?.getFilteredSpeedMPS() ?? seedPosition.speedMPS ?? 0;
-        
-        const seed = {
-            lat: seedPosition.lat,
-            lng: seedPosition.lng,
-            accuracy: seedPosition.accuracy,
-            timestamp: bufferTimestamp,
-            heading: typeof heading === 'number' ? heading : null,
-            speedMPS: typeof speedMPS === 'number' && speedMPS >= 0 ? speedMPS : 0
-        };
-    
-        const n = Number.isFinite(count) && count > 0 ? Math.floor(count) : 1;
-    
-        window.positionBuffer.length = 0;
-        for (let i = 0; i < n; i++) {
-            window.positionBuffer.push({ ...seed });
-        }
+    // ── Tunable constants (behavior-preserving except where noted below) ───────
+const DEFAULT_SEED_ACCURACY_M = 20; // mirrors DEFAULT_ACCURACY_M in handlePositionUpdate
+const DEFAULT_SEED_COUNT      = 1;
+
+function seedPositionBuffer(seedPosition, count) {
+    if (!seedPosition || typeof seedPosition.lat !== 'number' || typeof seedPosition.lng !== 'number') return;
+
+    if (!Array.isArray(window.positionBuffer)) {
+        window.positionBuffer = [];
     }
+
+    const bufferTimestamp = seedPosition.timestamp || Date.now();
+
+    // Prefer the raw value actually passed in for THIS seed over
+    // sensorFusion's filtered getters. This function exists to seed a clean
+    // Kalman baseline — typically called before the filter has fused
+    // anything — so querying the fusion system's own filtered output here is
+    // circular, and if sensorFusion is a singleton that isn't reset between
+    // sessions, its getters can return stale heading/speed from a previous
+    // track. The fresh, explicit seedPosition is the authoritative signal;
+    // sensorFusion is only a fallback for when the caller didn't supply one.
+    const rawHeading = typeof seedPosition.heading === 'number' && isFinite(seedPosition.heading)
+        ? seedPosition.heading
+        : null;
+    const heading = rawHeading ?? window.sensorFusion?.getFilteredHeading() ?? null;
+
+    const rawSpeedMPS = typeof seedPosition.speedMPS === 'number' && isFinite(seedPosition.speedMPS) && seedPosition.speedMPS >= 0
+        ? seedPosition.speedMPS
+        : null;
+    const speedMPS = rawSpeedMPS ?? window.sensorFusion?.getFilteredSpeedMPS() ?? 0;
+
+    const rawAccuracy = seedPosition.accuracy;
+    const accuracy = (typeof rawAccuracy === 'number' && isFinite(rawAccuracy) && rawAccuracy >= 0)
+        ? rawAccuracy
+        : DEFAULT_SEED_ACCURACY_M;
+
+    const seed = {
+        lat: seedPosition.lat,
+        lng: seedPosition.lng,
+        accuracy: accuracy,
+        timestamp: bufferTimestamp,
+        heading: typeof heading === 'number' ? heading : null,
+        speedMPS: typeof speedMPS === 'number' && speedMPS >= 0 ? speedMPS : 0
+    };
+
+    const n = Number.isFinite(count) && count > 0 ? Math.floor(count) : DEFAULT_SEED_COUNT;
+
+    window.positionBuffer.length = 0;
+    for (let i = 0; i < n; i++) {
+        window.positionBuffer.push({ ...seed });
+    }
+}
             
       function getSpeedBasedZoom(speedMPS, closestDistance) {
         const distanceFeet = (closestDistance ?? Infinity) * 3.28084;
