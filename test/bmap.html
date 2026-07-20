@@ -1617,19 +1617,8 @@ window.sensorFusion = new SensorFusionManager().init();
         PAN_DURATION_BASE:    0.22,
         PAN_DURATION_FAST:    0.10,
         FREE_MIN_PAN_M:       4.0,
-        // Roaming safety-net tuning. Below the walking ceiling, panning/
-        // zooming away from the dot while moving is left alone entirely —
-        // that's "looking around" and is intentional. At/above the ceiling
-        // (driving speed), if the dot gets within ROAM_EDGE_MARGIN_PX_DRIVE
-        // of leaving the visible map, follow mode is restored automatically
-        // so the dot can't silently vanish off-screen while driving.
         ROAM_WALK_SPEED_CEILING_MPS: 2.0,   // ~4.5 mph
         ROAM_EDGE_MARGIN_PX_DRIVE:   60,
-        // _seedVelocityOnResume() is allowed to use them to seed the Kalman
-        // filter. Previously unbounded — a restart after any idle period
-        // (or a direction change while stopped) could seed the filter with
-        // an arbitrarily stale, wrong-direction velocity, causing the
-        // marker to visibly jump/stutter the instant motion resumed.
         RESUME_SEED_MAX_AGE_MS: 1500
     };
 
@@ -1656,6 +1645,8 @@ window.sensorFusion = new SensorFusionManager().init();
 
     let _centeredLat = null;
     let _centeredLng = null;
+    
+    let _markerIconEl = null;
 
     const _now = () => performance.now();
 
@@ -1726,26 +1717,57 @@ window.sensorFusion = new SensorFusionManager().init();
         }
         return _markerEl;
     }
+    
+    function _getMarkerIconEl() {
+        if (_markerIconEl && _markerIconEl.isConnected) return _markerIconEl;
+        const el = _getMarkerEl();
+        _markerIconEl = el ? el.querySelector('.user-marker-icon') : null;
+        return _markerIconEl;
+    }
+    
+    function _applyMarkerOffset(dx, dy) {
+        const icon = _getMarkerIconEl();
+        if (icon) icon.style.transform = 'translate3d(' + dx + 'px,' + dy + 'px,0)';
+    }
+    
+    function _resetMarkerOffset() {
+        const icon = _getMarkerIconEl();
+        if (icon) icon.style.transform = '';
+    }
 
     function _setMarkerPosition(lat, lng) {
         if (typeof userMarker !== 'undefined' && userMarker) {
             var el = userMarker.getElement ? userMarker.getElement() : null;
             if (el) {
                 el.style.transition = 'none';
-                var icon = el.querySelector('.user-marker-icon');
-                if (icon) icon.style.transition = 'none';
+                var icon = _getMarkerIconEl();
+                if (icon) {
+                    icon.style.transition = 'none';
+                    icon.style.transform = '';   // clear sub-pixel offset
+                }
             }
             userMarker.setLatLng([lat, lng]);
         }
     }
 
-    function _snapViewport(lat, lng) {
+      function _snapViewport(lat, lng) {
         if (!map) return;
+    
         if (_centeredLat !== null) {
             const prevPx = map.latLngToContainerPoint([_centeredLat, _centeredLng]);
             const nextPx = map.latLngToContainerPoint([lat, lng]);
             const pxDist = Math.hypot(nextPx.x - prevPx.x, nextPx.y - prevPx.y);
+    
+            // Skip sub-pixel snaps. Leaflet rounds pan offsets to whole pixels
+            // (Map.panBy: offset = point(offset).round()), so a sub-pixel setView
+            // moves nothing or 1px — but always fires the full move/moveend/
+            // viewreset chain: markercluster re-bounds, tile-layer update pass,
+            // interaction handlers. 60x/sec of that while standing still is the
+            // stutter. Between snaps nothing moves, so the dot stays perfectly
+            // centered; 1px is below perception (this is how stock map apps pan).
+            if (pxDist < 1) return;
         }
+    
         _centeredLat = lat; _centeredLng = lng;
         map.setView([lat, lng], map.getZoom(), { animate: false, reset: false, pan: { noMoveStart: true } });
     }
@@ -1921,6 +1943,14 @@ window.sensorFusion = new SensorFusionManager().init();
             _snapViewport(hLat, hLng);
             const c = map.getCenter();
             _setMarkerPosition(c.lat, c.lng);
+        
+            // Sub-pixel correction. Leaflet snapped the map center to the
+            // nearest integer pixel; the predicted position is continuous.
+            // The remainder (< 1px) is applied as a GPU-composited transform
+            // on the marker icon so the dot glides between 1px map snaps.
+            const centerPx = map.latLngToContainerPoint(c);
+            const predPx   = map.latLngToContainerPoint([hLat, hLng]);
+            _applyMarkerOffset(predPx.x - centerPx.x, predPx.y - centerPx.y);
         } else if (window.followUser) {
             _setMarkerPosition(hLat, hLng);
             _snapViewport(hLat, hLng);
@@ -1953,6 +1983,7 @@ window.sensorFusion = new SensorFusionManager().init();
             _active = false; _panPending = false; _panTarget = null;
             _centeredLat = null; _centeredLng = null;
             window.__drHeld = null;
+            _resetMarkerOffset();
             const el = _getMarkerEl();
             if (el) { el.style.willChange = ''; el.style.transition = ''; _markerTransSet = false; }
         },
@@ -1979,7 +2010,7 @@ window.sensorFusion = new SensorFusionManager().init();
         },
 
         getPredictedPosition()  { return _lastPredictedPos; },
-        invalidateMarkerCache() { _markerEl = null; _markerTransSet = false; }
+        invalidateMarkerCache() { _markerEl = null; _markerIconEl = null; _markerTransSet = false; }
     };
 
     _start();
@@ -6532,7 +6563,6 @@ function initAudioPlayer() {
 
     // ─── Platform Detection ───────────────────────────────────────────────
     const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
-    // Removed unused isAndroid variable
 
     // ─── Save original source ─────────────────────────────────────────────
     if (audio.src && audio.src !== window.location.href && !audio.dataset.originalSrc) {
@@ -6550,6 +6580,11 @@ function initAudioPlayer() {
     let wasPlayingWhenHidden = false;
     let mediaSessionReady    = false;
 
+    // ─── Scrub handlers — function-scoped so cleanup() can remove them ────
+    let handleScrubStart = null;
+    let handleScrubMove  = null;
+    let handleScrubEnd   = null;
+
     // ─── Shared AudioContext ───────────────────────────────────────────────
     function getSharedAudioContext() {
         if (window._sharedAudioCtx && window._sharedAudioCtx.state !== 'closed') {
@@ -6563,7 +6598,6 @@ function initAudioPlayer() {
             const AC = window.AudioContext || window.webkitAudioContext;
             if (!AC) return null;
             window._sharedAudioCtx = new AC();
-
             if (isIOS) {
                 window._sharedAudioCtx.onstatechange = () => {
                     const ctx = window._sharedAudioCtx;
@@ -6588,7 +6622,6 @@ function initAudioPlayer() {
     function setupMediaSession() {
         if (mediaSessionReady || !('mediaSession' in navigator)) return;
         mediaSessionReady = true;
-
         try {
             navigator.mediaSession.metadata = new MediaMetadata({
                 title:  document.getElementById('locationTitle')?.textContent   || 'Minnesota Then',
@@ -6599,12 +6632,10 @@ function initAudioPlayer() {
                     { src: 'https://www.mnthen.com/images/icon-512.png', sizes: '512x512', type: 'image/png' }
                 ]
             });
-
             navigator.mediaSession.setActionHandler('play',         () => { if (audio.paused)  togglePlay(); });
             navigator.mediaSession.setActionHandler('pause',        () => { if (!audio.paused) togglePlay(); });
             navigator.mediaSession.setActionHandler('seekbackward', (d) => { seek(-(d.seekOffset || 10)); });
             navigator.mediaSession.setActionHandler('seekforward',  (d) => { seek(d.seekOffset || 10);   });
-
             updateMediaSessionPosition();
         } catch (e) {
             console.warn('[Audio] Media Session setup failed:', e);
@@ -6658,16 +6689,13 @@ function initAudioPlayer() {
                 lastPlaybackPosition = audio.currentTime;
                 throttledSavePosition(audio.currentTime);
             }
-
             if (userWantsPlayback) {
                 wasPlayingWhenHidden = true;
                 screenWentAway = true;
-
                 if (!audio.paused) {
                     audio.pause();
                 }
-
-                playPauseBtn.innerHTML = '<i class="bi bi-play" aria-hidden="true"></i>'; 
+                playPauseBtn.innerHTML = '<i class="bi bi-play" aria-hidden="true"></i>';
                 playPauseBtn.setAttribute('aria-label', 'Play');
                 releaseWakeLock();
             }
@@ -6678,7 +6706,6 @@ function initAudioPlayer() {
                      window._sharedAudioCtx.state === 'interrupted')) {
                     window._sharedAudioCtx.resume().catch(() => {});
                 }
-
                 setTimeout(() => {
                     if (screenWentAway && audio.paused) {
                         showSourcePopup(
@@ -6703,7 +6730,7 @@ function initAudioPlayer() {
 
     // ─── Audio Element Events ─────────────────────────────────────────────
     audio.addEventListener('play', () => {
-        playPauseBtn.innerHTML = '<i class="bi bi-pause" aria-hidden="true"></i>'; 
+        playPauseBtn.innerHTML = '<i class="bi bi-pause" aria-hidden="true"></i>';
         playPauseBtn.setAttribute('aria-label', 'Pause');
         if (typeof announceToScreenReader === 'function') {
             announceToScreenReader('Audio playback started');
@@ -6711,7 +6738,7 @@ function initAudioPlayer() {
     });
 
     audio.addEventListener('pause', () => {
-        playPauseBtn.innerHTML = '<i class="bi bi-play" aria-hidden="true"></i>'; 
+        playPauseBtn.innerHTML = '<i class="bi bi-play" aria-hidden="true"></i>';
         playPauseBtn.setAttribute('aria-label', 'Play');
         releaseWakeLock();
         if (typeof announceToScreenReader === 'function') {
@@ -6722,11 +6749,10 @@ function initAudioPlayer() {
     // ─── Core Playback Toggle ─────────────────────────────────────────────
     function togglePlay() {
         if (!isPlayerActive) return;
-
         const hasValidSrc = audio.src &&
-                            audio.src !== window.location.href &&
-                            audio.src !== '' &&
-                            audio.src !== 'about:blank';
+            audio.src !== window.location.href &&
+            audio.src !== '' &&
+            audio.src !== 'about:blank';
         if (!hasValidSrc) return;
 
         if (audio.paused) {
@@ -6735,11 +6761,8 @@ function initAudioPlayer() {
                 audio.currentTime = parseFloat(resumePos);
                 delete audio.dataset.resumePosition;
             }
-
             getSharedAudioContext();
-
             const playPromise = audio.play();
-
             if (playPromise !== undefined) {
                 playPromise
                     .then(() => {
@@ -6765,7 +6788,6 @@ function initAudioPlayer() {
     // ─── Error Handling ───────────────────────────────────────────────────
     function handlePlayError(error) {
         console.error('[Audio] Play failed:', error?.name, error?.message);
-
         releaseWakeLock();
         playPauseBtn.innerHTML = '<i class="bi bi-play" aria-hidden="true"></i>';
         playPauseBtn.setAttribute('aria-label', 'Play');
@@ -6793,7 +6815,7 @@ function initAudioPlayer() {
             retryCount++;
             setTimeout(() => attemptRecovery(), 1000 * retryCount);
         } else {
-            playPauseBtn.innerHTML = '<i class="bi bi-exclamation-triangle" aria-hidden="true"></i>'; 
+            playPauseBtn.innerHTML = '<i class="bi bi-exclamation-triangle" aria-hidden="true"></i>';
             playPauseBtn.setAttribute('aria-label', 'Audio Error');
             showSourcePopup(
                 'Audio Error',
@@ -6805,20 +6827,15 @@ function initAudioPlayer() {
     // ─── Recovery ─────────────────────────────────────────────────────────
     function attemptRecovery() {
         if (!isPlayerActive) return;
-
         console.log(`[Audio] Recovery attempt ${retryCount}/${maxRetries}`);
-
         const savedPos  = lastPlaybackPosition || 0;
         const targetSrc = audio.dataset.originalSrc || audio.getAttribute('data-src');
-
         if (targetSrc && (!audio.src || audio.src === window.location.href)) {
             audio.src = targetSrc;
         }
-
         if (audio.error || !audio.src || audio.src === window.location.href) {
             audio.load();
         }
-
         const onReady = () => {
             if (savedPos > 0 && !screenWentAway) {
                 audio.currentTime = savedPos;
@@ -6829,7 +6846,6 @@ function initAudioPlayer() {
             audio.removeEventListener('loadedmetadata', onReady);
             audio.removeEventListener('canplay', onReady);
         };
-
         audio.addEventListener('loadedmetadata', onReady);
         audio.addEventListener('canplay', onReady);
     }
@@ -6851,7 +6867,6 @@ function initAudioPlayer() {
         const percent = (audio.currentTime / audio.duration) * 100;
         progressBar.style.width = `${percent}%`;
         currentTimeSpan.textContent = formatTime(audio.currentTime);
-
         if (audio.currentTime > 0) {
             lastPlaybackPosition = audio.currentTime;
             throttledSavePosition(audio.currentTime);
@@ -6863,7 +6878,7 @@ function initAudioPlayer() {
         const rect = progressContainer.getBoundingClientRect();
         const clientX = e.clientX ?? e.touches?.[0]?.clientX;
         if (clientX === undefined || rect.width <= 0) return;
-        audio.currentTime = Math.max(0, Math.min(((clientX - rect.left) / rect.width) * audio.duration, audio.duration)); 
+        audio.currentTime = Math.max(0, Math.min(((clientX - rect.left) / rect.width) * audio.duration, audio.duration));
         updateMediaSessionPosition();
         if (typeof announceToScreenReader === 'function') {
             announceToScreenReader(`Jumped to ${formatTime(audio.currentTime)}`);
@@ -6894,17 +6909,14 @@ function initAudioPlayer() {
 
     audio.addEventListener('ended', () => {
         userWantsPlayback = false;
-        playPauseBtn.innerHTML = '<i class="bi bi-play" aria-hidden="true"></i>'; 
+        playPauseBtn.innerHTML = '<i class="bi bi-play" aria-hidden="true"></i>';
         playPauseBtn.setAttribute('aria-label', 'Play');
         releaseWakeLock();
         progressBar.style.width = '0%';
-
         try { localStorage.removeItem('audioPosition'); } catch (e) {}
-
         if ('mediaSession' in navigator) {
             navigator.mediaSession.playbackState = 'none';
         }
-
         if (typeof announceToScreenReader === 'function') {
             announceToScreenReader('Audio playback completed');
         }
@@ -6916,9 +6928,8 @@ function initAudioPlayer() {
     audio.addEventListener('error', (e) => {
         console.error('[Audio] Element error:', audio.error?.code, audio.error?.message);
         if (!isPlayerActive) return;
-
         releaseWakeLock();
-        playPauseBtn.innerHTML = '<i class="bi bi-play" aria-hidden="true"></i>'; 
+        playPauseBtn.innerHTML = '<i class="bi bi-play" aria-hidden="true"></i>';
         playPauseBtn.setAttribute('aria-label', 'Play');
 
         if (screenWentAway || wasPlayingWhenHidden) {
@@ -6935,7 +6946,7 @@ function initAudioPlayer() {
             retryCount++;
             setTimeout(() => attemptRecovery(), 1000 * retryCount);
         } else {
-            playPauseBtn.innerHTML = '<i class="bi bi-exclamation-triangle" aria-hidden="true"></i>'; 
+            playPauseBtn.innerHTML = '<i class="bi bi-exclamation-triangle" aria-hidden="true"></i>';
             playPauseBtn.setAttribute('aria-label', 'Audio Error');
             showSourcePopup(
                 'Audio Error',
@@ -6944,35 +6955,36 @@ function initAudioPlayer() {
         }
     });
 
-    // Added touch scrubbing support. The setProgress function 
-    // already handled e.touches, but the events were never bound!
+    // ─── Touch scrubbing ──────────────────────────────────────────────────
+    // Handlers are assigned (not declared) here so cleanup() — which lives
+    // outside this if-block — can reference and remove them.
     if (progressContainer) {
         progressContainer.addEventListener('click', setProgress);
-        
+
         let isScrubbing = false;
-        
-        const handleScrubStart = (e) => {
+
+        handleScrubStart = (e) => {
             isScrubbing = true;
             setProgress(e);
         };
-        
-        const handleScrubMove = (e) => {
+
+        handleScrubMove = (e) => {
             if (!isScrubbing) return;
             setProgress(e);
-            e.preventDefault(); // Prevent page scrolling while scrubbing
+            e.preventDefault();
         };
-        
-        const handleScrubEnd = () => {
+
+        handleScrubEnd = () => {
             isScrubbing = false;
         };
-        
+
         progressContainer.addEventListener('touchstart', handleScrubStart, { passive: false });
-        progressContainer.addEventListener('touchmove', handleScrubMove, { passive: false });
-        progressContainer.addEventListener('touchend', handleScrubEnd);
+        progressContainer.addEventListener('touchmove',  handleScrubMove,  { passive: false });
+        progressContainer.addEventListener('touchend',   handleScrubEnd);
         progressContainer.addEventListener('touchcancel', handleScrubEnd);
     }
 
-    // Network recovery
+    // ─── Network recovery ─────────────────────────────────────────────────
     const onlineHandler = () => {
         if (audio.error && isPlayerActive) {
             console.log('[Audio] Network recovered, attempting reload');
@@ -6998,28 +7010,29 @@ function initAudioPlayer() {
     // ─── Cleanup ──────────────────────────────────────────────────────────
     return function cleanup() {
         console.log('[Audio] Cleanup starting');
+
         isPlayerActive = false;
         releaseWakeLock();
-    
+
         document.removeEventListener('visibilitychange', visibilityHandler);
         window.removeEventListener('blur',   blurHandler);
         window.removeEventListener('online', onlineHandler);
-        
-        if (progressContainer && progressContainer.isConnected) {
-            progressContainer.removeEventListener('touchstart', handleScrubStart);
-            progressContainer.removeEventListener('touchmove', handleScrubMove);
-            progressContainer.removeEventListener('touchend', handleScrubEnd);
+
+        if (progressContainer && progressContainer.isConnected && handleScrubStart) {
+            progressContainer.removeEventListener('touchstart',  handleScrubStart);
+            progressContainer.removeEventListener('touchmove',   handleScrubMove);
+            progressContainer.removeEventListener('touchend',    handleScrubEnd);
             progressContainer.removeEventListener('touchcancel', handleScrubEnd);
         }
-    
+
         if (audio && audio.isConnected) {
             audio.pause();
             userWantsPlayback = false;
         }
-    
+
         console.log('[Audio] Cleanup complete');
-        };
-    }
+    };
+}
         
 function showAdditionalInfo() {
     const locationId = window.lastVisitedLocationId || lastVisitedLocationId;
