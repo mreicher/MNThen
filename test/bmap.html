@@ -3183,6 +3183,11 @@ const DEFAULT_BACKGROUND_THRESHOLD_MS = 30_000;
 const VISIBILITY_DEBOUNCE_MS          = 500;
 const REWAKE_LOCKOUT_MS               = 2000;
 
+// ── Tunable constants (behavior-preserving) ─────────────────────────────────
+const DEFAULT_BACKGROUND_THRESHOLD_MS = 30_000;
+const VISIBILITY_DEBOUNCE_MS          = 500;
+const REWAKE_LOCKOUT_MS               = 2000;
+
 function handleVisibilityChange() {
     if (document.hidden) {
         // Tab/app going to background
@@ -3220,17 +3225,22 @@ function handleVisibilityChange() {
         // be — but only the long-absence branch below calls
         // updateLocationAfterBackground(), which is the only other place
         // that might restart them. That left short absences (the common
-        // case: alt-tab, a notification, switching apps briefly) with the
-        // map loop and dead reckoning torn down and never restarted —
-        // permanently dead after the very first short tab switch, same
-        // failure shape as the proximity-check latch bug. Restart both here,
-        // unconditionally, before branching on duration, so every foreground
-        // transition resumes them regardless of what happens below.
-        // TODO: confirm `startMapLoop` is the actual counterpart to
-        // disposeMapLoop() in this codebase — name is inferred, not verified.
-        if (typeof startMapLoop === 'function') {
-            startMapLoop();
-        }
+        // case: alt-tab, a notification, switching apps briefly) with dead
+        // reckoning torn down and never restarted — permanently dead after
+        // the very first short tab switch, same failure shape as the
+        // proximity-check latch bug below. Restart it here, unconditionally,
+        // before branching on duration, so every foreground transition
+        // resumes it regardless of what happens below.
+        //
+        // NOTE on the map loop specifically: disposeMapLoop() above has no
+        // verified restart counterpart anywhere in this codebase. An earlier
+        // pass called a guessed `startMapLoop()` global here — it doesn't
+        // actually exist in this codebase, so that call was silent dead
+        // code that never restarted anything. Removed rather than kept as a
+        // no-op guess. This means the map loop is currently NOT resumed by
+        // this function at all — that's a real gap (not just a naming
+        // guess) and needs its actual restart hook identified and wired in
+        // here, or short-absence tab switches will still leave it dead.
         if (window.deadReckoning && typeof window.deadReckoning.start === 'function') {
             window.deadReckoning.start();
         }
@@ -5432,56 +5442,161 @@ function updateDistanceBox(forceUpdate = false, precalcUserPos = null, precalcCl
      calculateDistance({lat, lng}, {lat, lng})
    Returns meters, or Infinity on invalid input.
    ────────────────────────────────────────────── */
-function calculateDistance(pos1OrLat, pos2OrLng, lat2, lng2) {
-    var lat1, lng1, lat2_, lng2_;
+    
+    var EARTH_RADIUS_M = 6371000;
+    var DEG_TO_RAD = Math.PI / 180;
+    var COORD_EPSILON = 1e-8;
+    
+    /**
+     * Calculates the great-circle distance between two points using the
+     * Haversine formula.
+     *
+     * Accepts two calling conventions (backwards-compatible):
+     */
+    function calculateDistance(pos1OrLat, pos2OrLng, lat2, lng2) {
+        var lat1, lng1, latB, lngB;
+    
+        // ── Resolve the two calling conventions ─────────────────────────────
+        if (typeof lat2 === 'number' && typeof lng2 === 'number') {
+            // Four-number form: calculateDistance(lat1, lng1, lat2, lng2)
+            if (
+                typeof pos1OrLat !== 'number' ||
+                typeof pos2OrLng !== 'number' ||
+                !isFinite(pos1OrLat) || !isFinite(pos2OrLng) ||
+                !isFinite(lat2)      || !isFinite(lng2)
+            ) {
+                return Infinity;
+            }
+            lat1 = pos1OrLat;
+            lng1 = pos2OrLng;
+            latB = lat2;
+            lngB = lng2;
+        } else {
+            // Object form: calculateDistance({ lat, lng }, { lat, lng })
+            var pos1 = pos1OrLat;
+            var pos2 = pos2OrLng;
+    
+            if (
+                !pos1 || !pos2 ||
+                typeof pos1.lat !== 'number' || typeof pos1.lng !== 'number' ||
+                typeof pos2.lat !== 'number' || typeof pos2.lng !== 'number' ||
+                !isFinite(pos1.lat) || !isFinite(pos1.lng) ||
+                !isFinite(pos2.lat) || !isFinite(pos2.lng)
+            ) {
+                return Infinity;
+            }
+            lat1 = pos1.lat;
+            lng1 = pos1.lng;
+            latB = pos2.lat;
+            lngB = pos2.lng;
+        }
+    
+        // ── Same-point / near-identical short-circuit ───────────────────────
+        // Exact match: skip everything.
+        if (lat1 === latB && lng1 === lngB) {
+            return 0;
+        }
+    
+        // Near-identical: both deltas below ~1 mm.  Skips six trig calls
+        // for repeated calls where the user hasn't meaningfully moved.
+        if (
+            Math.abs(latB - lat1) < COORD_EPSILON &&
+            Math.abs(lngB - lng1) < COORD_EPSILON
+        ) {
+            return 0;
+        }
+    
+        // ── Haversine formula ───────────────────────────────────────────────
+        var lat1r = lat1 * DEG_TO_RAD;
+        var latBr = latB * DEG_TO_RAD;
+        var dLat  = (latB - lat1) * DEG_TO_RAD;
+        var dLng  = (lngB - lng1) * DEG_TO_RAD;
+    
+        var sinHalfDLat = Math.sin(dLat * 0.5);
+        var sinHalfDLng = Math.sin(dLng * 0.5);
+    
+        var a = sinHalfDLat * sinHalfDLat +
+                Math.cos(lat1r) * Math.cos(latBr) *
+                sinHalfDLng * sinHalfDLng;
+    
+        // Clamp to [0, 1] to guard against floating-point drift.
+        // Drift can push `a` slightly negative for near-antipodal points,
+        // which would make Math.sqrt(a) return NaN.
+        if (a > 1) a = 1;
+        if (a < 0) a = 0;
+    
+        return EARTH_RADIUS_M * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    }
+        
+// ─────────────────────────────────────────────────────────────────────────
+//  Geolocation option tiers
+//
+//  Speed thresholds (m/s)        Real-world equivalent
+//  ──────────────────────        ─────────────────────
+//  < 0.5  STATIONARY             Standing, slow shuffle   (~1.8 km/h)
+//  0.5–3  WALKING                Brisk walk → light jog   (~10.8 km/h)
+//  ≥ 3    MOVING                 Run, cycle, vehicle
+//
+//  Faster movement → the position goes stale sooner, so we demand
+//  a fresher fix (lower maximumAge) and accept a shorter timeout.
+//  Slower movement → we can tolerate a cached fix and give the
+//  GPS chip more time to acquire a lock.
+// ─────────────────────────────────────────────────────────────────────────
 
-    if (typeof lat2 === 'number' && typeof lng2 === 'number') {
-        if (typeof pos1OrLat !== 'number' || typeof pos2OrLng !== 'number' ||
-            !isFinite(pos1OrLat) || !isFinite(pos2OrLng) || !isFinite(lat2) || !isFinite(lng2)) {
-            return Infinity;
-        }
-        lat1 = pos1OrLat;  lng1 = pos2OrLng;
-        lat2_ = lat2;      lng2_ = lng2;
-    } else {
-        var pos1 = pos1OrLat;
-        var pos2 = pos2OrLng;
-        if (!pos1 || !pos2 ||
-            typeof pos1.lat !== 'number' || typeof pos1.lng !== 'number' ||
-            typeof pos2.lat !== 'number' || typeof pos2.lng !== 'number' ||
-            !isFinite(pos1.lat) || !isFinite(pos1.lng) || !isFinite(pos2.lat) || !isFinite(pos2.lng)) {
-            return Infinity;
-        }
-        lat1 = pos1.lat;   lng1 = pos1.lng;
-        lat2_ = pos2.lat;  lng2_ = pos2.lng;
+const SPEED_STATIONARY_MAX = 0.5;
+const SPEED_WALKING_MAX = 3;
+
+/**
+ * Per-tier geolocation settings.
+ *
+ *   timeout    – ms before the position request is abandoned.
+ *   maximumAge – ms; a cached position older than this is rejected.
+ *
+ * To add a new tier (e.g. "driving"), add a row here and a threshold
+ * constant above.  No other code needs to change.
+ */
+const GEO_TIER_OPTIONS = {
+    moving:     { timeout: 10000, maximumAge: 1000  },
+    walking:    { timeout: 15000, maximumAge: 3000  },
+    stationary: { timeout: 30000, maximumAge: 15000 }
+};
+
+/**
+ * Returns a PositionOptions object tuned to the user's current speed.
+ *
+ *   Speed ≥ 3 m/s   →  short timeout, fresh fix only   (moving)
+ *   0.5 – 3 m/s     →  medium timeout, mild cache       (walking)
+ *   < 0.5 m/s       →  long timeout, generous cache     (stationary)
+ */
+function getGeolocationOptions(speedMPS = 0) {
+    // ── Normalise input ─────────────────────────────────────────────────
+    // The default parameter handles `undefined` / no-arg calls.
+    // This guard additionally catches NaN, Infinity, strings, etc.
+    if (typeof speedMPS !== 'number' || !isFinite(speedMPS)) {
+        speedMPS = 0;
     }
 
-    var toRad = Math.PI / 180;
-    var lat1r = lat1 * toRad;
-    var lat2r = lat2_ * toRad;
-    var dLat  = (lat2_ - lat1) * toRad;
-    var dLng  = (lng2_ - lng1) * toRad;
+    // ── Classify into a tier ────────────────────────────────────────────
+    let tier;
+    if (speedMPS >= SPEED_WALKING_MAX) {
+        tier = 'moving';
+    } else if (speedMPS >= SPEED_STATIONARY_MAX) {
+        tier = 'walking';
+    } else {
+        tier = 'stationary';
+    }
 
-    var sinDLat = Math.sin(dLat * 0.5);
-    var sinDLng = Math.sin(dLng * 0.5);
+    const settings = GEO_TIER_OPTIONS[tier];
 
-    var a = sinDLat * sinDLat +
-            Math.cos(lat1r) * Math.cos(lat2r) * sinDLng * sinDLng;
-
-    if (a > 1) a = 1;
-    if (a < 0) a = 0;  // Guard against negative floating point drift
-
-    return 6371000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-        
-function getGeolocationOptions(speedMPS = 0) {
-    const isStationary = speedMPS < 0.5;
-    const isWalking = speedMPS >= 0.5 && speedMPS < 3;
-    const isMoving = speedMPS >= 3;
-    
     return {
+        // NOTE: kept as `true` for all tiers to preserve existing behaviour.
+        // A future optimisation could set this to `false` for the stationary
+        // tier (Wi-Fi / cell triangulation is sufficient and saves battery),
+        // but that would change the accuracy contract callers currently rely
+        // on, so it is left as-is.
         enableHighAccuracy: true,
-        timeout: isMoving ? 10000 : isWalking ? 15000 : 30000,
-        maximumAge: isMoving ? 1000 : isWalking ? 3000 : 15000
+        timeout:    settings.timeout,
+        maximumAge: settings.maximumAge
     };
 }
 
@@ -5489,87 +5604,159 @@ function getGeolocationOptions(speedMPS = 0) {
    handleLocationError — retry with exponential
    backoff, fast-fail on permission denied.
    ────────────────────────────────────────────── */
-  function handleLocationError(error) {
-    console.warn("Error getting user location:", error);
-
-    // Scoped retry state per error instance to prevent cross-talk
-    var localRetryCount = error._retryCount || 0;
-
-    if (error?.code === 1) {
-        retryCount = 0; // Reset global for future errors
+    
+    var retryCount = 0;
+    
+    function handleLocationError(error) {
+        console.warn("Error getting user location:", error);
+    
+        // ── Scoped retry state ──────────────────────────────────────────────
+        // Stored on the error instance so concurrent error chains
+        // (e.g. watchPosition + getCurrentPosition) never share state.
+        var localRetryCount = error._retryCount || 0;
+    
+        // ── Permission denied → fail fast, no retry ─────────────────────────
+        if (error?.code === 1) {
+            if (typeof hideLoadingMessage === 'function') hideLoadingMessage();
+    
+            showPopup(
+                "Location Error",
+                "Please allow access to your location to use this feature."
+            );
+    
+            if (typeof onLocationFailure === 'function') {
+                onLocationFailure(error);
+            }
+            return;
+        }
+    
+        // ── Retry configuration ─────────────────────────────────────────────
+        var maxRetries =
+            (typeof CONFIG !== 'undefined' && CONFIG.MAX_RETRIES) || 3;
+        var retryDelay =
+            (typeof CONFIG !== 'undefined' && CONFIG.RETRY_DELAY) || 1000;
+    
+        // ── Retry with exponential back-off ─────────────────────────────────
+        if (localRetryCount < maxRetries) {
+            var nextRetryCount = localRetryCount + 1;
+            var backoffMs = Math.min(
+                10000,
+                retryDelay * Math.pow(2, nextRetryCount - 1)
+            );
+    
+            console.log(
+                "Retrying to get location (Attempt " +
+                nextRetryCount + " of " + maxRetries +
+                " in " + backoffMs + "ms)"
+            );
+    
+            setTimeout(function () {
+                if (!navigator.geolocation) {
+                    console.warn("Geolocation API not available");
+                    return;
+                }
+    
+                // ── Timeout-aware retry options ─────────────────────────────
+                // A code-3 (TIMEOUT) error means the GPS chip attempted a fix
+                // but could not acquire one in time.  Switch to aggressive
+                // high-accuracy settings to force the hardware to re-lock:
+                //
+                //   enableHighAccuracy : true  → use GPS hardware, not Wi-Fi/cell
+                //   timeout            : 15 s  → give the chip more time to lock
+                //   maximumAge         : 0     → reject stale cached positions
+                //
+                // For every other error code we fall back to the project-wide
+                // defaults so we don't waste battery unnecessarily.
+                var isTimeout = error?.code === 3;
+                var retryOptions;
+    
+                if (isTimeout) {
+                    retryOptions = {
+                        enableHighAccuracy: true,
+                        timeout: 15000,
+                        maximumAge: 0
+                    };
+                    console.log(
+                        "Timeout detected – retrying with high-accuracy " +
+                        "options to force GPS re-acquisition"
+                    );
+                } else {
+                    retryOptions = getGeolocationOptions(0);
+                }
+    
+                navigator.geolocation.getCurrentPosition(
+                    function (position) {
+                        console.log(
+                            "Location retrieved successfully after retry"
+                        );
+    
+                        if (typeof hideLoadingMessage === 'function') {
+                            hideLoadingMessage();
+                        }
+    
+                        updateUserLocation(position, true);
+    
+                        // Restart continuous tracking if it was stopped
+                        if (
+                            typeof startPositionUpdates === 'function' &&
+                            !window.positionWatchId
+                        ) {
+                            startPositionUpdates();
+                        }
+                    },
+                    function (err) {
+                        err._retryCount = nextRetryCount;
+                        handleLocationError(err);
+                    },
+                    retryOptions
+                );
+            }, backoffMs);
+    
+            return;
+        }
+    
+        // ── Max retries exhausted ───────────────────────────────────────────
+        // This is the ONLY place the deprecated global is touched.
+        // A success or permission-denied in one chain must not clobber
+        // state that another concurrent chain may still need.
+        retryCount = 0;
+    
         if (typeof hideLoadingMessage === 'function') hideLoadingMessage();
-        showPopup("Location Error", "Please allow access to your location to use this feature.");
+    
+        var errorMessage =
+            "An error occurred while getting your location.";
+    
+        if (error?.code !== undefined) {
+            switch (error.code) {
+                case 1:
+                    errorMessage =
+                        "Please allow access to your location to use this feature.";
+                    break;
+                case 2:
+                    errorMessage =
+                        "Your location is currently unavailable. " +
+                        "Please try again later.";
+                    break;
+                case 3:
+                    errorMessage =
+                        "Getting your location took too long. " +
+                        "Please try again.";
+                    break;
+                case 0:
+                    errorMessage =
+                        "Unable to determine your location. " +
+                        "Please check your device settings and try again.";
+                    break;
+            }
+        }
+    
+        showPopup("Location Error", errorMessage);
+    
         if (typeof onLocationFailure === 'function') {
             onLocationFailure(error);
         }
-        return;
     }
-
-    var maxRetries = (typeof CONFIG !== 'undefined' && CONFIG.MAX_RETRIES) || 3;
-    var retryDelay = (typeof CONFIG !== 'undefined' && CONFIG.RETRY_DELAY) || 1000;
-
-    if (localRetryCount < maxRetries) {
-        var nextRetryCount = localRetryCount + 1;
-        var backoffMs = Math.min(10000, retryDelay * Math.pow(2, nextRetryCount - 1));
-
-        console.log(`Retrying to get location (Attempt ${nextRetryCount} of ${maxRetries} in ${backoffMs}ms)`);
-
-        setTimeout(() => {
-            if (!navigator.geolocation) {
-                console.warn('Geolocation API not available');
-                return;
-            }
-
-            navigator.geolocation.getCurrentPosition(
-                (position) => {
-                    console.log("Location retrieved successfully after retry");
-                    if (typeof hideLoadingMessage === 'function') hideLoadingMessage();
-                    updateUserLocation(position, true);
-                    retryCount = 0; // Reset global on success
-
-                    // Restart continuous tracking if it was stopped
-                    if (typeof startPositionUpdates === 'function' && !window.positionWatchId) {
-                        startPositionUpdates();
-                    }
-                },
-                (err) => {
-                    err._retryCount = nextRetryCount;
-                    handleLocationError(err);
-                },
-                getGeolocationOptions(0)
-            );
-        }, backoffMs);
-        return;
-    }
-
-    // Max retries reached
-    retryCount = 0;
-    if (typeof hideLoadingMessage === 'function') hideLoadingMessage();
-
-    let errorMessage = "An error occurred while getting your location.";
-    if (error?.code !== undefined) {
-        switch (error.code) {
-            case 1:
-                errorMessage = "Please allow access to your location to use this feature.";
-                break;
-            case 2:
-                errorMessage = "Your location is currently unavailable. Please try again later.";
-                break;
-            case 3:
-                errorMessage = "Getting your location took too long. Please try again.";
-                break;
-            case 0:
-                errorMessage = "Unable to determine your location. Please check your device settings and try again.";
-                break;
-        }
-    }
-
-    showPopup("Location Error", errorMessage);
-    if (typeof onLocationFailure === 'function') {
-        onLocationFailure(error);
-    }
-}
-
+        
 /* ──────────────────────────────────────────────
    showPopup — modal alert with fade, keyboard trap,
    and body scroll lock. Auto-dismisses existing popups.
@@ -5649,73 +5836,73 @@ function getGeolocationOptions(speedMPS = 0) {
 /* ──────────────────────────────────────────────
    recenterMap — soft pan to user, keep current zoom.
    ────────────────────────────────────────────── */
-   let recenterTimer;
-
-function recenterMap() {
-    const btn = cachedElements?.recenterButton ?? document.getElementById('recenterButton');
-    if (!btn || !userMarker?.getLatLng()) return;
-
-    btn.disabled = true;
-    btn.style.backgroundColor = 'var(--primary-color)';
-    btn.style.color = 'white';
-
-    map.closePopup();
-    map.panTo(userMarker.getLatLng(), {
-        animate: true,
-        duration: 0.5,
-        easeLinearity: 0.25,
-        noZoom: true
-    });
-
-    followUser = true;
-    window.followUser = true;
-    announceToScreenReader('Map re-centred on your location');
-
-    clearTimeout(recenterTimer);
-    recenterTimer = setTimeout(() => {
-        btn.style.backgroundColor = 'white';
-        btn.style.color = 'var(--primary-color)';
-        btn.disabled = false;
-        recenterTimer = null;
-    }, 500);
-}
-
-function fullResetMap() {
-    const pos = window.lastPosition;
-    const btn = cachedElements?.recenterButton ?? document.getElementById('recenterButton');
+    let recenterTimer;
     
-    if (!btn || !userMarker?.getLatLng()) return;
-
-    btn.disabled = true;
-    btn.style.backgroundColor = 'var(--primary-color)';
-    btn.style.color = 'white';
-
-    map.closePopup();
-
-    if (window.zoomController) {
-        window.zoomController.stop();
+    function recenterMap() {
+        const btn = cachedElements?.recenterButton ?? document.getElementById('recenterButton');
+        if (!btn || !userMarker?.getLatLng()) return;
+    
+        btn.disabled = true;
+        btn.style.backgroundColor = 'var(--primary-color)';
+        btn.style.color = 'white';
+    
+        map.closePopup();
+        map.panTo(userMarker.getLatLng(), {
+            animate: true,
+            duration: 0.5,
+            easeLinearity: 0.25,
+            noZoom: true
+        });
+    
+        followUser = true;
+        window.followUser = true;
+        announceToScreenReader('Map re-centred on your location');
+    
+        clearTimeout(recenterTimer);
+        recenterTimer = setTimeout(() => {
+            btn.style.backgroundColor = 'white';
+            btn.style.color = 'var(--primary-color)';
+            btn.disabled = false;
+            recenterTimer = null;
+        }, 500);
     }
-
-    map.setView(userMarker.getLatLng(), 17, {
-        animate: true,
-        duration: 0.5,
-        easeLinearity: 0.25
-    });
-
-    window.followUser = true;
-    followUser = true;
-    window.isMapInteracting = false;
-
-    announceToScreenReader('Map re-centred on your location');
-
-    clearTimeout(recenterTimer);
-    recenterTimer = setTimeout(() => {
-        btn.style.backgroundColor = 'white';
-        btn.style.color = 'var(--primary-color)';
-        btn.disabled = false;
-        recenterTimer = null;
-    }, 500);
-}
+    
+    function fullResetMap() {
+        const pos = window.lastPosition;
+        const btn = cachedElements?.recenterButton ?? document.getElementById('recenterButton');
+        
+        if (!btn || !userMarker?.getLatLng()) return;
+    
+        btn.disabled = true;
+        btn.style.backgroundColor = 'var(--primary-color)';
+        btn.style.color = 'white';
+    
+        map.closePopup();
+    
+        if (window.zoomController) {
+            window.zoomController.stop();
+        }
+    
+        map.setView(userMarker.getLatLng(), 17, {
+            animate: true,
+            duration: 0.5,
+            easeLinearity: 0.25
+        });
+    
+        window.followUser = true;
+        followUser = true;
+        window.isMapInteracting = false;
+    
+        announceToScreenReader('Map re-centred on your location');
+    
+        clearTimeout(recenterTimer);
+        recenterTimer = setTimeout(() => {
+            btn.style.backgroundColor = 'white';
+            btn.style.color = 'var(--primary-color)';
+            btn.disabled = false;
+            recenterTimer = null;
+        }, 500);
+    }
 
 /* ---------- 2-MINUTE LOCATION COOLDOWN ---------- */
 const COOLDOWN_PERIOD_MS = 2 * 60 * 1000;
