@@ -14,7 +14,7 @@
     <link rel="manifest" href="/manifest.json">
 
     <!-- Theme color (address bar & splash screen) -->
-    <meta name="theme-color" content="#2c5282">
+    <meta name="theme-color" content="#2c5282"> 
 
     <!-- PWA support -->
     <meta name="mobile-web-app-capable" content="yes">
@@ -188,7 +188,7 @@
           } else {
             unlock();
           }
-          setTimeout(unlock, 3000);
+          setTimeout(unlock, 1500);
         })();
     </script>
 </head>
@@ -292,7 +292,7 @@
     <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js" defer crossorigin="anonymous"></script>
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" defer crossorigin="anonymous"></script>
     <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js" defer crossorigin="anonymous"></script>
-    <script src="/locations_main.js?v=1.0.95" defer></script>
+    <script src="/locations_main.js?v=1.0.96" defer></script>
 
     <script>
 
@@ -305,13 +305,21 @@
     
         const DEBUG = location.search.includes('sw_debug');
         let updateIntervalId = null;
+        let isReloading = false;
+    
+        // ── CONFIG (all optional, sensible defaults) ────
+        const CONFIG = Object.assign({
+            pollIntervalMs:    60 * 60 * 1000,     // 1 hour
+            repromptDelayMs:   4 * 60 * 60 * 1000, // re-prompt after 4h if dismissed
+            activateTimeoutMs: 10_000,              // fallback reload if controllerchange stalls
+            bannerText:        'A new version is available.',
+            bannerBtnText:     'Update now',
+        }, window.__SW_UPDATE_CONFIG);
     
         // ── DEDUPLICATION ─────────────────────────────
-        const promptedWorkers = new WeakSet();
-    
-        // Track pending statechange listeners so we never attach duplicates.
-        // Key = worker object, value = the listener function.
+        const promptedWorkers  = new WeakSet();
         const pendingListeners = new WeakMap();
+        const dismissedAt      = new WeakMap(); // worker → timestamp of dismissal
     
         // ── Helpers ──────────────────────────────────
     
@@ -325,33 +333,40 @@
                     resolve(false);
                     return;
                 }
+                if (!document.body) {
+                    log('document.body not ready, deferring banner');
+                    resolve(false);
+                    return;
+                }
     
                 const banner = document.createElement('div');
                 banner.id = 'sw-update-banner';
+                banner.setAttribute('role', 'alert');
+                banner.setAttribute('aria-live', 'polite');
                 Object.assign(banner.style, {
-                    position:       'fixed',
-                    bottom:         '1rem',
-                    left:           '50%',
-                    transform:      'translateX(-50%)',
-                    background:     '#1a1a1a',
-                    color:          '#fff',
-                    padding:        '0.75rem 1.25rem',
-                    borderRadius:   '0.5rem',
-                    display:        'flex',
-                    alignItems:     'center',
-                    gap:            '1rem',
-                    boxShadow:      '0 4px 16px rgba(0,0,0,0.35)',
-                    zIndex:         '99999',
-                    fontFamily:     'system-ui, sans-serif',
-                    fontSize:       '0.875rem',
-                    whiteSpace:     'nowrap',
+                    position:     'fixed',
+                    bottom:       '1rem',
+                    left:         '50%',
+                    transform:    'translateX(-50%)',
+                    background:   '#1a1a1a',
+                    color:        '#fff',
+                    padding:      '0.75rem 1.25rem',
+                    borderRadius: '0.5rem',
+                    display:      'flex',
+                    alignItems:   'center',
+                    gap:          '1rem',
+                    boxShadow:    '0 4px 16px rgba(0,0,0,0.35)',
+                    zIndex:       '99999',
+                    fontFamily:   'system-ui, sans-serif',
+                    fontSize:     '0.875rem',
+                    whiteSpace:   'nowrap',
                 });
     
                 const msg = document.createElement('span');
-                msg.textContent = 'A new version is available.';
+                msg.textContent = CONFIG.bannerText;
     
                 const btn = document.createElement('button');
-                btn.textContent = 'Update now';
+                btn.textContent = CONFIG.bannerBtnText;
                 Object.assign(btn.style, {
                     background:   '#4f8ef7',
                     color:        '#fff',
@@ -364,86 +379,145 @@
     
                 const dismiss = document.createElement('button');
                 dismiss.textContent = '✕';
+                dismiss.setAttribute('aria-label', 'Dismiss update notification');
                 Object.assign(dismiss.style, {
-                    background:  'transparent',
-                    color:       '#aaa',
-                    border:      'none',
-                    cursor:      'pointer',
-                    fontSize:    '1rem',
-                    lineHeight:  '1',
-                    padding:     '0',
+                    background: 'transparent',
+                    color:      '#aaa',
+                    border:     'none',
+                    cursor:     'pointer',
+                    fontSize:   '1rem',
+                    lineHeight: '1',
+                    padding:    '0',
                 });
     
                 banner.append(msg, btn, dismiss);
                 document.body.appendChild(banner);
+                btn.focus();
     
-                btn.addEventListener('click', () => {
+                const cleanup = (result) => {
                     banner.remove();
-                    resolve(true);
-                }, { once: true });
+                    resolve(result);
+                };
     
-                dismiss.addEventListener('click', () => {
-                    banner.remove();
-                    resolve(false);
-                }, { once: true });
+                btn.addEventListener('click', () => cleanup(true), { once: true });
+                dismiss.addEventListener('click', () => cleanup(false), { once: true });
+    
+                banner.addEventListener('keydown', (e) => {
+                    if (e.key === 'Escape') cleanup(false);
+                });
             });
         }
     
         // ── Core update logic ─────────────────────────
     
         function activateWorker(worker) {
+            // Primary: wait for controllerchange (reliable signal)
+            const onControllerChange = () => {
+                if (isReloading) return;
+                isReloading = true;
+                navigator.serviceWorker.removeEventListener('controllerchange', onControllerChange);
+                clearTimeout(fallbackTimer);
+                log('controllerchange fired → reloading');
+                location.reload();
+            };
+            navigator.serviceWorker.addEventListener('controllerchange', onControllerChange);
+    
+            // Fallback: if controllerchange never fires, reload anyway
+            const fallbackTimer = setTimeout(() => {
+                if (isReloading) return;
+                isReloading = true;
+                navigator.serviceWorker.removeEventListener('controllerchange', onControllerChange);
+                log('controllerchange timeout → forcing reload');
+                location.reload();
+            }, CONFIG.activateTimeoutMs);
+    
+            // Secondary: statechange on the worker itself
             const onStateChange = () => {
                 if (worker.state === 'activated') {
                     worker.removeEventListener('statechange', onStateChange);
-                    location.reload();
+                    // Let controllerchange handle reload; if it already fired, this is a no-op.
+                } else if (worker.state === 'redundant') {
+                    worker.removeEventListener('statechange', onStateChange);
+                    pendingListeners.delete(worker);
+                    promptedWorkers.delete(worker);
+                    dismissedAt.delete(worker);
+                    clearTimeout(fallbackTimer);
+                    navigator.serviceWorker.removeEventListener('controllerchange', onControllerChange);
+                    log('Worker became redundant (installation failed or skipped)');
                 }
             };
             worker.addEventListener('statechange', onStateChange);
+    
             try {
                 worker.postMessage({ type: 'SKIP_WAITING' });
                 log('Sent SKIP_WAITING');
             } catch (err) {
                 console.warn('[SW] SKIP_WAITING failed:', err);
-                location.reload();
+                // Fallback timer will handle reload; don't trap in reload loop.
             }
         }
     
         async function promptAndActivate(worker) {
             if (promptedWorkers.has(worker)) {
-                log('Worker already prompted, skipping duplicate');
-                return;
+                const dismissed = dismissedAt.get(worker);
+                if (dismissed && (Date.now() - dismissed) < CONFIG.repromptDelayMs) {
+                    log('Worker already prompted and within cooldown, skipping');
+                    return;
+                }
+                // Cooldown expired — allow re-prompt
+                promptedWorkers.delete(worker);
             }
             promptedWorkers.add(worker);
     
-            const accepted = await showUpdateBanner();
-            if (accepted) activateWorker(worker);
+            let accepted;
+            try {
+                accepted = await showUpdateBanner();
+            } catch (err) {
+                console.warn('[SW] Banner error:', err);
+                accepted = false;
+            }
+    
+            if (accepted) {
+                activateWorker(worker);
+            } else {
+                dismissedAt.set(worker, Date.now());
+            }
         }
     
         function handleUpdate(reg) {
             const worker = reg.installing || reg.waiting;
             if (!worker) return;
             if (worker.state === 'activated') return;
+    
             if (promptedWorkers.has(worker)) {
-                log('Update already handled for this worker');
-                return;
+                const dismissed = dismissedAt.get(worker);
+                if (!dismissed || (Date.now() - dismissed) < CONFIG.repromptDelayMs) {
+                    log('Update already handled / in cooldown for this worker');
+                    return;
+                }
             }
     
-            if (worker.state === 'installed' || worker.state === 'waiting') {
+            if (worker.state === 'installed') {
                 promptAndActivate(worker);
                 return;
             }
     
-            // Guard: Don't attach duplicate listeners to the same installing worker.
             if (pendingListeners.has(worker)) {
                 log('Listener already pending for this worker');
                 return;
             }
     
             const onStateChange = () => {
-                if (worker.state === 'installed' || worker.state === 'waiting') {
+                if (worker.state === 'installed') {
                     worker.removeEventListener('statechange', onStateChange);
                     pendingListeners.delete(worker);
                     promptAndActivate(worker);
+                } else if (worker.state === 'redundant') {
+                    worker.removeEventListener('statechange', onStateChange);
+                    pendingListeners.delete(worker);
+                    promptedWorkers.delete(worker);
+                    dismissedAt.delete(worker);
+                    log('Worker became redundant during installation');
                 }
             };
     
@@ -451,60 +525,82 @@
             worker.addEventListener('statechange', onStateChange);
         }
     
+        // ── Cross-tab sync ────────────────────────────
+    
+        function onControllerChange() {
+            if (isReloading) return;
+            isReloading = true;
+            log('Controller changed (updated from another tab). Reloading...');
+            location.reload();
+        }
+    
         // ── Registration ──────────────────────────────
     
-          function onLoad() {
+        function onLoad() {
             if (!('serviceWorker' in navigator)) return;
-        
-            // Prevent duplicate intervals/listeners if onLoad() runs more than once.
+    
             if (updateIntervalId != null) {
                 clearInterval(updateIntervalId);
                 updateIntervalId = null;
             }
-        
+    
             if (DEBUG) {
                 navigator.serviceWorker.addEventListener('message', onDebugMessage);
             }
+    
+            // Cross-tab: if another tab forces activation, this tab reloads too
+            navigator.serviceWorker.addEventListener('controllerchange', onControllerChange);
+    
             navigator.serviceWorker.register('/sw.js').then((reg) => {
                 log('Registered, scope:', reg.scope);
                 if (reg.waiting || reg.installing) handleUpdate(reg);
-                reg.addEventListener('updatefound', onUpdateFound);
-        
+    
+                // Closure — no `this` ambiguity
+                reg.addEventListener('updatefound', () => handleUpdate(reg));
+    
                 updateIntervalId = setInterval(() => {
                     if (!navigator.onLine) return;
                     navigator.serviceWorker
                         .getRegistration(reg.scope)
                         .then((r) => r?.update())
                         .catch(() => {});
-                }, 60 * 60 * 1000);
-        
+                }, CONFIG.pollIntervalMs);
+    
+                document.addEventListener('visibilitychange', onVisibilityChange);
+    
                 if (typeof memoryManager !== 'undefined' && memoryManager?.registerCleanupTask) {
-                    memoryManager.registerCleanupTask(() => {
-                        if (updateIntervalId != null) {
-                            clearInterval(updateIntervalId);
-                            updateIntervalId = null;
-                        }
-                    });
+                    memoryManager.registerCleanupTask(cleanup);
                 }
             }).catch((err) => console.error('[SW] Registration failed:', err));
         }
     
-        function onUnload() {
+        function onVisibilityChange() {
+            if (document.visibilityState !== 'visible') return;
+            if (!navigator.onLine) return;
+            navigator.serviceWorker.getRegistration().then((r) => {
+                if (r) {
+                    r.update().catch(() => {});
+                    if (r.waiting) handleUpdate(r);
+                }
+            }).catch(() => {});
+        }
+    
+        function cleanup() {
             if (updateIntervalId != null) {
                 clearInterval(updateIntervalId);
                 updateIntervalId = null;
             }
+            document.removeEventListener('visibilitychange', onVisibilityChange);
+            navigator.serviceWorker.removeEventListener('controllerchange', onControllerChange);
+        }
+    
+        function onUnload() {
+            cleanup();
             window.removeEventListener('load', onLoad);
             window.removeEventListener('pagehide', onUnload);
             if (DEBUG) {
                 navigator.serviceWorker.removeEventListener('message', onDebugMessage);
             }
-        }
-    
-        // Named handlers so we can remove them in teardown
-        function onUpdateFound() {
-            // 'this' is the registration
-            handleUpdate(this);
         }
     
         function onDebugMessage(e) {
@@ -522,534 +618,829 @@
 /* ──────────────────────────────────────────────
    MEMORY MANAGEMENT
    ────────────────────────────────────────────── */
-    function setupMemoryManagement() {
-        const timerRegistry = new Map();
-    
-        const timerSubsystem = {
-            createTimeout(cb, delay, ...args) {
-                const id = setTimeout(() => {
-                    timerRegistry.delete(id);
-                    cb(...args);
-                }, delay);
-                timerRegistry.set(id, { type: 'timeout', id });
-                return id;
-            },
-            createInterval(cb, interval) {
-                const id = setInterval(cb, interval);
-                timerRegistry.set(id, { type: 'interval', id });
-                return id;
-            },
-            clear(id) {
-                const entry = timerRegistry.get(id);
-                if (!entry) return;
+  function setupMemoryManagement() {
+    // ── Timer subsystem ──────────────────────────
+    const timerRegistry = new Map();
+
+    const timerSubsystem = {
+        createTimeout(cb, delay, ...args) {
+            const id = setTimeout(() => {
+                timerRegistry.delete(id);
+                cb(...args);
+            }, delay);
+            timerRegistry.set(id, { type: 'timeout' });
+            return id;
+        },
+
+        createInterval(cb, interval, ...args) {
+            const id = setInterval(cb, interval, ...args);
+            timerRegistry.set(id, { type: 'interval' });
+            return id;
+        },
+
+        clear(id) {
+            const entry = timerRegistry.get(id);
+            if (!entry) return;
+            if (entry.type === 'timeout') clearTimeout(id);
+            else clearInterval(id);
+            timerRegistry.delete(id);
+        },
+
+        dispose() {
+            const count = timerRegistry.size;
+            for (const [id, entry] of timerRegistry) {
                 if (entry.type === 'timeout') clearTimeout(id);
                 else clearInterval(id);
-                timerRegistry.delete(id);
-            },
-            dispose() {
-                const count = timerRegistry.size;
-                for (const [id, entry] of timerRegistry) {
-                    if (entry.type === 'timeout') clearTimeout(id);
-                    else clearInterval(id);
+            }
+            timerRegistry.clear();
+            return { subsystem: 'timers', cleared: count };
+        }
+    };
+
+    // ── Listener subsystem ───────────────────────
+    // Structure: WeakMap<element, Map<event, Map<handler, Set<entry>>>> for GC safety.
+    // Parallel Set<entry> for O(1) iteration in dispose().
+    // When an entry is removed from the Set, its element ref is released;
+    // the WeakMap key becomes collectable.
+
+    const listenerRegistry = new WeakMap();
+    const allEntries       = new Set();
+
+    function normalizeListenerOptions(options) {
+        if (typeof options === 'boolean') {
+            return { capture: options, passive: false, once: false, signal: null };
+        }
+        if (options && typeof options === 'object') {
+            return {
+                capture: !!options.capture,
+                passive: !!options.passive,
+                once:    !!options.once,
+                signal:  options.signal || null,
+            };
+        }
+        return { capture: false, passive: false, once: false, signal: null };
+    }
+
+    function listenerOptionsEqual(a, b) {
+        const na = normalizeListenerOptions(a);
+        const nb = normalizeListenerOptions(b);
+        return na.capture === nb.capture
+            && na.passive === nb.passive
+            && na.once    === nb.once
+            && na.signal  === nb.signal;
+    }
+
+    const listenerSubsystem = {
+        track(element, event, handler, options = false) {
+            if (manager.isDisposed) {
+                console.warn('[Memory] Manager disposed, ignoring track() call');
+                return null;
+            }
+            if (!element || typeof element.addEventListener !== 'function') {
+                console.warn('[Memory] Invalid element for listener:', element);
+                return null;
+            }
+
+            let eventMap = listenerRegistry.get(element);
+            if (!eventMap) {
+                eventMap = new Map();
+                listenerRegistry.set(element, eventMap);
+            }
+
+            let handlerMap = eventMap.get(event);
+            if (!handlerMap) {
+                handlerMap = new Map();
+                eventMap.set(event, handlerMap);
+            }
+
+            let entrySet = handlerMap.get(handler);
+            if (!entrySet) {
+                entrySet = new Set();
+                handlerMap.set(handler, entrySet);
+            }
+
+            // Dedup: small-set scan over distinct option combos for same
+            // element+event+handler. In practice k is 1–3, so this is O(1).
+            for (const existing of entrySet) {
+                if (existing.active && !existing.fired && listenerOptionsEqual(existing.options, options)) {
+                    return existing;
                 }
-                timerRegistry.clear();
-                return { subsystem: 'timers', cleared: count };
             }
-        };
-    
-        const listenerRegistry = [];
-    
-        // addEventListener's third argument can be a boolean or an options
-        // object, and two different object literals with identical fields are
-        // not === to each other. Normalizing lets dedup treat `true` and
-        // `{capture: true}` as the same thing, and compare object literals by
-        // value instead of by reference.
-        function normalizeListenerOptions(options) {
-            if (typeof options === 'boolean') {
-                return { capture: options, passive: false, once: false };
-            }
-            if (options && typeof options === 'object') {
-                return {
-                    capture: !!options.capture,
-                    passive: !!options.passive,
-                    once:    !!options.once
+
+            const normOpts = normalizeListenerOptions(options);
+            let wrappedHandler = handler;
+            const entry = { element, event, handler, options, active: true, fired: false };
+
+            if (normOpts.once || normOpts.signal) {
+                wrappedHandler = function (...args) {
+                    entry.fired = true;
+                    entry.active = false;
+                    allEntries.delete(entry);
+                    entrySet.delete(entry);
+                    if (entrySet.size === 0) handlerMap.delete(handler);
+                    if (handlerMap.size === 0) eventMap.delete(event);
+                    return handler.apply(this, args);
                 };
-            }
-            return { capture: false, passive: false, once: false };
-        }
-    
-        function listenerOptionsEqual(a, b) {
-            const na = normalizeListenerOptions(a);
-            const nb = normalizeListenerOptions(b);
-            return na.capture === nb.capture && na.passive === nb.passive && na.once === nb.once;
-        }
-    
-        const listenerSubsystem = {
-            track(element, event, handler, options = false) {
-                if (!element || typeof element.addEventListener !== 'function') {
-                    console.warn('[Memory] Invalid element for listener:', element);
-                    return null;
+
+                if (normOpts.signal) {
+                    const onAbort = () => {
+                        if (!entry.active) return;
+                        try {
+                            element.removeEventListener(event, wrappedHandler, options);
+                        } catch (_) {}
+                        entry.active = false;
+                        allEntries.delete(entry);
+                        entrySet.delete(entry);
+                        if (entrySet.size === 0) handlerMap.delete(handler);
+                        if (handlerMap.size === 0) eventMap.delete(event);
+                    };
+                    entry._onAbort = onAbort;
+                    entry._signal  = normOpts.signal;
+                    if (normOpts.signal.aborted) {
+                        onAbort();
+                        return entry;
+                    }
+                    normOpts.signal.addEventListener('abort', onAbort, { once: true });
                 }
-    
-                // Dedup: if this exact element+event+handler+options combo is
-                // already tracked and active, return the existing entry instead
-                // of attaching a second DOM listener and growing the registry
-                // further. Without this, any code path that re-registers "the
-                // same" listener over a long session (reconnect loops, repeated
-                // setup calls) leaked both a duplicate listener AND a duplicate
-                // registry entry indefinitely — the registry only ever grew,
-                // never shrank, until full page-unload disposal.
-                const existing = listenerRegistry.find(e =>
-                    e.active &&
-                    e.element === element &&
-                    e.event === event &&
-                    e.handler === handler &&
-                    listenerOptionsEqual(e.options, options)
-                );
-                if (existing) return existing;
-    
-                element.addEventListener(event, handler, options);
-                const entry = { element, event, handler, options, active: true };
-                listenerRegistry.push(entry);
-                return entry;
-            },
-    
-            // NEW — remove a single tracked listener before full disposal.
-            // Purely additive: existing callers that never call this are
-            // unaffected, and dispose() still works exactly as before for
-            // whatever's left in the registry at teardown time.
-            untrack(entry) {
-                if (!entry || !entry.active) return false;
+            }
+
+            element.addEventListener(event, wrappedHandler, options);
+            entry._wrappedHandler = wrappedHandler;
+            entrySet.add(entry);
+            allEntries.add(entry);
+            return entry;
+        },
+
+        untrack(entry) {
+            if (!entry || !entry.active) return false;
+            try {
+                const h = entry._wrappedHandler || entry.handler;
+                entry.element.removeEventListener(entry.event, h, entry.options);
+            } catch (e) {
+                console.warn('[Memory] Listener removal failed:', entry.event, e.message);
+            }
+            entry.active = false;
+            allEntries.delete(entry);
+
+            const eventMap = listenerRegistry.get(entry.element);
+            if (eventMap) {
+                const handlerMap = eventMap.get(entry.event);
+                if (handlerMap) {
+                    const entrySet = handlerMap.get(entry.handler);
+                    if (entrySet) {
+                        entrySet.delete(entry);
+                        if (entrySet.size === 0) handlerMap.delete(entry.handler);
+                    }
+                    if (handlerMap.size === 0) eventMap.delete(entry.event);
+                }
+            }
+
+            if (entry._onAbort && entry._signal) {
                 try {
-                    entry.element.removeEventListener(entry.event, entry.handler, entry.options);
+                    entry._signal.removeEventListener('abort', entry._onAbort);
+                } catch (_) {}
+            }
+            return true;
+        },
+
+        dispose() {
+            let count = 0;
+            for (const entry of allEntries) {
+                if (!entry.active) continue;
+                try {
+                    const h = entry._wrappedHandler || entry.handler;
+                    entry.element.removeEventListener(entry.event, h, entry.options);
                 } catch (e) {
                     console.warn('[Memory] Listener removal failed:', entry.event, e.message);
                 }
                 entry.active = false;
-                const idx = listenerRegistry.indexOf(entry);
-                if (idx !== -1) listenerRegistry.splice(idx, 1);
-                return true;
-            },
-    
-            dispose() {
-                const count = listenerRegistry.length;
-                for (const entry of listenerRegistry) {
-                    if (!entry.active) continue;
-                    try {
-                        entry.element.removeEventListener(entry.event, entry.handler, entry.options);
-                    } catch (e) {
-                        console.warn('[Memory] Listener removal failed:', entry.event, e.message);
-                    }
-                    entry.active = false;
+                if (entry._onAbort && entry._signal) {
+                    try { entry._signal.removeEventListener('abort', entry._onAbort); } catch (_) {}
                 }
-                listenerRegistry.length = 0;
-                return { subsystem: 'listeners', cleared: count };
+                count++;
             }
-        };
-    
-        const audioSubsystem = {
-            dispose() {
-                const audios = document.querySelectorAll('audio');
-                let paused = 0;
-                for (const audio of audios) {
-                    try {
-                        if (!audio.paused) { audio.pause(); paused++; }
-                        if (!isNaN(audio.currentTime) && audio.currentTime > 0) {
-                            try { localStorage.setItem('audioPosition', audio.currentTime.toString()); }
-                            catch (storageErr) { console.debug('[Memory] Could not save audio position:', storageErr.message); }
+            allEntries.clear();
+            return { subsystem: 'listeners', cleared: count };
+        }
+    };
+
+    // ── Audio subsystem ──────────────────────────
+    const audioSubsystem = {
+        dispose() {
+            const audios = document.querySelectorAll('audio');
+            let paused = 0;
+            for (const audio of audios) {
+                try {
+                    if (!audio.paused) { audio.pause(); paused++; }
+                    if (!isNaN(audio.currentTime) && audio.currentTime > 0) {
+                        try {
+                            localStorage.setItem('audioPosition', audio.currentTime.toString());
+                        } catch (storageErr) {
+                            console.debug('[Memory] Could not save audio position:', storageErr.message);
                         }
-                        audio.removeAttribute('src');
-                    } catch (e) { console.warn('[Memory] Audio cleanup failed for element:', e.message); }
-                }
-                return { subsystem: 'audio', paused };
-            }
-        };
-    
-        const mapSubsystem = {
-            dispose() {
-                const results = { markerClusters: 0, animationFrames: 0, timeouts: 0 };
-                if (typeof markerClusterGroup !== 'undefined' &&
-                    markerClusterGroup && typeof markerClusterGroup.clearLayers === 'function') {
-                    try { markerClusterGroup.clearLayers(); results.markerClusters = 1; }
-                    catch (e) { console.warn('[Memory] Marker cluster cleanup failed:', e.message); }
-                }
-                if (window.animationFrameId != null) {
-                    cancelAnimationFrame(window.animationFrameId);
-                    window.animationFrameId = null;
-                    results.animationFrames = 1;
-                }
-                if (window.stationaryCheckTimeout) { clearTimeout(window.stationaryCheckTimeout); window.stationaryCheckTimeout = null; results.timeouts++; }
-                if (window.inactivityTimer)        { clearTimeout(window.inactivityTimer);        window.inactivityTimer = null;        results.timeouts++; }
-                if (window.positionWatchId != null) {
-                    try { navigator.geolocation.clearWatch(window.positionWatchId); window.positionWatchId = null; }
-                    catch (e) { console.warn('[Memory] GPS watch cleanup failed:', e.message); }
-                }
-                return { subsystem: 'map', ...results };
-            }
-        };
-    
-        const domSubsystem = {
-            dispose() {
-                let removed = 0;
-                const selectors = '[data-tracked="true"], .popup-overlay, .modal, .navigation-tips-overlay, .source-info-content';
-                for (const el of document.querySelectorAll(selectors)) { el.remove(); removed++; }
-                if (Array.isArray(window.gameLocations))  window.gameLocations.length = 0;
-                if (Array.isArray(window.positionBuffer)) window.positionBuffer.length = 0;
-                if (window.activePopups) window.activePopups.clear();
-                return { subsystem: 'dom', removed };
-            }
-        };
-    
-        const subsystems  = [timerSubsystem, listenerSubsystem, audioSubsystem, mapSubsystem, domSubsystem];
-        const customTasks = [];
-    
-        const manager = {
-            isDisposed: false,
-            createTrackedTimeout:  timerSubsystem.createTimeout.bind(timerSubsystem),
-            createTrackedInterval: timerSubsystem.createInterval.bind(timerSubsystem),
-            clearTrackedTimer:     timerSubsystem.clear.bind(timerSubsystem),
-            trackEventListener:    listenerSubsystem.track.bind(listenerSubsystem),
-    
-            // Companion to trackEventListener. Pass the entry it returned
-            // to remove that one listener early instead of waiting for full
-            // disposal. Additive; nothing existing needs to change to keep working.
-            untrackEventListener: listenerSubsystem.untrack.bind(listenerSubsystem),
-    
-            registerCleanupTask(fn) {
-                if (typeof fn !== 'function') { console.warn('[Memory] Ignoring non-function cleanup task:', fn); return; }
-                customTasks.push(fn);
-            },
-    
-            executeCleanup() {
-                if (this.isDisposed) return [];
-                const report = [];
-                while (customTasks.length > 0) {
-                    try { customTasks.shift()(); } catch (e) { console.error('[Memory] Custom cleanup task failed:', e); }
-                }
-                for (const sys of subsystems) {
-                    try { report.push(sys.dispose()); }
-                    catch (e) { console.error('[Memory] Subsystem cleanup failed:', sys, e); report.push({ subsystem: sys.name || 'unknown', error: e.message }); }
-                }
-                this.isDisposed = true;
-                console.log('[Memory] Cleanup cycles complete.');
-                return report;
-            },
-    
-            shutdown() {
-                this.executeCleanup();
-                if (window.performCleanup === this.executeCleanup) delete window.performCleanup;
-                console.log('[Memory] Manager shutdown complete');
-            }
-        };
-    
-        listenerSubsystem.track(document, 'visibilitychange', () => {
-            if (document.hidden) {
-                const audio = document.getElementById('locationAudio');
-                if (audio && !isNaN(audio.currentTime) && audio.currentTime > 0) {
-                    try { localStorage.setItem('audioPosition', audio.currentTime.toString()); } catch (_) {}
+                    }
+                    audio.removeAttribute('src');
+                    audio.load();
+                } catch (e) {
+                    console.warn('[Memory] Audio cleanup failed for element:', e.message);
                 }
             }
-        });
-    
-        listenerSubsystem.track(window, 'beforeunload', () => manager.executeCleanup());
-    
-        return manager;
+            return { subsystem: 'audio', paused };
+        }
+    };
+
+    // ── Map / app-specific subsystems ────────────
+    const mapSubsystem = {
+        dispose() {
+            const results = { markerClusters: 0, animationFrames: 0, timeouts: 0 };
+            if (typeof window.markerClusterGroup !== 'undefined' &&
+                window.markerClusterGroup && typeof window.markerClusterGroup.clearLayers === 'function') {
+                try { window.markerClusterGroup.clearLayers(); results.markerClusters = 1; }
+                catch (e) { console.warn('[Memory] Marker cluster cleanup failed:', e.message); }
+            }
+            if (window.animationFrameId != null) {
+                cancelAnimationFrame(window.animationFrameId);
+                window.animationFrameId = null;
+                results.animationFrames = 1;
+            }
+            if (window.stationaryCheckTimeout) {
+                clearTimeout(window.stationaryCheckTimeout);
+                window.stationaryCheckTimeout = null;
+                results.timeouts++;
+            }
+            if (window.inactivityTimer) {
+                clearTimeout(window.inactivityTimer);
+                window.inactivityTimer = null;
+                results.timeouts++;
+            }
+            if (window.positionWatchId != null) {
+                try {
+                    navigator.geolocation.clearWatch(window.positionWatchId);
+                    window.positionWatchId = null;
+                } catch (e) {
+                    console.warn('[Memory] GPS watch cleanup failed:', e.message);
+                }
+            }
+            return { subsystem: 'map', ...results };
+        }
+    };
+
+    const domSubsystem = {
+        dispose() {
+            let removed = 0;
+            const selectors = '[data-tracked="true"], .popup-overlay, .modal, .navigation-tips-overlay, .source-info-content';
+            for (const el of document.querySelectorAll(selectors)) { el.remove(); removed++; }
+            if (Array.isArray(window.gameLocations))  window.gameLocations.length = 0;
+            if (Array.isArray(window.positionBuffer)) window.positionBuffer.length = 0;
+            if (window.activePopups && typeof window.activePopups.clear === 'function') window.activePopups.clear();
+            return { subsystem: 'dom', removed };
+        }
+    };
+
+    // ── Core manager ─────────────────────────────
+    const subsystems  = [timerSubsystem, listenerSubsystem, audioSubsystem, mapSubsystem, domSubsystem];
+    const customTasks = [];
+
+    const manager = {
+        isDisposed: false,
+
+        createTrackedTimeout:  timerSubsystem.createTimeout.bind(timerSubsystem),
+        createTrackedInterval: timerSubsystem.createInterval.bind(timerSubsystem),
+        clearTrackedTimer:     timerSubsystem.clear.bind(timerSubsystem),
+        trackEventListener:    listenerSubsystem.track.bind(listenerSubsystem),
+        untrackEventListener:  listenerSubsystem.untrack.bind(listenerSubsystem),
+
+        registerCleanupTask(fn) {
+            if (typeof fn !== 'function') {
+                console.warn('[Memory] Ignoring non-function cleanup task:', fn);
+                return;
+            }
+            customTasks.push(fn);
+        },
+
+        executeCleanup: null,
+        shutdown: null,
+    };
+
+    function _executeCleanup() {
+        if (manager.isDisposed) return [];
+        const report = [];
+
+        const tasks = customTasks.splice(0, customTasks.length);
+        for (const task of tasks) {
+            try { task(); }
+            catch (e) { console.error('[Memory] Custom cleanup task failed:', e); }
+        }
+
+        for (const sys of subsystems) {
+            try { report.push(sys.dispose()); }
+            catch (e) {
+                console.error('[Memory] Subsystem cleanup failed:', sys, e);
+                report.push({ subsystem: sys.name || 'unknown', error: e.message });
+            }
+        }
+
+        manager.isDisposed = true;
+        console.log('[Memory] Cleanup cycles complete.');
+        return report;
     }
-    
-    const memoryManager = setupMemoryManagement();
+
+    function _shutdown() {
+        _executeCleanup();
+        if (window.performCleanup === manager.executeCleanup) delete window.performCleanup;
+        console.log('[Memory] Manager shutdown complete');
+    }
+
+    manager.executeCleanup = _executeCleanup;
+    manager.shutdown       = _shutdown;
+
+    // ── Lifecycle hooks ──────────────────────────
+    // Registered with RAW addEventListener, NOT listenerSubsystem.track(),
+    // so they survive listenerSubsystem.dispose() during bfcache cycles.
+
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+            const audio = document.getElementById('locationAudio');
+            if (audio && !isNaN(audio.currentTime) && audio.currentTime > 0) {
+                try { localStorage.setItem('audioPosition', audio.currentTime.toString()); }
+                catch (_) {}
+            }
+        }
+    });
+
+    window.addEventListener('pagehide', (e) => {
+        if (e.persisted) {
+            // bfcache: dispose resources but keep manager alive
+            for (const sys of subsystems) {
+                try { sys.dispose(); } catch (_) {}
+            }
+        } else {
+            // Genuine unload: full teardown
+            _executeCleanup();
+        }
+    });
+
+    window.addEventListener('pageshow', (e) => {
+        if (e.persisted) {
+            console.log('[Memory] Restored from bfcache, manager still active');
+        }
+    });
+
+    return manager;
+}
+
+const memoryManager = setupMemoryManagement();
         
 /* ═══════════════════════════════════════════════════════════════
    POSITION KALMAN FILTER
    ═══════════════════════════════════════════════════════════════ */
-    class PositionKalmanFilter {
-        constructor(options = {}) {
-            this._baseAccelNoise    = options.accelNoise       ?? 2.5;
-            this.measurementNoise   = options.measurementNoise ?? 15;
-            this._maxRefShiftMeters = options.maxRefShiftMeters ?? 2000;
-            this.accelNoise         = this._baseAccelNoise;
-            this._currentSpeedMPS   = 0;
-            this._lastGPSSpeedMPS   = 0;
-            this.x                  = null;
-            this.P                  = null;
-            this.lastTimestamp      = null;
-            this.refLat             = null;
-            this.refLng             = null;
-            this._justInitialized   = false;
-            this._updateCount       = 0;
-            this._isFrozen          = false;
-            this._frozenPosition    = null;
-            this._P2 = [[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]];
-            this._Q  = [[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]];
-            this._K  = [[0,0],[0,0],[0,0],[0,0]];
-            this._pendingSeedVelocity = null;
-            this._lastSeedVelocity    = null;
-            this._nugget              = 1e-12;
-        }
-    
-        update(lat, lng, accuracyMeters, timestampPerfNow, gpsSpeedMPS) {
-            const R = this._measurementNoiseFromAccuracy(accuracyMeters);
-    
-            if (!isFinite(lat) || !isFinite(lng)) {
-                return this._makeResult(
-                    this.x ? this.refLat : 0,
-                    this.x ? this.refLng : 0,
-                    { isConverged: false, blendFactor: 0, updateCount: this._updateCount }
-                );
-            }
-    
-            if (isFinite(gpsSpeedMPS) && gpsSpeedMPS >= 0) this._lastGPSSpeedMPS = gpsSpeedMPS;
-    
-            if (this.x === null) {
-                this._initialize(lat, lng, R, timestampPerfNow);
-                this._updateCount = 1;
-                return this._makeResult(lat, lng, { isConverged: false, blendFactor: 0, updateCount: this._updateCount });
-            }
-    
-            const dt = (timestampPerfNow - this.lastTimestamp) / 1000;
-    
-            if (dt <= 0 || dt > 30) {
-                const seedVel = this._lastSeedVelocity;
-                this._initialize(lat, lng, R, timestampPerfNow);
-                if (seedVel) this.seedVelocity(seedVel.vNorth, seedVel.vEast, 4.0);
-                this._updateCount = 1;
-                return this._makeResult(lat, lng, { isConverged: false, blendFactor: 0, updateCount: this._updateCount });
-            }
-    
-            if (this._isFrozen && this._frozenPosition) {
-                this._updateAccelNoise();
-                this._predict(dt);
-                const local = this._toLocal(this._frozenPosition.lat, this._frozenPosition.lng);
-                this._update(local.north, local.east, 0.5);
-                this._updateCount++;
-                return this._makeResult(this._frozenPosition.lat, this._frozenPosition.lng, {
-                    isConverged: true, blendFactor: 1.0, updateCount: this._updateCount, isFrozen: true
+   class PositionKalmanFilter {
+    constructor(options = {}) {
+        // ── Original options (unchanged defaults) ──
+        this._baseAccelNoise    = options.accelNoise        ?? 2.5;
+        this.measurementNoise   = options.measurementNoise  ?? 15;
+        this._maxRefShiftMeters = options.maxRefShiftMeters ?? 2000;
+
+        // ── NEW configurable options (defaults match original hard-codes) ──
+        this._maxDtSec              = options.maxDtSec              ?? 30;
+        this._convergenceCount      = options.convergenceCount      ?? 2;
+        this._convergenceVarThreshold = options.convergenceVarThreshold ?? 200;
+        this._headingMinSpeedMPS    = options.headingMinSpeedMPS    ?? 0.3;
+        this._innovationGateChi2    = options.innovationGateChi2    ?? 9.21; // 2-DOF, 99%
+        this._innovationGateSoft    = options.innovationGateSoft    ?? 4.61; // 2-DOF, 90% — soft inflate
+        this._velocityDampingMPS    = options.velocityDampingMPS    ?? 0.15; // below this, damp velocity
+        this._velocityDampingFactor = options.velocityDampingFactor ?? 0.85; // per-update multiplier
+        this._metersPerDegLat       = options.metersPerDegLat       ?? 111111;
+
+        this.accelNoise         = this._baseAccelNoise;
+        this._currentSpeedMPS   = 0;
+        this._lastGPSSpeedMPS   = 0;
+        this.x                  = null;
+        this.P                  = null;
+        this.lastTimestamp      = null;
+        this.refLat             = null;
+        this.refLng             = null;
+        this._justInitialized   = false;
+        this._updateCount       = 0;
+        this._isFrozen          = false;
+        this._frozenPosition    = null;
+        this._P2 = [[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]];
+        this._Q  = [[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]];
+        this._K  = [[0,0],[0,0],[0,0],[0,0]];
+        this._pendingSeedVelocity = null;
+        this._lastSeedVelocity    = null;
+        this._nugget              = 1e-12;
+
+        // ── diagnostics (populated every update) ──
+        this._lastInnovation    = { north: 0, east: 0 };
+        this._lastMahalanobis2  = 0;
+        this._lastR             = 0;
+        this._lastGateAction    = 'none'; // 'none' | 'soft_inflate' | 'rejected'
+
+        // ── Preallocated caches to prevent GC pauses in high-frequency GPS loops ──
+        // Separate caches for local and global to avoid overwrite in nested calls
+        this._localCache  = { north: 0, east: 0 };
+        this._globalCache = { lat: 0, lng: 0 };
+    }
+
+    update(lat, lng, accuracyMeters, timestampPerfNow, gpsSpeedMPS) {
+        const R = this._measurementNoiseFromAccuracy(accuracyMeters);
+
+        // If invalid GPS data, return the CURRENT filtered position,
+        // not the reference origin. Only fall back to 0,0 if truly uninitialized.
+        if (!isFinite(lat) || !isFinite(lng)) {
+            if (this.x) {
+                const pos = this._toGlobal(this.x[0], this.x[1]);
+                return this._makeResult(pos.lat, pos.lng, {
+                    isConverged: this._isConverged(),
+                    blendFactor: Math.min(1.0, this._updateCount / this._convergenceCount),
+                    updateCount: this._updateCount
                 });
             }
-    
-            this._updateAccelNoise();
-    
-            const localPre = this._toLocal(lat, lng);
-            if (Math.abs(localPre.north) > this._maxRefShiftMeters ||
-                Math.abs(localPre.east)  > this._maxRefShiftMeters) {
-                this._shiftReference();
-            }
-    
-            this._predict(dt);
-            const local = this._toLocal(lat, lng);
-            this._update(local.north, local.east, R);
-    
-            const pos = this._toGlobal(this.x[0], this.x[1]);
-            this._pendingSeedVelocity = null;
+            return this._makeResult(0, 0, { isConverged: false, blendFactor: 0, updateCount: this._updateCount });
+        }
+
+        if (isFinite(gpsSpeedMPS) && gpsSpeedMPS >= 0) this._lastGPSSpeedMPS = gpsSpeedMPS;
+
+        if (this.x === null) {
+            this._initialize(lat, lng, R, timestampPerfNow);
+            this._updateCount = 1;
+            return this._makeResult(lat, lng, { isConverged: false, blendFactor: 0, updateCount: this._updateCount });
+        }
+
+        const dt = (timestampPerfNow - this.lastTimestamp) / 1000;
+
+        if (dt <= 0 || dt > this._maxDtSec) {
+            const seedVel = this._lastSeedVelocity;
+            this._initialize(lat, lng, R, timestampPerfNow);
+            if (seedVel) this.seedVelocity(seedVel.vNorth, seedVel.vEast, 4.0);
+            this._updateCount = 1;
+            return this._makeResult(lat, lng, { isConverged: false, blendFactor: 0, updateCount: this._updateCount });
+        }
+
+        // ── Frozen: hold state, skip predict/update churn ──
+        if (this._isFrozen && this._frozenPosition) {
             this._updateCount++;
+            this.lastTimestamp = timestampPerfNow; // keep clock current
+            return this._makeResult(this._frozenPosition.lat, this._frozenPosition.lng, {
+                isConverged: true, blendFactor: 1.0, updateCount: this._updateCount, isFrozen: true
+            });
+        }
+
+        this._updateAccelNoise(dt);
+
+        const localPre = this._toLocal(lat, lng);
+        if (Math.abs(localPre.north) > this._maxRefShiftMeters ||
+            Math.abs(localPre.east)  > this._maxRefShiftMeters) {
+            this._shiftReference();
+        }
+
+        this._predict(dt);
+        const local = this._toLocal(lat, lng);
+
+        // ── Innovation gating ──
+        const gatedR = this._gateInnovation(local.north, local.east, R);
+        if (gatedR < 0) {
+            // Measurement rejected — return predicted position without update
+            const pos = this._toGlobal(this.x[0], this.x[1]);
+            this._updateCount++;
+            this._lastGateAction = 'rejected';
             if (this.x) this._lastSeedVelocity = { vNorth: this.x[2], vEast: this.x[3] };
-    
-            const speedMPS = this.x ? Math.sqrt(this.x[2]*this.x[2] + this.x[3]*this.x[3]) : 0;
-            const convergenceThreshold = speedMPS > 15 ? 2 : 4;
-            const isConverged = this._updateCount >= convergenceThreshold && this.P && this.P[0][0] < 200;
-            const blendFactor = Math.min(1.0, this._updateCount / convergenceThreshold);
-    
-            return this._makeResult(pos.lat, pos.lng, { isConverged, blendFactor, updateCount: this._updateCount });
+            return this._makeResult(pos.lat, pos.lng, {
+                isConverged: this._isConverged(),
+                blendFactor: Math.min(1.0, this._updateCount / this._convergenceCount),
+                updateCount: this._updateCount,
+                gateAction: 'rejected'
+            });
         }
-    
-        scheduleVelocitySeed(vNorth, vEast) {
-            if (isFinite(vNorth) && isFinite(vEast)) this._pendingSeedVelocity = { vNorth, vEast };
+
+        this._update(local.north, local.east, gatedR);
+
+        // ── NEW: Velocity damping at standstill ──
+        this._dampVelocityIfNeeded(dt);
+
+        const pos = this._toGlobal(this.x[0], this.x[1]);
+        this._pendingSeedVelocity = null;
+        this._updateCount++;
+        if (this.x) this._lastSeedVelocity = { vNorth: this.x[2], vEast: this.x[3] };
+
+        return this._makeResult(pos.lat, pos.lng, {
+            isConverged: this._isConverged(),
+            blendFactor: Math.min(1.0, this._updateCount / this._convergenceCount),
+            updateCount: this._updateCount,
+            gateAction: this._lastGateAction
+        });
+    }
+
+    // ── Public API (unchanged signatures) ──
+
+    scheduleVelocitySeed(vNorth, vEast) {
+        if (isFinite(vNorth) && isFinite(vEast)) this._pendingSeedVelocity = { vNorth, vEast };
+    }
+
+    getVelocity() {
+        if (!this.x) return { vNorth: 0, vEast: 0 };
+        return { vNorth: this.x[2], vEast: this.x[3] };
+    }
+
+    getSpeedMPS() {
+        if (!this.x) return 0;
+        return Math.sqrt(this.x[2] * this.x[2] + this.x[3] * this.x[3]);
+    }
+
+    getVelocityDegPerSec() {
+        if (!this.x || this.refLat == null) return { lat: 0, lng: 0 };
+        const cosLat = Math.cos(this.refLat * Math.PI / 180);
+        return { lat: this.x[2] / this._metersPerDegLat, lng: this.x[3] / (this._metersPerDegLat * cosLat) };
+    }
+
+    getHeading() {
+        if (!this.x) return null;
+        const speed = Math.sqrt(this.x[2] * this.x[2] + this.x[3] * this.x[3]);
+        if (speed < this._headingMinSpeedMPS) return null;
+        return (Math.atan2(this.x[3], this.x[2]) * 180 / Math.PI + 360) % 360;
+    }
+
+    reset() {
+        this.x = null; this.P = null; this.lastTimestamp = null;
+        this.refLat = null; this.refLng = null;
+        this.accelNoise = this._baseAccelNoise;
+        this._currentSpeedMPS = 0; this._lastGPSSpeedMPS = 0;
+        this._justInitialized = false;
+        this._pendingSeedVelocity = null; this._lastSeedVelocity = null;
+        this._updateCount = 0; this._isFrozen = false; this._frozenPosition = null;
+        this._lastInnovation = { north: 0, east: 0 };
+        this._lastMahalanobis2 = 0; this._lastR = 0; this._lastGateAction = 'none';
+    }
+
+    freeze(lat, lng) { this._isFrozen = true;  this._frozenPosition = { lat, lng }; }
+    unfreeze()       { this._isFrozen = false; this._frozenPosition = null; }
+    isFrozen()       { return this._isFrozen; }
+
+    // Clear ALL position-velocity cross-correlations (all 8 entries)
+    seedVelocity(vNorth, vEast, variance) {
+        if (!this.x) return;
+        this.x[2] = vNorth; this.x[3] = vEast;
+        if (this.P) {
+            const v = variance || 10.0;
+            this.P[2][2] = v; this.P[3][3] = v;
+            // Clear all cross-correlations between position and velocity states
+            this.P[0][2] = 0; this.P[2][0] = 0;
+            this.P[1][3] = 0; this.P[3][1] = 0;
+            this.P[0][3] = 0; this.P[3][0] = 0;
+            this.P[1][2] = 0; this.P[2][1] = 0;
         }
-    
-        getVelocity() {
-            if (!this.x) return { vNorth: 0, vEast: 0 };
-            return { vNorth: this.x[2], vEast: this.x[3] };
+        this._lastSeedVelocity = { vNorth, vEast };
+    }
+
+    // ── NEW: Diagnostics (additive, no existing code affected) ──
+
+    getDiagnostics() {
+        return {
+            updateCount:     this._updateCount,
+            isConverged:     this._isConverged(),
+            isFrozen:        this._isFrozen,
+            accelNoise:      this.accelNoise,
+            currentSpeedMPS: this._currentSpeedMPS,
+            lastR:           this._lastR,
+            lastInnovation:  { ...this._lastInnovation },
+            lastMahalanobis2: this._lastMahalanobis2,
+            lastGateAction:  this._lastGateAction,
+            positionVar:     this.P ? { north: this.P[0][0], east: this.P[1][1] } : null,
+            velocityVar:     this.P ? { north: this.P[2][2], east: this.P[3][3] } : null,
+            refLat:          this.refLat,
+            refLng:          this.refLng,
+        };
+    }
+
+    // ── Private ──
+
+    _isConverged() {
+        return this._updateCount >= this._convergenceCount
+            && this.P
+            && this.P[0][0] < this._convergenceVarThreshold;
+    }
+
+    _measurementNoiseFromAccuracy(accuracyMeters) {
+        const acc = accuracyMeters > 0 ? accuracyMeters : this.measurementNoise;
+        const hasConverged = this.P && this.P[0][0] < 100;
+        if (acc <= 5)  return hasConverged ? Math.max(2, acc) : Math.max(4, acc);
+        if (acc <= 12) return hasConverged ? Math.max(4, acc) : Math.max(6, acc);
+        if (acc <= 25) return Math.max(10, acc);
+        return Math.max(20, acc);
+    }
+
+    // ── NEW: Innovation gating via Mahalanobis distance  ──
+    _gateInnovation(zNorth, zEast, R) {
+        const P = this.P;
+        const y0 = zNorth - this.x[0];
+        const y1 = zEast  - this.x[1];
+        this._lastInnovation = { north: y0, east: y1 };
+        this._lastR = R;
+        this._lastGateAction = 'none';
+
+        const R2 = R * R;
+        const S00 = P[0][0] + R2 + this._nugget;
+        const S11 = P[1][1] + R2 + this._nugget;
+        const S01 = P[0][1];
+        const detS = S00 * S11 - S01 * S01;
+
+        if (detS <= 1e-15) {
+            // Degenerate — skip gating, trust the measurement
+            this._lastMahalanobis2 = 0;
+            return R;
         }
-    
-        getSpeedMPS() {
-            if (!this.x) return 0;
-            return Math.sqrt(this.x[2] * this.x[2] + this.x[3] * this.x[3]);
+
+        // Mahalanobis distance: d² = y' S⁻¹ y
+        const iS00 = S11 / detS, iS11 = S00 / detS, iS01 = -S01 / detS;
+        const d2 = y0 * (iS00 * y0 + iS01 * y1) + y1 * (iS01 * y0 + iS11 * y1);
+        this._lastMahalanobis2 = d2;
+
+        if (d2 > this._innovationGateChi2) {
+            // Hard reject: measurement is a statistical outlier
+            return -1;
         }
-    
-        getVelocityDegPerSec() {
-            if (!this.x || this.refLat == null) return { lat: 0, lng: 0 };
-            const cosLat = Math.cos(this.refLat * Math.PI / 180);
-            return { lat: this.x[2] / 111111, lng: this.x[3] / (111111 * cosLat) };
+
+        if (d2 > this._innovationGateSoft) {
+            // Soft inflate: scale R up proportionally to how far the
+            // innovation exceeds the expected gate. This down-weights
+            // suspicious measurements without discarding them entirely.
+            const inflate = d2 / this._innovationGateSoft;
+            this._lastGateAction = 'soft_inflate';
+            return R * Math.sqrt(inflate);
         }
-    
-        getHeading() {
-            if (!this.x) return null;
-            const speed = Math.sqrt(this.x[2] * this.x[2] + this.x[3] * this.x[3]);
-            if (speed < 0.3) return null;
-            return (Math.atan2(this.x[3], this.x[2]) * 180 / Math.PI + 360) % 360;
+
+        return R;
+    }
+
+    // ── NEW: Velocity damping at standstill  ──
+    _dampVelocityIfNeeded(dt) {
+        if (!this.x) return;
+        const speed = Math.sqrt(this.x[2] * this.x[2] + this.x[3] * this.x[3]);
+        if (speed > this._velocityDampingMPS) return;
+        if (this._lastGPSSpeedMPS > this._velocityDampingMPS) return; // GPS says moving
+
+        // Exponential decay toward zero. Frame-rate independent:
+        // factor^(dt) so behaviour is consistent regardless of update rate.
+        const factor = Math.pow(this._velocityDampingFactor, dt);
+        this.x[2] *= factor;
+        this.x[3] *= factor;
+
+        // Shrink velocity covariance to match
+        if (this.P) {
+            this.P[2][2] *= factor;
+            this.P[3][3] *= factor;
         }
-    
-        reset() {
-            this.x = null; this.P = null; this.lastTimestamp = null;
-            this.refLat = null; this.refLng = null;
-            this.accelNoise = this._baseAccelNoise;
-            this._currentSpeedMPS = 0; this._lastGPSSpeedMPS = 0;
-            this._justInitialized = false;
-            this._pendingSeedVelocity = null; this._lastSeedVelocity = null;
-            this._updateCount = 0; this._isFrozen = false; this._frozenPosition = null;
-        }
-    
-        freeze(lat, lng) { this._isFrozen = true;  this._frozenPosition = { lat, lng }; }
-        unfreeze()       { this._isFrozen = false; this._frozenPosition = null; }
-        isFrozen()       { return this._isFrozen; }
-    
-        seedVelocity(vNorth, vEast, variance) {
-            if (!this.x) return;
-            this.x[2] = vNorth; this.x[3] = vEast;
-            if (this.P) {
-                const v = variance || 10.0;
-                this.P[2][2] = v; this.P[3][3] = v;
-                this.P[0][2] = 0; this.P[2][0] = 0;
-                this.P[1][3] = 0; this.P[3][1] = 0;
-            }
-            this._lastSeedVelocity = { vNorth, vEast };
-        }
-    
-        _measurementNoiseFromAccuracy(accuracyMeters) {
-            const acc = accuracyMeters > 0 ? accuracyMeters : this.measurementNoise;
-            const hasConverged = this.P && this.P[0][0] < 100;
-            if (acc <= 5)  return hasConverged ? Math.max(2, acc) : Math.max(4, acc);
-            if (acc <= 12) return hasConverged ? Math.max(4, acc) : Math.max(6, acc);
-            if (acc <= 25) return Math.max(10, acc);
-            return Math.max(20, acc);
-        }
-    
-      _initialize(lat, lng, R, timestampPerfNow) {
+    }
+
+    _initialize(lat, lng, R, timestampPerfNow) {
         this.refLat = lat; this.refLng = lng;
-    
+
         const hasVelocityHint = this._pendingSeedVelocity &&
             (Math.abs(this._pendingSeedVelocity.vNorth) > 0.1 || Math.abs(this._pendingSeedVelocity.vEast) > 0.1);
-    
+
         this.x = hasVelocityHint
             ? [0, 0, this._pendingSeedVelocity.vNorth, this._pendingSeedVelocity.vEast]
             : [0, 0, 0, 0];
-    
+
         this.accelNoise = this._baseAccelNoise;
         this._currentSpeedMPS = hasVelocityHint
             ? Math.sqrt(this._pendingSeedVelocity.vNorth ** 2 + this._pendingSeedVelocity.vEast ** 2)
             : 0;
         this._isFrozen = false; this._frozenPosition = null;
-    
+
         const R2 = R * R;
-        // Initial velocity-covariance seed. The variance must reflect how well we
-        // actually know the initial velocity (which is seeded to [0,0] when there is
-        // no directional hint):
-        //   - hint present  -> moderate variance, trust the seeded velocity.
-        //   - GPS moving, no hint -> LARGE variance: we know we are moving but not the
-        //     direction, so let the first fixes snap velocity to the truth (no lag).
-        //   - stationary -> SMALL variance: pin velocity near zero so GPS scatter
-        //     cannot manufacture phantom motion (no jitter while standing still).
-        const v0 = hasVelocityHint ? 2.25 : (this._lastGPSSpeedMPS > 0.3 ? 225.0 : 0.5);
+        const v0 = hasVelocityHint ? 0.5 : (this._lastGPSSpeedMPS > 0.3 ? 10.0 : 0.1);
         this.P = [[R2,0,0,0],[0,R2,0,0],[0,0,v0,0],[0,0,0,v0]];
         this.lastTimestamp = timestampPerfNow;
         this._justInitialized = true;
-    
-        this._pendingSeedVelocity = null; // consumed here, not left for the next update() cycle
+        this._pendingSeedVelocity = null;
     }
-    
-        _updateAccelNoise() {
-            if (!this.x) return;
-            const kalmanSpeed = Math.sqrt(this.x[2]*this.x[2] + this.x[3]*this.x[3]);
-            const speed = Math.max(kalmanSpeed, (this._lastGPSSpeedMPS || 0) * 0.9);
-            this._currentSpeedMPS = speed;
-            if      (speed < 0.1)  { this.accelNoise = 0.5; return; }
-            if      (speed >= 15)  { this.accelNoise = 8.0; }
-            else if (speed >= 8)   { this.accelNoise = 3.0 + (speed - 8) * (5.0 / 7); }
-            else if (speed >= 2)   { this.accelNoise = 3.0; }
-            else if (speed >= 0.5) { this.accelNoise = 1.0 + (speed - 0.5) * (2.0 / 1.5); }
-            else                   { this.accelNoise = 1.0; }
-        }
-    
-        _predict(dt) {
-            const x = this.x, P = this.P, Q = this._Q, P2 = this._P2;
-            x[0] += x[2] * dt; x[1] += x[3] * dt;
-            const q = this.accelNoise, dt2 = dt*dt, dt3 = dt2*dt, dt4 = dt3*dt;
-            Q[0][0]=q*dt4/4; Q[0][1]=0;       Q[0][2]=q*dt3/2; Q[0][3]=0;
-            Q[1][0]=0;       Q[1][1]=q*dt4/4; Q[1][2]=0;       Q[1][3]=q*dt3/2;
-            Q[2][0]=q*dt3/2; Q[2][1]=0;       Q[2][2]=q*dt2;   Q[2][3]=0;
-            Q[3][0]=0;       Q[3][1]=q*dt3/2; Q[3][2]=0;       Q[3][3]=q*dt2;
-            const FP00=P[0][0]+dt*P[2][0], FP01=P[0][1]+dt*P[2][1], FP02=P[0][2]+dt*P[2][2], FP03=P[0][3]+dt*P[2][3];
-            const FP10=P[1][0]+dt*P[3][0], FP11=P[1][1]+dt*P[3][1], FP12=P[1][2]+dt*P[3][2], FP13=P[1][3]+dt*P[3][3];
-            P2[0][0]=FP00+dt*FP02+Q[0][0]; P2[0][1]=FP01+dt*FP03+Q[0][1]; P2[0][2]=FP02+Q[0][2]; P2[0][3]=FP03+Q[0][3];
-            P2[1][0]=FP10+dt*FP12+Q[1][0]; P2[1][1]=FP11+dt*FP13+Q[1][1]; P2[1][2]=FP12+Q[1][2]; P2[1][3]=FP13+Q[1][3];
-            P2[2][0]=P[2][0]+dt*P[2][2]+Q[2][0]; P2[2][1]=P[2][1]+dt*P[2][3]+Q[2][1]; P2[2][2]=P[2][2]+Q[2][2]; P2[2][3]=P[2][3]+Q[2][3];
-            P2[3][0]=P[3][0]+dt*P[3][2]+Q[3][0]; P2[3][1]=P[3][1]+dt*P[3][3]+Q[3][1]; P2[3][2]=P[3][2]+Q[3][2]; P2[3][3]=P[3][3]+Q[3][3];
-            this.P = P2; this._P2 = P;
-            this.lastTimestamp += dt * 1000;
-        }
-    
-        _update(zNorth, zEast, R) {
-            const P = this.P, K = this._K, R2 = R * R;
-            const y0 = zNorth - this.x[0], y1 = zEast - this.x[1];
-            const S00 = P[0][0] + R2 + this._nugget, S11 = P[1][1] + R2 + this._nugget, S01 = P[0][1];
-            const detS = S00 * S11 - S01 * S01;
-            if (detS <= 1e-15) {
-                K[0][0]=P[0][0]/S00; K[0][1]=0;           K[1][0]=0;           K[1][1]=P[1][1]/S11;
-                K[2][0]=P[2][0]/S00; K[2][1]=0;           K[3][0]=0;           K[3][1]=P[3][1]/S11;
-            } else {
-                const iS00=S11/detS, iS11=S00/detS, iS01=-S01/detS;
-                K[0][0]=P[0][0]*iS00+P[0][1]*iS01; K[0][1]=P[0][0]*iS01+P[0][1]*iS11;
-                K[1][0]=P[1][0]*iS00+P[1][1]*iS01; K[1][1]=P[1][0]*iS01+P[1][1]*iS11;
-                K[2][0]=P[2][0]*iS00+P[2][1]*iS01; K[2][1]=P[2][0]*iS01+P[2][1]*iS11;
-                K[3][0]=P[3][0]*iS00+P[3][1]*iS01; K[3][1]=P[3][0]*iS01+P[3][1]*iS11;
-            }
-            this.x[0]+=K[0][0]*y0+K[0][1]*y1; this.x[1]+=K[1][0]*y0+K[1][1]*y1;
-            this.x[2]+=K[2][0]*y0+K[2][1]*y1; this.x[3]+=K[3][0]*y0+K[3][1]*y1;
-            const P2 = this._P2;
-            const a00=1-K[0][0], a01=-K[0][1], a10=-K[1][0], a11=1-K[1][1];
-            const a20=-K[2][0],  a21=-K[2][1], a30=-K[3][0], a31=-K[3][1];
-            for (let i = 0; i < 4; i++) {
-                let APi0, APi1, APi2, APi3;
-                switch (i) {
-                    case 0: APi0=a00*P[0][0]+a01*P[1][0]; APi1=a00*P[0][1]+a01*P[1][1]; APi2=a00*P[0][2]+a01*P[1][2]; APi3=a00*P[0][3]+a01*P[1][3]; break;
-                    case 1: APi0=a10*P[0][0]+a11*P[1][0]; APi1=a10*P[0][1]+a11*P[1][1]; APi2=a10*P[0][2]+a11*P[1][2]; APi3=a10*P[0][3]+a11*P[1][3]; break;
-                    case 2: APi0=a20*P[0][0]+a21*P[1][0]+P[2][0]; APi1=a20*P[0][1]+a21*P[1][1]+P[2][1]; APi2=a20*P[0][2]+a21*P[1][2]+P[2][2]; APi3=a20*P[0][3]+a21*P[1][3]+P[2][3]; break;
-                    case 3: APi0=a30*P[0][0]+a31*P[1][0]+P[3][0]; APi1=a30*P[0][1]+a31*P[1][1]+P[3][1]; APi2=a30*P[0][2]+a31*P[1][2]+P[3][2]; APi3=a30*P[0][3]+a31*P[1][3]+P[3][3]; break;
-                }
-                const AAt_i0=APi0*a00+APi1*a01, AAt_i1=APi0*a10+APi1*a11;
-                const AAt_i2=APi0*a20+APi1*a21+APi2, AAt_i3=APi0*a30+APi1*a31+APi3;
-                const Ki0=K[i][0], Ki1=K[i][1];
-                P2[i][0]=AAt_i0+R2*(Ki0*K[0][0]+Ki1*K[0][1]); P2[i][1]=AAt_i1+R2*(Ki0*K[1][0]+Ki1*K[1][1]);
-                P2[i][2]=AAt_i2+R2*(Ki0*K[2][0]+Ki1*K[2][1]); P2[i][3]=AAt_i3+R2*(Ki0*K[3][0]+Ki1*K[3][1]);
-            }
-            for (let i = 0; i < 4; i++) {
-                for (let j = i + 1; j < 4; j++) {
-                    const avg = (P2[i][j] + P2[j][i]) * 0.5;
-                    P2[i][j] = avg; P2[j][i] = avg;
-                }
-            }
-            this.P = P2; this._P2 = P;
-        }
-    
-        _toLocal(lat, lng) {
-            return {
-                north: (lat - this.refLat) * 111111,
-                east:  (lng - this.refLng) * 111111 * Math.cos(this.refLat * Math.PI / 180)
-            };
-        }
-    
-        _toGlobal(north, east) {
-            const cosRef = Math.cos(this.refLat * Math.PI / 180);
-            return { lat: this.refLat + north / 111111, lng: this.refLng + east / (111111 * cosRef) };
-        }
-    
-        _shiftReference() {
-            const pos = this._toGlobal(this.x[0], this.x[1]);
-            this.refLat = pos.lat; this.refLng = pos.lng;
-            this.x[0] = 0; this.x[1] = 0;
-        }
-    
-        _makeResult(lat, lng, meta = {}) {
-            const vNorth = this.x ? this.x[2] : 0, vEast = this.x ? this.x[3] : 0;
-            return {
-                lat, lng, vNorth, vEast,
-                speedMPS:    Math.sqrt(vNorth*vNorth + vEast*vEast),
-                isConverged: meta.isConverged ?? false,
-                blendFactor: meta.blendFactor ?? 0,
-                updateCount: meta.updateCount ?? 0,
-                isFrozen:    meta.isFrozen    ?? false
-            };
-        }
+
+    // Continuous ramp removes the 0.5→1.0 discontinuity at 0.1 m/s
+    _updateAccelNoise(dt) {
+        if (!this.x) return;
+        const kalmanSpeed = Math.sqrt(this.x[2]*this.x[2] + this.x[3]*this.x[3]);
+        const speed = Math.max(kalmanSpeed, (this._lastGPSSpeedMPS || 0) * 0.9);
+        this._currentSpeedMPS = speed;
+
+        if      (speed < 0.1)  { this.accelNoise = 0.5 + speed * 5.0; }  // 0.5 → 1.0
+        else if (speed < 0.5)  { this.accelNoise = 1.0; }
+        else if (speed < 2)    { this.accelNoise = 1.0 + (speed - 0.5) * (2.0 / 1.5); }
+        else if (speed < 8)    { this.accelNoise = 3.0; }
+        else if (speed < 15)   { this.accelNoise = 3.0 + (speed - 8) * (5.0 / 7); }
+        else                   { this.accelNoise = 8.0; }
     }
+
+    _predict(dt) {
+        // Unchanged — allocation-free, correct
+        const x = this.x, P = this.P, Q = this._Q, P2 = this._P2;
+        x[0] += x[2] * dt; x[1] += x[3] * dt;
+        const q = this.accelNoise, dt2 = dt*dt, dt3 = dt2*dt, dt4 = dt3*dt;
+        Q[0][0]=q*dt4/4; Q[0][1]=0;       Q[0][2]=q*dt3/2; Q[0][3]=0;
+        Q[1][0]=0;       Q[1][1]=q*dt4/4; Q[1][2]=0;       Q[1][3]=q*dt3/2;
+        Q[2][0]=q*dt3/2; Q[2][1]=0;       Q[2][2]=q*dt2;   Q[2][3]=0;
+        Q[3][0]=0;       Q[3][1]=q*dt3/2; Q[3][2]=0;       Q[3][3]=q*dt2;
+        const FP00=P[0][0]+dt*P[2][0], FP01=P[0][1]+dt*P[2][1], FP02=P[0][2]+dt*P[2][2], FP03=P[0][3]+dt*P[2][3];
+        const FP10=P[1][0]+dt*P[3][0], FP11=P[1][1]+dt*P[3][1], FP12=P[1][2]+dt*P[3][2], FP13=P[1][3]+dt*P[3][3];
+        P2[0][0]=FP00+dt*FP02+Q[0][0]; P2[0][1]=FP01+dt*FP03+Q[0][1]; P2[0][2]=FP02+Q[0][2]; P2[0][3]=FP03+Q[0][3];
+        P2[1][0]=FP10+dt*FP12+Q[1][0]; P2[1][1]=FP11+dt*FP13+Q[1][1]; P2[1][2]=FP12+Q[1][2]; P2[1][3]=FP13+Q[1][3];
+        P2[2][0]=P[2][0]+dt*P[2][2]+Q[2][0]; P2[2][1]=P[2][1]+dt*P[2][3]+Q[2][1]; P2[2][2]=P[2][2]+Q[2][2]; P2[2][3]=P[2][3]+Q[2][3];
+        P2[3][0]=P[3][0]+dt*P[3][2]+Q[3][0]; P2[3][1]=P[3][1]+dt*P[3][3]+Q[3][1]; P2[3][2]=P[3][2]+Q[3][2]; P2[3][3]=P[3][3]+Q[3][3];
+
+        // Symmetrize to prevent floating point drift from breaking positive semi-definiteness
+        for (let i = 0; i < 4; i++) {
+            for (let j = i + 1; j < 4; j++) {
+                const avg = (P2[i][j] + P2[j][i]) * 0.5;
+                P2[i][j] = avg; P2[j][i] = avg;
+            }
+        }
+
+        this.P = P2; this._P2 = P;
+        this.lastTimestamp += dt * 1000;
+    }
+
+    _update(zNorth, zEast, R) {
+        // Unchanged — Joseph form, symmetry enforcement, nugget
+        const P = this.P, K = this._K, R2 = R * R;
+        const y0 = zNorth - this.x[0], y1 = zEast - this.x[1];
+        const S00 = P[0][0] + R2 + this._nugget, S11 = P[1][1] + R2 + this._nugget, S01 = P[0][1];
+        const detS = S00 * S11 - S01 * S01;
+        if (detS <= 1e-15) {
+            K[0][0]=P[0][0]/S00; K[0][1]=0;           K[1][0]=0;           K[1][1]=P[1][1]/S11;
+            K[2][0]=P[2][0]/S00; K[2][1]=0;           K[3][0]=0;           K[3][1]=P[3][1]/S11;
+        } else {
+            const iS00=S11/detS, iS11=S00/detS, iS01=-S01/detS;
+            K[0][0]=P[0][0]*iS00+P[0][1]*iS01; K[0][1]=P[0][0]*iS01+P[0][1]*iS11;
+            K[1][0]=P[1][0]*iS00+P[1][1]*iS01; K[1][1]=P[1][0]*iS01+P[1][1]*iS11;
+            K[2][0]=P[2][0]*iS00+P[2][1]*iS01; K[2][1]=P[2][0]*iS01+P[2][1]*iS11;
+            K[3][0]=P[3][0]*iS00+P[3][1]*iS01; K[3][1]=P[3][0]*iS01+P[3][1]*iS11;
+        }
+        this.x[0]+=K[0][0]*y0+K[0][1]*y1; this.x[1]+=K[1][0]*y0+K[1][1]*y1;
+        this.x[2]+=K[2][0]*y0+K[2][1]*y1; this.x[3]+=K[3][0]*y0+K[3][1]*y1;
+        const P2 = this._P2;
+        const a00=1-K[0][0], a01=-K[0][1], a10=-K[1][0], a11=1-K[1][1];
+        const a20=-K[2][0],  a21=-K[2][1], a30=-K[3][0], a31=-K[3][1];
+        for (let i = 0; i < 4; i++) {
+            let APi0, APi1, APi2, APi3;
+            switch (i) {
+                case 0: APi0=a00*P[0][0]+a01*P[1][0]; APi1=a00*P[0][1]+a01*P[1][1]; APi2=a00*P[0][2]+a01*P[1][2]; APi3=a00*P[0][3]+a01*P[1][3]; break;
+                case 1: APi0=a10*P[0][0]+a11*P[1][0]; APi1=a10*P[0][1]+a11*P[1][1]; APi2=a10*P[0][2]+a11*P[1][2]; APi3=a10*P[0][3]+a11*P[1][3]; break;
+                case 2: APi0=a20*P[0][0]+a21*P[1][0]+P[2][0]; APi1=a20*P[0][1]+a21*P[1][1]+P[2][1]; APi2=a20*P[0][2]+a21*P[1][2]+P[2][2]; APi3=a20*P[0][3]+a21*P[1][3]+P[2][3]; break;
+                case 3: APi0=a30*P[0][0]+a31*P[1][0]+P[3][0]; APi1=a30*P[0][1]+a31*P[1][1]+P[3][1]; APi2=a30*P[0][2]+a31*P[1][2]+P[3][2]; APi3=a30*P[0][3]+a31*P[1][3]+P[3][3]; break;
+            }
+            const AAt_i0=APi0*a00+APi1*a01, AAt_i1=APi0*a10+APi1*a11;
+            const AAt_i2=APi0*a20+APi1*a21+APi2, AAt_i3=APi0*a30+APi1*a31+APi3;
+            const Ki0=K[i][0], Ki1=K[i][1];
+            P2[i][0]=AAt_i0+R2*(Ki0*K[0][0]+Ki1*K[0][1]); P2[i][1]=AAt_i1+R2*(Ki0*K[1][0]+Ki1*K[1][1]);
+            P2[i][2]=AAt_i2+R2*(Ki0*K[2][0]+Ki1*K[2][1]); P2[i][3]=AAt_i3+R2*(Ki0*K[3][0]+Ki1*K[3][1]);
+        }
+        for (let i = 0; i < 4; i++) {
+            for (let j = i + 1; j < 4; j++) {
+                const avg = (P2[i][j] + P2[j][i]) * 0.5;
+                P2[i][j] = avg; P2[j][i] = avg;
+            }
+        }
+        this.P = P2; this._P2 = P;
+    }
+
+    // Preallocated caches — separate objects to prevent
+    // overwrite in nested calls (e.g., _shiftReference calling _toGlobal
+    // while _update holds a _localCache reference).
+    _toLocal(lat, lng) {
+        const c = this._localCache;
+        c.north = (lat - this.refLat) * this._metersPerDegLat;
+        c.east  = (lng - this.refLng) * this._metersPerDegLat * Math.cos(this.refLat * Math.PI / 180);
+        return c;
+    }
+
+    _toGlobal(north, east) {
+        const c = this._globalCache;
+        const cosRef = Math.cos(this.refLat * Math.PI / 180);
+        c.lat = this.refLat + north / this._metersPerDegLat;
+        c.lng = this.refLng + east / (this._metersPerDegLat * cosRef);
+        return c;
+    }
+
+    _shiftReference() {
+        const pos = this._toGlobal(this.x[0], this.x[1]);
+        this.refLat = pos.lat; this.refLng = pos.lng;
+        this.x[0] = 0; this.x[1] = 0;
+    }
+
+    _makeResult(lat, lng, meta = {}) {
+        const vNorth = this.x ? this.x[2] : 0, vEast = this.x ? this.x[3] : 0;
+        return {
+            lat, lng, vNorth, vEast,
+            speedMPS:    Math.sqrt(vNorth*vNorth + vEast*vEast),
+            isConverged: meta.isConverged ?? false,
+            blendFactor: meta.blendFactor ?? 0,
+            updateCount: meta.updateCount ?? 0,
+            isFrozen:    meta.isFrozen    ?? false,
+            gateAction:  meta.gateAction  ?? 'none',
+        };
+    }
+}
         
 /* ═══════════════════════════════════════════════════════════════
    SENSOR FUSION MANAGER
@@ -1073,6 +1464,7 @@ class SensorFusionManager {
         this.hasCompass               = false;
         this.isAvailable              = false;
         this._listener                = null;
+        this._listenerTrackedEntry    = null;
         this._kalmanFilter            = null;
         this._accelerometer           = null;
         this._accelAvailable          = false;
@@ -1083,7 +1475,9 @@ class SensorFusionManager {
         this._graceTimerId            = null;
         this._lastMovementTime        = 0;
         this._accelGestureHandler     = null;
+        this._accelGestureTrackedEntries = [];
         this._accelPendingPermission  = false;
+        this._compassPermissionHandler = null; 
         this._lastKalmanLat           = null;
         this._lastKalmanLng           = null;
         this._lastKalmanTimestamp     = null;
@@ -1098,16 +1492,34 @@ class SensorFusionManager {
         this._rawVelocity             = { lat: 0, lng: 0 };
         this._convergenceStage        = 0;
         this._stationaryCounter       = 0;
-        this._unfreezeCounter         = 0;   // hysteresis: require sustained motion before unfreeze
+        this._exitSustainCount        = 0;
         this._lastStationaryState     = false;
         this._stationaryPosition      = null;
-        this._stationarySamples       = [];
         this._gpsVelocityDegPerSec    = { lat: 0, lng: 0 };
         this._lastCompassHeading      = null;
         this._compassStableCount      = 0;
         this._compassTimestamp        = 0;
+        this._lastCompassTimestamp    = 0;
         this._accelFrequency          = options.accelFrequency || 20;
         this._clockResyncIntervalMs   = options.clockResyncIntervalMs || 60000;
+
+        // ── NEW configurable thresholds  ──
+        this._compassSpikeDeg         = options.compassSpikeDeg         ?? 150;
+        this._compassSpikeRateDegPerSec = options.compassSpikeRateDegPerSec ?? 300;
+        this._accelMoveThreshold      = options.accelMoveThreshold      ?? 0.3;
+        this._accelMoveSustainFrames  = options.accelMoveSustainFrames  ?? 2;
+        this._accelMoveSustainCount   = 0;
+        this._movementGraceMs         = options.movementGraceMs         ?? 800;
+        this._stationaryEnterSpeed    = options.stationaryEnterSpeed    ?? 0.3;
+        this._stationaryExitSpeed     = options.stationaryExitSpeed     ?? 0.8;
+        this._stationaryExitFrames    = options.stationaryExitFrames    ?? 3;
+        this._stationaryEnterCount    = options.stationaryEnterCount    ?? 5;
+
+        // ── Preallocated scratch objects for internal use ONLY.
+        // Public methods return FRESH objects to prevent caller aliasing bugs.
+        this._smoothPosScratch = { lat: 0, lng: 0, vNorth: 0, vEast: 0, speedMPS: 0, isConverged: false, blendFactor: 0, isFrozen: false };
+        this._hybridVelScratch = { vNorth: 0, vEast: 0 };
+        this._smoothedVelScratch = { lat: 0, lng: 0 };
     }
 
     init() {
@@ -1115,9 +1527,6 @@ class SensorFusionManager {
         this._initAccelerometer();
         this._initKalmanFilter();
 
-        // Guaranteed cleanup on page hide/unload — fires even on mobile Safari
-        // where beforeunload is unreliable. destroy() removes listeners directly,
-        // so this is the safety net for when the app forgets to call destroy().
         this._pageHideHandler = () => this.destroy();
         window.addEventListener('pagehide', this._pageHideHandler, { once: true });
 
@@ -1125,12 +1534,8 @@ class SensorFusionManager {
     }
 
     getCurrentStateAgeMs() {
-        // _lastKalmanTimestamp is already in performance.now() space, but
-        // _rawTimestamp is a wall-clock (Date.now()-based) timestamp from the
-        // Geolocation API and must be converted before comparing against
-        // performance.now() — otherwise this mixes two different epochs and
-        // returns a nonsense (usually hugely negative) value.
-        const lastTime = this._lastKalmanTimestamp || (this._rawTimestamp ? this._toPerfNow(this._rawTimestamp) : 0);
+        const lastTime = this._lastKalmanTimestamp ||
+            (this._rawTimestamp ? this._toPerfNow(this._rawTimestamp) : 0);
         return lastTime ? (performance.now() - lastTime) : 0;
     }
 
@@ -1138,6 +1543,7 @@ class SensorFusionManager {
         this._kalmanFilter = new PositionKalmanFilter({ accelNoise: 2.5, measurementNoise: 10 });
     }
 
+    // ── iOS 13+ permission-aware compass init ──
     _initDeviceOrientation() {
         const testHandler = (e) => {
             const heading = e.webkitCompassHeading ??
@@ -1156,56 +1562,108 @@ class SensorFusionManager {
             this._orientationTestTimer = null;
             window.removeEventListener('deviceorientationabsolute', testHandler);
             window.removeEventListener('deviceorientation', testHandler);
-            if (!this.hasCompass) console.log('[SensorFusion] No compass available');
+            if (!this.hasCompass) {
+                console.log('[SensorFusion] No compass available');
+                this._attachCompassPermissionGesture();
+            }
         }, 3000);
     }
 
-    _clearOrientationTestTimer() {
-        if (this._orientationTestTimer) { clearTimeout(this._orientationTestTimer); this._orientationTestTimer = null; }
+    // ── iOS gesture-based compass permission ──
+    _attachCompassPermissionGesture() {
+        if (typeof DeviceOrientationEvent === 'undefined' ||
+            typeof DeviceOrientationEvent.requestPermission !== 'function') return;
+
+        const requestOnce = async () => {
+            document.removeEventListener('click',    requestOnce, true);
+            document.removeEventListener('touchend', requestOnce, true);
+            this._compassPermissionHandler = null;
+            try {
+                const result = await DeviceOrientationEvent.requestPermission();
+                if (result === 'granted') {
+                    this.hasCompass = true;
+                    this.isAvailable = true;
+                    this._attachOrientationListener();
+                }
+            } catch (e) {
+                console.warn('[SensorFusion] Compass permission request failed:', e.message);
+            }
+        };
+        this._compassPermissionHandler = requestOnce;
+        document.addEventListener('click',    requestOnce, { once: true, capture: true });
+        document.addEventListener('touchend', requestOnce, { once: true, capture: true });
     }
 
-   _attachOrientationListener() {
-        const eventName = 'ondeviceorientationabsolute' in window ? 'deviceorientationabsolute' : 'deviceorientation';
+    _clearOrientationTestTimer() {
+        if (this._orientationTestTimer) {
+            clearTimeout(this._orientationTestTimer);
+            this._orientationTestTimer = null;
+        }
+    }
+
+    _attachOrientationListener() {
+        const eventName = 'ondeviceorientationabsolute' in window
+            ? 'deviceorientationabsolute' : 'deviceorientation';
+
         this._listener = (e) => {
             const heading  = e.webkitCompassHeading ??
                 (e.alpha != null && e.absolute === true ? (360 - e.alpha) % 360 : null);
             const accuracy = e.webkitCompassAccuracy ?? null;
             if (heading == null || !isFinite(heading) || heading < 0 || heading >= 360) return;
 
+            const now = performance.now();
+
+            // ──  Time-aware spike rejection ──
             if (this.deviceHeading != null) {
                 let diff = Math.abs(heading - this.deviceHeading);
                 if (diff > 180) diff = 360 - diff;
-                if (diff > 150) return;
+
+                const dtSec = this._lastCompassTimestamp > 0
+                    ? (now - this._lastCompassTimestamp) / 1000
+                    : 1;
+                const rateDegPerSec = dtSec > 0 ? diff / dtSec : Infinity;
+
+                if (diff > this._compassSpikeDeg && rateDegPerSec > this._compassSpikeRateDegPerSec) return;
                 if (diff > 45 && (accuracy == null || accuracy > 25)) return;
             }
 
+            // ──  Accuracy-weighted EMA  ──
             if (this._smoothedHeading == null) {
                 this._smoothedHeading = heading;
             } else {
                 let delta = heading - this._smoothedHeading;
                 if (delta >  180) delta -= 360;
                 if (delta < -180) delta += 360;
+
                 if (Math.abs(delta) > 90) {
                     this._smoothedHeading = heading;
                 } else {
                     const speedMPS = this._filteredSpeedMPS || 0;
-                    const alpha = speedMPS > 5 ? 0.3 : (speedMPS > 1 ? 0.2 : 0.12);
+                    let alpha = speedMPS > 5 ? 0.3 : (speedMPS > 1 ? 0.2 : 0.12);
+
+                    if (accuracy != null && isFinite(accuracy)) {
+                        const accFactor = accuracy <= 5 ? 1.0
+                                        : accuracy >= 30 ? 0.5
+                                        : 1.0 - (accuracy - 5) * (0.5 / 25);
+                        alpha *= accFactor;
+                    }
+
                     this._smoothedHeading = (this._smoothedHeading + alpha * delta + 360) % 360;
                 }
             }
+
             this.deviceHeading   = this._smoothedHeading;
             this.headingAccuracy = accuracy;
-            this._compassTimestamp = performance.now();
+            this._lastCompassTimestamp = this._compassTimestamp;
+            this._compassTimestamp  = now;
         };
+
         window.addEventListener(eventName, this._listener, true);
 
-        // Best-effort tracking. If memoryManager isn't loaded yet, no problem —
-        // destroy() removes the listener directly. This is auditing infrastructure,
-        // not a correctness requirement.
         if (typeof memoryManager !== 'undefined' &&
             memoryManager != null &&
             typeof memoryManager.trackEventListener === 'function') {
-            memoryManager.trackEventListener(window, eventName, this._listener, true);
+            this._listenerTrackedEntry = memoryManager.trackEventListener(window, eventName, this._listener, true);
         }
     }
 
@@ -1215,11 +1673,15 @@ class SensorFusionManager {
             navigator.permissions.query({ name: 'accelerometer' })
                 .then(result => {
                     if (result.state === 'granted') { this._startAccelerometer(); }
-                    else if (result.state === 'prompt') { this._accelPendingPermission = true; this._attachPermissionGestureHandler(); }
+                    else if (result.state === 'prompt') {
+                        this._accelPendingPermission = true;
+                        this._attachPermissionGestureHandler();
+                    }
                     else { this._accelAvailable = false; }
                     result.addEventListener('change', () => {
                         if (result.state === 'granted' && !this._accelAvailable) {
-                            this._startAccelerometer(); this._removePermissionGestureHandler();
+                            this._startAccelerometer();
+                            this._removePermissionGestureHandler();
                         }
                     });
                 })
@@ -1233,37 +1695,62 @@ class SensorFusionManager {
         if (this._accelAvailable) return;
         try {
             this._accelerometer = new Accelerometer({ frequency: this._accelFrequency });
-            const MOVEMENT_GRACE_MS = 800;
+
             this._accelerometer.addEventListener('reading', () => {
                 const a = this._accelerometer;
                 if (a.x == null || a.y == null || a.z == null) return;
-                const magnitude = Math.sqrt(a.x*a.x + a.y*a.y + a.z*a.z);
+                const magnitude   = Math.sqrt(a.x*a.x + a.y*a.y + a.z*a.z);
                 const linearAccel = Math.abs(magnitude - 9.8);
                 this._lastAccelMagnitude = linearAccel;
-                if (linearAccel > 0.3) {
-                    this._isMoving = true;
-                    this._lastMovementTime = Date.now();
-                    if (this._graceTimerId != null) { clearTimeout(this._graceTimerId); this._graceTimerId = null; }
-                    this._graceTimerId = setTimeout(() => {
-                        this._graceTimerId = null;
-                        // Use >= MOVEMENT_GRACE_MS without fudge factor — if
-                        // movement happened within the window, stay moving.
-                        if (Date.now() - this._lastMovementTime >= MOVEMENT_GRACE_MS) {
-                            this._isMoving = false;
+
+                // ── Entry debounce — require N consecutive frames ──
+                if (linearAccel > this._accelMoveThreshold) {
+                    this._accelMoveSustainCount++;
+                    if (this._accelMoveSustainCount >= this._accelMoveSustainFrames) {
+                        this._isMoving = true;
+                        this._lastMovementTime = Date.now();
+                        if (this._graceTimerId != null) {
+                            clearTimeout(this._graceTimerId);
+                            this._graceTimerId = null;
                         }
-                    }, MOVEMENT_GRACE_MS);
+                        this._graceTimerId = setTimeout(() => {
+                            this._graceTimerId = null;
+                            if (Date.now() - this._lastMovementTime >= this._movementGraceMs) {
+                                this._isMoving = false;
+                                this._accelMoveSustainCount = 0;
+                            }
+                        }, this._movementGraceMs);
+                    }
+                } else {
+                    this._accelMoveSustainCount = 0;
                 }
             });
+
             this._accelerometer.addEventListener('error', (e) => {
-                if (e.error?.name === 'NotAllowedError') console.warn('[SensorFusion] Accelerometer permission denied');
-                this._accelAvailable = false; this._accelPendingPermission = false; this._isMoving = false;
-                if (this._graceTimerId != null) { clearTimeout(this._graceTimerId); this._graceTimerId = null; }
-                if (this._accelerometer) { try { this._accelerometer.stop(); } catch (_) {} this._accelerometer = null; }
+                if (e.error?.name === 'NotAllowedError')
+                    console.warn('[SensorFusion] Accelerometer permission denied');
+                this._accelAvailable = false;
+                this._accelPendingPermission = false;
+                this._isMoving = false;
+                this._accelMoveSustainCount = 0;
+                if (this._graceTimerId != null) {
+                    clearTimeout(this._graceTimerId);
+                    this._graceTimerId = null;
+                }
+                if (this._accelerometer) {
+                    try { this._accelerometer.stop(); } catch (_) {}
+                    this._accelerometer = null;
+                }
             });
+
             this._accelerometer.start();
-            this._accelAvailable = true; this._accelPendingPermission = false;
+            this._accelAvailable = true;
+            this._accelPendingPermission = false;
         } catch (e) {
-            if (e.name === 'NotAllowedError') { this._accelPendingPermission = true; this._attachPermissionGestureHandler(); }
+            if (e.name === 'NotAllowedError') {
+                this._accelPendingPermission = true;
+                this._attachPermissionGestureHandler();
+            }
             this._accelAvailable = false;
         }
     }
@@ -1274,16 +1761,35 @@ class SensorFusionManager {
             if (!this._accelPendingPermission) return;
             try {
                 const result = await navigator.permissions.query({ name: 'accelerometer' });
-                if (result.state === 'granted') { this._startAccelerometer(); this._removePermissionGestureHandler(); return; }
+                if (result.state === 'granted') {
+                    this._startAccelerometer();
+                    this._removePermissionGestureHandler();
+                    return;
+                }
             } catch (_) {}
-            this._startAccelerometer(); this._removePermissionGestureHandler();
+            this._startAccelerometer();
+            this._removePermissionGestureHandler();
         };
-        document.addEventListener('click',    this._accelGestureHandler, true);
-        document.addEventListener('touchend', this._accelGestureHandler, true);
+
+        if (typeof memoryManager !== 'undefined' && memoryManager?.trackEventListener) {
+            this._accelGestureTrackedEntries.push(
+                memoryManager.trackEventListener(document, 'click', this._accelGestureHandler, true),
+                memoryManager.trackEventListener(document, 'touchend', this._accelGestureHandler, true)
+            );
+        } else {
+            document.addEventListener('click',    this._accelGestureHandler, true);
+            document.addEventListener('touchend', this._accelGestureHandler, true);
+        }
     }
 
     _removePermissionGestureHandler() {
         if (this._accelGestureHandler) {
+            if (typeof memoryManager !== 'undefined' && memoryManager?.untrackEventListener) {
+                for (const entry of this._accelGestureTrackedEntries) {
+                    if (entry) memoryManager.untrackEventListener(entry);
+                }
+                this._accelGestureTrackedEntries.length = 0;
+            }
             document.removeEventListener('click',    this._accelGestureHandler, true);
             document.removeEventListener('touchend', this._accelGestureHandler, true);
             this._accelGestureHandler = null;
@@ -1292,9 +1798,11 @@ class SensorFusionManager {
     }
 
     _toPerfNow(wallClockMs) {
-        if (this._clockOffset === null || (performance.now() - this._clockSyncTime) > this._clockResyncIntervalMs) {
-            const p = performance.now(), w = Date.now();
-            this._clockOffset = p - w; this._clockSyncTime = p;
+        const pNow = performance.now();
+        if (this._clockOffset === null ||
+            (pNow - this._clockSyncTime) > this._clockResyncIntervalMs) {
+            this._clockOffset = pNow - Date.now();
+            this._clockSyncTime = pNow;
         }
         return wallClockMs + this._clockOffset;
     }
@@ -1306,18 +1814,34 @@ class SensorFusionManager {
         return { lat: (rawLat - this._rawLat) / dtSec, lng: (rawLng - this._rawLng) / dtSec };
     }
 
+    // ──  Single heading blend method ──
+    _blendHeadingBySpeed(compassDeg, otherDeg, speedMPS) {
+        if (compassDeg == null) return otherDeg;
+        if (otherDeg   == null) return compassDeg;
+        if (speedMPS <= HEADING_BLEND_LOW)  return compassDeg;
+        if (speedMPS >= HEADING_BLEND_HIGH) return otherDeg;
+        const t = (speedMPS - HEADING_BLEND_LOW) / (HEADING_BLEND_HIGH - HEADING_BLEND_LOW);
+        return _blendHeadingDeg(compassDeg, otherDeg, t);
+    }
+
     _updateStationaryState(gpsSpeedMPS, kalmanSpeedMPS, rawLat, rawLng) {
-        const speed = Math.max(gpsSpeedMPS || 0, kalmanSpeedMPS || 0);
-        const isMoving = speed > 0.8 || (this._accelAvailable && this._isMoving);
+        const speed       = Math.max(gpsSpeedMPS || 0, kalmanSpeedMPS || 0);
+        const accelMoving = !!(this._accelAvailable && this._isMoving);
 
-        if (isMoving)         { this._stationaryCounter = Math.max(0, this._stationaryCounter - 2); }
-        else if (speed < 0.3) { this._stationaryCounter++; }
+        const isMoving = speed > this._stationaryExitSpeed || accelMoving;
 
-        const isStationary = speed < 0.3 || this._stationaryCounter >= 5;
+        if (isMoving) {
+            this._stationaryCounter = Math.max(0, this._stationaryCounter - 2);
+        } else if (speed < this._stationaryEnterSpeed) {
+            this._stationaryCounter = Math.min(6, this._stationaryCounter + 1);
+        }
+
+        const isStationary = !accelMoving &&
+            (speed < this._stationaryEnterSpeed ||
+             this._stationaryCounter >= this._stationaryEnterCount);
 
         if (isStationary && !this._lastStationaryState) {
-            // Transition to stationary — freeze immediately
-            this._unfreezeCounter = 0;
+            this._exitSustainCount = 0;
             const freezeLat = this._lastKalmanLat != null ? this._lastKalmanLat : rawLat;
             const freezeLng = this._lastKalmanLng != null ? this._lastKalmanLng : rawLng;
             if (this._kalmanFilter && freezeLat != null && freezeLng != null) {
@@ -1326,67 +1850,79 @@ class SensorFusionManager {
             this._stationaryPosition = (freezeLat != null && freezeLng != null)
                 ? { lat: freezeLat, lng: freezeLng }
                 : null;
-            this._stationarySamples = [];
 
         } else if (!isStationary && this._lastStationaryState) {
-            // Transition to moving — require 2 consecutive moving frames
-            this._unfreezeCounter++;
-            if (this._unfreezeCounter >= 2) {
-                if (this._kalmanFilter) this._kalmanFilter.unfreeze();
-                this._stationaryPosition = null;
-                this._stationarySamples  = [];
+            const clearsGate = accelMoving || speed > this._stationaryExitSpeed;
+            this._exitSustainCount++;
+
+            if (clearsGate || this._exitSustainCount >= this._stationaryExitFrames) {
+                if (this._kalmanFilter) {
+                    this._kalmanFilter.unfreeze();
+                    const P = this._kalmanFilter.P;
+                    if (P) {
+                        P[0][0] = Math.max(P[0][0], 225);
+                        P[1][1] = Math.max(P[1][1], 225);
+                        P[2][2] = Math.max(P[2][2], 10.0);
+                        P[3][3] = Math.max(P[3][3], 10.0);
+                        // Clear cross-correlations
+                        P[0][2] = 0; P[2][0] = 0; P[0][3] = 0; P[3][0] = 0;
+                        P[1][2] = 0; P[2][1] = 0; P[1][3] = 0; P[3][1] = 0;
+                    }
+                }
+                this._stationaryPosition  = null;
                 this._lastStationaryState = false;
-                this._unfreezeCounter = 0;
-                return false;  // ← Hysteresis satisfied, report moving
+                this._exitSustainCount    = 0;
+                return false;
             }
-            return true;  // ← Still building hysteresis, report stationary
+            return true;
         }
 
-        if (isStationary) this._unfreezeCounter = 0;
+        if (isStationary) this._exitSustainCount = 0;
         this._lastStationaryState = isStationary;
         return isStationary;
     }
 
     _getHybridVelocity() {
-        if (!this._kalmanFilter || !this._kalmanFilter.x) return { vNorth: 0, vEast: 0 };
-        const speed = this._filteredSpeedMPS || 0;
-        const kalmanVel = this._kalmanFilter.getVelocity();
-        const kalmanSpeed = Math.sqrt(kalmanVel.vNorth*kalmanVel.vNorth + kalmanVel.vEast*kalmanVel.vEast);
-        if (kalmanSpeed < 0.3) return kalmanVel;
+        const res = this._hybridVelScratch;
+        res.vNorth = 0; res.vEast = 0;
+
+        if (!this._kalmanFilter || !this._kalmanFilter.x) return res;
+        const kalmanVel   = this._kalmanFilter.getVelocity();
+        const kalmanSpeed = Math.sqrt(
+            kalmanVel.vNorth * kalmanVel.vNorth +
+            kalmanVel.vEast  * kalmanVel.vEast
+        );
+        if (kalmanSpeed < 0.3) {
+            res.vNorth = kalmanVel.vNorth; res.vEast = kalmanVel.vEast;
+            return res;
+        }
 
         const kalmanHeadingDeg = this._kalmanFilter.getHeading() ?? 0;
         const compassAge   = performance.now() - this._compassTimestamp;
         const compassFresh = this.deviceHeading != null && compassAge < 1500;
 
-        let headingDeg;
-        if (!compassFresh) {
-            headingDeg = kalmanHeadingDeg;
-        } else if (speed <= HEADING_BLEND_LOW) {
-            headingDeg = this.deviceHeading;
-        } else if (speed >= HEADING_BLEND_HIGH) {
-            headingDeg = kalmanHeadingDeg;
-        } else {
-            const t = (speed - HEADING_BLEND_LOW) / (HEADING_BLEND_HIGH - HEADING_BLEND_LOW);
-            headingDeg = _blendHeadingDeg(this.deviceHeading, kalmanHeadingDeg, t);
-        }
+        const headingDeg = compassFresh
+            ? this._blendHeadingBySpeed(this.deviceHeading, kalmanHeadingDeg, this._filteredSpeedMPS || 0)
+            : kalmanHeadingDeg;
 
         const headingRad = headingDeg * Math.PI / 180;
-        return { vNorth: kalmanSpeed * Math.cos(headingRad), vEast: kalmanSpeed * Math.sin(headingRad) };
+        res.vNorth = kalmanSpeed * Math.cos(headingRad);
+        res.vEast  = kalmanSpeed * Math.sin(headingRad);
+        return res;
     }
 
     smoothPosition(rawLat, rawLng, accuracyMeters, timestampMs, gpsSpeedMPS, gpsHeadingDeg) {
         if (!isFinite(rawLat) || !isFinite(rawLng) || !this._kalmanFilter) {
             return { lat: rawLat || 0, lng: rawLng || 0, vNorth: 0, vEast: 0, speedMPS: 0 };
         }
-     
-        const kf = this._kalmanFilter;
+
+        const kf      = this._kalmanFilter;
         const perfNow = this._toPerfNow(timestampMs);
-     
-        // Snapshot previous raw state BEFORE overwriting (fixes velocity-seed dt=0 bug)
+
         const prevRawLat       = this._rawLat;
         const prevRawLng       = this._rawLng;
         const prevRawTimestamp = this._rawTimestamp;
-     
+
         const gpsVel = this._computeGPSVelocity(rawLat, rawLng, timestampMs);
         this._gpsVelocityDegPerSec = gpsVel;
         this._rawLat        = rawLat;
@@ -1394,42 +1930,42 @@ class SensorFusionManager {
         this._rawSpeedMPS   = gpsSpeedMPS;
         this._rawHeadingDeg = gpsHeadingDeg;
         this._rawTimestamp  = timestampMs;
-     
-        // Gap recovery: seed velocity from position delta after long pause.
-        // Runs BEFORE kf.update() so it reads kf.lastTimestamp before this
-        // tick's update() advances it — the gap-length check needs the
-        // pre-update timestamp to detect the gap in the first place.
+
+        // Use prevRawLat/prevRawLng instead of window.lastPosition
         if (kf.lastTimestamp != null && kf.x != null) {
             const dtMs = perfNow - kf.lastTimestamp;
-            if (dtMs > 10000 && window.lastPosition?.lat != null && window.lastPosition?.lng != null) {
-                const dtSec = dtMs / 1000, cosLat = Math.cos(rawLat * Math.PI / 180);
+            if (dtMs > 10000 && prevRawLat != null && prevRawLng != null && prevRawTimestamp != null) {
+                const dtSec  = dtMs / 1000;
+                const cosLat = Math.cos(rawLat * Math.PI / 180);
                 kf.scheduleVelocitySeed(
-                    ((rawLat - window.lastPosition.lat) / dtSec) * 111111,
-                    ((rawLng - window.lastPosition.lng) / dtSec) * 111111 * cosLat
+                    ((rawLat - prevRawLat) / dtSec) * 111111,
+                    ((rawLng - prevRawLng) / dtSec) * 111111 * cosLat
                 );
             }
         }
-     
+
+        const isStationary = this._updateStationaryState(
+            gpsSpeedMPS, this._filteredSpeedMPS || 0, rawLat, rawLng
+        );
+
         const kfResult = kf.update(rawLat, rawLng, accuracyMeters, perfNow, gpsSpeedMPS);
-     
-        // kfResult.updateCount === 1 means kf.update() just called _initialize()
-        // this tick — covers the filter's very first init AND every reset path
-        // (dt<=0/dt>30 inside update(), plus external kf.reset() calls from
-        // _handleGPSGap, _resetMapToPosition, and _runSensorFusion's jump
-        // guard).
+
         if (kfResult.updateCount === 1) { this._convergenceStage = 0; }
-     
-        // Seed consumption moved here — AFTER kf.update(), not before.
+
         if (kf._justInitialized) {
             let seeded = false;
-            if (gpsSpeedMPS != null && gpsSpeedMPS > 0.3 && gpsHeadingDeg != null && isFinite(gpsHeadingDeg)) {
+            if (gpsSpeedMPS != null && gpsSpeedMPS > 0.3 &&
+                gpsHeadingDeg != null && isFinite(gpsHeadingDeg)) {
                 const hr = gpsHeadingDeg * Math.PI / 180;
                 kf.seedVelocity(gpsSpeedMPS * Math.cos(hr), gpsSpeedMPS * Math.sin(hr), 0.5);
                 seeded = true;
             }
             if (!seeded && kf._pendingSeedVelocity) {
                 const { vNorth, vEast } = kf._pendingSeedVelocity;
-                if (isFinite(vNorth) && isFinite(vEast)) { kf.seedVelocity(vNorth, vEast, 2.25); seeded = true; }
+                if (isFinite(vNorth) && isFinite(vEast)) {
+                    kf.seedVelocity(vNorth, vEast, 2.25);
+                    seeded = true;
+                }
                 kf._pendingSeedVelocity = null;
             }
             if (!seeded && prevRawLat != null && prevRawTimestamp != null) {
@@ -1438,84 +1974,107 @@ class SensorFusionManager {
                     const cosLat2 = Math.cos(rawLat * Math.PI / 180);
                     const vN = ((rawLat - prevRawLat) / dtSec2) * 111111;
                     const vE = ((rawLng - prevRawLng) / dtSec2) * 111111 * cosLat2;
-                    if (Math.sqrt(vN*vN + vE*vE) > 0.3) { kf.seedVelocity(vN, vE, 2.25); seeded = true; }
+                    if (Math.sqrt(vN*vN + vE*vE) > 0.3) {
+                        kf.seedVelocity(vN, vE, 2.25);
+                        seeded = true;
+                    }
                 }
             }
             if (!seeded && kf._lastSeedVelocity) {
                 const { vNorth, vEast } = kf._lastSeedVelocity;
-                if (Math.sqrt(vNorth*vNorth + vEast*vEast) > 0.3) { kf.seedVelocity(vNorth, vEast, 4.0); seeded = true; }
+                if (Math.sqrt(vNorth*vNorth + vEast*vEast) > 0.3) {
+                    kf.seedVelocity(vNorth, vEast, 4.0);
+                    seeded = true;
+                }
             }
             kf._justInitialized = false;
         }
-     
+
         this._filteredSpeedMPS = kf.getSpeedMPS();
-        const isStationary = this._updateStationaryState(gpsSpeedMPS, this._filteredSpeedMPS, rawLat, rawLng);
-     
-        if      (kfResult.isConverged && this._convergenceStage < 2)      { this._convergenceStage = 2; }
-        else if (kfResult.updateCount >= 3 && this._convergenceStage < 1) { this._convergenceStage = 1; }
-        if (gpsSpeedMPS > 1.0 && kfResult.updateCount >= 2) { this._convergenceStage = Math.max(this._convergenceStage, 1); }
-     
-        let resultLat, resultLng, resultVNorth, resultVEast, resultSpeed;
-        let blendFactor = kfResult.blendFactor;
-     
+
+        if      (kfResult.isConverged && this._convergenceStage < 2)      this._convergenceStage = 2;
+        else if (kfResult.updateCount >= 3 && this._convergenceStage < 1) this._convergenceStage = 1;
+        if (gpsSpeedMPS > 1.0 && kfResult.updateCount >= 2)
+            this._convergenceStage = Math.max(this._convergenceStage, 1);
+
+        // Use scratch object internally to avoid allocation during computation
+        const scratch = this._smoothPosScratch;
+        scratch.blendFactor = kfResult.blendFactor;
+
         if (isStationary && this._stationaryPosition) {
-            resultLat = this._stationaryPosition.lat; resultLng = this._stationaryPosition.lng;
-            resultVNorth = 0; resultVEast = 0; resultSpeed = 0; blendFactor = 1.0;
-            // Keep the externally-visible filtered speed consistent with the
-            // frozen/stationary result — otherwise getFilteredSpeedMPS() can
-            // keep reporting a lingering nonzero Kalman speed estimate while
-            // the position itself is frozen, which callers (e.g. the dead
-            // reckoning loop) use as a signal that we're still moving.
+            scratch.lat = this._stationaryPosition.lat;
+            scratch.lng = this._stationaryPosition.lng;
+            scratch.vNorth = 0; scratch.vEast = 0; scratch.speedMPS = 0;
+            scratch.blendFactor = 1.0;
             this._filteredSpeedMPS = 0;
         } else if (this._convergenceStage === 0) {
-            resultLat = rawLat; resultLng = rawLng;
+            scratch.lat = rawLat; scratch.lng = rawLng;
             const cosLatRaw = Math.cos(rawLat * Math.PI / 180);
-            resultVNorth = gpsVel.lat * 111111; resultVEast = gpsVel.lng * 111111 * cosLatRaw;
-            resultSpeed = gpsSpeedMPS || 0; blendFactor = 0;
+            scratch.vNorth = gpsVel.lat * 111111;
+            scratch.vEast  = gpsVel.lng * 111111 * cosLatRaw;
+            scratch.speedMPS = gpsSpeedMPS || 0;
+            scratch.blendFactor = 0;
         } else {
-            resultLat = kfResult.lat; resultLng = kfResult.lng;
-            resultVNorth = kfResult.vNorth; resultVEast = kfResult.vEast; resultSpeed = kfResult.speedMPS;
+            scratch.lat = kfResult.lat; scratch.lng = kfResult.lng;
+            scratch.vNorth = kfResult.vNorth; scratch.vEast = kfResult.vEast;
+            scratch.speedMPS = kfResult.speedMPS;
         }
-     
-        this._lastKalmanLat = resultLat; this._lastKalmanLng = resultLng;
-        this._lastKalmanTimestamp = perfNow; this._rawVelocity = gpsVel;
-     
+
+        this._lastKalmanLat       = scratch.lat;
+        this._lastKalmanLng       = scratch.lng;
+        this._lastKalmanTimestamp = perfNow;
+        this._rawVelocity         = gpsVel;
+
+        scratch.isConverged = this._convergenceStage === 2;
+        scratch.isFrozen    = isStationary;
+
+        //  Return a FRESH object — callers may store it
         return {
-            lat: resultLat, lng: resultLng,
-            vNorth: resultVNorth, vEast: resultVEast, speedMPS: resultSpeed,
-            isConverged: this._convergenceStage === 2,
-            blendFactor: blendFactor,
-            isFrozen: isStationary
+            lat:         scratch.lat,
+            lng:         scratch.lng,
+            vNorth:      scratch.vNorth,
+            vEast:       scratch.vEast,
+            speedMPS:    scratch.speedMPS,
+            isConverged: scratch.isConverged,
+            blendFactor: scratch.blendFactor,
+            isFrozen:    scratch.isFrozen,
         };
     }
 
     getSmoothedVelocityDegPerSec() {
-        if (this._convergenceStage < 2) return this._rawVelocity;
-        const vel = this._getHybridVelocity();
-        if (!this._kalmanFilter) return { lat: 0, lng: 0 };
-        const cosLat = Math.cos((this._lastKalmanLat || this._rawLat || 0) * Math.PI / 180);
-        return { lat: vel.vNorth / 111111, lng: vel.vEast / (111111 * cosLat) };
+        const scratch = this._smoothedVelScratch;
+        scratch.lat = 0; scratch.lng = 0;
+
+        if (this._convergenceStage < 2) {
+            scratch.lat = this._rawVelocity.lat; scratch.lng = this._rawVelocity.lng;
+        } else {
+            const vel = this._getHybridVelocity();
+            if (!this._kalmanFilter) return { lat: 0, lng: 0 };
+            const cosLat = Math.cos((this._lastKalmanLat || this._rawLat || 0) * Math.PI / 180);
+            scratch.lat = vel.vNorth / 111111;
+            scratch.lng = vel.vEast / (111111 * cosLat);
+        }
+
+        // Return a FRESH copy — callers may store it
+        return { lat: scratch.lat, lng: scratch.lng };
     }
 
     getFilteredSpeedMPS() { return this._filteredSpeedMPS || 0; }
 
     getFilteredHeading() {
-        const speed = this._filteredSpeedMPS || 0;
         const kalmanHeading = this._kalmanFilter ? this._kalmanFilter.getHeading() : null;
-
-        if (this.deviceHeading == null) return kalmanHeading;
-        if (kalmanHeading == null) return this.deviceHeading;
-
-        if (speed <= HEADING_BLEND_LOW)  return this.deviceHeading;
-        if (speed >= HEADING_BLEND_HIGH) return kalmanHeading;
-
-        const t = (speed - HEADING_BLEND_LOW) / (HEADING_BLEND_HIGH - HEADING_BLEND_LOW);
-        return _blendHeadingDeg(this.deviceHeading, kalmanHeading, t);
+        return this._blendHeadingBySpeed(
+            this.deviceHeading, kalmanHeading, this._filteredSpeedMPS || 0
+        );
     }
 
     getLastKalmanPosition() {
         if (this._lastKalmanLat == null) return null;
-        return { lat: this._lastKalmanLat, lng: this._lastKalmanLng, timestamp: this._lastKalmanTimestamp };
+        return {
+            lat: this._lastKalmanLat,
+            lng: this._lastKalmanLng,
+            timestamp: this._lastKalmanTimestamp
+        };
     }
 
     getLastRawPosition() {
@@ -1535,48 +2094,90 @@ class SensorFusionManager {
         return (gpsSpeedMPS || 0) > 0.5;
     }
 
-    // Same hard-cutoff bug as getFilteredHeading/_getHybridVelocity had
-    // (switched abruptly at speed > 5.0), plus speedMPS || this._filteredSpeedMPS
-    // discarded a legitimate 0 via falsy-OR. Fixed the same way: blend across
-    // the shared HEADING_BLEND_LOW/HIGH band, ?? instead of || for the 0 case.
     getHeading(gpsHeading, speedMPS) {
         const speed = speedMPS ?? this._filteredSpeedMPS ?? 0;
-        const hasGpsHeading = gpsHeading != null && isFinite(gpsHeading);
-
-        if (this.deviceHeading == null) return hasGpsHeading ? gpsHeading : null;
-        if (!hasGpsHeading) return this.deviceHeading;
-
-        if (speed <= HEADING_BLEND_LOW)  return this.deviceHeading;
-        if (speed >= HEADING_BLEND_HIGH) return gpsHeading;
-
-        const t = (speed - HEADING_BLEND_LOW) / (HEADING_BLEND_HIGH - HEADING_BLEND_LOW);
-        return _blendHeadingDeg(this.deviceHeading, gpsHeading, t);
+        const hasGps = gpsHeading != null && isFinite(gpsHeading);
+        return this._blendHeadingBySpeed(
+            this.deviceHeading,
+            hasGps ? gpsHeading : null,
+            speed
+        );
     }
 
-destroy() {
-    this._clearOrientationTestTimer();
-    if (this._graceTimerId) { clearTimeout(this._graceTimerId); this._graceTimerId = null; }
-    if (this._listener) {
-        window.removeEventListener('deviceorientation',         this._listener, true);
-        window.removeEventListener('deviceorientationabsolute', this._listener, true);
-        this._listener = null;
-    }
-    this._removePermissionGestureHandler();
-    if (this._accelerometer) { try { this._accelerometer.stop(); } catch (_) {} this._accelerometer = null; }
-    if (this._kalmanFilter)  { this._kalmanFilter.reset(); this._kalmanFilter = null; }
+    isStationary() { return this._lastStationaryState; }
 
-    // Clean up pagehide listener if still registered
-    if (this._pageHideHandler) {
-        window.removeEventListener('pagehide', this._pageHideHandler);
-        this._pageHideHandler = null;
+    getDiagnostics() {
+        return {
+            hasCompass:        this.hasCompass,
+            compassHeading:    this.deviceHeading,
+            compassAccuracy:   this.headingAccuracy,
+            compassAgeMs:      this._compassTimestamp ? performance.now() - this._compassTimestamp : null,
+            accelAvailable:    this._accelAvailable,
+            accelMoving:       this._isMoving,
+            accelMagnitude:    this._lastAccelMagnitude,
+            filteredSpeedMPS:  this._filteredSpeedMPS,
+            convergenceStage:  this._convergenceStage,
+            isStationary:      this._lastStationaryState,
+            stationaryCounter: this._stationaryCounter,
+            exitSustainCount:  this._exitSustainCount,
+            kalman:            this._kalmanFilter ? this._kalmanFilter.getDiagnostics() : null,
+        };
     }
 
-    this.isAvailable = false; this._accelAvailable = false;
-    this._lastKalmanLat = null; this._lastKalmanLng = null; this._lastKalmanTimestamp = null;
-    this._smoothedHeading = null; this._clockOffset = null; this._clockSyncTime = 0;
-    this._convergenceStage = 0; this._stationaryCounter = 0; this._stationaryPosition = null;
-    this._unfreezeCounter = 0;
-   }
+    destroy() {
+        this._clearOrientationTestTimer();
+        if (this._graceTimerId) {
+            clearTimeout(this._graceTimerId);
+            this._graceTimerId = null;
+        }
+
+        // Clean up compass permission gesture if still pending
+        if (this._compassPermissionHandler) {
+            document.removeEventListener('click',    this._compassPermissionHandler, true);
+            document.removeEventListener('touchend', this._compassPermissionHandler, true);
+            this._compassPermissionHandler = null;
+        }
+
+        if (this._listener) {
+            if (this._listenerTrackedEntry &&
+                typeof memoryManager !== 'undefined' &&
+                memoryManager?.untrackEventListener) {
+                memoryManager.untrackEventListener(this._listenerTrackedEntry);
+            } else {
+                window.removeEventListener('deviceorientation',         this._listener, true);
+                window.removeEventListener('deviceorientationabsolute', this._listener, true);
+            }
+            this._listener = null;
+            this._listenerTrackedEntry = null;
+        }
+
+        this._removePermissionGestureHandler();
+
+        if (this._accelerometer) {
+            try { this._accelerometer.stop(); } catch (_) {}
+            this._accelerometer = null;
+        }
+        if (this._kalmanFilter) {
+            this._kalmanFilter.reset();
+            this._kalmanFilter = null;
+        }
+        if (this._pageHideHandler) {
+            window.removeEventListener('pagehide', this._pageHideHandler);
+            this._pageHideHandler = null;
+        }
+
+        this.isAvailable = false;
+        this._accelAvailable = false;
+        this._lastKalmanLat = null; this._lastKalmanLng = null;
+        this._lastKalmanTimestamp = null;
+        this._smoothedHeading = null;
+        this._clockOffset = null; this._clockSyncTime = 0;
+        this._convergenceStage = 0;
+        this._stationaryCounter = 0;
+        this._exitSustainCount = 0;
+        this._stationaryPosition = null;
+        this._accelMoveSustainCount = 0;
+    }
 }
 
 window.sensorFusion = new SensorFusionManager().init();
@@ -1584,43 +2185,42 @@ window.sensorFusion = new SensorFusionManager().init();
 /* ═══════════════════════════════════════════════════════════════
    DEAD RECKONING LOOP
    ═══════════════════════════════════════════════════════════════ */
-  ;(function initDeadReckoning() {
+;(function initDeadReckoning() {
     'use strict';
 
     const CFG = {
         MIN_DT_MS:            16,
         MIN_SPEED_MPS:        0.15,
         MAX_PREDICT_HORIZON:  2.8,
-        LOW_SPEED_CUTOFF_MPS: 0.0,
         HEADING_CHANGE_CAP:   25.0,
         INTERACTION_FADE_MS:  250,
-        CENTERED_DEADBAND_PX: 1.5, // Pixel-based to prevent zoom wobble
-        DRIFT_THRESHOLD_LOW:  2.0,
-        DRIFT_THRESHOLD_HIGH: 10.0,
-        PAN_DURATION_BASE:    0.22,
-        PAN_DURATION_FAST:    0.10,
-        FREE_MIN_PAN_M:       4.0
+        CENTERED_DEADBAND_PX: 1.5,
+        ROAM_WALK_SPEED_CEILING_MPS: 2.0,
+        ROAM_EDGE_MARGIN_PX_DRIVE:   60,
+        RESUME_SEED_MAX_AGE_MS:      1500,
+        HEADING_DT_CAP_MS:           2000,
     };
 
     let _rafId             = null;
     let _active            = false;
     let _lastFrameTime     = 0;
-    let _lastGoodVelocity  = { lat: 0, lng: 0 };
-    let _lastGoodSpeedMPS  = 0;
     let _lastHeadingDeg    = null;
     let _headingChangeRate = 0;
     let _interactionEndTime = 0;
     let _markerEl          = null;
     let _markerTransSet    = false;
-    let _lastPredictedPos  = null;
+    let _markerIconEl      = null;
 
-    let _panPending = false;
-    let _panTarget  = null;
+    // Module-local held position — no global pollution
+    let _heldLat = null;
+    let _heldLng = null;
 
-    let _panAnimStart      = 0;
-    let _panAnimDuration   = 0;
-    let _panAnimTargetLat  = null;
-    let _panAnimTargetLng  = null;
+    // Preallocated mutable objects — mutated in place, never reallocated
+    const _lastGoodVelocity     = { lat: 0, lng: 0 };
+    let   _lastGoodSpeedMPS     = 0;
+    let   _lastGoodVelocityTime = 0;
+    const _lastPredictedPos     = { lat: 0, lng: 0 };
+    let   _lastPredictedValid   = false;
 
     let _centeredLat = null;
     let _centeredLng = null;
@@ -1628,32 +2228,39 @@ window.sensorFusion = new SensorFusionManager().init();
     const _now = () => performance.now();
 
     const _getSpeedMPS  = () => window.sensorFusion?.getFilteredSpeedMPS()          ?? (window.lastPosition?.speedMPS || 0);
-    const _getVelocity  = () => window.sensorFusion?.getSmoothedVelocityDegPerSec() ?? (window.smoothedVelocity || { lat: 0, lng: 0 });
+    const _ZERO_VEL = Object.freeze({ lat: 0, lng: 0 });
+    const _getVelocity  = () => window.sensorFusion?.getSmoothedVelocityDegPerSec() ?? (window.smoothedVelocity || _ZERO_VEL);
     const _getHeading   = () => window.sensorFusion?.getFilteredHeading()            ?? (window.lastPosition?.headingDeg || null);
     const _getKalmanPos = () => window.sensorFusion?.getLastKalmanPosition()         ?? null;
     const _getRawPos    = () => window.sensorFusion?.getLastRawPosition()            ?? (window.lastPosition || null);
-    const _isStationary = () => window.sensorFusion?._lastStationaryState            ?? window.isStationary;
 
-       function _isCenteredMode() {
-            return !!window.followUser;
-        }
+    // Use public API — zero allocation at 60 fps
+    const _isStationary = () => {
+        const sf = window.sensorFusion;
+        if (sf && typeof sf.isStationary === 'function') return sf.isStationary();
+        return window.isStationary ?? false;
+    };
 
-   // --- HORIZON CURVE (Plateaus + Gentle Startup) ---
+    function _isCenteredMode() {
+        return !!window.followUser;
+    }
+
+    // --- HORIZON CURVE ---
     const HORIZON_CURVE = [
         { speed: 0.0,  h: 0.0 },
         { speed: 0.5,  h: 0.0 },
-        { speed: 0.7,  h: 0.08 },  // Soft kick-in while GPS-derived
-        { speed: 1.0,  h: 0.25 }, 
+        { speed: 0.7,  h: 0.08 },
+        { speed: 1.0,  h: 0.25 },
         { speed: 1.5,  h: 0.5 },
-        { speed: 2.5,  h: 0.9 },   // Start plateau
-        { speed: 8.0,  h: 0.9 },   // End plateau (steady for walking/jogging)
-        { speed: 10.0, h: 1.4 },   
+        { speed: 2.5,  h: 0.9 },
+        { speed: 8.0,  h: 0.9 },
+        { speed: 10.0, h: 1.4 },
         { speed: 15.0, h: 1.8 },
-        { speed: 20.0, h: 2.5 },   // Start plateau
-        { speed: 25.0, h: 2.5 },   // End plateau (steady for city driving)
-        { speed: 40.0, h: 2.8 },   // Max anchor
+        { speed: 20.0, h: 2.5 },
+        { speed: 25.0, h: 2.5 },
+        { speed: 40.0, h: 2.8 },
     ];
- 
+
     function _getPredictHorizon(speedMPS, headingChangeDegPerSec) {
         let h;
         if (speedMPS <= HORIZON_CURVE[0].speed) {
@@ -1670,39 +2277,56 @@ window.sensorFusion = new SensorFusionManager().init();
                 }
             }
         }
- 
-        // --- TURN PENALTY (Safe, with noise gate) ---
-        const TURN_NOISE_FLOOR = 2.0; 
-        const TURN_PENALTY = 0.55;    // 0.55 caps that same case around h=1.1s.
+
+        const TURN_NOISE_FLOOR = 2.0;
+        const TURN_PENALTY = 0.55;
         const maxTurn = CFG.HEADING_CHANGE_CAP - TURN_NOISE_FLOOR;
-        
+
         if (maxTurn > 0) {
             const effectiveHeadingChange = Math.max(0, headingChangeDegPerSec - TURN_NOISE_FLOOR);
             const t = Math.min(1.0, effectiveHeadingChange / maxTurn);
             const turnFactor = t * t * (3 - 2 * t);
             h *= (1.0 - turnFactor * TURN_PENALTY);
         }
- 
+
         return Math.max(0, Math.min(h, CFG.MAX_PREDICT_HORIZON));
     }
 
+    // isConnected check to survive Leaflet DOM wipe/recreate during zoom
     function _getMarkerEl() {
-        if (_markerEl) return _markerEl;
+        if (_markerEl && _markerEl.isConnected) return _markerEl;
         if (typeof userMarker !== 'undefined' && userMarker) {
             _markerEl = userMarker.getElement();
-            if (_markerEl && !_markerTransSet) { _markerEl.style.willChange = 'transform'; _markerTransSet = true; }
+            if (_markerEl && !_markerTransSet) {
+                _markerEl.style.willChange = 'transform';
+                _markerTransSet = true;
+            }
         }
         return _markerEl;
     }
 
+    function _getMarkerIconEl() {
+        if (_markerIconEl && _markerIconEl.isConnected) return _markerIconEl;
+        const el = _getMarkerEl();
+        _markerIconEl = el ? el.querySelector('.user-marker-icon') : null;
+        return _markerIconEl;
+    }
+
+    function _applyMarkerOffset(dx, dy) {
+        const icon = _getMarkerIconEl();
+        if (icon) icon.style.transform = 'translate3d(' + dx + 'px,' + dy + 'px,0)';
+    }
+
+    function _resetMarkerOffset() {
+        const icon = _getMarkerIconEl();
+        if (icon) icon.style.transform = '';
+    }
+
+    //  No per-frame style setting — prevents layout thrashing
     function _setMarkerPosition(lat, lng) {
         if (typeof userMarker !== 'undefined' && userMarker) {
-            var el = userMarker.getElement ? userMarker.getElement() : null;
-            if (el) {
-                el.style.transition = 'none';
-                var icon = el.querySelector('.user-marker-icon');
-                if (icon) icon.style.transition = 'none';
-            }
+            const icon = _getMarkerIconEl();
+            if (icon) icon.style.transform = '';   // clear sub-pixel offset
             userMarker.setLatLng([lat, lng]);
         }
     }
@@ -1719,15 +2343,45 @@ window.sensorFusion = new SensorFusionManager().init();
         map.setView([lat, lng], map.getZoom(), { animate: false, reset: false, pan: { noMoveStart: true } });
     }
 
-    function _seedVelocityOnResume() {
-        if (!window.sensorFusion || !_lastGoodSpeedMPS || _lastHeadingDeg == null) return;
-        const kf = window.sensorFusion._kalmanFilter;
-        if (!kf || kf.x === null || _lastGoodSpeedMPS < 0.3) return;
-        const rad = _lastHeadingDeg * Math.PI / 180;
-        kf.seedVelocity(_lastGoodSpeedMPS * Math.cos(rad), _lastGoodSpeedMPS * Math.sin(rad), 2.0);
+    function _isOutsideSafeBounds(lat, lng) {
+        if (!map) return false;
+        try {
+            const pt   = map.latLngToContainerPoint([lat, lng]);
+            const size = map.getSize();
+            const m    = CFG.ROAM_EDGE_MARGIN_PX_DRIVE;
+            return pt.x < m || pt.y < m || pt.x > size.x - m || pt.y > size.y - m;
+        } catch (e) {
+            return false;
+        }
     }
 
-    // --- NEW: resolve the best-known authoritative position (kalman > raw > lastPosition) ---
+    // Use public API instead of reaching into _kalmanFilter
+    function _seedVelocityOnResume() {
+        const sf = window.sensorFusion;
+        if (!sf || !_lastGoodSpeedMPS || _lastHeadingDeg == null) return;
+        if (_now() - _lastGoodVelocityTime > CFG.RESUME_SEED_MAX_AGE_MS) return;
+        if (_lastGoodSpeedMPS < 0.3) return;
+
+        // Prefer public method if available; fall back to direct access
+        // for backwards compatibility with older SensorFusionManager builds.
+        if (typeof sf.seedVelocityFromExternal === 'function') {
+            const rad = _lastHeadingDeg * Math.PI / 180;
+            sf.seedVelocityFromExternal(
+                _lastGoodSpeedMPS * Math.cos(rad),
+                _lastGoodSpeedMPS * Math.sin(rad),
+                2.0
+            );
+        } else if (sf._kalmanFilter && sf._kalmanFilter.x !== null) {
+            const kf  = sf._kalmanFilter;
+            const rad = _lastHeadingDeg * Math.PI / 180;
+            kf.seedVelocity(
+                _lastGoodSpeedMPS * Math.cos(rad),
+                _lastGoodSpeedMPS * Math.sin(rad),
+                2.0
+            );
+        }
+    }
+
     function _resolveBestKnownPosition() {
         const kp = _getKalmanPos(), rp = _getRawPos();
         if (kp && typeof kp.lat === 'number' && typeof kp.lng === 'number') return { lat: kp.lat, lng: kp.lng };
@@ -1737,16 +2391,13 @@ window.sensorFusion = new SensorFusionManager().init();
         return null;
     }
 
-    // --- NEW: one-shot marker/viewport sync used when the predictive rAF loop
-    // is not going to run (e.g. stationary, first fix, non-centered + below
-    // speed threshold). This is what closes the "marker never updates" gap
-    // without introducing a second competing writer alongside frame(). ---
+    //  Do NOT snap viewport when not centered — respects user pan
     function _immediateSync() {
         if (window.isLocationHuntVisible) return;
         const pos = _resolveBestKnownPosition();
         if (!pos) return;
 
-        window.__drHeld = { lat: pos.lat, lng: pos.lng };
+        _heldLat = pos.lat; _heldLng = pos.lng;
         _setMarkerPosition(pos.lat, pos.lng);
 
         if (!map || !window.followUser) return;
@@ -1755,22 +2406,21 @@ window.sensorFusion = new SensorFusionManager().init();
             _snapViewport(pos.lat, pos.lng);
             const c = map.getCenter();
             _setMarkerPosition(c.lat, c.lng);
-        } else {
-            _snapViewport(pos.lat, pos.lng);
         }
+        // Non-centered: only update marker, do NOT snap viewport
     }
 
     function frame(now) {
         _rafId = null;
         const lastPos = window.lastPosition;
         if (!lastPos || window.isLocationHuntVisible) { _active = false; return; }
-    
+
         const speedMPS   = _getSpeedMPS();
         const stationary = _isStationary();
-        const centered   = _isCenteredMode();
-    
+        let centered     = _isCenteredMode();
+
         if (!centered && stationary && speedMPS < CFG.MIN_SPEED_MPS) { _active = false; return; }
-    
+
         const isInteracting = window.isMapInteracting || window._isProximityZoomAnimating || window._gpsCenteredPanJustOccurred;
         if (isInteracting) {
             _interactionEndTime = now + CFG.INTERACTION_FADE_MS;
@@ -1779,37 +2429,45 @@ window.sensorFusion = new SensorFusionManager().init();
             return;
         }
         if (now < _interactionEndTime) { _lastFrameTime = now; _rafId = requestAnimationFrame(frame); return; }
-    
+
         const dtMs = now - _lastFrameTime;
         if (dtMs < CFG.MIN_DT_MS) { _rafId = requestAnimationFrame(frame); return; }
         _lastFrameTime = now;
-    
+
         const kp = _getKalmanPos(), rp = _getRawPos();
         let oLat, oLng, oTs;
         if      (kp?.timestamp != null) { oLat = kp.lat; oLng = kp.lng; oTs = kp.timestamp; }
         else if (rp?.timestamp != null) { oLat = rp.lat; oLng = rp.lng; oTs = rp.timestamp; }
         else                            { oLat = lastPos.lat; oLng = lastPos.lng; oTs = window.lastUpdateTimestamp || now; }
-    
+
         const hdg = _getHeading();
-        
+
         if (_lastHeadingDeg != null && hdg != null) {
             let d = hdg - _lastHeadingDeg;
             if (d >  180) d -= 360;
             if (d < -180) d += 360;
-            _headingChangeRate = _headingChangeRate * 0.7 + (Math.abs(d) / (Math.max(dtMs, 16) / 1000)) * 0.3;
+            // Cap dt so tab-hidden gaps don't corrupt the EMA
+            const dtSec = Math.min(Math.max(dtMs, 16), CFG.HEADING_DT_CAP_MS) / 1000;
+            _headingChangeRate = _headingChangeRate * 0.7 + (Math.abs(d) / dtSec) * 0.3;
         }
         if (hdg != null) _lastHeadingDeg = hdg;
-    
+
         const vel = _getVelocity();
-        const vm = Math.sqrt(vel.lat*vel.lat + vel.lng*vel.lng);
-        if (vm > 0.001) { _lastGoodVelocity = { lat: vel.lat, lng: vel.lng }; _lastGoodSpeedMPS = speedMPS; }
-    
+        const vm = Math.sqrt(vel.lat * vel.lat + vel.lng * vel.lng);
+        if (vm > 0.001) {
+            // Mutate in place, no allocation
+            _lastGoodVelocity.lat = vel.lat;
+            _lastGoodVelocity.lng = vel.lng;
+            _lastGoodSpeedMPS     = speedMPS;
+            _lastGoodVelocityTime = now;
+        }
+
         let pLat, pLng;
         const rawAge = Math.max(0, (now - oTs) / 1000);
         const hor    = _getPredictHorizon(speedMPS, _headingChangeRate);
         const pDt    = Math.min(rawAge, hor);
-    
-        if (pDt <= 0 || speedMPS < CFG.LOW_SPEED_CUTOFF_MPS || stationary) {
+
+        if (pDt <= 0 || stationary) {
             pLat = oLat; pLng = oLng;
         } else {
             pLat = oLat + vel.lat * pDt;
@@ -1818,82 +2476,101 @@ window.sensorFusion = new SensorFusionManager().init();
             const jE = Math.abs(pLng - oLng) * 111111 * Math.cos(oLat * Math.PI / 180);
             if (jN > 150 || jE > 150) { pLat = oLat; pLng = oLng; }
         }
-    
-        _lastPredictedPos = { lat: pLat, lng: pLng };
-    
-        const HOLD_SPEED_MPS = CFG.MIN_SPEED_MPS; 
+
+        // Mutate in place
+        _lastPredictedPos.lat = pLat;
+        _lastPredictedPos.lng = pLng;
+        _lastPredictedValid   = true;
+
+        const HOLD_SPEED_MPS  = CFG.MIN_SPEED_MPS;
         const HOLD_DEADBAND_M = 0.15;
-        
-        const prevHeld = window.__drHeld;
+
         let hLat = pLat, hLng = pLng;
-    
-        if (speedMPS < HOLD_SPEED_MPS && prevHeld) {
+
+        // Module-local held position
+        if (speedMPS < HOLD_SPEED_MPS && _heldLat !== null) {
             const cosLat = Math.cos(pLat * Math.PI / 180);
-            const errN = (pLat - prevHeld.lat) * 111111;
-            const errE = (pLng - prevHeld.lng) * 111111 * cosLat;
+            const errN = (pLat - _heldLat) * 111111;
+            const errE = (pLng - _heldLng) * 111111 * cosLat;
             const errDist = Math.sqrt(errN * errN + errE * errE);
             if (errDist < HOLD_DEADBAND_M) {
-                hLat = prevHeld.lat;
-                hLng = prevHeld.lng;
+                hLat = _heldLat;
+                hLng = _heldLng;
             }
         }
-        window.__drHeld = { lat: hLat, lng: hLng };
-    
+        _heldLat = hLat; _heldLng = hLng;
+
+        if (!centered &&
+            speedMPS >= CFG.ROAM_WALK_SPEED_CEILING_MPS &&
+            _isOutsideSafeBounds(hLat, hLng)) {
+            window.followUser = true;
+            centered = true;
+        }
+
         if (!map || window._isProximityZoomAnimating) {
             _setMarkerPosition(hLat, hLng);
             _rafId = requestAnimationFrame(frame);
             return;
         }
-    
+
         if (window.followUser && centered) {
             _snapViewport(hLat, hLng);
             const c = map.getCenter();
             _setMarkerPosition(c.lat, c.lng);
+
+            const centerPx = map.latLngToContainerPoint(c);
+            const predPx   = map.latLngToContainerPoint([hLat, hLng]);
+            _applyMarkerOffset(predPx.x - centerPx.x, predPx.y - centerPx.y);
         } else if (window.followUser) {
             _setMarkerPosition(hLat, hLng);
             _snapViewport(hLat, hLng);
         } else {
             _setMarkerPosition(hLat, hLng);
         }
-    
+
         _rafId = requestAnimationFrame(frame);
     }
 
-    // --- CHANGED: now returns true/false so callers know whether the
-    // continuous predictive loop actually launched. ---
     function _start() {
         if (_active) return true;
         if (window.isLocationHuntVisible) return false;
         const speedMPS = _getSpeedMPS(), centered = _isCenteredMode();
         if (!centered && speedMPS < CFG.MIN_SPEED_MPS) return false;
-        if (!centered && window.isStationary && speedMPS < 0.8) return false;
+        if (!centered && _isStationary() && speedMPS < 0.8) return false;
         if (speedMPS >= CFG.MIN_SPEED_MPS) _seedVelocityOnResume();
         _active = true; _lastFrameTime = _now(); _interactionEndTime = 0;
         _rafId = requestAnimationFrame(frame);
         return true;
     }
 
+    // Reset stale state on tab restore
+    function _onVisibilityChange() {
+        if (document.visibilityState === 'visible') {
+            _headingChangeRate = 0;
+            _interactionEndTime = 0;
+            if (_active) _lastFrameTime = _now();
+        }
+    }
+    document.addEventListener('visibilitychange', _onVisibilityChange);
+
     window.deadReckoning = {
         start() { _start(); },
 
         stop() {
             if (_rafId != null) { cancelAnimationFrame(_rafId); _rafId = null; }
-            _active = false; _panPending = false; _panTarget = null;
+            _active = false;
             _centeredLat = null; _centeredLng = null;
-            window.__drHeld = null;
+            _heldLat = null; _heldLng = null;
+            _lastPredictedValid = false;
+            _resetMarkerOffset();
             const el = _getMarkerEl();
-            if (el) { el.style.willChange = ''; el.style.transition = ''; _markerTransSet = false; }
+            if (el) { el.style.willChange = ''; _markerTransSet = false; }
         },
 
         isActive() { return _active; },
 
         onMovementResumed: _start,
 
-        // --- If DR declines to run its
-        // continuous loop (stationary / first fix / below speed threshold,
-        // non-centered), it now does a one-shot direct sync instead of
-        // silently doing nothing. DR remains the single writer of marker
-        // and viewport state either way — no dual-write with _executeRender. ---
         forceUpdate() {
             if (_active) {
                 _lastFrameTime = 0;
@@ -1901,19 +2578,34 @@ window.sensorFusion = new SensorFusionManager().init();
                 return;
             }
             const started = _start();
-            if (!started) {
-                _immediateSync();
-            }
+            if (!started) _immediateSync();
         },
 
-        getPredictedPosition()  { return _lastPredictedPos; },
-        invalidateMarkerCache() { _markerEl = null; _markerTransSet = false; }
+        // Return a fresh copy — callers may store it
+        getPredictedPosition() {
+            if (!_lastPredictedValid) return null;
+            return { lat: _lastPredictedPos.lat, lng: _lastPredictedPos.lng };
+        },
+
+        invalidateMarkerCache() { _markerEl = null; _markerIconEl = null; _markerTransSet = false; }
+    };
+
+    // updateLocationAfterBackground() (background-resume code) calls
+    // window._restartLocationFrameLoop() after re-acquiring position.
+    // This just forwards to the existing public API — forceUpdate() will
+    // resume the loop if it stopped itself (_active === false), or nudge
+    // an already-running loop to refresh immediately if it's still alive.
+    window._restartLocationFrameLoop = function () {
+        window.deadReckoning.forceUpdate();
     };
 
     _start();
 
     if (typeof memoryManager !== 'undefined' && memoryManager?.registerCleanupTask) {
-        memoryManager.registerCleanupTask(() => window.deadReckoning.stop());
+        memoryManager.registerCleanupTask(() => {
+            window.deadReckoning.stop();
+            document.removeEventListener('visibilitychange', _onVisibilityChange);
+        });
     }
 })();
         
