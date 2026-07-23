@@ -913,63 +913,38 @@
             return Math.max(20, acc);
         }
     
-        _initialize(lat, lng, R, timestampPerfNow) {
-            this.refLat = lat;
-            this.refLng = lng;
-            this.accelNoise = this._baseAccelNoise;
-            this._isFrozen = false;
-            this._frozenPosition = null;
-            this.lastTimestamp = timestampPerfNow;
-            this._justInitialized = true;
-        
-            const vHint = this._pendingSeedVelocity;
-            const hasVelocityHint = vHint &&
-                (Math.abs(vHint.vNorth) > 0.1 || Math.abs(vHint.vEast) > 0.1);
-        
-            if (hasVelocityHint) {
-                this.x = [0, 0, vHint.vNorth, vHint.vEast];
-                this._currentSpeedMPS = Math.hypot(vHint.vNorth, vHint.vEast);
-            } else {
-                this.x = [0, 0, 0, 0];
-                this._currentSpeedMPS = 0;
-            }
-        
-            const lastSpeed    = Number.isFinite(this._lastGPSSpeedMPS) ? this._lastGPSSpeedMPS : 0;
-            const isMoving     = !hasVelocityHint && lastSpeed > 0.3;
-            const isStationary = !hasVelocityHint && !isMoving;
-        
-            //  hint        →  2.25   (σ ≈ 1.5 m/s — trust the seeded direction)
-            //  GPS moving  →  225    (σ ≈ 15 m/s  — snap to truth in 1–2 fixes)
-            //  stationary  →  2.0    (σ ≈ 1.4 m/s — suppresses sub-1 m/s GPS scatter
-            //                          yet ~4× the Kalman gain of the old 0.5, so the
-            //                          first real walking fix moves the estimate)
-            let v0;
-            if (hasVelocityHint) {
-                v0 = 2.25;
-            } else if (isMoving) {
-                v0 = 225.0;
-            } else {
-                v0 = 2.0;
-            }
-        
-            //  Position-velocity cross-correlation.  Seeded ONLY in the stationary
-            //  regime.  The original left these at 0, which meant the first position
-            //  innovation produced zero velocity correction (K_vel = P_velpos · S⁻¹ = 0).
-            //  A moderate correlation (ρ ≈ 0.5) lets the first fix nudge velocity
-            //  immediately, removing one full update cycle of dead time.
-            //  PD check: det = R²·v0 − pv² = 0.75·R²·v0 > 0  ✓
-            const pv = isStationary ? 0.5 * R * Math.sqrt(v0) : 0;
-            const R2 = R * R;
-        
-            this.P = [
-                [R2,  0,  pv,   0 ],
-                [ 0, R2,   0,  pv ],
-                [pv,  0,  v0,   0 ],
-                [ 0, pv,   0,  v0 ],
-            ];
-        
-            this._pendingSeedVelocity = null;
-        }
+      _initialize(lat, lng, R, timestampPerfNow) {
+        this.refLat = lat; this.refLng = lng;
+    
+        const hasVelocityHint = this._pendingSeedVelocity &&
+            (Math.abs(this._pendingSeedVelocity.vNorth) > 0.1 || Math.abs(this._pendingSeedVelocity.vEast) > 0.1);
+    
+        this.x = hasVelocityHint
+            ? [0, 0, this._pendingSeedVelocity.vNorth, this._pendingSeedVelocity.vEast]
+            : [0, 0, 0, 0];
+    
+        this.accelNoise = this._baseAccelNoise;
+        this._currentSpeedMPS = hasVelocityHint
+            ? Math.sqrt(this._pendingSeedVelocity.vNorth ** 2 + this._pendingSeedVelocity.vEast ** 2)
+            : 0;
+        this._isFrozen = false; this._frozenPosition = null;
+    
+        const R2 = R * R;
+        // Initial velocity-covariance seed. The variance must reflect how well we
+        // actually know the initial velocity (which is seeded to [0,0] when there is
+        // no directional hint):
+        //   - hint present  -> moderate variance, trust the seeded velocity.
+        //   - GPS moving, no hint -> LARGE variance: we know we are moving but not the
+        //     direction, so let the first fixes snap velocity to the truth (no lag).
+        //   - stationary -> SMALL variance: pin velocity near zero so GPS scatter
+        //     cannot manufacture phantom motion (no jitter while standing still).
+        const v0 = hasVelocityHint ? 2.25 : (this._lastGPSSpeedMPS > 0.3 ? 225.0 : 0.5);
+        this.P = [[R2,0,0,0],[0,R2,0,0],[0,0,v0,0],[0,0,0,v0]];
+        this.lastTimestamp = timestampPerfNow;
+        this._justInitialized = true;
+    
+        this._pendingSeedVelocity = null; // consumed here, not left for the next update() cycle
+    }
     
         _updateAccelNoise() {
             if (!this.x) return;
@@ -1109,7 +1084,6 @@ class SensorFusionManager {
         this._lastMovementTime        = 0;
         this._accelGestureHandler     = null;
         this._accelPendingPermission  = false;
-        this._watchRestartPending     = false;
         this._lastKalmanLat           = null;
         this._lastKalmanLng           = null;
         this._lastKalmanTimestamp     = null;
@@ -1255,7 +1229,7 @@ class SensorFusionManager {
         }
     }
 
-      _startAccelerometer() {
+    _startAccelerometer() {
         if (this._accelAvailable) return;
         try {
             this._accelerometer = new Accelerometer({ frequency: this._accelFrequency });
@@ -1269,36 +1243,11 @@ class SensorFusionManager {
                 if (linearAccel > 0.3) {
                     this._isMoving = true;
                     this._lastMovementTime = Date.now();
-    
-                    // ── Kick GPS into fresh-fix mode on movement onset ──
-                    // The watch was started with stationary maximumAge (2500 ms),
-                    // so the browser may serve a stale fix for up to 2.5 s after
-                    // the user starts walking.  Restarting the watch forces a
-                    // fresh request; getWatchOptions() re-evaluates and picks
-                    // tighter options now that isMoving is true.
-                    //
-                    // Guards:
-                    //   • _watchRestartPending prevents stacking restarts
-                    //   • 100 ms debounce absorbs rapid accelerometer bursts
-                    //   • typeof check: no-ops if startPositionUpdates is absent
-                    //   • positionWatchId null-check: no-ops if watch already dead
-                    if (window.positionWatchId != null &&
-                        typeof startPositionUpdates === 'function' &&
-                        !this._watchRestartPending) {
-                        this._watchRestartPending = true;
-                        setTimeout(() => {
-                            this._watchRestartPending = false;
-                            if (this._isMoving && window.positionWatchId != null) {
-                                navigator.geolocation.clearWatch(window.positionWatchId);
-                                window.positionWatchId = null;
-                                startPositionUpdates();
-                            }
-                        }, 100);
-                    }
-    
                     if (this._graceTimerId != null) { clearTimeout(this._graceTimerId); this._graceTimerId = null; }
                     this._graceTimerId = setTimeout(() => {
                         this._graceTimerId = null;
+                        // Use >= MOVEMENT_GRACE_MS without fudge factor — if
+                        // movement happened within the window, stay moving.
                         if (Date.now() - this._lastMovementTime >= MOVEMENT_GRACE_MS) {
                             this._isMoving = false;
                         }
@@ -1357,17 +1306,17 @@ class SensorFusionManager {
         return { lat: (rawLat - this._rawLat) / dtSec, lng: (rawLng - this._rawLng) / dtSec };
     }
 
-   _updateStationaryState(gpsSpeedMPS, kalmanSpeedMPS, rawLat, rawLng) {
+    _updateStationaryState(gpsSpeedMPS, kalmanSpeedMPS, rawLat, rawLng) {
         const speed = Math.max(gpsSpeedMPS || 0, kalmanSpeedMPS || 0);
         const isMoving = speed > 0.8 || (this._accelAvailable && this._isMoving);
-    
+
         if (isMoving)         { this._stationaryCounter = Math.max(0, this._stationaryCounter - 2); }
         else if (speed < 0.3) { this._stationaryCounter++; }
-    
+
         const isStationary = speed < 0.3 || this._stationaryCounter >= 5;
-    
+
         if (isStationary && !this._lastStationaryState) {
-            // Transition to stationary — freeze immediately 
+            // Transition to stationary — freeze immediately
             this._unfreezeCounter = 0;
             const freezeLat = this._lastKalmanLat != null ? this._lastKalmanLat : rawLat;
             const freezeLng = this._lastKalmanLng != null ? this._lastKalmanLng : rawLng;
@@ -1378,32 +1327,21 @@ class SensorFusionManager {
                 ? { lat: freezeLat, lng: freezeLng }
                 : null;
             this._stationarySamples = [];
-    
+
         } else if (!isStationary && this._lastStationaryState) {
-            // Transition to moving — hysteresis gate.
-            //
-            // When the accelerometer independently confirms physical motion,
-            // a single GPS frame is sufficient: two sensors agreeing is a
-            // stronger signal than one sensor agreeing twice.  Without the
-            // accelerometer (desktop, older phones, permission denied) the
-            // original 2-frame safety net is preserved to guard against a
-            // lone GPS jitter spike.
+            // Transition to moving — require 2 consecutive moving frames
             this._unfreezeCounter++;
-    
-            const accelConfirms  = this._accelAvailable && this._isMoving;
-            const requiredFrames = accelConfirms ? 1 : 2;
-    
-            if (this._unfreezeCounter >= requiredFrames) {
+            if (this._unfreezeCounter >= 2) {
                 if (this._kalmanFilter) this._kalmanFilter.unfreeze();
-                this._stationaryPosition  = null;
-                this._stationarySamples   = [];
+                this._stationaryPosition = null;
+                this._stationarySamples  = [];
                 this._lastStationaryState = false;
-                this._unfreezeCounter     = 0;
+                this._unfreezeCounter = 0;
                 return false;  // ← Hysteresis satisfied, report moving
             }
             return true;  // ← Still building hysteresis, report stationary
         }
-    
+
         if (isStationary) this._unfreezeCounter = 0;
         this._lastStationaryState = isStationary;
         return isStationary;
@@ -1657,7 +1595,6 @@ window.sensorFusion = new SensorFusionManager().init();
         HEADING_CHANGE_CAP:   25.0,
         INTERACTION_FADE_MS:  250,
         CENTERED_DEADBAND_PX: 1.5, // Pixel-based to prevent zoom wobble
-        TURN_FOLLOW_GAIN:     0.4, 
         DRIFT_THRESHOLD_LOW:  2.0,
         DRIFT_THRESHOLD_HIGH: 10.0,
         PAN_DURATION_BASE:    0.22,
@@ -1672,7 +1609,6 @@ window.sensorFusion = new SensorFusionManager().init();
     let _lastGoodSpeedMPS  = 0;
     let _lastHeadingDeg    = null;
     let _headingChangeRate = 0;
-    let _signedHeadingRate = 0;
     let _interactionEndTime = 0;
     let _markerEl          = null;
     let _markerTransSet    = false;
@@ -1703,20 +1639,19 @@ window.sensorFusion = new SensorFusionManager().init();
         }
 
    // --- HORIZON CURVE (Plateaus + Gentle Startup) ---
-      const HORIZON_CURVE = [
-        { speed:  0.0, h: 0.0  },   // stationary — no prediction
-        { speed:  0.3, h: 0.0  },   // GPS noise floor — still zero
-        { speed:  0.5, h: 0.06 },   // first-step kick-in (~3 cm)
-        { speed:  0.7, h: 0.12 },   // confident walking onset (~8 cm)
-        { speed:  1.0, h: 0.25 },   // ── identical from here down ──
-        { speed:  1.5, h: 0.5  },
-        { speed:  2.5, h: 0.9  },   // Start plateau
-        { speed:  8.0, h: 0.9  },   // End plateau (steady for walking/jogging)
-        { speed: 10.0, h: 1.4  },
-        { speed: 15.0, h: 1.8  },
-        { speed: 20.0, h: 2.5  },   // Start plateau
-        { speed: 25.0, h: 2.5  },   // End plateau (steady for city driving)
-        { speed: 40.0, h: 2.8  },   // Max anchor
+    const HORIZON_CURVE = [
+        { speed: 0.0,  h: 0.0 },
+        { speed: 0.5,  h: 0.0 },
+        { speed: 0.7,  h: 0.08 },  // Soft kick-in while GPS-derived
+        { speed: 1.0,  h: 0.25 }, 
+        { speed: 1.5,  h: 0.5 },
+        { speed: 2.5,  h: 0.9 },   // Start plateau
+        { speed: 8.0,  h: 0.9 },   // End plateau (steady for walking/jogging)
+        { speed: 10.0, h: 1.4 },   
+        { speed: 15.0, h: 1.8 },
+        { speed: 20.0, h: 2.5 },   // Start plateau
+        { speed: 25.0, h: 2.5 },   // End plateau (steady for city driving)
+        { speed: 40.0, h: 2.8 },   // Max anchor
     ];
  
     function _getPredictHorizon(speedMPS, headingChangeDegPerSec) {
@@ -1792,7 +1727,7 @@ window.sensorFusion = new SensorFusionManager().init();
         kf.seedVelocity(_lastGoodSpeedMPS * Math.cos(rad), _lastGoodSpeedMPS * Math.sin(rad), 2.0);
     }
 
-    // --- Resolve the best-known authoritative position (kalman > raw > lastPosition) ---
+    // --- NEW: resolve the best-known authoritative position (kalman > raw > lastPosition) ---
     function _resolveBestKnownPosition() {
         const kp = _getKalmanPos(), rp = _getRawPos();
         if (kp && typeof kp.lat === 'number' && typeof kp.lng === 'number') return { lat: kp.lat, lng: kp.lng };
@@ -1802,7 +1737,7 @@ window.sensorFusion = new SensorFusionManager().init();
         return null;
     }
 
-    // --- One-shot marker/viewport sync used when the predictive rAF loop
+    // --- NEW: one-shot marker/viewport sync used when the predictive rAF loop
     // is not going to run (e.g. stationary, first fix, non-centered + below
     // speed threshold). This is what closes the "marker never updates" gap
     // without introducing a second competing writer alongside frame(). ---
@@ -1825,185 +1760,144 @@ window.sensorFusion = new SensorFusionManager().init();
         }
     }
 
-        function _scheduleNext() {
-            if (_active) _rafId = requestAnimationFrame(frame);
-            }
-
-        function frame(now) {
-            _rafId = null;
-        
-            // Belt-and-suspenders: if stop() fired mid-frame or between
-            // frames, bail immediately without touching map/marker state.
-            if (!_active) return;
-        
-            const lastPos = window.lastPosition;
-            if (!lastPos || window.isLocationHuntVisible) { _active = false; return; }
-        
-            const speedMPS   = _getSpeedMPS();
-            const stationary = _isStationary();
-            const centered   = _isCenteredMode();
-        
-            if (!centered && stationary && speedMPS < CFG.MIN_SPEED_MPS) { _active = false; return; }
-        
-            // ── Interaction gate (250 ms fade) ──
-            const isInteracting = window.isMapInteracting
-                               || window._isProximityZoomAnimating
-                               || window._gpsCenteredPanJustOccurred;
-            if (isInteracting) {
-                _interactionEndTime = now + CFG.INTERACTION_FADE_MS;
-                _lastFrameTime = now;
-                _scheduleNext();
-                return;
-            }
-            if (now < _interactionEndTime) {
-                _lastFrameTime = now;
-                _scheduleNext();
-                return;
-            }
-        
-            // ── Frame-rate gate ──
-            const dtMs = now - _lastFrameTime;
-            if (dtMs < CFG.MIN_DT_MS) { _scheduleNext(); return; }
+    function frame(now) {
+        _rafId = null;
+        const lastPos = window.lastPosition;
+        if (!lastPos || window.isLocationHuntVisible) { _active = false; return; }
+    
+        const speedMPS   = _getSpeedMPS();
+        const stationary = _isStationary();
+        const centered   = _isCenteredMode();
+    
+        if (!centered && stationary && speedMPS < CFG.MIN_SPEED_MPS) { _active = false; return; }
+    
+        const isInteracting = window.isMapInteracting || window._isProximityZoomAnimating || window._gpsCenteredPanJustOccurred;
+        if (isInteracting) {
+            _interactionEndTime = now + CFG.INTERACTION_FADE_MS;
             _lastFrameTime = now;
-        
-            // ── Origin position (Kalman > raw > lastPosition) ──
-            const kp = _getKalmanPos(), rp = _getRawPos();
-            let oLat, oLng, oTs;
-            if      (kp?.timestamp != null) { oLat = kp.lat; oLng = kp.lng; oTs = kp.timestamp; }
-            else if (rp?.timestamp != null) { oLat = rp.lat; oLng = rp.lng; oTs = rp.timestamp; }
-            else                            { oLat = lastPos.lat; oLng = lastPos.lng; oTs = window.lastUpdateTimestamp || now; }
-        
-            // ── Heading tracking ──
-            const hdg = _getHeading();
-            if (_lastHeadingDeg != null && hdg != null) {
-                let d = hdg - _lastHeadingDeg;
-                if (d >  180) d -= 360;
-                if (d < -180) d += 360;
-                const dtSec = Math.max(dtMs, 16) / 1000;
-                const instantRate = d / dtSec;
-                _headingChangeRate = _headingChangeRate * 0.6
-                                   + Math.abs(instantRate) * 0.4;
-                _signedHeadingRate = Math.max(-90, Math.min(90, instantRate));
-            }
-            if (hdg != null) _lastHeadingDeg = hdg;
-        
-            // ── Velocity (direct Kalman output — no secondary EMA) ──
-            const vel = _getVelocity();
-            const vm  = Math.sqrt(vel.lat * vel.lat + vel.lng * vel.lng);
-            if (vm > 0.001) {
-                _lastGoodVelocity = { lat: vel.lat, lng: vel.lng };
-                _lastGoodSpeedMPS = speedMPS;
-            }
-        
-            // ── Prediction with lightweight velocity rotation ──
-            let pLat, pLng;
-            const rawAge = Math.max(0, (now - oTs) / 1000);
-            const hor    = _getPredictHorizon(speedMPS, _headingChangeRate);
-            const pDt    = Math.min(rawAge, hor);
-        
-            if (pDt <= 0 || speedMPS < CFG.LOW_SPEED_CUTOFF_MPS || stationary) {
-                pLat = oLat;
-                pLng = oLng;
-            } else {
-                const turnRad = _signedHeadingRate * (Math.PI / 180) * pDt * CFG.TURN_FOLLOW_GAIN;
-                const cosT = Math.cos(turnRad);
-                const sinT = Math.sin(turnRad);
-                const rvLat = vel.lat * cosT - vel.lng * sinT;
-                const rvLng = vel.lat * sinT + vel.lng * cosT;
-        
-                pLat = oLat + rvLat * pDt;
-                pLng = oLng + rvLng * pDt;
-        
-                const jN = Math.abs(pLat - oLat) * 111111;
-                const jE = Math.abs(pLng - oLng) * 111111 * Math.cos(oLat * Math.PI / 180);
-                if (jN > 150 || jE > 150) { pLat = oLat; pLng = oLng; }
-            }
-        
-            _lastPredictedPos = { lat: pLat, lng: pLng };
-        
-            // ── Low-speed hold with proportional deadband ──
-            const HOLD_SPEED_MPS  = CFG.MIN_SPEED_MPS;
-            const HOLD_DEADBAND_M = 0.15;
-            const prevHeld = window.__drHeld;
-            let hLat = pLat, hLng = pLng;
-        
-            if (speedMPS < HOLD_SPEED_MPS && prevHeld) {
-                const deadband = HOLD_DEADBAND_M * (1.0 - speedMPS / HOLD_SPEED_MPS);
-                const cosLat   = Math.cos(pLat * Math.PI / 180);
-                const errN     = (pLat - prevHeld.lat) * 111111;
-                const errE     = (pLng - prevHeld.lng) * 111111 * cosLat;
-                const errDist  = Math.sqrt(errN * errN + errE * errE);
-                if (errDist < deadband) {
-                    hLat = prevHeld.lat;
-                    hLng = prevHeld.lng;
-                }
-            }
-            window.__drHeld = { lat: hLat, lng: hLng };
-        
-            // ── Render ──
-            if (!map || window._isProximityZoomAnimating) {
-                _setMarkerPosition(hLat, hLng);
-                _scheduleNext();
-                return;
-            }
-        
-            if (window.followUser && centered) {
-                _snapViewport(hLat, hLng);
-                const c = map.getCenter();
-                _setMarkerPosition(c.lat, c.lng);
-            } else if (window.followUser) {
-                _setMarkerPosition(hLat, hLng);
-                _snapViewport(hLat, hLng);
-            } else {
-                _setMarkerPosition(hLat, hLng);
-            }
-        
-            _scheduleNext();
+            _rafId = requestAnimationFrame(frame);
+            return;
         }
-      
-        function _start() {
-            if (_active) return true;
-            if (window.isLocationHuntVisible) return false;
-            const speedMPS = _getSpeedMPS(), centered = _isCenteredMode();
-            if (!centered && speedMPS < CFG.MIN_SPEED_MPS) return false;
-            if (!centered && window.isStationary && speedMPS < 0.8) return false;
-            if (speedMPS >= CFG.MIN_SPEED_MPS) _seedVelocityOnResume();
-            _active             = true;
-            _lastFrameTime      = _now();
-            _interactionEndTime = 0;
-            _lastHeadingDeg     = null;   // avoid heading spike after long stop
-            _signedHeadingRate  = 0;
-            _headingChangeRate  = 0;
-            _scheduleNext();
-            return true;
+        if (now < _interactionEndTime) { _lastFrameTime = now; _rafId = requestAnimationFrame(frame); return; }
+    
+        const dtMs = now - _lastFrameTime;
+        if (dtMs < CFG.MIN_DT_MS) { _rafId = requestAnimationFrame(frame); return; }
+        _lastFrameTime = now;
+    
+        const kp = _getKalmanPos(), rp = _getRawPos();
+        let oLat, oLng, oTs;
+        if      (kp?.timestamp != null) { oLat = kp.lat; oLng = kp.lng; oTs = kp.timestamp; }
+        else if (rp?.timestamp != null) { oLat = rp.lat; oLng = rp.lng; oTs = rp.timestamp; }
+        else                            { oLat = lastPos.lat; oLng = lastPos.lng; oTs = window.lastUpdateTimestamp || now; }
+    
+        const hdg = _getHeading();
+        
+        if (_lastHeadingDeg != null && hdg != null) {
+            let d = hdg - _lastHeadingDeg;
+            if (d >  180) d -= 360;
+            if (d < -180) d += 360;
+            _headingChangeRate = _headingChangeRate * 0.7 + (Math.abs(d) / (Math.max(dtMs, 16) / 1000)) * 0.3;
+        }
+        if (hdg != null) _lastHeadingDeg = hdg;
+    
+        const vel = _getVelocity();
+        const vm = Math.sqrt(vel.lat*vel.lat + vel.lng*vel.lng);
+        if (vm > 0.001) { _lastGoodVelocity = { lat: vel.lat, lng: vel.lng }; _lastGoodSpeedMPS = speedMPS; }
+    
+        let pLat, pLng;
+        const rawAge = Math.max(0, (now - oTs) / 1000);
+        const hor    = _getPredictHorizon(speedMPS, _headingChangeRate);
+        const pDt    = Math.min(rawAge, hor);
+    
+        if (pDt <= 0 || speedMPS < CFG.LOW_SPEED_CUTOFF_MPS || stationary) {
+            pLat = oLat; pLng = oLng;
+        } else {
+            pLat = oLat + vel.lat * pDt;
+            pLng = oLng + vel.lng * pDt;
+            const jN = Math.abs(pLat - oLat) * 111111;
+            const jE = Math.abs(pLng - oLng) * 111111 * Math.cos(oLat * Math.PI / 180);
+            if (jN > 150 || jE > 150) { pLat = oLat; pLng = oLng; }
         }
     
+        _lastPredictedPos = { lat: pLat, lng: pLng };
+    
+        const HOLD_SPEED_MPS = CFG.MIN_SPEED_MPS; 
+        const HOLD_DEADBAND_M = 0.15;
+        
+        const prevHeld = window.__drHeld;
+        let hLat = pLat, hLng = pLng;
+    
+        if (speedMPS < HOLD_SPEED_MPS && prevHeld) {
+            const cosLat = Math.cos(pLat * Math.PI / 180);
+            const errN = (pLat - prevHeld.lat) * 111111;
+            const errE = (pLng - prevHeld.lng) * 111111 * cosLat;
+            const errDist = Math.sqrt(errN * errN + errE * errE);
+            if (errDist < HOLD_DEADBAND_M) {
+                hLat = prevHeld.lat;
+                hLng = prevHeld.lng;
+            }
+        }
+        window.__drHeld = { lat: hLat, lng: hLng };
+    
+        if (!map || window._isProximityZoomAnimating) {
+            _setMarkerPosition(hLat, hLng);
+            _rafId = requestAnimationFrame(frame);
+            return;
+        }
+    
+        if (window.followUser && centered) {
+            _snapViewport(hLat, hLng);
+            const c = map.getCenter();
+            _setMarkerPosition(c.lat, c.lng);
+        } else if (window.followUser) {
+            _setMarkerPosition(hLat, hLng);
+            _snapViewport(hLat, hLng);
+        } else {
+            _setMarkerPosition(hLat, hLng);
+        }
+    
+        _rafId = requestAnimationFrame(frame);
+    }
+
+    // --- CHANGED: now returns true/false so callers know whether the
+    // continuous predictive loop actually launched. ---
+    function _start() {
+        if (_active) return true;
+        if (window.isLocationHuntVisible) return false;
+        const speedMPS = _getSpeedMPS(), centered = _isCenteredMode();
+        if (!centered && speedMPS < CFG.MIN_SPEED_MPS) return false;
+        if (!centered && window.isStationary && speedMPS < 0.8) return false;
+        if (speedMPS >= CFG.MIN_SPEED_MPS) _seedVelocityOnResume();
+        _active = true; _lastFrameTime = _now(); _interactionEndTime = 0;
+        _rafId = requestAnimationFrame(frame);
+        return true;
+    }
+
     window.deadReckoning = {
         start() { _start(); },
-    
+
         stop() {
             if (_rafId != null) { cancelAnimationFrame(_rafId); _rafId = null; }
-            _active             = false;
-            _panPending         = false;
-            _panTarget          = null;
-            _centeredLat        = null;
-            _centeredLng        = null;
-            _signedHeadingRate  = 0;
-            _headingChangeRate  = 0;
-            _lastHeadingDeg     = null;
-            window.__drHeld     = null;
+            _active = false; _panPending = false; _panTarget = null;
+            _centeredLat = null; _centeredLng = null;
+            window.__drHeld = null;
             const el = _getMarkerEl();
             if (el) { el.style.willChange = ''; el.style.transition = ''; _markerTransSet = false; }
         },
-    
+
         isActive() { return _active; },
-    
+
         onMovementResumed: _start,
-    
+
+        // --- If DR declines to run its
+        // continuous loop (stationary / first fix / below speed threshold,
+        // non-centered), it now does a one-shot direct sync instead of
+        // silently doing nothing. DR remains the single writer of marker
+        // and viewport state either way — no dual-write with _executeRender. ---
         forceUpdate() {
             if (_active) {
                 _lastFrameTime = 0;
-                if (_rafId == null) _scheduleNext();
+                if (_rafId == null) _rafId = requestAnimationFrame(frame);
                 return;
             }
             const started = _start();
@@ -2011,17 +1905,17 @@ window.sensorFusion = new SensorFusionManager().init();
                 _immediateSync();
             }
         },
-        
+
         getPredictedPosition()  { return _lastPredictedPos; },
         invalidateMarkerCache() { _markerEl = null; _markerTransSet = false; }
-        };
-        
-        _start();
-    
+    };
+
+    _start();
+
     if (typeof memoryManager !== 'undefined' && memoryManager?.registerCleanupTask) {
         memoryManager.registerCleanupTask(() => window.deadReckoning.stop());
     }
-    })();
+})();
         
 /* ──────────────────────────────────────────────
    CONFIG — GPS & proximity tuning
@@ -2903,24 +2797,31 @@ const trackedTimeouts = new Set();
    GPS POWER MODE 
    ────────────────────────────────────────────── */
     function getWatchOptions() {
-    const speedMPH = (window.lastPosition?.speedMPS ?? 0) * 2.23694;
-    const isStationaryFlag = window.sensorFusion?._lastStationaryState ?? window.isStationary;
+        const speedMPH = (window.lastPosition?.speedMPS ?? 0) * 2.23694;
 
-    const stationary = isStationaryFlag || speedMPH < 0.3;
-    const driving    = speedMPH >= 5 || (!isStationaryFlag && speedMPH >= 4);
-    const highSpeed  = speedMPH >= 45;
+        // Match the authoritative stationary signal used elsewhere (see
+        // deadReckoning's _isStationary()) instead of window.isStationary alone.
+        // Nothing in the app assigns window.isStationary directly — the real
+        // value lives on sensorFusion._lastStationaryState — so reading it by
+        // itself here meant this was always `undefined`, which silently
+        // collapsed the driving hysteresis below into just `speedMPH >= 4`.
+        const isStationaryFlag = window.sensorFusion?._lastStationaryState ?? window.isStationary;
 
-    const maximumAge = stationary ? 2500   
-                      : highSpeed  ? 0
-                      : driving    ? 250
-                      :              1500;  
-
-    return {
-        enableHighAccuracy: true,
-        maximumAge,
-        timeout: stationary ? 15000 : driving ? 10000 : 12000,
-    };
-}
+        const stationary = isStationaryFlag || speedMPH < 0.3;
+        const driving    = speedMPH >= 5 || (!isStationaryFlag && speedMPH >= 4);
+        const highSpeed  = speedMPH >= 45;
+     
+        const maximumAge = stationary ? 5000
+                          : highSpeed  ? 0
+                          : driving    ? 250
+                          :              2000; // walking / low-speed transitional
+     
+        return {
+            enableHighAccuracy: true,
+            maximumAge,
+            timeout: stationary ? 20000 : driving ? 10000 : 15000,
+        };
+    }
 
 /* ──────────────────────────────────────────────
    POSITION UPDATES — GPS watch + power manager
@@ -3423,7 +3324,7 @@ const trackedTimeouts = new Set();
         const STATIONARY_SPEED_MPH = 1.0;
     
         const onInteractionStart = () => {
-            // Ignore programmatic moves (zoom transitions, recentering)
+            // FIX: Ignore programmatic moves (zoom transitions, recentering)
             // This prevents followUser from being toggled off automatically.
             if (window._programmaticFlyInProgress) {
                 return;
@@ -4454,52 +4355,73 @@ function _publishFusionState(fusionResult, fix) {
 /* ──────────────────────────────────────────────
    Unified Render Executor
    ────────────────────────────────────────────── */
-     function _executeRender(state) {
-        if (!state || window.isMapInteracting) {
-            window.lastMapUpdateTime = Date.now();
-            return;
-        }
-    
-        // Validate position before any render operations
-        if (typeof state.position?.lat !== 'number' || typeof state.position?.lng !== 'number' ||
-            isNaN(state.position.lat) || isNaN(state.position.lng)) {
-            console.warn('[Render] Invalid position, skipping');
-            window.lastMapUpdateTime = Date.now();
-            return;
-        }
-    
-        try {
-            var zoomResult = getSpeedBasedZoom(state.speedMPS, state.closestDistance);
-    
-            if (zoomResult !== null && map && zoomResult.zoom !== null && map.getZoom() !== zoomResult.zoom) {
-                // CRITICAL: Set guard BEFORE any map operation
-                window._programmaticFlyInProgress = true;
-                
-                // Use setZoom for the animation
-                map.setZoom(zoomResult.zoom, { 
-                    animate: true, 
-                    duration: 0.25, 
-                    noMoveStart: true 
-                });
-                
-                // IMPORTANT: Reset guard after animation completes
-                setTimeout(function() {
-                    window._programmaticFlyInProgress = false;
-                }, 300);
-            }
-        } catch (e) {
-            console.warn('[Render] Zoom error:', e);
-            // Ensure guard is cleared on error
-            window._programmaticFlyInProgress = false;
-        }
-    
-        // Force DR update — but only if position is not frozen
-        if (window.deadReckoning && typeof window.deadReckoning.forceUpdate === 'function' && !state.isFrozen) {
-            window.deadReckoning.forceUpdate();
-        }
-    
+   function _executeRender(state) {
+    if (!state || window.isMapInteracting) {
         window.lastMapUpdateTime = Date.now();
+        return;
     }
+
+    // Validate position before any render operations
+    if (typeof state.position?.lat !== 'number' || typeof state.position?.lng !== 'number' ||
+        isNaN(state.position.lat) || isNaN(state.position.lng)) {
+        console.warn('[Render] Invalid position, skipping');
+        window.lastMapUpdateTime = Date.now();
+        return;
+    }
+
+    // Keep the marker in sync with the latest position every render,
+    // independent of whether a zoom change happens this frame.
+    if (userMarker && typeof userMarker.setLatLng === 'function') {
+        userMarker.setLatLng([state.position.lat, state.position.lng]);
+    }
+
+    try {
+        var zoomResult = getSpeedBasedZoom(state.speedMPS, state.closestDistance);
+
+        if (zoomResult !== null && map && zoomResult.zoom !== null && map.getZoom() !== zoomResult.zoom) {
+            // CRITICAL: Set guard BEFORE any map operation
+            window._programmaticFlyInProgress = true;
+
+            // Clear any pending guard-reset from a prior zoom render so it
+            // can't clear the guard out from under this one.
+            if (window._programmaticFlyGuardTimeout) {
+                clearTimeout(window._programmaticFlyGuardTimeout);
+            }
+
+            // Use setView instead of setZoom: Leaflet's setZoom zooms around
+            // the map's current center, which drifts from the user's actual
+            // position over time. That drift gets magnified at higher zoom
+            // levels and can push the marker off-screen. setView applies
+            // pan + zoom atomically, centered on the real position.
+            map.setView([state.position.lat, state.position.lng], zoomResult.zoom, {
+                animate: true,
+                duration: 0.25,
+                noMoveStart: true
+            });
+
+            // IMPORTANT: Reset guard after animation completes
+            window._programmaticFlyGuardTimeout = setTimeout(function() {
+                window._programmaticFlyInProgress = false;
+                window._programmaticFlyGuardTimeout = null;
+            }, 300);
+        }
+    } catch (e) {
+        console.warn('[Render] Zoom error:', e);
+        // Ensure guard is cleared on error
+        window._programmaticFlyInProgress = false;
+        if (window._programmaticFlyGuardTimeout) {
+            clearTimeout(window._programmaticFlyGuardTimeout);
+            window._programmaticFlyGuardTimeout = null;
+        }
+    }
+
+    // Force DR update — but only if position is not frozen
+    if (window.deadReckoning && typeof window.deadReckoning.forceUpdate === 'function' && !state.isFrozen) {
+        window.deadReckoning.forceUpdate();
+    }
+
+    window.lastMapUpdateTime = Date.now();
+}
         
 /* ──────────────────────────────────────────────
   Dead Reckoning Control 
