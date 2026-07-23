@@ -1802,7 +1802,7 @@ window.sensorFusion = new SensorFusionManager().init();
         return null;
     }
 
-    // --- NEW: one-shot marker/viewport sync used when the predictive rAF loop
+    // --- One-shot marker/viewport sync used when the predictive rAF loop
     // is not going to run (e.g. stationary, first fix, non-centered + below
     // speed threshold). This is what closes the "marker never updates" gap
     // without introducing a second competing writer alongside frame(). ---
@@ -1825,229 +1825,203 @@ window.sensorFusion = new SensorFusionManager().init();
         }
     }
 
-      function frame(now) {
-        _rafId = null;
-        const lastPos = window.lastPosition;
-        if (!lastPos || window.isLocationHuntVisible) { _active = false; return; }
-    
-        const speedMPS   = _getSpeedMPS();
-        const stationary = _isStationary();
-        const centered   = _isCenteredMode();
-    
-        if (!centered && stationary && speedMPS < CFG.MIN_SPEED_MPS) { _active = false; return; }
-    
-        // ── Interaction gate (250 ms fade) ──
-        const isInteracting = window.isMapInteracting
-                           || window._isProximityZoomAnimating
-                           || window._gpsCenteredPanJustOccurred;
-        if (isInteracting) {
-            _interactionEndTime = now + CFG.INTERACTION_FADE_MS;
-            _lastFrameTime = now;
-            _rafId = requestAnimationFrame(frame);
-            return;
-        }
-        if (now < _interactionEndTime) {
-            _lastFrameTime = now;
-            _rafId = requestAnimationFrame(frame);
-            return;
-        }
-    
-        // ── Frame-rate gate ──
-        const dtMs = now - _lastFrameTime;
-        if (dtMs < CFG.MIN_DT_MS) { _rafId = requestAnimationFrame(frame); return; }
-        _lastFrameTime = now;
-    
-        // ── Origin position (Kalman > raw > lastPosition) ──
-        const kp = _getKalmanPos(), rp = _getRawPos();
-        let oLat, oLng, oTs;
-        if      (kp?.timestamp != null) { oLat = kp.lat; oLng = kp.lng; oTs = kp.timestamp; }
-        else if (rp?.timestamp != null) { oLat = rp.lat; oLng = rp.lng; oTs = rp.timestamp; }
-        else                            { oLat = lastPos.lat; oLng = lastPos.lng; oTs = window.lastUpdateTimestamp || now; }
-    
-        // ── Heading tracking ──
-        // Two outputs from the same heading delta:
-        //   _headingChangeRate   — magnitude EMA (0.6/0.4), feeds the horizon
-        //                          turn penalty.  Slightly faster blend than the
-        //                          old 0.7/0.3 so the penalty kicks in ~1 frame
-        //                          sooner at the start of a turn.
-        //   _signedHeadingRate   — instantaneous signed deg/s, NO EMA.  Feeds
-        //                          the velocity rotation below.  Clamped to
-        //                          ±90 deg/s to reject impossible GPS heading
-        //                          spikes.  Zero lag by design: we want the
-        //                          rotation to respond on the SAME frame the
-        //                          turn is detected, not 3 frames later.
-        const hdg = _getHeading();
-        if (_lastHeadingDeg != null && hdg != null) {
-            let d = hdg - _lastHeadingDeg;
-            if (d >  180) d -= 360;
-            if (d < -180) d += 360;
-            const dtSec = Math.max(dtMs, 16) / 1000;
-            const instantRate = d / dtSec;
-    
-            // Magnitude EMA — horizon turn penalty (conservative reduction)
-            _headingChangeRate = _headingChangeRate * 0.6
-                               + Math.abs(instantRate) * 0.4;
-    
-            // Signed instantaneous — velocity rotation (zero-lag direction)
-            _signedHeadingRate = Math.max(-90, Math.min(90, instantRate));
-        }
-        if (hdg != null) _lastHeadingDeg = hdg;
-    
-        // ── Velocity (direct Kalman output — no secondary EMA) ──
-        const vel = _getVelocity();
-        const vm  = Math.sqrt(vel.lat * vel.lat + vel.lng * vel.lng);
-        if (vm > 0.001) {
-            _lastGoodVelocity = { lat: vel.lat, lng: vel.lng };
-            _lastGoodSpeedMPS = speedMPS;
-        }
-    
-        // ── Prediction with lightweight velocity rotation ──
-        // Pure linear extrapolation cuts chords on curves because the
-        // Kalman velocity always lags the true direction by ~1 fix.
-        // Rotating the velocity vector by a fraction of the detected
-        // heading change gives the prediction a gentle curve without
-        // the full arc integral, EMA lag, or mode-switching that made
-        // the 1172 version overshoot.
-        //
-        //   turnRad = signedRate × pDt × TURN_FOLLOW_GAIN
-        //
-        // At TURN_FOLLOW_GAIN = 0.4 and walking speed (1.4 m/s) through
-        // a 90° turn (~90 deg/s), the rotation over a 0.5 s horizon is
-        // 90 × 0.5 × 0.4 = 18° — enough to visibly follow the curve
-        // without oversteering.  On a straight path, _signedHeadingRate
-        // oscillates around 0 (GPS noise), so turnRad ≈ 0 and the
-        // rotation is identity — identical to pure linear.
-        let pLat, pLng;
-        const rawAge = Math.max(0, (now - oTs) / 1000);
-        const hor    = _getPredictHorizon(speedMPS, _headingChangeRate);
-        const pDt    = Math.min(rawAge, hor);
-    
-        if (pDt <= 0 || speedMPS < CFG.LOW_SPEED_CUTOFF_MPS || stationary) {
-            pLat = oLat;
-            pLng = oLng;
-        } else {
-            const turnRad = _signedHeadingRate * (Math.PI / 180) * pDt * CFG.TURN_FOLLOW_GAIN;
-            const cosT = Math.cos(turnRad);
-            const sinT = Math.sin(turnRad);
-            const rvLat = vel.lat * cosT - vel.lng * sinT;
-            const rvLng = vel.lat * sinT + vel.lng * cosT;
-    
-            pLat = oLat + rvLat * pDt;
-            pLng = oLng + rvLng * pDt;
-    
-            // Sanity clamp — reject teleport-scale jumps
-            const jN = Math.abs(pLat - oLat) * 111111;
-            const jE = Math.abs(pLng - oLng) * 111111 * Math.cos(oLat * Math.PI / 180);
-            if (jN > 150 || jE > 150) { pLat = oLat; pLng = oLng; }
-        }
-    
-        _lastPredictedPos = { lat: pLat, lng: pLng };
-    
-        // Pin radius shrinks linearly from HOLD_DEADBAND_M (at speed 0)
-        // to 0 (at speed → HOLD_SPEED_MPS).  Eliminates the hard release
-        // "pop" at the 0.15 m/s threshold.  At rest the full 0.15 m
-        // radius still absorbs GPS jitter exactly as before.
-        const HOLD_SPEED_MPS  = CFG.MIN_SPEED_MPS;   // 0.15
-        const HOLD_DEADBAND_M = 0.15;
-    
-        const prevHeld = window.__drHeld;
-        let hLat = pLat, hLng = pLng;
-    
-        if (speedMPS < HOLD_SPEED_MPS && prevHeld) {
-            const deadband = HOLD_DEADBAND_M * (1.0 - speedMPS / HOLD_SPEED_MPS);
-            const cosLat   = Math.cos(pLat * Math.PI / 180);
-            const errN     = (pLat - prevHeld.lat) * 111111;
-            const errE     = (pLng - prevHeld.lng) * 111111 * cosLat;
-            const errDist  = Math.sqrt(errN * errN + errE * errE);
-            if (errDist < deadband) {
-                hLat = prevHeld.lat;
-                hLng = prevHeld.lng;
+        function _scheduleNext() {
+            if (_active) _rafId = requestAnimationFrame(frame);
             }
+
+        function frame(now) {
+            _rafId = null;
+        
+            // Belt-and-suspenders: if stop() fired mid-frame or between
+            // frames, bail immediately without touching map/marker state.
+            if (!_active) return;
+        
+            const lastPos = window.lastPosition;
+            if (!lastPos || window.isLocationHuntVisible) { _active = false; return; }
+        
+            const speedMPS   = _getSpeedMPS();
+            const stationary = _isStationary();
+            const centered   = _isCenteredMode();
+        
+            if (!centered && stationary && speedMPS < CFG.MIN_SPEED_MPS) { _active = false; return; }
+        
+            // ── Interaction gate (250 ms fade) ──
+            const isInteracting = window.isMapInteracting
+                               || window._isProximityZoomAnimating
+                               || window._gpsCenteredPanJustOccurred;
+            if (isInteracting) {
+                _interactionEndTime = now + CFG.INTERACTION_FADE_MS;
+                _lastFrameTime = now;
+                _scheduleNext();
+                return;
+            }
+            if (now < _interactionEndTime) {
+                _lastFrameTime = now;
+                _scheduleNext();
+                return;
+            }
+        
+            // ── Frame-rate gate ──
+            const dtMs = now - _lastFrameTime;
+            if (dtMs < CFG.MIN_DT_MS) { _scheduleNext(); return; }
+            _lastFrameTime = now;
+        
+            // ── Origin position (Kalman > raw > lastPosition) ──
+            const kp = _getKalmanPos(), rp = _getRawPos();
+            let oLat, oLng, oTs;
+            if      (kp?.timestamp != null) { oLat = kp.lat; oLng = kp.lng; oTs = kp.timestamp; }
+            else if (rp?.timestamp != null) { oLat = rp.lat; oLng = rp.lng; oTs = rp.timestamp; }
+            else                            { oLat = lastPos.lat; oLng = lastPos.lng; oTs = window.lastUpdateTimestamp || now; }
+        
+            // ── Heading tracking ──
+            const hdg = _getHeading();
+            if (_lastHeadingDeg != null && hdg != null) {
+                let d = hdg - _lastHeadingDeg;
+                if (d >  180) d -= 360;
+                if (d < -180) d += 360;
+                const dtSec = Math.max(dtMs, 16) / 1000;
+                const instantRate = d / dtSec;
+                _headingChangeRate = _headingChangeRate * 0.6
+                                   + Math.abs(instantRate) * 0.4;
+                _signedHeadingRate = Math.max(-90, Math.min(90, instantRate));
+            }
+            if (hdg != null) _lastHeadingDeg = hdg;
+        
+            // ── Velocity (direct Kalman output — no secondary EMA) ──
+            const vel = _getVelocity();
+            const vm  = Math.sqrt(vel.lat * vel.lat + vel.lng * vel.lng);
+            if (vm > 0.001) {
+                _lastGoodVelocity = { lat: vel.lat, lng: vel.lng };
+                _lastGoodSpeedMPS = speedMPS;
+            }
+        
+            // ── Prediction with lightweight velocity rotation ──
+            let pLat, pLng;
+            const rawAge = Math.max(0, (now - oTs) / 1000);
+            const hor    = _getPredictHorizon(speedMPS, _headingChangeRate);
+            const pDt    = Math.min(rawAge, hor);
+        
+            if (pDt <= 0 || speedMPS < CFG.LOW_SPEED_CUTOFF_MPS || stationary) {
+                pLat = oLat;
+                pLng = oLng;
+            } else {
+                const turnRad = _signedHeadingRate * (Math.PI / 180) * pDt * CFG.TURN_FOLLOW_GAIN;
+                const cosT = Math.cos(turnRad);
+                const sinT = Math.sin(turnRad);
+                const rvLat = vel.lat * cosT - vel.lng * sinT;
+                const rvLng = vel.lat * sinT + vel.lng * cosT;
+        
+                pLat = oLat + rvLat * pDt;
+                pLng = oLng + rvLng * pDt;
+        
+                const jN = Math.abs(pLat - oLat) * 111111;
+                const jE = Math.abs(pLng - oLng) * 111111 * Math.cos(oLat * Math.PI / 180);
+                if (jN > 150 || jE > 150) { pLat = oLat; pLng = oLng; }
+            }
+        
+            _lastPredictedPos = { lat: pLat, lng: pLng };
+        
+            // ── Low-speed hold with proportional deadband ──
+            const HOLD_SPEED_MPS  = CFG.MIN_SPEED_MPS;
+            const HOLD_DEADBAND_M = 0.15;
+            const prevHeld = window.__drHeld;
+            let hLat = pLat, hLng = pLng;
+        
+            if (speedMPS < HOLD_SPEED_MPS && prevHeld) {
+                const deadband = HOLD_DEADBAND_M * (1.0 - speedMPS / HOLD_SPEED_MPS);
+                const cosLat   = Math.cos(pLat * Math.PI / 180);
+                const errN     = (pLat - prevHeld.lat) * 111111;
+                const errE     = (pLng - prevHeld.lng) * 111111 * cosLat;
+                const errDist  = Math.sqrt(errN * errN + errE * errE);
+                if (errDist < deadband) {
+                    hLat = prevHeld.lat;
+                    hLng = prevHeld.lng;
+                }
+            }
+            window.__drHeld = { lat: hLat, lng: hLng };
+        
+            // ── Render ──
+            if (!map || window._isProximityZoomAnimating) {
+                _setMarkerPosition(hLat, hLng);
+                _scheduleNext();
+                return;
+            }
+        
+            if (window.followUser && centered) {
+                _snapViewport(hLat, hLng);
+                const c = map.getCenter();
+                _setMarkerPosition(c.lat, c.lng);
+            } else if (window.followUser) {
+                _setMarkerPosition(hLat, hLng);
+                _snapViewport(hLat, hLng);
+            } else {
+                _setMarkerPosition(hLat, hLng);
+            }
+        
+            _scheduleNext();
         }
-        window.__drHeld = { lat: hLat, lng: hLng };
-    
-        // ── Render ──
-        if (!map || window._isProximityZoomAnimating) {
-            _setMarkerPosition(hLat, hLng);
-            _rafId = requestAnimationFrame(frame);
-            return;
-        }
-    
-        if (window.followUser && centered) {
-            _snapViewport(hLat, hLng);
-            const c = map.getCenter();
-            _setMarkerPosition(c.lat, c.lng);
-        } else if (window.followUser) {
-            _setMarkerPosition(hLat, hLng);
-            _snapViewport(hLat, hLng);
-        } else {
-            _setMarkerPosition(hLat, hLng);
-        }
-    
-        _rafId = requestAnimationFrame(frame);
-    }
       
-  function _start() {
-    if (_active) return true;
-    if (window.isLocationHuntVisible) return false;
-    const speedMPS = _getSpeedMPS(), centered = _isCenteredMode();
-    if (!centered && speedMPS < CFG.MIN_SPEED_MPS) return false;
-    if (!centered && window.isStationary && speedMPS < 0.8) return false;
-    if (speedMPS >= CFG.MIN_SPEED_MPS) _seedVelocityOnResume();
-    _active             = true;
-    _lastFrameTime      = _now();
-    _interactionEndTime = 0;
-    _lastHeadingDeg     = null;   // avoid heading spike after long stop
-    _signedHeadingRate  = 0;
-    _headingChangeRate  = 0;
-    _rafId = requestAnimationFrame(frame);
-    return true;
-}
-
-window.deadReckoning = {
-    start() { _start(); },
-
-    stop() {
-        if (_rafId != null) { cancelAnimationFrame(_rafId); _rafId = null; }
-        _active             = false;
-        _panPending         = false;
-        _panTarget          = null;
-        _centeredLat        = null;
-        _centeredLng        = null;
-        _signedHeadingRate  = 0;
-        _headingChangeRate  = 0;
-        _lastHeadingDeg     = null;
-        window.__drHeld     = null;
-        const el = _getMarkerEl();
-        if (el) { el.style.willChange = ''; el.style.transition = ''; _markerTransSet = false; }
-    },
-
-    isActive() { return _active; },
-
-    onMovementResumed: _start,
-
-    forceUpdate() {
-        if (_active) {
-            _lastFrameTime = 0;
-            if (_rafId == null) _rafId = requestAnimationFrame(frame);
-            return;
+        function _start() {
+            if (_active) return true;
+            if (window.isLocationHuntVisible) return false;
+            const speedMPS = _getSpeedMPS(), centered = _isCenteredMode();
+            if (!centered && speedMPS < CFG.MIN_SPEED_MPS) return false;
+            if (!centered && window.isStationary && speedMPS < 0.8) return false;
+            if (speedMPS >= CFG.MIN_SPEED_MPS) _seedVelocityOnResume();
+            _active             = true;
+            _lastFrameTime      = _now();
+            _interactionEndTime = 0;
+            _lastHeadingDeg     = null;   // avoid heading spike after long stop
+            _signedHeadingRate  = 0;
+            _headingChangeRate  = 0;
+            _scheduleNext();
+            return true;
         }
-        const started = _start();
-        if (!started) {
-            _immediateSync();
-        }
-    },
-
-    getPredictedPosition()  { return _lastPredictedPos; },
-    invalidateMarkerCache() { _markerEl = null; _markerTransSet = false; }
-};
-
-_start();
-
-if (typeof memoryManager !== 'undefined' && memoryManager?.registerCleanupTask) {
-    memoryManager.registerCleanupTask(() => window.deadReckoning.stop());
-}
-})();
+    
+    window.deadReckoning = {
+        start() { _start(); },
+    
+        stop() {
+            if (_rafId != null) { cancelAnimationFrame(_rafId); _rafId = null; }
+            _active             = false;
+            _panPending         = false;
+            _panTarget          = null;
+            _centeredLat        = null;
+            _centeredLng        = null;
+            _signedHeadingRate  = 0;
+            _headingChangeRate  = 0;
+            _lastHeadingDeg     = null;
+            window.__drHeld     = null;
+            const el = _getMarkerEl();
+            if (el) { el.style.willChange = ''; el.style.transition = ''; _markerTransSet = false; }
+        },
+    
+        isActive() { return _active; },
+    
+        onMovementResumed: _start,
+    
+        forceUpdate() {
+            if (_active) {
+                _lastFrameTime = 0;
+                if (_rafId == null) _scheduleNext();
+                return;
+            }
+            const started = _start();
+            if (!started) {
+                _immediateSync();
+            }
+        },
+        
+        getPredictedPosition()  { return _lastPredictedPos; },
+        invalidateMarkerCache() { _markerEl = null; _markerTransSet = false; }
+        };
+        
+        _start();
+    
+    if (typeof memoryManager !== 'undefined' && memoryManager?.registerCleanupTask) {
+        memoryManager.registerCleanupTask(() => window.deadReckoning.stop());
+    }
+    })();
         
 /* ──────────────────────────────────────────────
    CONFIG — GPS & proximity tuning
