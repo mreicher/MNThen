@@ -3927,108 +3927,150 @@ function _handleTriggerZone(location, distanceFeet, now, isOnCooldown) {
    TILE PREFETCH UTILITY
    ────────────────────────────────────────────── */
     const TILE_PREFETCH_STAGGER_MS = 50;
-const TILE_PREFETCH_TTL_MS = 10 * 60 * 1000; // Re-prefetch after 10 min
-
-function _prefetchMapTiles(location, now) {
-    const prefetchKey = `_didPrefetch19_${location.id}`;
-    const lastPrefetchTime = window[`_time${prefetchKey}`];
-
-    // Re-prefetch if stale (cache may have evicted) or never done
-    if (window[prefetchKey] && lastPrefetchTime && (now - lastPrefetchTime) < TILE_PREFETCH_TTL_MS) {
-        return;
+    const TILE_PREFETCH_TTL_MS = 10 * 60 * 1000; // Re-prefetch after 10 min
+    const PROXIMITY_ZOOM_LEVEL = 19;             // Matches getSpeedBasedZoom's zoom-in target
+    const TILE_PREFETCH_MAX_FAILURES = 2;        // Roll back the success stamp after this many tile errors
+    
+    // Slippy-map tile coordinates for a lat/lng at a given zoom.
+    // Same math as before, isolated so the tile loop can't accidentally
+    // read a stale/partial coordinate object mid-compute.
+    function _latLngToTile(lat, lng, zoom) {
+        const n = Math.pow(2, zoom);
+        const latRad = lat * Math.PI / 180;
+        return {
+            n,
+            x: Math.floor((lng + 180) / 360 * n),
+            y: Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n)
+        };
     }
-
-    if (!window.map || typeof map.getCenter !== 'function' || typeof map.getZoom !== 'function') {
-        console.warn('[Prefetch] Map not available for tile prefetch');
-        return;
-    }
-
-    try {
-        const currentZoom = map.getZoom();
-
-        // Only prefetch if we're zoomed out — at z19 already, tiles are visible
-        if (currentZoom >= 19) {
-            window[prefetchKey] = true;
-            window[`_time${prefetchKey}`] = now;
+    
+    function _prefetchMapTiles(location, now) {
+        if (!location || location.id == null) return;
+    
+        const prefetchKey = `_didPrefetch19_${location.id}`;
+        const timeKey = `_time${prefetchKey}`;
+        const lastPrefetchTime = window[timeKey];
+    
+        // Re-prefetch if stale (cache may have evicted) or never done.
+        if (window[prefetchKey] && lastPrefetchTime && (now - lastPrefetchTime) < TILE_PREFETCH_TTL_MS) {
             return;
         }
-
-        const center = map.getCenter();
-        if (!center || typeof center.lat !== 'number' || typeof center.lng !== 'number') {
-            throw new Error('Invalid map center');
+    
+        // FIX: `map` is a top-level `let` binding in this script — NOT a window
+        // property. `window.map` is always undefined, so the original guard was
+        // permanently true and every prefetch silently no-op'd. Use the bare
+        // identifier (in scope here) with the same defensive shape checks.
+        if (!map || typeof map.getCenter !== 'function' || typeof map.getZoom !== 'function') {
+            console.warn('[Prefetch] Map not available for tile prefetch');
+            return;
         }
-
-        const targetZoom = 19; // Match proximity zoom target
-        const tileUrlTemplate = window.currentTileLayer?._url
-            || 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
-
-        const targetLat = location.lat || center.lat;
-        const targetLng = location.lng || center.lng;
-
-        const latRad = targetLat * Math.PI / 180;
-        const n = Math.pow(2, targetZoom);
-        const xtile = Math.floor((targetLng + 180) / 360 * n);
-        const ytile = Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n);
-
-        const tilesToPrefetch = [];
-        const subdomains = ['a', 'b', 'c'];
-
-        for (let dx = -1; dx <= 1; dx++) {
-            for (let dy = -1; dy <= 1; dy++) {
-                const x = xtile + dx;
-                const y = ytile + dy;
-
-                if (x < 0 || x >= n || y < 0 || y >= n) continue;
-
-                const subdomain = subdomains[(x + y) % subdomains.length];
-
-                const url = tileUrlTemplate
-                    .replace('{z}', targetZoom)
-                    .replace('{x}', x)
-                    .replace('{y}', y)
-                    .replace('{s}', subdomain);
-
-                tilesToPrefetch.push(url);
+    
+        try {
+            const currentZoom = map.getZoom();
+    
+            // Already zoomed in — the z19 tiles are on screen, nothing to warm.
+            // Stamp the key so we don't re-check until the TTL expires.
+            if (currentZoom >= PROXIMITY_ZOOM_LEVEL) {
+                window[prefetchKey] = true;
+                window[timeKey] = now;
+                return;
             }
+    
+            const center = map.getCenter();
+            if (!center || !Number.isFinite(center.lat) || !Number.isFinite(center.lng)) {
+                console.warn('[Prefetch] Invalid map center, skipping');
+                return;
+            }
+    
+            // FIX: the original `location.lat || center.lat` is a falsy-OR — a
+            // legitimate coordinate of 0 would be discarded and replaced by the
+            // map center (the same bug class the codebase already fixed for
+            // speedMPS). Validate with Number.isFinite; fall back only when the
+            // location coordinate is genuinely missing/invalid.
+            const targetLat = Number.isFinite(location.lat) ? location.lat : center.lat;
+            const targetLng = Number.isFinite(location.lng) ? location.lng : center.lng;
+            if (!Number.isFinite(targetLat) || !Number.isFinite(targetLng)) {
+                console.warn('[Prefetch] No valid target coordinates, skipping');
+                return;
+            }
+    
+            const targetZoom = PROXIMITY_ZOOM_LEVEL;
+            const tileUrlTemplate = window.currentTileLayer?._url
+                || 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
+    
+            const { n, x: xtile, y: ytile } = _latLngToTile(targetLat, targetLng, targetZoom);
+    
+            const tilesToPrefetch = [];
+            const subdomains = ['a', 'b', 'c'];
+    
+            for (let dx = -1; dx <= 1; dx++) {
+                for (let dy = -1; dy <= 1; dy++) {
+                    const x = xtile + dx;
+                    const y = ytile + dy;
+    
+                    // Bounds check — written so NaN is rejected too. The original
+                    // `x < 0 || x >= n` form lets NaN through (NaN comparisons are
+                    // always false), which would have built garbage tile URLs.
+                    if (!(x >= 0 && x < n && y >= 0 && y < n)) continue;
+    
+                    const subdomain = subdomains[(x + y) % subdomains.length];
+                    const url = tileUrlTemplate
+                        .replace('{z}', targetZoom)
+                        .replace('{x}', x)
+                        .replace('{y}', y)
+                        .replace('{s}', subdomain);
+    
+                    tilesToPrefetch.push(url);
+                }
+            }
+    
+            if (tilesToPrefetch.length === 0) {
+                console.warn('[Prefetch] No valid tiles to prefetch for', location.name || location.id);
+                return;
+            }
+    
+            // Supersede guard: a newer batch cancels any not-yet-fired loads from
+            // this one (the timeout callback checks the id before creating the Image).
+            window._tilePrefetchBatchId = (window._tilePrefetchBatchId ?? 0) + 1;
+            const batchId = window._tilePrefetchBatchId;
+    
+            let errorCount = 0;
+    
+            tilesToPrefetch.forEach((url, index) => {
+                createTrackedTimeout(() => {
+                    if (window._tilePrefetchBatchId !== batchId) return;
+    
+                    const img = new Image();
+                    // Don't let background tile warming compete with visible
+                    // content for decode time or network priority — mirrors what
+                    // preloadLocationData() already does for hero images.
+                    img.decoding = 'async';
+                    if ('fetchPriority' in img) img.fetchPriority = 'low';
+                    img.onerror = () => {
+                        errorCount++;
+                        // Too many failures → the cache warm likely didn't stick.
+                        // Clear the stamp so the next approach retries instead of
+                        // waiting out the full TTL on a cold cache.
+                        if (errorCount > TILE_PREFETCH_MAX_FAILURES) {
+                            window[prefetchKey] = false;
+                            window[timeKey] = 0;
+                        }
+                    };
+                    img.src = url;
+                }, index * TILE_PREFETCH_STAGGER_MS);
+            });
+    
+            // Stamp success up front so repeated GPS ticks inside the stagger
+            // window don't re-fire the whole batch; onerror rolls this back if
+            // the warm actually fails.
+            window[prefetchKey] = true;
+            window[timeKey] = now;
+            console.log(`[Prefetch] Initiated staggered load of ${tilesToPrefetch.length} tiles at zoom ${targetZoom} for`, location.name || location.id);
+    
+        } catch (err) {
+            console.warn('[Prefetch] Failed to prefetch tiles:', err);
         }
-
-        if (!window._tilePrefetchBatchId) {
-            window._tilePrefetchBatchId = 0;
-        }
-        const batchId = ++window._tilePrefetchBatchId;
-
-        let delay = 0;
-        let loadedCount = 0;
-        let errorCount = 0;
-
-        tilesToPrefetch.forEach((url) => {
-            createTrackedTimeout(() => {
-                if (window._tilePrefetchBatchId !== batchId) return;
-
-                const img = new Image();
-                img.onload = () => { loadedCount++; };
-                img.onerror = () => {
-                    errorCount++;
-                    // Don't mark as fully prefetched if tiles failed
-                    if (errorCount > 2) {
-                        window[prefetchKey] = false;
-                        window[`_time${prefetchKey}`] = 0;
-                    }
-                };
-                img.src = url;
-            }, delay);
-
-            delay += TILE_PREFETCH_STAGGER_MS;
-        });
-
-        window[prefetchKey] = true;
-        window[`_time${prefetchKey}`] = now;
-        console.log(`[Prefetch] Initiated staggered load of ${tilesToPrefetch.length} tiles at zoom ${targetZoom} for`, location.name || location.id);
-
-    } catch (err) {
-        console.warn('[Prefetch] Failed to prefetch tiles:', err);
     }
-}
 
 /* ──────────────────────────────────────────────
    MARKER UPDATE — RAF-coalesced with compositor hints
