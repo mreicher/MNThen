@@ -2680,35 +2680,54 @@ const trackedTimeouts = new Set();
         _initUserLocationAttempt(position);
     }
     
-    // Internal continuation of initializeUserLocation's work, once the
-    // already-initialized / already-in-progress guards above have passed.
-    //
-    // Marker-not-ready retries call this directly instead of going back through
-    // the public initializeUserLocation. That matters: window._initializationInProgress
-    // stays true for the *entire* backoff window this way. Previously it was reset
-    // to false right before scheduling the retry timeout, which meant a GPS update
-    // arriving mid-backoff skipped the "defer into _pendingInitPosition" branch
-    // (the flag guarding it was already off) and kicked off a second, fully
-    // independent init attempt in parallel — its own retry timers, its own writes
-    // to the shared _markerRetryCount, and potentially a duplicate
-    // startPositionUpdates()/GPS watch once both chains found the marker ready.
-    function _initUserLocationAttempt(position) {
+   function _initUserLocationAttempt(position) {
+        // ── Defensive validation ──────────────────────────────────────────────
+        // Guards against direct invocation with malformed data. The parent
+        // (initializeUserLocation) already validates, but this makes the
+        // function self-contained and safe if ever called from a new path.
+        if (!position?.coords) {
+            window._initializationInProgress = false;
+            handleLocationError(new Error('Invalid initial position'));
+            return;
+        }
+    
         const { latitude: lat, longitude: lng, accuracy, heading, speed } = position.coords;
     
+        if (!Number.isFinite(lat) || !Number.isFinite(lng) ||
+            Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+            window._initializationInProgress = false;
+            handleLocationError(new Error('Invalid coordinates'));
+            return;
+        }
+    
+        // ── Idempotency guard ─────────────────────────────────────────────────
+        // If initialization already completed (e.g. a stale retry fires after
+        // success), just sync the marker and bail — don't re-run the full
+        // init pipeline against live state.
+        if (window._initializationComplete) {
+            if (userMarker) userMarker.setLatLng([lat, lng]);
+            if (map) map.panTo([lat, lng], { animate: false });
+            window._initializationInProgress = false;
+            return;
+        }
+    
         try {
-            // Marker may not be ready yet — retry up to 3 times with backoff.
+            // ── STEP 1: Marker availability (retry with backoff) ──────────────
             if (!userMarker) {
                 window._markerRetryCount = (window._markerRetryCount || 0) + 1;
     
                 if (window._markerRetryCount <= 3) {
+                    // Exponential backoff: 100ms, 200ms, 400ms
+                    const delayMs = 100 * Math.pow(2, window._markerRetryCount - 1);
                     createTrackedTimeout(() => {
                         const pos = window._pendingInitPosition || position;
                         window._pendingInitPosition = null;
                         _initUserLocationAttempt(pos);
-                    }, 100 * window._markerRetryCount);
-                    return; // _initializationInProgress intentionally stays true here
+                    }, delayMs);
+                    return; // _initializationInProgress intentionally stays true
                 }
     
+                // Exhausted retries — fail cleanly
                 window._initializationInProgress = false;
                 window._markerRetryCount = 0;
                 handleLocationError(new Error('Map marker initialization failed'));
@@ -2716,79 +2735,132 @@ const trackedTimeouts = new Set();
             }
     
             window._markerRetryCount = 0;
-            userMarker.setLatLng([lat, lng]);
     
+            // ── STEP 2: Map validation ────────────────────────────────────────
             if (!map) throw new Error('Map not initialized');
     
-            // Match the speed-aware initial zoom used elsewhere (e.g.
-            // _resetMapToPosition's init path) instead of always hardcoding 17.
+            // ── STEP 3: Position the marker and viewport ──────────────────────
+            userMarker.setLatLng([lat, lng]);
+    
+            // Speed-aware initial zoom, matching _resetMapToPosition's init path.
             const targetZoom = (typeof getSpeedBasedZoom === 'function')
                 ? (getSpeedBasedZoom(speed || 0) || 17)
                 : 17;
-            map.setView([lat, lng], targetZoom, { animate: false });
     
-            // Seed position buffer with a single entry for a clean Kalman baseline.
-            seedPositionBuffer?.({
-                lat, lng, accuracy,
-                timestamp: position.timestamp || Date.now(),
-                heading: heading ?? null,
-                speedMPS: speed || 0,
+            // pan.noMoveStart suppresses the synchronous 'movestart' event that
+            // Leaflet fires on setView. Without it, onInteractionStart (registered
+            // by setupMapInteractionHandlers) runs immediately and sets
+            // followUser = false — the "floating off screen" bug documented in
+            // _resetMapToPosition. Nested inside `pan`, not top-level, per
+            // Leaflet 1.9.4's setView → _resetView reading path.
+            map.setView([lat, lng], targetZoom, {
+                animate: false,
+                pan: { noMoveStart: true }
             });
     
-            // Seed Kalman velocity if GPS already reports motion, skipping cold-start lag.
-            // Wrapped so a throwing sensorFusion module can't abort the rest of init
-            // (GPS watch, hunt/proximity checks, pending-position flush below).
+            // Defensive re-assertion: guarantees followUser/isMapInteracting are
+            // correct going into dead reckoning's first rAF frame, even if a
+            // zoomstart handler or future Leaflet change flips them. Runs
+            // synchronously before any rAF callback — no race.
+            window.followUser = true;
+            window.isMapInteracting = false;
+    
+            // ── STEP 4: Seed position buffer ──────────────────────────────────
+            // Single entry for a clean Kalman baseline.
+            if (typeof seedPositionBuffer === 'function') {
+                seedPositionBuffer({
+                    lat, lng,
+                    accuracy: accuracy || 20,
+                    timestamp: position.timestamp || Date.now(),
+                    heading: (heading != null && Number.isFinite(heading)) ? heading : null,
+                    speedMPS: Math.max(0, speed || 0),
+                }, 1);
+            }
+    
+            // ── STEP 5: Seed Kalman velocity ──────────────────────────────────
+            // Wrapped independently so a throwing sensorFusion module can't
+            // abort GPS watch startup, hunt/proximity checks, or the
+            // pending-position flush below.
             try {
                 const kf = window.sensorFusion?._kalmanFilter;
                 if (kf) {
-                    if (speed > 0.3 && heading != null && isFinite(heading)) {
+                    const speedMPS = Math.max(0, speed || 0);
+                    if (speedMPS > 0.3 && heading != null && Number.isFinite(heading)) {
                         const rad = heading * Math.PI / 180;
-                        kf.seedVelocity(speed * Math.cos(rad), speed * Math.sin(rad), 10.0);
-                    } else if (speed > 0.3) {
-                        kf.seedVelocity(0, 0, 50.0); // Speed known, heading unknown — high variance
+                        kf.seedVelocity(speedMPS * Math.cos(rad), speedMPS * Math.sin(rad), 10.0);
+                    } else if (speedMPS > 0.3) {
+                        // Speed known, heading unknown — high variance lets the
+                        // first fixes snap velocity to truth without lag.
+                        kf.seedVelocity(0, 0, 50.0);
                     }
                     // speed ≤ 0.3 m/s: zero-velocity init is correct, do nothing.
                 }
             } catch (kfErr) {
-                console.warn('[Init] Kalman velocity seed failed', kfErr);
+                console.warn('[Init] Kalman velocity seed failed:', kfErr);
             }
     
-            hideLoadingMessage?.();
+            // ── STEP 6: Dismiss loading UI ────────────────────────────────────
+            if (typeof hideLoadingMessage === 'function') hideLoadingMessage();
     
-            if (typeof startHunt === 'function' && !window._huntStarted) {
-                window._huntStarted = true;
-                startHunt();
+            // ── STEP 7: Start location-based features ─────────────────────────
+            // Each guarded independently so a failure in one doesn't block the other.
+            try {
+                if (typeof startHunt === 'function' && !window._huntStarted) {
+                    window._huntStarted = true;
+                    startHunt();
+                }
+            } catch (huntErr) {
+                console.error('[Init] startHunt failed:', huntErr);
+                window._huntStarted = false;
             }
     
-            if (typeof startIdleProximityCheck === 'function' && !window._proximityCheckStarted) {
-                window._proximityCheckStarted = true;
-                startIdleProximityCheck();
+            try {
+                if (typeof startIdleProximityCheck === 'function' && !window._proximityCheckStarted) {
+                    window._proximityCheckStarted = true;
+                    startIdleProximityCheck();
+                }
+            } catch (proxErr) {
+                console.error('[Init] startIdleProximityCheck failed:', proxErr);
+                window._proximityCheckStarted = false;
             }
     
-            window._initializationComplete  = true;
+            // ── STEP 8: Mark initialization complete ──────────────────────────
+            window._initializationComplete   = true;
             window._initializationInProgress = false;
             window._lastSuccessfulInit       = Date.now();
             window._initRecoveryAttempts     = 0;
     
-            // Start GPS watch; retry once if it fails to attach.
-            const watchId = startPositionUpdates();
-            if (watchId === null) {
+            // ── STEP 9: Start continuous GPS tracking ─────────────────────────
+            // Wrapped so a synchronous throw from watchPosition (rare but
+            // possible on some Android WebViews) doesn't prevent the pending
+            // position flush below.
+            try {
+                const watchId = startPositionUpdates();
+                if (watchId === null) {
+                    createTrackedTimeout(() => {
+                        if (!window.positionWatchId) startPositionUpdates();
+                    }, 3000);
+                }
+            } catch (watchErr) {
+                console.error('[Init] startPositionUpdates failed:', watchErr);
+                // Schedule a deferred retry — GPS watch is critical.
                 createTrackedTimeout(() => {
-                    if (!window.positionWatchId) startPositionUpdates();
+                    if (!window.positionWatchId) {
+                        try { startPositionUpdates(); } catch (_) {}
+                    }
                 }, 3000);
             }
     
-            // Apply any position that queued while init was in flight. Routed
-            // through the normal ongoing-update pipeline (when available) so
-            // displayed position and internal state (dead reckoning, sensorFusion,
-            // distance checks) stay in sync, instead of only moving the marker.
+            // ── STEP 10: Flush any position that queued during init ───────────
+            // Routed through the normal ongoing-update pipeline so displayed
+            // position and internal state (dead reckoning, sensorFusion,
+            // distance checks) stay in sync.
             const pending = window._pendingInitPosition;
             if (pending) {
                 window._pendingInitPosition = null;
                 const pLat = pending?.coords?.latitude;
                 const pLng = pending?.coords?.longitude;
-                const pendingValid = pLat != null && pLng != null &&
-                    !isNaN(pLat) && !isNaN(pLng) &&
+                const pendingValid = Number.isFinite(pLat) && Number.isFinite(pLng) &&
                     Math.abs(pLat) <= 90 && Math.abs(pLng) <= 180;
     
                 if (pendingValid) {
@@ -2801,9 +2873,13 @@ const trackedTimeouts = new Set();
             }
     
         } catch (err) {
+            // ── Error recovery ────────────────────────────────────────────────
             console.error('Location initialization error:', err);
             window._initializationInProgress = false;
     
+            // Roll back feature flags only if init never completed, so a
+            // failure in step 9/10 doesn't undo a successful hunt/proximity
+            // start from a prior attempt.
             if (!window._initializationComplete) {
                 window._huntStarted           = false;
                 window._proximityCheckStarted = false;
@@ -2814,6 +2890,7 @@ const trackedTimeouts = new Set();
             window._initRecoveryAttempts = (window._initRecoveryAttempts || 0) + 1;
     
             if (window._initRecoveryAttempts <= 3) {
+                // Exponential backoff: 2s, 4s, 8s (capped at 15s)
                 const backoffMs = Math.min(15000, Math.pow(2, window._initRecoveryAttempts) * 1000);
                 createTrackedTimeout(() => {
                     if (navigator.geolocation && !window._initializationComplete) {
@@ -2825,11 +2902,13 @@ const trackedTimeouts = new Set();
                     }
                 }, backoffMs);
             } else {
-                showPopup?.(
-                    'Location Error',
-                    'Unable to get your location after multiple attempts. Please check your GPS settings and refresh the page.',
-                    'error'
-                );
+                if (typeof showPopup === 'function') {
+                    showPopup(
+                        'Location Error',
+                        'Unable to get your location after multiple attempts. Please check your GPS settings and refresh the page.',
+                        'error'
+                    );
+                }
             }
         }
     }
