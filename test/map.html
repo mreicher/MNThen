@@ -3254,14 +3254,13 @@ function handlePositionUpdate(position) {
 /* ──────────────────────────────────────────────
    BACKGROUND LOCATION UPDATE
    ────────────────────────────────────────────── */
-  let geolocationRequestPending = false;
+let geolocationRequestPending = false;
 let warmupWatchId = null;
 let _backgroundUpdateTimeout = null;
 
 function updateLocationAfterBackground() {
     window.lastHiddenTime = window.lastHiddenTime || Date.now();
 
-    // Skip if we already refreshed recently.
     const timeSinceLastBg = Date.now() - (window._lastBackgroundUpdate || 0);
     if (timeSinceLastBg < 30_000 && window.lastPosition) {
         if (map) {
@@ -3276,16 +3275,16 @@ function updateLocationAfterBackground() {
 
     window._isLocationUpdateInProgress = true;
 
-    // Defined up front so the catch-all below can always reset
-    // _isLocationUpdateInProgress. Previously a synchronous throw above the
-    // old inline cleanup could leave the flag stuck true, permanently
-    // no-oping every future call via the guard above.
-    const cleanup = () => {
+    // Stops the pending/timeout state WITHOUT touching the warmup watch.
+    // Used when the 10s window expires: we want to stop counting this
+    // attempt as "in flight" and clear the timer, but the watch is
+    // deliberately left alive so a late-arriving fix can still fire
+    // onPositionSuccess and auto-dismiss the retry modal. Without this
+    // split, the previous cleanup() cleared the watch before the modal
+    // even appeared, so the modal's only route to auto-dismissal was
+    // already dead by the time it showed up.
+    const stopTimerKeepWatch = () => {
         geolocationRequestPending = false;
-        if (warmupWatchId !== null) {
-            navigator.geolocation.clearWatch(warmupWatchId);
-            warmupWatchId = null;
-        }
         if (_backgroundUpdateTimeout) {
             clearTimeout(_backgroundUpdateTimeout);
             _backgroundUpdateTimeout = null;
@@ -3293,21 +3292,42 @@ function updateLocationAfterBackground() {
         window._isLocationUpdateInProgress = false;
     };
 
+    // Full teardown: stops the timer AND clears the watch, and dismisses
+    // the retry modal if present. Used on success, on synchronous setup
+    // failure, and when the user explicitly cancels.
+    const cleanup = () => {
+        stopTimerKeepWatch();
+        if (warmupWatchId !== null) {
+            navigator.geolocation.clearWatch(warmupWatchId);
+            warmupWatchId = null;
+        }
+        document.getElementById('geolocation-retry-modal')?.remove();
+    };
+
     try {
         const awayMs = Date.now() - (window.lastHiddenTime || 0);
 
-        // Only tear down the map loop after a long absence.
         if (awayMs > 30000 && typeof disposeMapLoop === 'function') {
             disposeMapLoop();
         }
 
-        // Reset stale speed averages / filter after a long absence.
         if (awayMs > 10000) {
             window._modeSpeedEMA = undefined;
             window._visualSpeedEMA = undefined;
             window._proxSpeedEMA = null;
             if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
-                window.sensorFusion._kalmanFilter.reset();
+                try {
+                    window.sensorFusion._kalmanFilter.reset();
+                    // Paired with the Kalman reset elsewhere in this codebase
+                    // (_resetMapToPosition) — without this, stale smoothed
+                    // heading/speed can briefly linger after a long absence
+                    // even though the filter itself was reset.
+                    if (typeof window.sensorFusion.resetState === 'function') {
+                        window.sensorFusion.resetState();
+                    }
+                } catch (e) {
+                    console.warn('[Background] Kalman/sensorFusion reset failed', e);
+                }
             }
         }
 
@@ -3320,11 +3340,6 @@ function updateLocationAfterBackground() {
             _backgroundUpdateTimeout = null;
         }
 
-        // Restart the main watch unconditionally — do NOT gate it on the
-        // warmup fix below, which could otherwise leave tracking dead for up
-        // to MAX_DURATION if that fix is slow or fails. startPositionUpdates()
-        // clears any existing watch first, so this is safe even if
-        // positionWatchId was already null.
         if (window.positionWatchId != null) {
             navigator.geolocation.clearWatch(window.positionWatchId);
             window.positionWatchId = null;
@@ -3335,11 +3350,8 @@ function updateLocationAfterBackground() {
 
         geolocationRequestPending = true;
 
-        // Opportunistic fast snap for the UI only — the main watch above
-        // already owns continuous tracking regardless of how this resolves.
         const MAX_DURATION = 10000;
 
-        // ── Retry Modal (CSS-driven) ──
         const showRetryModal = () => {
             if (document.getElementById('geolocation-retry-modal')) return;
 
@@ -3372,7 +3384,13 @@ function updateLocationAfterBackground() {
             const closeBtn = document.createElement('button');
             closeBtn.className = 'geo-retry-cancel';
             closeBtn.textContent = 'Cancel';
-            closeBtn.addEventListener('click', () => { overlay.remove(); });
+            closeBtn.addEventListener('click', () => {
+                overlay.remove();
+                // User explicitly gave up — stop the lingering warmup watch
+                // too, rather than letting it keep polling GPS in the
+                // background for no visible benefit.
+                cleanup();
+            });
 
             overlay.addEventListener('click', (e) => {
                 if (e.target === overlay) overlay.remove();
@@ -3387,19 +3405,13 @@ function updateLocationAfterBackground() {
         };
 
         const safeToShowModal = () => {
-            // Number.isFinite guard so a NaN speedMPS is handled explicitly,
-            // matching the speedMPS guarding done elsewhere in this codebase.
             const rawSpeedMPS = window.lastPosition?.speedMPS;
             const speedMPH = (Number.isFinite(rawSpeedMPS) ? rawSpeedMPS : 0) * 2.23694;
             return speedMPH < 5;
         };
 
-        // ── Handle successful position acquisition (fast opportunistic snap) ──
         const onPositionSuccess = (position) => {
             const coords = position?.coords;
-            // Range + NaN check, matching every other position entry point in
-            // this codebase (handlePositionUpdate, initializeUserLocation,
-            // _resetMapToPosition).
             if (!coords ||
                 isNaN(coords.latitude) ||
                 isNaN(coords.longitude) ||
@@ -3412,8 +3424,9 @@ function updateLocationAfterBackground() {
 
             if (Date.now() - position.timestamp > 30000) return;
 
-            // Cleanup on success — clears the timeout too. The main watch is
-            // already running independently, so nothing else needs restarting.
+            // Full cleanup — this also dismisses the retry modal if it's
+            // showing, whether this fix arrived within the original 10s
+            // window or arrived late via the watch kept alive after timeout.
             cleanup();
 
             window._lastBackgroundUpdate = Date.now();
@@ -3425,21 +3438,9 @@ function updateLocationAfterBackground() {
             const currentCenter = map.getCenter();
             const distanceMoved = currentCenter.distanceTo([latitude, longitude]);
 
-            // Accuracy-aware "did we actually move?" gate. The old fixed 5 m
-            // threshold was smaller than a single poor-accuracy fix's error,
-            // so a noisy warmup fix routinely exceeded it and fired the
-            // destructive full reset below — nulling lastPosition and
-            // hard-snapping the map to a wrong spot, the bounce seen on
-            // background return. Treat displacement within ~2× the reported
-            // accuracy as GPS noise and take the gentle update path (the
-            // filter, with its stage-0 hold, smooths it from there). Only a
-            // real move beyond the noise floor does the reset. Floored at the
-            // original 5 m so good-accuracy behavior is unchanged; capped so
-            // garbage accuracy can't mask a genuine move.
             const moveNoiseFloorM = Math.min(Math.max((coords.accuracy || 20) * 2, 5), 100);
 
             if (distanceMoved < moveNoiseFloorM) {
-                // Within GPS noise — gentle update, no destructive reset.
                 updateUserLocation(position, true);
                 if (typeof updateDistanceBox === 'function') updateDistanceBox();
                 if (typeof isSignificantMovement === 'function' &&
@@ -3449,12 +3450,8 @@ function updateLocationAfterBackground() {
                 return;
             }
 
-            // Significant movement — full reset.
             requestAnimationFrame(() => {
                 try {
-                    // A fresher fix may have landed via the main watch while
-                    // this frame was pending; don't let this stale warmup fix
-                    // stomp newer state with a destructive reset.
                     if (window.lastUpdateTime && position.timestamp <= window.lastUpdateTime) {
                         if (typeof updateDistanceBox === 'function') updateDistanceBox();
                         return;
@@ -3490,8 +3487,18 @@ function updateLocationAfterBackground() {
 
         const onPositionError = (error) => {
             console.warn("Geolocation error:", error.message, "Code:", error.code);
-            // Don't cleanup here — let the timeout handle it. Safe because the
-            // main watch is already running independently.
+
+            // PERMISSION_DENIED won't resolve by waiting out the timeout —
+            // the user has to act. Skip straight to the modal instead of
+            // burning the full 10s first. Other error codes (POSITION_
+            // UNAVAILABLE, TIMEOUT) can plausibly still resolve, so those
+            // still wait for the normal timeout path below.
+            if (error.code === error.PERMISSION_DENIED && geolocationRequestPending) {
+                stopTimerKeepWatch();
+                if (safeToShowModal()) {
+                    showRetryModal();
+                }
+            }
         };
 
         warmupWatchId = navigator.geolocation.watchPosition(
@@ -3504,10 +3511,9 @@ function updateLocationAfterBackground() {
             }
         );
 
-        // Timeout handler — tracked so it's cleaned up on page unload.
         _backgroundUpdateTimeout = createTrackedTimeout(() => {
             if (geolocationRequestPending) {
-                cleanup();
+                stopTimerKeepWatch(); // watch stays alive on purpose — see above
                 if (safeToShowModal()) {
                     showRetryModal();
                 }
@@ -3515,9 +3521,6 @@ function updateLocationAfterBackground() {
         }, MAX_DURATION);
 
     } catch (err) {
-        // Catch-all for anything above throwing synchronously — without this,
-        // _isLocationUpdateInProgress would stay stuck true and every later
-        // call would silently no-op.
         console.error('updateLocationAfterBackground setup failed:', err);
         cleanup();
     }
@@ -3526,7 +3529,7 @@ function updateLocationAfterBackground() {
 /* ──────────────────────────────────────────────
    POSITION BUFFER
    ────────────────────────────────────────────── */
-        function seedPositionBuffer(seedPosition, count) {
+    function seedPositionBuffer(seedPosition, count) {
         if (!seedPosition || typeof seedPosition.lat !== 'number' || typeof seedPosition.lng !== 'number') return;
         
         if (!Array.isArray(window.positionBuffer)) {
@@ -3555,7 +3558,7 @@ function updateLocationAfterBackground() {
         }
     }
             
-      function getSpeedBasedZoom(speedMPS, closestDistance) {
+    function getSpeedBasedZoom(speedMPS, closestDistance) {
         const distanceFeet = (closestDistance ?? Infinity) * 3.28084;
         const speedMPH = (speedMPS ?? 0) * 2.23694;
     
@@ -3983,12 +3986,27 @@ function _handleTriggerZone(location, distanceFeet, now, isOnCooldown) {
    ────────────────────────────────────────────── */
     const TILE_PREFETCH_STAGGER_MS = 50;
     const TILE_PREFETCH_TTL_MS = 10 * 60 * 1000; // Re-prefetch after 10 min
-    const PROXIMITY_ZOOM_LEVEL = 19;             // Matches getSpeedBasedZoom's zoom-in target
-    const TILE_PREFETCH_MAX_FAILURES = 2;        // Roll back the success stamp after this many tile errors
+    const PROXIMITY_ZOOM_LEVEL = 19;
+    const TILE_PREFETCH_MAX_FAILURES = 2;
+    const TILE_PREFETCH_MAX_CONCURRENT = 3;
+    // Unofficial but widely cited OSM guideline: keep well under ~2 req/sec
+    // average to the public tile servers. This is a floor, not a target —
+    // prefetch is background/non-interactive traffic, so it should sit far
+    // below whatever a real user's own panning/zooming generates.
+    const TILE_PREFETCH_MIN_DISPATCH_INTERVAL_MS = 600; // ~1.6 req/sec ceiling
     
-    // Slippy-map tile coordinates for a lat/lng at a given zoom.
-    // Same math as before, isolated so the tile loop can't accidentally
-    // read a stale/partial coordinate object mid-compute.
+    // Global backoff: if OSM starts erroring/rate-limiting us, stop prefetching
+    // entirely for a cooldown period instead of retrying the same location
+    // immediately (which is the opposite of what you want under rate-limiting).
+    const TILE_PREFETCH_BACKOFF_MS = 5 * 60 * 1000;
+    const TILE_PREFETCH_BACKOFF_THRESHOLD = 4; // consecutive global failures
+    
+    if (!window._tilePrefetchQueue) window._tilePrefetchQueue = [];
+    if (window._tilePrefetchActive == null) window._tilePrefetchActive = 0;
+    if (window._tileLastDispatchTime == null) window._tileLastDispatchTime = 0;
+    if (window._tileGlobalConsecutiveFailures == null) window._tileGlobalConsecutiveFailures = 0;
+    if (window._tileBackoffUntil == null) window._tileBackoffUntil = 0;
+    
     function _latLngToTile(lat, lng, zoom) {
         const n = Math.pow(2, zoom);
         const latRad = lat * Math.PI / 180;
@@ -3999,22 +4017,76 @@ function _handleTriggerZone(location, distanceFeet, now, isOnCooldown) {
         };
     }
     
+    // Rate-limited + concurrency-capped dispatcher. Reschedules itself instead
+    // of firing everything as soon as concurrency allows — that's what actually
+    // keeps us under the requests/sec ceiling, not just the concurrency cap.
+    function _pumpTilePrefetchQueue() {
+        if (window._tilePrefetchQueue.length === 0) return;
+        if (window._tilePrefetchActive >= TILE_PREFETCH_MAX_CONCURRENT) return;
+    
+        const now = Date.now();
+        if (now < window._tileBackoffUntil) {
+            // In cooldown after repeated failures — try again once it lifts.
+            createTrackedTimeout(_pumpTilePrefetchQueue, window._tileBackoffUntil - now);
+            return;
+        }
+    
+        const elapsed = now - window._tileLastDispatchTime;
+        if (elapsed < TILE_PREFETCH_MIN_DISPATCH_INTERVAL_MS) {
+            createTrackedTimeout(_pumpTilePrefetchQueue, TILE_PREFETCH_MIN_DISPATCH_INTERVAL_MS - elapsed);
+            return;
+        }
+    
+        const job = window._tilePrefetchQueue.shift();
+        if (window._tilePrefetchBatchId !== job.batchId) {
+            _pumpTilePrefetchQueue(); // superseded, skip without spending a rate-limit slot
+            return;
+        }
+    
+        window._tileLastDispatchTime = now;
+        window._tilePrefetchActive++;
+    
+        const img = new Image();
+        img.decoding = 'async';
+        if ('fetchPriority' in img) img.fetchPriority = 'low';
+    
+        const finish = () => {
+            window._tilePrefetchActive--;
+            _pumpTilePrefetchQueue();
+        };
+        img.onload = () => {
+            window._tileGlobalConsecutiveFailures = 0;
+            finish();
+        };
+        img.onerror = () => {
+            job.onErrorTracker();
+            window._tileGlobalConsecutiveFailures++;
+            if (window._tileGlobalConsecutiveFailures >= TILE_PREFETCH_BACKOFF_THRESHOLD) {
+                window._tileBackoffUntil = Date.now() + TILE_PREFETCH_BACKOFF_MS;
+                window._tilePrefetchQueue.length = 0; // drop queued work, don't add to the pile-up
+                console.warn('[Prefetch] Repeated tile failures — backing off prefetch for', TILE_PREFETCH_BACKOFF_MS / 1000, 's');
+            }
+            finish();
+        };
+        img.src = job.url;
+    
+        // Keep draining if concurrency still allows another immediate dispatch
+        // (rate limiter above will hold it if not enough time has passed).
+        _pumpTilePrefetchQueue();
+    }
+    
     function _prefetchMapTiles(location, now) {
         if (!location || location.id == null) return;
+        if (now < window._tileBackoffUntil) return; // in cooldown, skip silently
     
         const prefetchKey = `_didPrefetch19_${location.id}`;
         const timeKey = `_time${prefetchKey}`;
         const lastPrefetchTime = window[timeKey];
     
-        // Re-prefetch if stale (cache may have evicted) or never done.
         if (window[prefetchKey] && lastPrefetchTime && (now - lastPrefetchTime) < TILE_PREFETCH_TTL_MS) {
             return;
         }
     
-        // FIX: `map` is a top-level `let` binding in this script — NOT a window
-        // property. `window.map` is always undefined, so the original guard was
-        // permanently true and every prefetch silently no-op'd. Use the bare
-        // identifier (in scope here) with the same defensive shape checks.
         if (!map || typeof map.getCenter !== 'function' || typeof map.getZoom !== 'function') {
             console.warn('[Prefetch] Map not available for tile prefetch');
             return;
@@ -4023,8 +4095,6 @@ function _handleTriggerZone(location, distanceFeet, now, isOnCooldown) {
         try {
             const currentZoom = map.getZoom();
     
-            // Already zoomed in — the z19 tiles are on screen, nothing to warm.
-            // Stamp the key so we don't re-check until the TTL expires.
             if (currentZoom >= PROXIMITY_ZOOM_LEVEL) {
                 window[prefetchKey] = true;
                 window[timeKey] = now;
@@ -4037,11 +4107,6 @@ function _handleTriggerZone(location, distanceFeet, now, isOnCooldown) {
                 return;
             }
     
-            // FIX: the original `location.lat || center.lat` is a falsy-OR — a
-            // legitimate coordinate of 0 would be discarded and replaced by the
-            // map center (the same bug class the codebase already fixed for
-            // speedMPS). Validate with Number.isFinite; fall back only when the
-            // location coordinate is genuinely missing/invalid.
             const targetLat = Number.isFinite(location.lat) ? location.lat : center.lat;
             const targetLng = Number.isFinite(location.lng) ? location.lng : center.lng;
             if (!Number.isFinite(targetLat) || !Number.isFinite(targetLng)) {
@@ -4055,28 +4120,25 @@ function _handleTriggerZone(location, distanceFeet, now, isOnCooldown) {
     
             const { n, x: xtile, y: ytile } = _latLngToTile(targetLat, targetLng, targetZoom);
     
+            // Cardinal neighbors + center only (5 tiles instead of 9) — cuts
+            // volume against the public server by ~45% for a small coverage loss.
+            const offsets = [[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1]];
             const tilesToPrefetch = [];
             const subdomains = ['a', 'b', 'c'];
     
-            for (let dx = -1; dx <= 1; dx++) {
-                for (let dy = -1; dy <= 1; dy++) {
-                    const x = xtile + dx;
-                    const y = ytile + dy;
+            for (const [dx, dy] of offsets) {
+                const x = xtile + dx;
+                const y = ytile + dy;
+                if (!(x >= 0 && x < n && y >= 0 && y < n)) continue;
     
-                    // Bounds check — written so NaN is rejected too. The original
-                    // `x < 0 || x >= n` form lets NaN through (NaN comparisons are
-                    // always false), which would have built garbage tile URLs.
-                    if (!(x >= 0 && x < n && y >= 0 && y < n)) continue;
+                const subdomain = subdomains[(x + y) % subdomains.length];
+                const url = tileUrlTemplate
+                    .replace('{z}', targetZoom)
+                    .replace('{x}', x)
+                    .replace('{y}', y)
+                    .replace('{s}', subdomain);
     
-                    const subdomain = subdomains[(x + y) % subdomains.length];
-                    const url = tileUrlTemplate
-                        .replace('{z}', targetZoom)
-                        .replace('{x}', x)
-                        .replace('{y}', y)
-                        .replace('{s}', subdomain);
-    
-                    tilesToPrefetch.push(url);
-                }
+                tilesToPrefetch.push(url);
             }
     
             if (tilesToPrefetch.length === 0) {
@@ -4084,43 +4146,26 @@ function _handleTriggerZone(location, distanceFeet, now, isOnCooldown) {
                 return;
             }
     
-            // Supersede guard: a newer batch cancels any not-yet-fired loads from
-            // this one (the timeout callback checks the id before creating the Image).
             window._tilePrefetchBatchId = (window._tilePrefetchBatchId ?? 0) + 1;
             const batchId = window._tilePrefetchBatchId;
     
             let errorCount = 0;
+            const onErrorTracker = () => {
+                errorCount++;
+                if (errorCount > TILE_PREFETCH_MAX_FAILURES) {
+                    window[prefetchKey] = false;
+                    window[timeKey] = 0;
+                }
+            };
     
-            tilesToPrefetch.forEach((url, index) => {
-                createTrackedTimeout(() => {
-                    if (window._tilePrefetchBatchId !== batchId) return;
-    
-                    const img = new Image();
-                    // Don't let background tile warming compete with visible
-                    // content for decode time or network priority — mirrors what
-                    // preloadLocationData() already does for hero images.
-                    img.decoding = 'async';
-                    if ('fetchPriority' in img) img.fetchPriority = 'low';
-                    img.onerror = () => {
-                        errorCount++;
-                        // Too many failures → the cache warm likely didn't stick.
-                        // Clear the stamp so the next approach retries instead of
-                        // waiting out the full TTL on a cold cache.
-                        if (errorCount > TILE_PREFETCH_MAX_FAILURES) {
-                            window[prefetchKey] = false;
-                            window[timeKey] = 0;
-                        }
-                    };
-                    img.src = url;
-                }, index * TILE_PREFETCH_STAGGER_MS);
+            tilesToPrefetch.forEach((url) => {
+                window._tilePrefetchQueue.push({ url, batchId, onErrorTracker });
             });
+            _pumpTilePrefetchQueue();
     
-            // Stamp success up front so repeated GPS ticks inside the stagger
-            // window don't re-fire the whole batch; onerror rolls this back if
-            // the warm actually fails.
             window[prefetchKey] = true;
             window[timeKey] = now;
-            console.log(`[Prefetch] Initiated staggered load of ${tilesToPrefetch.length} tiles at zoom ${targetZoom} for`, location.name || location.id);
+            console.log(`[Prefetch] Queued ${tilesToPrefetch.length} tiles at zoom ${targetZoom} for`, location.name || location.id);
     
         } catch (err) {
             console.warn('[Prefetch] Failed to prefetch tiles:', err);
