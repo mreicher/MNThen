@@ -1380,19 +1380,20 @@ class SensorFusionManager {
         return { vNorth: kalmanSpeed * Math.cos(headingRad), vEast: kalmanSpeed * Math.sin(headingRad) };
     }
 
-    smoothPosition(rawLat, rawLng, accuracyMeters, timestampMs, gpsSpeedMPS, gpsHeadingDeg) {
+   smoothPosition(rawLat, rawLng, accuracyMeters, timestampMs, gpsSpeedMPS, gpsHeadingDeg) {
         if (!isFinite(rawLat) || !isFinite(rawLng) || !this._kalmanFilter) {
             return { lat: rawLat || 0, lng: rawLng || 0, vNorth: 0, vEast: 0, speedMPS: 0 };
         }
-     
+    
         const kf = this._kalmanFilter;
         const perfNow = this._toPerfNow(timestampMs);
-     
-        // Snapshot previous raw state BEFORE overwriting (fixes velocity-seed dt=0 bug)
+    
+        // Snapshot prior raw state before overwriting — the position-delta
+        // velocity seed below needs it for a nonzero dt.
         const prevRawLat       = this._rawLat;
         const prevRawLng       = this._rawLng;
         const prevRawTimestamp = this._rawTimestamp;
-     
+    
         const gpsVel = this._computeGPSVelocity(rawLat, rawLng, timestampMs);
         this._gpsVelocityDegPerSec = gpsVel;
         this._rawLat        = rawLat;
@@ -1400,32 +1401,33 @@ class SensorFusionManager {
         this._rawSpeedMPS   = gpsSpeedMPS;
         this._rawHeadingDeg = gpsHeadingDeg;
         this._rawTimestamp  = timestampMs;
-     
-        // Gap recovery: seed velocity from position delta after long pause.
-        // Runs BEFORE kf.update() so it reads kf.lastTimestamp before this
-        // tick's update() advances it — the gap-length check needs the
-        // pre-update timestamp to detect the gap in the first place.
+    
+        // Gap recovery: after a >10s pause, seed velocity from the position
+        // delta. Runs before kf.update() so it reads the pre-update timestamp.
+        // Gated on the displacement exceeding GPS noise — a sub-accuracy "move"
+        // is jitter, and seeding velocity from it makes dead reckoning drift on
+        // a bogus vector when returning from background on poor accuracy.
         if (kf.lastTimestamp != null && kf.x != null) {
             const dtMs = perfNow - kf.lastTimestamp;
             if (dtMs > 10000 && window.lastPosition?.lat != null && window.lastPosition?.lng != null) {
                 const dtSec = dtMs / 1000, cosLat = Math.cos(rawLat * Math.PI / 180);
-                kf.scheduleVelocitySeed(
-                    ((rawLat - window.lastPosition.lat) / dtSec) * 111111,
-                    ((rawLng - window.lastPosition.lng) / dtSec) * 111111 * cosLat
-                );
+                const dN = (rawLat - window.lastPosition.lat) * 111111;
+                const dE = (rawLng - window.lastPosition.lng) * 111111 * cosLat;
+                if (Math.hypot(dN, dE) > Math.max((accuracyMeters || 20) * 2, 10)) {
+                    kf.scheduleVelocitySeed(dN / dtSec, dE / dtSec);
+                }
             }
         }
-     
+    
         const kfResult = kf.update(rawLat, rawLng, accuracyMeters, perfNow, gpsSpeedMPS);
-     
-        // kfResult.updateCount === 1 means kf.update() just called _initialize()
-        // this tick — covers the filter's very first init AND every reset path
-        // (dt<=0/dt>30 inside update(), plus external kf.reset() calls from
-        // _handleGPSGap, _resetMapToPosition, and _runSensorFusion's jump
-        // guard).
+    
+        // updateCount === 1 means kf.update() just (re)initialized this tick —
+        // first init or any reset path (_handleGPSGap, _resetMapToPosition,
+        // _runSensorFusion's jump guard).
         if (kfResult.updateCount === 1) { this._convergenceStage = 0; }
-     
-        // Seed consumption moved here — AFTER kf.update(), not before.
+    
+        // Consume a pending velocity seed AFTER update(), in priority order:
+        // GPS speed+heading → gap-recovery seed → raw position delta → last seed.
         if (kf._justInitialized) {
             let seeded = false;
             if (gpsSpeedMPS != null && gpsSpeedMPS > 0.3 && gpsHeadingDeg != null && isFinite(gpsHeadingDeg)) {
@@ -1453,39 +1455,62 @@ class SensorFusionManager {
             }
             kf._justInitialized = false;
         }
-     
+    
         this._filteredSpeedMPS = kf.getSpeedMPS();
         const isStationary = this._updateStationaryState(gpsSpeedMPS, this._filteredSpeedMPS, rawLat, rawLng);
-     
+    
         if      (kfResult.isConverged && this._convergenceStage < 2)      { this._convergenceStage = 2; }
         else if (kfResult.updateCount >= 3 && this._convergenceStage < 1) { this._convergenceStage = 1; }
         if (gpsSpeedMPS > 1.0 && kfResult.updateCount >= 2) { this._convergenceStage = Math.max(this._convergenceStage, 1); }
-     
+    
         let resultLat, resultLng, resultVNorth, resultVEast, resultSpeed;
         let blendFactor = kfResult.blendFactor;
-     
+        let holdStill = false;
+    
         if (isStationary && this._stationaryPosition) {
             resultLat = this._stationaryPosition.lat; resultLng = this._stationaryPosition.lng;
             resultVNorth = 0; resultVEast = 0; resultSpeed = 0; blendFactor = 1.0;
-            // Keep the externally-visible filtered speed consistent with the
-            // frozen/stationary result — otherwise getFilteredSpeedMPS() can
-            // keep reporting a lingering nonzero Kalman speed estimate while
-            // the position itself is frozen, which callers (e.g. the dead
-            // reckoning loop) use as a signal that we're still moving.
+            // Keep filtered speed consistent with the frozen position, so callers
+            // (dead reckoning) don't see a lingering nonzero speed while frozen.
             this._filteredSpeedMPS = 0;
         } else if (this._convergenceStage === 0) {
-            resultLat = rawLat; resultLng = rawLng;
-            const cosLatRaw = Math.cos(rawLat * Math.PI / 180);
-            resultVNorth = gpsVel.lat * 111111; resultVEast = gpsVel.lng * 111111 * cosLatRaw;
-            resultSpeed = gpsSpeedMPS || 0; blendFactor = 0;
+            // Pre-convergence the raw fix is shown unfiltered, which bounces the
+            // marker on poor accuracy. If we have a trusted position and this fix
+            // lands near it (didn't really move — just noisy GPS), hold the
+            // trusted position until the filter converges. First init (no trusted
+            // position) and a real move (fix far away) both fall through to the
+            // raw fix — unchanged behavior.
+            let holdLat = null, holdLng = null;
+            if (this._lastKalmanLat != null && this._lastKalmanLng != null) {
+                const cosLatH = Math.cos(this._lastKalmanLat * Math.PI / 180);
+                const dN = (rawLat - this._lastKalmanLat) * 111111;
+                const dE = (rawLng - this._lastKalmanLng) * 111111 * cosLatH;
+                const holdRadiusM = Math.min(Math.max((accuracyMeters || 20) * 3, 15), 100);
+                if (Math.hypot(dN, dE) <= holdRadiusM) {
+                    holdLat = this._lastKalmanLat; holdLng = this._lastKalmanLng;
+                }
+            }
+            if (holdLat != null) {
+                resultLat = holdLat; resultLng = holdLng;
+                resultVNorth = 0; resultVEast = 0; resultSpeed = 0; blendFactor = 0;
+                holdStill = true;
+            } else {
+                resultLat = rawLat; resultLng = rawLng;
+                const cosLatRaw = Math.cos(rawLat * Math.PI / 180);
+                resultVNorth = gpsVel.lat * 111111; resultVEast = gpsVel.lng * 111111 * cosLatRaw;
+                resultSpeed = gpsSpeedMPS || 0; blendFactor = 0;
+            }
         } else {
             resultLat = kfResult.lat; resultLng = kfResult.lng;
             resultVNorth = kfResult.vNorth; resultVEast = kfResult.vEast; resultSpeed = kfResult.speedMPS;
         }
-     
+    
         this._lastKalmanLat = resultLat; this._lastKalmanLng = resultLng;
-        this._lastKalmanTimestamp = perfNow; this._rawVelocity = gpsVel;
-     
+        this._lastKalmanTimestamp = perfNow;
+        // Zero the velocity dead reckoning reads between fixes while holding, so
+        // it doesn't extrapolate the marker off the held position.
+        this._rawVelocity = holdStill ? { lat: 0, lng: 0 } : gpsVel;
+    
         return {
             lat: resultLat, lng: resultLng,
             vNorth: resultVNorth, vEast: resultVEast, speedMPS: resultSpeed,
@@ -2115,23 +2140,8 @@ const trackedTimeouts = new Set();
             try { localStorage.removeItem(k); } catch (_) {}
             try { sessionStorage.removeItem(k); } catch (_) {}
         });
-    /*
-        // ── Map creation ──
-        map = L.map('map', {
-            zoomControl: false,
-            doubleClickZoom: false, 
-            zoomSnap: 0.1,
-            zoomDelta: 0.5,
-            wheelDebounceTime: 100,
-            tapTolerance: 15,
-            bounceAtZoomLimits: false,
-            renderer: L.canvas(),
-            fadeAnimation: false,
-            zoomAnimationThreshold: 4,
-            markerZoomAnimation: false
-        }).setView([46.392410, -94.636230], 9);
-    */
-    
+        
+        // ── Map creation ──    
         map = L.map('map', {
             zoomControl: false,
             doubleClickZoom: false,
@@ -2630,14 +2640,19 @@ const trackedTimeouts = new Set();
 /* ──────────────────────────────────────────────
    ACCURACY INDICATOR — CSS-driven
    ────────────────────────────────────────────── */
-    function updateAccuracyIndicator(accuracy) {
+   function updateAccuracyIndicator(accuracy) {
         const indicator = document.getElementById('accuracyIndicator');
         if (!indicator) return;
     
+        // Non-finite or negative readings (NaN, undefined, sensor junk) count as
+        // poor signal. Identical to the old fall-through — those values already
+        // failed both `< 20` and `< 50` and landed on 'accuracy-low' — just explicit.
+        const valid = Number.isFinite(accuracy) && accuracy >= 0;
+    
         indicator.classList.remove('accuracy-high', 'accuracy-medium', 'accuracy-low');
-        if (accuracy < 20) indicator.classList.add('accuracy-high');
-        else if (accuracy < 50) indicator.classList.add('accuracy-medium');
-        else indicator.classList.add('accuracy-low');
+        if (valid && accuracy < 20)       indicator.classList.add('accuracy-high');
+        else if (valid && accuracy < 50)  indicator.classList.add('accuracy-medium');
+        else                              indicator.classList.add('accuracy-low');
     }
 
 /* ──────────────────────────────────────────────
@@ -2990,70 +3005,93 @@ const trackedTimeouts = new Set();
 /* ──────────────────────────────────────────────
    POSITION UPDATES — GPS watch + power manager
    ────────────────────────────────────────────── */
-function startPositionUpdates() {
-    try {
-        if (window.positionWatchId != null) {
-            navigator.geolocation.clearWatch(window.positionWatchId);
-            window.positionWatchId = null;
-        }
-        const opts = getWatchOptions();
-        window.positionWatchId = navigator.geolocation.watchPosition(
-            handlePositionUpdate,
-            handleLocationError,
-            opts
-        );
-        // Remember the options this watch was created with so the recheck
-        // below can tell whether the speed tier has actually changed, instead
-        // of tearing down/recreating the watch every tick.
-        window._activeWatchOptions = opts;
-
-        // watchPosition locks in maximumAge/timeout for its whole lifetime —
-        // it never re-reads getWatchOptions() on its own. Poll for a tier
-        // change and only recreate the watch when maximumAge actually differs
-        // (idempotent: clear-if-exists then set, same pattern as above), so a
-        // stationary->walking->driving transition isn't stuck on whatever
-        // tier was active when tracking started.
-        if (window._watchOptionsRecheckInterval) {
-            clearInterval(window._watchOptionsRecheckInterval);
-        }
-        window._watchOptionsRecheckInterval = setInterval(() => {
-            const latest = getWatchOptions();
-            if (latest.maximumAge !== window._activeWatchOptions?.maximumAge) {
-                startPositionUpdates();
+    function startPositionUpdates() {
+        try {
+            if (window.positionWatchId != null) {
+                navigator.geolocation.clearWatch(window.positionWatchId);
+                window.positionWatchId = null;
             }
-        }, 3000);
-
-        if (!window._positionUpdatesListenersSetup) {
-            window._positionUpdatesListenersSetup = true;
-            const onlineHandler = () => {
-                if (window.onlineRestartTimeout) clearTimeout(window.onlineRestartTimeout);
-                window.onlineRestartTimeout = createTrackedTimeout(() => {
-                    window.onlineRestartTimeout = null;
-                    if (window.positionWatchId == null) {
-                        startPositionUpdates();
-                    }
-                }, 500);
-            };
-            const offlineHandler = () => {
-                if (window.onlineRestartTimeout) {
-                    clearTimeout(window.onlineRestartTimeout);
-                    window.onlineRestartTimeout = null;
+    
+            const opts = getWatchOptions();
+            window.positionWatchId = navigator.geolocation.watchPosition(
+                handlePositionUpdate,
+                handleLocationError,
+                opts
+            );
+    
+            // Snapshot for tier-change detection below.
+            window._activeWatchOptions = opts;
+    
+            // watchPosition locks maximumAge/timeout for life — poll for tier
+            // changes and recreate only when maximumAge actually differs.
+            //
+            // document.hidden guard: keeps the interval alive but inert while
+            // backgrounded. Deliberately NOT in disposeMapLoop's intervalHandles —
+            // disposeMapLoop runs on every hide (short or long), and nothing
+            // restarts this after a short tab switch, so clearing it there would
+            // kill adaptive polling permanently after the first quick alt-tab.
+            if (window._watchOptionsRecheckInterval) {
+                clearInterval(window._watchOptionsRecheckInterval);
+            }
+            window._watchOptionsRecheckInterval = setInterval(() => {
+                if (document.hidden) return;
+                const latest = getWatchOptions();
+                if (latest.maximumAge !== window._activeWatchOptions?.maximumAge) {
+                    startPositionUpdates();
                 }
-            };
-            window.addEventListener('online', onlineHandler);
-            window.addEventListener('offline', offlineHandler);
-            if (typeof memoryManager?.trackEventListener === 'function') {
-                memoryManager.trackEventListener(window, 'online', onlineHandler);
-                memoryManager.trackEventListener(window, 'offline', offlineHandler);
+            }, 3000);
+    
+            // Page-unload cleanup (interval is intentionally outside disposeMapLoop).
+            // Prevents a tick from calling watchPosition() mid-teardown.
+            if (!window._watchRecheckCleanupRegistered) {
+                window._watchRecheckCleanupRegistered = true;
+                if (typeof memoryManager?.registerCleanupTask === 'function') {
+                    memoryManager.registerCleanupTask(() => {
+                        if (window._watchOptionsRecheckInterval) {
+                            clearInterval(window._watchOptionsRecheckInterval);
+                            window._watchOptionsRecheckInterval = null;
+                        }
+                    });
+                }
             }
+    
+            // One-time online/offline handlers.
+            if (!window._positionUpdatesListenersSetup) {
+                window._positionUpdatesListenersSetup = true;
+    
+                const onlineHandler = () => {
+                    if (window.onlineRestartTimeout) clearTimeout(window.onlineRestartTimeout);
+                    window.onlineRestartTimeout = createTrackedTimeout(() => {
+                        window.onlineRestartTimeout = null;
+                        if (window.positionWatchId == null) {
+                            startPositionUpdates();
+                        }
+                    }, 500);
+                };
+    
+                const offlineHandler = () => {
+                    if (window.onlineRestartTimeout) {
+                        clearTimeout(window.onlineRestartTimeout);
+                        window.onlineRestartTimeout = null;
+                    }
+                };
+    
+                window.addEventListener('online', onlineHandler);
+                window.addEventListener('offline', offlineHandler);
+    
+                if (typeof memoryManager?.trackEventListener === 'function') {
+                    memoryManager.trackEventListener(window, 'online', onlineHandler);
+                    memoryManager.trackEventListener(window, 'offline', offlineHandler);
+                }
+            }
+    
+            return window.positionWatchId;
+        } catch (err) {
+            console.error('Geolocation unavailable:', err);
+            handleLocationError({ code: 0, message: 'Geolocation unavailable' });
+            return null;
         }
-        return window.positionWatchId;
-    } catch (err) {
-        console.error('Geolocation unavailable:', err);
-        handleLocationError({ code: 0, message: 'Geolocation unavailable' });
-        return null;
     }
-}
 
 /* ──────────────────────────────────────────────
    POSITION UPDATE HANDLER
@@ -3216,290 +3254,274 @@ function handlePositionUpdate(position) {
 /* ──────────────────────────────────────────────
    BACKGROUND LOCATION UPDATE
    ────────────────────────────────────────────── */
-        let geolocationRequestPending = false;
-        let warmupWatchId = null;
-        let _backgroundUpdateTimeout = null;
-    
-    function updateLocationAfterBackground() {
-        window.lastHiddenTime = window.lastHiddenTime || Date.now();
-    
-        // Don't refresh if we recently got a background update
-        const timeSinceLastBg = Date.now() - (window._lastBackgroundUpdate || 0);
-        if (timeSinceLastBg < 30_000 && window.lastPosition) {
-            if (map) {
-                map.invalidateSize({ pan: false });
-                userMarker?.setLatLng([window.lastPosition.lat, window.lastPosition.lng]);
-            }
-            return;
+  let geolocationRequestPending = false;
+let warmupWatchId = null;
+let _backgroundUpdateTimeout = null;
+
+function updateLocationAfterBackground() {
+    window.lastHiddenTime = window.lastHiddenTime || Date.now();
+
+    // Skip if we already refreshed recently.
+    const timeSinceLastBg = Date.now() - (window._lastBackgroundUpdate || 0);
+    if (timeSinceLastBg < 30_000 && window.lastPosition) {
+        if (map) {
+            map.invalidateSize({ pan: false });
+            userMarker?.setLatLng([window.lastPosition.lat, window.lastPosition.lng]);
         }
-    
-        if (window._isLocationUpdateInProgress) return;
-    
-        if (!("geolocation" in navigator)) return;
-    
-        window._isLocationUpdateInProgress = true;
-    
-        // Defined here, before any of the fallible setup below, and wrapped
-        // around that setup in the try/catch further down. Previously cleanup
-        // was only defined partway through this function, with nothing to reset
-        // window._isLocationUpdateInProgress if something above it (e.g. a
-        // disposeMapLoop() call, or watchPosition itself) threw synchronously —
-        // that would leave the flag stuck true forever, silently no-oping every
-        // future call to this function via the guard above.
-        const cleanup = () => {
-            geolocationRequestPending = false;
-            if (warmupWatchId !== null) {
-                navigator.geolocation.clearWatch(warmupWatchId);
-                warmupWatchId = null;
+        return;
+    }
+
+    if (window._isLocationUpdateInProgress) return;
+    if (!("geolocation" in navigator)) return;
+
+    window._isLocationUpdateInProgress = true;
+
+    // Defined up front so the catch-all below can always reset
+    // _isLocationUpdateInProgress. Previously a synchronous throw above the
+    // old inline cleanup could leave the flag stuck true, permanently
+    // no-oping every future call via the guard above.
+    const cleanup = () => {
+        geolocationRequestPending = false;
+        if (warmupWatchId !== null) {
+            navigator.geolocation.clearWatch(warmupWatchId);
+            warmupWatchId = null;
+        }
+        if (_backgroundUpdateTimeout) {
+            clearTimeout(_backgroundUpdateTimeout);
+            _backgroundUpdateTimeout = null;
+        }
+        window._isLocationUpdateInProgress = false;
+    };
+
+    try {
+        const awayMs = Date.now() - (window.lastHiddenTime || 0);
+
+        // Only tear down the map loop after a long absence.
+        if (awayMs > 30000 && typeof disposeMapLoop === 'function') {
+            disposeMapLoop();
+        }
+
+        // Reset stale speed averages / filter after a long absence.
+        if (awayMs > 10000) {
+            window._modeSpeedEMA = undefined;
+            window._visualSpeedEMA = undefined;
+            window._proxSpeedEMA = null;
+            if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
+                window.sensorFusion._kalmanFilter.reset();
             }
-            if (_backgroundUpdateTimeout) {
-                clearTimeout(_backgroundUpdateTimeout);
-                _backgroundUpdateTimeout = null;
-            }
-            window._isLocationUpdateInProgress = false;
+        }
+
+        if (warmupWatchId !== null) {
+            navigator.geolocation.clearWatch(warmupWatchId);
+            warmupWatchId = null;
+        }
+        if (_backgroundUpdateTimeout) {
+            clearTimeout(_backgroundUpdateTimeout);
+            _backgroundUpdateTimeout = null;
+        }
+
+        // Restart the main watch unconditionally — do NOT gate it on the
+        // warmup fix below, which could otherwise leave tracking dead for up
+        // to MAX_DURATION if that fix is slow or fails. startPositionUpdates()
+        // clears any existing watch first, so this is safe even if
+        // positionWatchId was already null.
+        if (window.positionWatchId != null) {
+            navigator.geolocation.clearWatch(window.positionWatchId);
+            window.positionWatchId = null;
+        }
+        if (typeof startPositionUpdates === 'function') {
+            startPositionUpdates();
+        }
+
+        geolocationRequestPending = true;
+
+        // Opportunistic fast snap for the UI only — the main watch above
+        // already owns continuous tracking regardless of how this resolves.
+        const MAX_DURATION = 10000;
+
+        // ── Retry Modal (CSS-driven) ──
+        const showRetryModal = () => {
+            if (document.getElementById('geolocation-retry-modal')) return;
+
+            const overlay = document.createElement('div');
+            overlay.id = 'geolocation-retry-modal';
+            overlay.className = 'geo-retry-overlay';
+            overlay.setAttribute('role', 'dialog');
+            overlay.setAttribute('aria-modal', 'true');
+            overlay.setAttribute('aria-label', 'Location retry');
+
+            const card = document.createElement('div');
+            card.className = 'geo-retry-card';
+
+            const title = document.createElement('div');
+            title.className = 'geo-retry-title';
+            title.textContent = 'Location Needed';
+
+            const text = document.createElement('p');
+            text.className = 'geo-retry-text';
+            text.innerHTML = 'We\'re still locating your device.<br>Please ensure location services are enabled, and try again.';
+
+            const retryBtn = document.createElement('button');
+            retryBtn.className = 'geo-retry-btn';
+            retryBtn.textContent = '↻ Try Again';
+            retryBtn.addEventListener('click', () => {
+                overlay.remove();
+                updateLocationAfterBackground();
+            });
+
+            const closeBtn = document.createElement('button');
+            closeBtn.className = 'geo-retry-cancel';
+            closeBtn.textContent = 'Cancel';
+            closeBtn.addEventListener('click', () => { overlay.remove(); });
+
+            overlay.addEventListener('click', (e) => {
+                if (e.target === overlay) overlay.remove();
+            });
+
+            card.appendChild(title);
+            card.appendChild(text);
+            card.appendChild(retryBtn);
+            card.appendChild(closeBtn);
+            overlay.appendChild(card);
+            document.body.appendChild(overlay);
         };
-    
-        try {
-            // Only dispose map loop if away longer than 30s
-            const awayMs = Date.now() - (window.lastHiddenTime || 0);
-            if (awayMs > 30000 && typeof disposeMapLoop === 'function') {
-                disposeMapLoop();
+
+        const safeToShowModal = () => {
+            // Number.isFinite guard so a NaN speedMPS is handled explicitly,
+            // matching the speedMPS guarding done elsewhere in this codebase.
+            const rawSpeedMPS = window.lastPosition?.speedMPS;
+            const speedMPH = (Number.isFinite(rawSpeedMPS) ? rawSpeedMPS : 0) * 2.23694;
+            return speedMPH < 5;
+        };
+
+        // ── Handle successful position acquisition (fast opportunistic snap) ──
+        const onPositionSuccess = (position) => {
+            const coords = position?.coords;
+            // Range + NaN check, matching every other position entry point in
+            // this codebase (handlePositionUpdate, initializeUserLocation,
+            // _resetMapToPosition).
+            if (!coords ||
+                isNaN(coords.latitude) ||
+                isNaN(coords.longitude) ||
+                Math.abs(coords.latitude) > 90 ||
+                Math.abs(coords.longitude) > 180 ||
+                coords.accuracy == null ||
+                coords.accuracy <= 0) {
+                return;
             }
-    
-            // Reset stale speed averages after long background absence
-            if (awayMs > 10000) {
-                window._modeSpeedEMA = undefined;
-                window._visualSpeedEMA = undefined;
-                window._proxSpeedEMA = null;
-                if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
-                    window.sensorFusion._kalmanFilter.reset();
+
+            if (Date.now() - position.timestamp > 30000) return;
+
+            // Cleanup on success — clears the timeout too. The main watch is
+            // already running independently, so nothing else needs restarting.
+            cleanup();
+
+            window._lastBackgroundUpdate = Date.now();
+
+            if (!map) return;
+
+            const { latitude, longitude } = coords;
+
+            const currentCenter = map.getCenter();
+            const distanceMoved = currentCenter.distanceTo([latitude, longitude]);
+
+            // Accuracy-aware "did we actually move?" gate. The old fixed 5 m
+            // threshold was smaller than a single poor-accuracy fix's error,
+            // so a noisy warmup fix routinely exceeded it and fired the
+            // destructive full reset below — nulling lastPosition and
+            // hard-snapping the map to a wrong spot, the bounce seen on
+            // background return. Treat displacement within ~2× the reported
+            // accuracy as GPS noise and take the gentle update path (the
+            // filter, with its stage-0 hold, smooths it from there). Only a
+            // real move beyond the noise floor does the reset. Floored at the
+            // original 5 m so good-accuracy behavior is unchanged; capped so
+            // garbage accuracy can't mask a genuine move.
+            const moveNoiseFloorM = Math.min(Math.max((coords.accuracy || 20) * 2, 5), 100);
+
+            if (distanceMoved < moveNoiseFloorM) {
+                // Within GPS noise — gentle update, no destructive reset.
+                updateUserLocation(position, true);
+                if (typeof updateDistanceBox === 'function') updateDistanceBox();
+                if (typeof isSignificantMovement === 'function' &&
+                    isSignificantMovement({ lat: latitude, lng: longitude })) {
+                    if (typeof resetInactivityTimer === 'function') resetInactivityTimer(false);
                 }
+                return;
             }
-    
-            // Clean up any existing warmup watch
-            if (warmupWatchId !== null) {
-                navigator.geolocation.clearWatch(warmupWatchId);
-                warmupWatchId = null;
-            }
-    
-            // Clear any existing timeout
-            if (_backgroundUpdateTimeout) {
-                clearTimeout(_backgroundUpdateTimeout);
-                _backgroundUpdateTimeout = null;
-            }
-    
-            // Get continuous tracking running again immediately.
-            // Briefly clear then restart the main watch so it picks up fresh state
-            // cleanly, but do NOT gate this on the warmup watch below succeeding —
-            // that was the mechanism that could leave the app with zero location
-            // updates for up to MAX_DURATION if the warmup fix was slow or failed.
-            // startPositionUpdates() clears any existing watch itself before
-            // starting a new one, so this is safe to call unconditionally even if
-            // positionWatchId was already null.
-            if (window.positionWatchId != null) {
-                navigator.geolocation.clearWatch(window.positionWatchId);
-                window.positionWatchId = null;
-            }
-            if (typeof startPositionUpdates === 'function') {
-                startPositionUpdates();
-            }
-    
-            geolocationRequestPending = true;
-    
-            // This watch is purely an opportunistic fast snap for the UI 
-            // (recenter, distance box, clear retry state) — the main watch above already owns getting tracking running again,
-            // so this no longer needs to be sized as the last-resort fallback.
-            const MAX_DURATION = 10000;
-    
-            // ── Retry Modal (CSS-driven) ──
-            const showRetryModal = () => {
-                if (document.getElementById('geolocation-retry-modal')) return;
-    
-                const overlay = document.createElement('div');
-                overlay.id = 'geolocation-retry-modal';
-                overlay.className = 'geo-retry-overlay';
-                overlay.setAttribute('role', 'dialog');
-                overlay.setAttribute('aria-modal', 'true');
-                overlay.setAttribute('aria-label', 'Location retry');
-    
-                const card = document.createElement('div');
-                card.className = 'geo-retry-card';
-    
-                const title = document.createElement('div');
-                title.className = 'geo-retry-title';
-                title.textContent = 'Location Needed';
-    
-                const text = document.createElement('p');
-                text.className = 'geo-retry-text';
-                text.innerHTML = 'We\'re still locating your device.<br>Please ensure location services are enabled, and try again.';
-    
-                const retryBtn = document.createElement('button');
-                retryBtn.className = 'geo-retry-btn';
-                retryBtn.textContent = '↻ Try Again';
-                retryBtn.addEventListener('click', () => {
-                    overlay.remove();
-                    updateLocationAfterBackground();
-                });
-    
-                const closeBtn = document.createElement('button');
-                closeBtn.className = 'geo-retry-cancel';
-                closeBtn.textContent = 'Cancel';
-                closeBtn.addEventListener('click', () => { overlay.remove(); });
-    
-                overlay.addEventListener('click', (e) => {
-                    if (e.target === overlay) overlay.remove();
-                });
-    
-                card.appendChild(title);
-                card.appendChild(text);
-                card.appendChild(retryBtn);
-                card.appendChild(closeBtn);
-                overlay.appendChild(card);
-                document.body.appendChild(overlay);
-            };
-    
-            const safeToShowModal = () => {
-                // Number.isFinite (not just `|| 0`) so a NaN speedMPS can't slip
-                // through — it already degraded safely (NaN < 5 is false, so the
-                // modal simply wouldn't show), but this makes that explicit
-                // rather than incidental, matching the clamping/guarding done on
-                // speedMPS everywhere else in this codebase.
-                const rawSpeedMPS = window.lastPosition?.speedMPS;
-                const speedMPH = (Number.isFinite(rawSpeedMPS) ? rawSpeedMPS : 0) * 2.23694;
-                return speedMPH < 5;
-            };
-    
-            // ── Handle successful position acquisition (fast opportunistic snap) ──
-            const onPositionSuccess = (position) => {
-                const coords = position?.coords;
-                // Range-checked in addition to the NaN check, matching the
-                // validation applied to every other position entry point in this
-                // codebase (handlePositionUpdate, initializeUserLocation,
-                // _resetMapToPosition) — a watch callback here shouldn't be held
-                // to a looser standard than those.
-                if (!coords ||
-                    isNaN(coords.latitude) ||
-                    isNaN(coords.longitude) ||
-                    Math.abs(coords.latitude) > 90 ||
-                    Math.abs(coords.longitude) > 180 ||
-                    coords.accuracy == null ||
-                    coords.accuracy <= 0) {
-                    return;
-                }
-    
-                if (Date.now() - position.timestamp > 30000) return;
-    
-                // Cleanup immediately on success — this clears the timeout too.
-                // The main watch is already running independently (started above),
-                // so there's nothing left to restart here.
-                cleanup();
-    
-                window._lastBackgroundUpdate = Date.now();
-    
-                // Guard against map not being ready, matching how every other
-                // function in this codebase treats `map` as something that has
-                // to be checked, not assumed.
-                if (!map) return;
-    
-                const { latitude, longitude } = coords;
-    
-                const currentCenter = map.getCenter();
-                const distanceMoved = currentCenter.distanceTo([latitude, longitude]);
-    
-                if (distanceMoved < 5) {
-                    // Small movement — just update
+
+            // Significant movement — full reset.
+            requestAnimationFrame(() => {
+                try {
+                    // A fresher fix may have landed via the main watch while
+                    // this frame was pending; don't let this stale warmup fix
+                    // stomp newer state with a destructive reset.
+                    if (window.lastUpdateTime && position.timestamp <= window.lastUpdateTime) {
+                        if (typeof updateDistanceBox === 'function') updateDistanceBox();
+                        return;
+                    }
+
+                    const currentZoom = map.getZoom();
+
+                    window.lastPosition = null;
+                    if (window.positionBuffer) window.positionBuffer.length = 0;
+                    if (window.lastVelocity) window.lastVelocity = { lat: 0, lng: 0 };
+                    window.isStationary = false;
+                    window.stationaryStartTime = null;
+                    window.stationaryCount = 0;
+                    window.lastUpdateTime = Date.now();
+
                     updateUserLocation(position, true);
-                    if (typeof updateDistanceBox === 'function') updateDistanceBox();
+                    map.setView([latitude, longitude], currentZoom, {
+                        animate: false,
+                        duration: 0,
+                        pan: { noMoveStart: true }
+                    });
+
                     if (typeof isSignificantMovement === 'function' &&
                         isSignificantMovement({ lat: latitude, lng: longitude })) {
                         if (typeof resetInactivityTimer === 'function') resetInactivityTimer(false);
                     }
-                    return;
+                    if (typeof updateDistanceBox === 'function') updateDistanceBox();
+                } catch (error) {
+                    console.error("Error applying location:", error);
                 }
-    
-                // Significant movement — full reset
-                requestAnimationFrame(() => {
-                    try {
-                        // A fresher fix may have already landed via the main
-                        // watch (running independently since it was restarted
-                        // synchronously above) while this frame was pending —
-                        // GPS watches can resolve almost immediately off a
-                        // cached fix. Without this check, this now-stale warmup
-                        // position would stomp over more current state with a
-                        // destructive reset (nulling lastPosition/positionBuffer)
-                        // right after the main watch had already written it.
-                        if (window.lastUpdateTime && position.timestamp <= window.lastUpdateTime) {
-                            if (typeof updateDistanceBox === 'function') updateDistanceBox();
-                            return;
-                        }
-    
-                        const currentZoom = map.getZoom();
-    
-                        window.lastPosition = null;
-                        if (window.positionBuffer) window.positionBuffer.length = 0;
-                        if (window.lastVelocity) window.lastVelocity = { lat: 0, lng: 0 };
-                        window.isStationary = false;
-                        window.stationaryStartTime = null;
-                        window.stationaryCount = 0;
-                        window.lastUpdateTime = Date.now();
-    
-                        updateUserLocation(position, true);
-                        map.setView([latitude, longitude], currentZoom, {
-                            animate: false,
-                            duration: 0,
-                            pan: { noMoveStart: true } 
-                        });
-    
-                        if (typeof isSignificantMovement === 'function' &&
-                            isSignificantMovement({ lat: latitude, lng: longitude })) {
-                            if (typeof resetInactivityTimer === 'function') resetInactivityTimer(false);
-                        }
-                        if (typeof updateDistanceBox === 'function') updateDistanceBox();
-                    } catch (error) {
-                        console.error("Error applying location:", error);
-                    }
-                });
-            };
-    
-            const onPositionError = (error) => {
-                console.warn("Geolocation error:", error.message, "Code:", error.code);
-                // Don't cleanup here — let the timeout handle it. This is now safe:
-                // the main watch is already running independently, so a slow or
-                // failed warmup fix no longer leaves tracking dead in the meantime.
-            };
-    
-            // Start watching for position — opportunistic fast snap only. The main
-            // watch above already covers continuous tracking regardless of how
-            // this one resolves.
-            warmupWatchId = navigator.geolocation.watchPosition(
-                onPositionSuccess,
-                onPositionError,
-                {
-                    enableHighAccuracy: true,
-                    timeout: 8000,
-                    maximumAge: 10000
+            });
+        };
+
+        const onPositionError = (error) => {
+            console.warn("Geolocation error:", error.message, "Code:", error.code);
+            // Don't cleanup here — let the timeout handle it. Safe because the
+            // main watch is already running independently.
+        };
+
+        warmupWatchId = navigator.geolocation.watchPosition(
+            onPositionSuccess,
+            onPositionError,
+            {
+                enableHighAccuracy: true,
+                timeout: 8000,
+                maximumAge: 10000
+            }
+        );
+
+        // Timeout handler — tracked so it's cleaned up on page unload.
+        _backgroundUpdateTimeout = createTrackedTimeout(() => {
+            if (geolocationRequestPending) {
+                cleanup();
+                if (safeToShowModal()) {
+                    showRetryModal();
                 }
-            );
-    
-            // Timeout handler — tracked so it's cleaned up on page unload
-            _backgroundUpdateTimeout = createTrackedTimeout(() => {
-                if (geolocationRequestPending) {
-                    cleanup();
-                    if (safeToShowModal()) {
-                        showRetryModal();
-                    }
-                }
-            }, MAX_DURATION);
-    
-        } catch (err) {
-            // Catch-all for anything above throwing synchronously (disposeMapLoop,
-            // startPositionUpdates, watchPosition itself, etc.) — without this,
-            // window._isLocationUpdateInProgress would be left stuck true and
-            // every subsequent call to this function would silently no-op.
-            console.error('updateLocationAfterBackground setup failed:', err);
-            cleanup();
-        }
+            }
+        }, MAX_DURATION);
+
+    } catch (err) {
+        // Catch-all for anything above throwing synchronously — without this,
+        // _isLocationUpdateInProgress would stay stuck true and every later
+        // call would silently no-op.
+        console.error('updateLocationAfterBackground setup failed:', err);
+        cleanup();
     }
+}
       
 /* ──────────────────────────────────────────────
    POSITION BUFFER
@@ -4245,126 +4267,140 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
 /* ═══════════════════════════════════════════════════════════════
    updateUserLocation  
    ─────────────────────────────────────────────────────────────*/
-  function updateUserLocation(position, forceUpdate) {
-        if (forceUpdate === undefined) forceUpdate = false;
-        var now = performance.now();
-        if (!forceUpdate && now - (window._lastUpdateUserLocation || 0) < 8) {
-            return;
-        }
-        window._lastUpdateUserLocation = now;
-        var currentGen = (window._locationUpdateGeneration || 0) + 1;
-        window._locationUpdateGeneration = currentGen;
-        if (window._debounceTimeoutId) {
-            clearTimeout(window._debounceTimeoutId);
-            window._debounceTimeoutId = null;
-        }
-        var fix = _extractGPSFix(position, forceUpdate);
-        if (fix) {
-            if (window._gpsTimeoutTimer) {
-                clearTimeout(window._gpsTimeoutTimer);
-                window._gpsTimeoutTimer = null;
-            }
-            if (window.isGPSSearching) {
-                window.isGPSSearching = false;
-                if (typeof hideGPSSearchingState === 'function') hideGPSSearchingState();
-            }
-        } else {
-            if (!window._gpsTimeoutTimer) {
-                window._gpsTimeoutTimer = createTrackedTimeout(function() {
-                    window._gpsTimeoutTimer = null;
-                    if (!window.isGPSSearching) {
-                        window.isGPSSearching = true;
-                        if (typeof showGPSSearchingState === 'function') showGPSSearchingState();
-                    }
-                }, 30000);
-            }
-            return;
-        }
-        var lastPos = window.lastPosition;
-        if (!lastPos) {
-            _initializeUserLocationState(fix, fix.timestamp, forceUpdate);
-            return;
-        }
-        // Raw gap, clamped only for negative clock skew — this is what decides
-        // *which recovery path* _handleGPSGap takes (medium-seed vs. full reset),
-        // and it also becomes the medium-gap velocity-seed dt so the seeded
-        // velocity reflects true average speed over the gap, not a speed inflated
-        // by dividing real displacement by an artificially shrunk time window.
-        var rawTimeDelta = (fix.timestamp - window.lastUpdateTime) / 1000;
-        rawTimeDelta = Math.max(0, rawTimeDelta);
-        // Separate clamp for the prediction/fusion math downstream (unchanged
-        // behavior): huge gap → 30s max, prevents runaway extrapolation in
-        // _runSensorFusion / _buildRenderState.
-        var timeDelta = Math.min(rawTimeDelta, 30);
-        _handleGPSGap(fix, lastPos, rawTimeDelta);
-        var isStationaryFlag = window.sensorFusion ? window.sensorFusion._lastStationaryState : window.isStationary;
-        if (isStationaryFlag && window.sensorFusion && window.sensorFusion.isDeviceMoving(fix.speedMPS)) {
-            var kf = window.sensorFusion._kalmanFilter;
-            if (kf && kf.P && kf.x) {
-                kf.P[2][2] = 225; kf.P[3][3] = 225;
-                kf.P[0][2] = 0;   kf.P[2][0] = 0;
-                kf.P[1][3] = 0;   kf.P[3][1] = 0;
-            }
-        }
-        var fusionResult = _runSensorFusion(fix, lastPos, timeDelta, forceUpdate);
-        if (!fusionResult) {
-            return;
-        }
-        _publishFusionState(fusionResult, fix);
-        var renderState = _buildRenderState(fusionResult, fix, lastPos, timeDelta);
-        _scheduleUnifiedRender(renderState);
-        var validHeading = (typeof fusionResult.heading === 'number' && !isNaN(fusionResult.heading))
-            ? fusionResult.heading
-            : (lastPos.heading || null);
-        window.lastPosition = {
-            lat:       fix.lat,
-            lng:       fix.lng,
-            accuracy:  fix.accuracy,
-            heading:   validHeading,
-            timestamp: fix.timestamp,
-            speedMPS:  (typeof fusionResult.speedMPS === 'number' && !isNaN(fusionResult.speedMPS))
-                ? Math.max(0, fusionResult.speedMPS)
-                : 0
-        };
-        window.lastUpdateTime      = fix.timestamp;
-        window.lastUpdateTimestamp = fix.timestamp;
-        _controlDeadReckoning(fusionResult);
-        if (typeof updateDistanceBox === 'function') {
-            updateDistanceBox(forceUpdate, window.lastPosition,
-                renderState.closestLocation, renderState.closestDistance);
-        }
-        if (typeof _ensureWillChange === 'function') _ensureWillChange();
-        if (typeof _scheduleWillChangeReset === 'function') _scheduleWillChangeReset();
+ function updateUserLocation(position, forceUpdate) {
+    if (forceUpdate === undefined) forceUpdate = false;
+    var now = performance.now();
+    if (!forceUpdate && now - (window._lastUpdateUserLocation || 0) < 8) {
+        return;
     }
+    window._lastUpdateUserLocation = now;
+    var currentGen = (window._locationUpdateGeneration || 0) + 1;
+    window._locationUpdateGeneration = currentGen;
+    if (window._debounceTimeoutId) {
+        clearTimeout(window._debounceTimeoutId);
+        window._debounceTimeoutId = null;
+    }
+    var fix = _extractGPSFix(position, forceUpdate);
+    if (fix) {
+        if (window._gpsTimeoutTimer) {
+            clearTimeout(window._gpsTimeoutTimer);
+            window._gpsTimeoutTimer = null;
+        }
+        if (window.isGPSSearching) {
+            window.isGPSSearching = false;
+            if (typeof hideGPSSearchingState === 'function') hideGPSSearchingState();
+        }
+    } else {
+        if (!window._gpsTimeoutTimer) {
+            window._gpsTimeoutTimer = createTrackedTimeout(function() {
+                window._gpsTimeoutTimer = null;
+                if (!window.isGPSSearching) {
+                    window.isGPSSearching = true;
+                    if (typeof showGPSSearchingState === 'function') showGPSSearchingState();
+                }
+            }, 30000);
+        }
+        return;
+    }
+    var lastPos = window.lastPosition;
+    if (!lastPos) {
+        _initializeUserLocationState(fix, fix.timestamp, forceUpdate);
+        return;
+    }
+    // Raw gap, clamped only for negative clock skew — this is what decides
+    // *which recovery path* _handleGPSGap takes (medium-seed vs. full reset),
+    // and it also becomes the medium-gap velocity-seed dt so the seeded
+    // velocity reflects true average speed over the gap, not a speed inflated
+    // by dividing real displacement by an artificially shrunk time window.
+    var rawTimeDelta = (fix.timestamp - window.lastUpdateTime) / 1000;
+    rawTimeDelta = Math.max(0, rawTimeDelta);
+    // Separate clamp for the prediction/fusion math downstream (unchanged
+    // behavior): huge gap → 30s max, prevents runaway extrapolation in
+    // _runSensorFusion / _buildRenderState.
+    var timeDelta = Math.min(rawTimeDelta, 30);
+    _handleGPSGap(fix, lastPos, rawTimeDelta);
+    var isStationaryFlag = window.sensorFusion ? window.sensorFusion._lastStationaryState : window.isStationary;
+    if (isStationaryFlag && window.sensorFusion && window.sensorFusion.isDeviceMoving(fix.speedMPS)) {
+        var kf = window.sensorFusion._kalmanFilter;
+        if (kf && kf.P && kf.x) {
+            kf.P[2][2] = 225; kf.P[3][3] = 225;
+            kf.P[0][2] = 0;   kf.P[2][0] = 0;
+            kf.P[1][3] = 0;   kf.P[3][1] = 0;
+        }
+    }
+    var fusionResult = _runSensorFusion(fix, lastPos, timeDelta, forceUpdate);
+    if (!fusionResult) {
+        return;
+    }
+    _publishFusionState(fusionResult, fix);
+    var renderState = _buildRenderState(fusionResult, fix, lastPos, timeDelta);
+    _scheduleUnifiedRender(renderState);
+    var validHeading = (typeof fusionResult.heading === 'number' && !isNaN(fusionResult.heading))
+        ? fusionResult.heading
+        : (lastPos.heading || null);
+    window.lastPosition = {
+        lat:       fix.lat,
+        lng:       fix.lng,
+        accuracy:  fix.accuracy,
+        heading:   validHeading,
+        timestamp: fix.timestamp,
+        speedMPS:  (typeof fusionResult.speedMPS === 'number' && !isNaN(fusionResult.speedMPS))
+            ? Math.max(0, fusionResult.speedMPS)
+            : 0
+    };
+    window.lastUpdateTime      = fix.timestamp;
+    window.lastUpdateTimestamp = fix.timestamp;
+    _controlDeadReckoning(fusionResult);
+    if (typeof updateDistanceBox === 'function') {
+        updateDistanceBox(forceUpdate, window.lastPosition,
+            renderState.closestLocation, renderState.closestDistance);
+    }
+    // Live accuracy indicator — mirrors the init-path call in
+    // _resetMapToPosition so the dot tracks current GPS quality, not just
+    // the quality at boot. Guarded like every other cross-function call
+    // here; a no-op if the indicator element/function is absent. Not
+    // reached on the very first fix (that returns via _initializeUserLocationState
+    // above), so there's no double-update with the init path.
+    if (typeof updateAccuracyIndicator === 'function') {
+        updateAccuracyIndicator(fix.accuracy);
+    }
+    if (typeof _ensureWillChange === 'function') _ensureWillChange();
+    if (typeof _scheduleWillChangeReset === 'function') _scheduleWillChangeReset();
+}
  
 /* ──────────────────────────────────────────────
    STEP 1: GPS Fix Extraction & Validation 
    ────────────────────────────────────────────── */
-function _extractGPSFix(position, forceUpdate) {
-    var coords = (position || {}).coords;
-    if (!coords || !Number.isFinite(coords.latitude) || !Number.isFinite(coords.longitude)) {
-        return null;
+    function _extractGPSFix(position, forceUpdate) {
+        var coords = (position || {}).coords;
+        if (!coords || !Number.isFinite(coords.latitude) || !Number.isFinite(coords.longitude)) {
+            return null;
+        }
+    
+        var gpsAge = (Date.now() - (position.timestamp || 0)) / 1000;
+        if (!forceUpdate && gpsAge > 4.0) return null;
+    
+        // Number.isFinite (not just != null) so a NaN heading — which the
+        // Geolocation API reports when direction is unknown — normalizes to
+        // null here instead of leaking through. Matches handlePositionUpdate.
+        var rawHeading = Number.isFinite(coords.heading) ? coords.heading : null;
+    
+        return {
+            lat: coords.latitude,
+            lng: coords.longitude,
+            // Same guard pattern as speedMPS below — `|| 20` would let a
+            // negative (non-spec) accuracy through; this rejects it.
+            accuracy: (Number.isFinite(coords.accuracy) && coords.accuracy > 0)
+                ? coords.accuracy
+                : 20,
+            heading: rawHeading,
+            speedMPS: Math.max(0, coords.speed || 0),
+            timestamp: Number.isFinite(position.timestamp)
+                ? position.timestamp
+                : Date.now()
+        };
     }
- 
-    var gpsAge = (Date.now() - (position.timestamp || 0)) / 1000;
-    if (!forceUpdate && gpsAge > 4.0) return null;
- 
-    var rawHeading = coords.heading !== undefined && coords.heading !== null
-        ? coords.heading
-        : null;
- 
-    return {
-        lat: coords.latitude,
-        lng: coords.longitude,
-        accuracy: coords.accuracy || 20,
-        heading: rawHeading,
-        speedMPS: Math.max(0, coords.speed || 0),
-        timestamp: (position.timestamp && isFinite(position.timestamp))
-            ? position.timestamp
-            : Date.now()
-    };
-}
- 
+     
 /* ──────────────────────────────────────────────
    STEP 2: Gap Handling & Velocity Seeding 
    ────────────────────────────────────────────── */
@@ -4412,204 +4448,204 @@ function _extractGPSFix(position, forceUpdate) {
 /* ──────────────────────────────────────────────
    STEP 3: Sensor Fusion 
    ────────────────────────────────────────────── */
-function _runSensorFusion(fix, lastPos, timeDelta, forceUpdate) {
-    if (!window.sensorFusion) {
-        return {
-            lat: fix.lat, lng: fix.lng,
-            speedMPS: fix.speedMPS,
-            heading: fix.heading,
-            isConverged: false,
-            blendFactor: 0,
-            isFrozen: false,
-            vNorth: 0, vEast: 0
-        };
-    }
-
-    var kf = window.sensorFusion._kalmanFilter;
-
-    if (lastPos && !forceUpdate) {
-        var jumpDist = calculateDistance(lastPos, fix);
-        var dynamicThreshold = Math.max(50, fix.speedMPS * 3, fix.accuracy * 2.5);
-
-        if (jumpDist > dynamicThreshold) {
-            // Don't seed the glitch — use last good position and let filter
-            // converge from there, or reset and skip this fix entirely
-            if (kf) kf.reset();
-            // Seed with last good position instead of glitch
-            window.sensorFusion.smoothPosition(
-                lastPos.lat, lastPos.lng, fix.accuracy,
-                fix.timestamp, 0, lastPos.heading
-            );
+    function _runSensorFusion(fix, lastPos, timeDelta, forceUpdate) {
+        if (!window.sensorFusion) {
             return {
-                lat: lastPos.lat, lng: lastPos.lng,
-                speedMPS: 0,
-                heading: lastPos.heading,
+                lat: fix.lat, lng: fix.lng,
+                speedMPS: fix.speedMPS,
+                heading: fix.heading,
                 isConverged: false,
                 blendFactor: 0,
-                isFrozen: true,  // Mark as frozen so DR doesn't extrapolate
+                isFrozen: false,
                 vNorth: 0, vEast: 0
             };
         }
-    }
-
-    var result = window.sensorFusion.smoothPosition(
-        fix.lat, fix.lng, fix.accuracy,
-        fix.timestamp, fix.speedMPS, fix.heading
-    );
-
-    // Validate result has required fields before clamping
-    if (!result || typeof result.vNorth !== 'number' || typeof result.vEast !== 'number') {
-        return {
-            lat: fix.lat, lng: fix.lng,
-            speedMPS: fix.speedMPS,
-            heading: fix.heading,
-            isConverged: false,
-            blendFactor: 0,
-            isFrozen: false,
-            vNorth: 0, vEast: 0
-        };
-    }
-
-    if (!result.isConverged && lastPos && timeDelta > 0 && timeDelta < 8) {
-        var lastSpeed = (lastPos.speedMPS || 0);
-        var accel = Math.abs(result.speedMPS - lastSpeed) / timeDelta;
-        var speedMPH = result.speedMPS * 2.23694;
-
-        var maxAccel =
-            speedMPH < 3  ? 25 :
-            speedMPH < 8  ? 22 :
-            speedMPH < 15 ? 18 :
-            speedMPH < 45 ? 15 :
-            speedMPH < 80 ? 12 : 10;
-
-        if (accel > maxAccel) {
-            var maxDelta   = maxAccel * timeDelta;
-            var direction  = result.speedMPS >= lastSpeed ? 1 : -1;
-            var clampSpeed = Math.max(0, lastSpeed + direction * maxDelta);
-
-            var mag = Math.sqrt(result.vNorth * result.vNorth + result.vEast * result.vEast);
-            var vN, vE;
-            if (mag > 1e-6) {
-                var scale = clampSpeed / mag;
-                vN = result.vNorth * scale;
-                vE = result.vEast  * scale;
-            } else {
-                // Use last known heading instead of defaulting to 0
-                var hdg = (lastPos.heading != null ? lastPos.heading : result.heading) || 0;
-                var hdgRad = hdg * Math.PI / 180;
-                vN = clampSpeed * Math.cos(hdgRad);
-                vE = clampSpeed * Math.sin(hdgRad);
+    
+        var kf = window.sensorFusion._kalmanFilter;
+    
+        if (lastPos && !forceUpdate) {
+            var jumpDist = calculateDistance(lastPos, fix);
+            var dynamicThreshold = Math.max(50, fix.speedMPS * 3, fix.accuracy * 2.5);
+    
+            if (jumpDist > dynamicThreshold) {
+                // Don't seed the glitch — use last good position and let filter
+                // converge from there, or reset and skip this fix entirely
+                if (kf) kf.reset();
+                // Seed with last good position instead of glitch
+                window.sensorFusion.smoothPosition(
+                    lastPos.lat, lastPos.lng, fix.accuracy,
+                    fix.timestamp, 0, lastPos.heading
+                );
+                return {
+                    lat: lastPos.lat, lng: lastPos.lng,
+                    speedMPS: 0,
+                    heading: lastPos.heading,
+                    isConverged: false,
+                    blendFactor: 0,
+                    isFrozen: true,  // Mark as frozen so DR doesn't extrapolate
+                    vNorth: 0, vEast: 0
+                };
             }
-
-            var dLat = (vN * timeDelta) / 111320;
-            var dLng = (vE * timeDelta) / (111320 * Math.cos(lastPos.lat * Math.PI / 180));
-
-            result = Object.assign({}, result, {
-                speedMPS: clampSpeed,
-                vNorth:   vN,
-                vEast:    vE,
-                lat:      lastPos.lat + dLat,
-                lng:      lastPos.lng + dLng
-            });
         }
+    
+        var result = window.sensorFusion.smoothPosition(
+            fix.lat, fix.lng, fix.accuracy,
+            fix.timestamp, fix.speedMPS, fix.heading
+        );
+    
+        // Validate result has required fields before clamping
+        if (!result || typeof result.vNorth !== 'number' || typeof result.vEast !== 'number') {
+            return {
+                lat: fix.lat, lng: fix.lng,
+                speedMPS: fix.speedMPS,
+                heading: fix.heading,
+                isConverged: false,
+                blendFactor: 0,
+                isFrozen: false,
+                vNorth: 0, vEast: 0
+            };
+        }
+    
+        if (!result.isConverged && lastPos && timeDelta > 0 && timeDelta < 8) {
+            var lastSpeed = (lastPos.speedMPS || 0);
+            var accel = Math.abs(result.speedMPS - lastSpeed) / timeDelta;
+            var speedMPH = result.speedMPS * 2.23694;
+    
+            var maxAccel =
+                speedMPH < 3  ? 25 :
+                speedMPH < 8  ? 22 :
+                speedMPH < 15 ? 18 :
+                speedMPH < 45 ? 15 :
+                speedMPH < 80 ? 12 : 10;
+    
+            if (accel > maxAccel) {
+                var maxDelta   = maxAccel * timeDelta;
+                var direction  = result.speedMPS >= lastSpeed ? 1 : -1;
+                var clampSpeed = Math.max(0, lastSpeed + direction * maxDelta);
+    
+                var mag = Math.sqrt(result.vNorth * result.vNorth + result.vEast * result.vEast);
+                var vN, vE;
+                if (mag > 1e-6) {
+                    var scale = clampSpeed / mag;
+                    vN = result.vNorth * scale;
+                    vE = result.vEast  * scale;
+                } else {
+                    // Use last known heading instead of defaulting to 0
+                    var hdg = (lastPos.heading != null ? lastPos.heading : result.heading) || 0;
+                    var hdgRad = hdg * Math.PI / 180;
+                    vN = clampSpeed * Math.cos(hdgRad);
+                    vE = clampSpeed * Math.sin(hdgRad);
+                }
+    
+                var dLat = (vN * timeDelta) / 111320;
+                var dLng = (vE * timeDelta) / (111320 * Math.cos(lastPos.lat * Math.PI / 180));
+    
+                result = Object.assign({}, result, {
+                    speedMPS: clampSpeed,
+                    vNorth:   vN,
+                    vEast:    vE,
+                    lat:      lastPos.lat + dLat,
+                    lng:      lastPos.lng + dLng
+                });
+            }
+        }
+    
+        return result;
     }
-
-    return result;
-}
  
 /* ──────────────────────────────────────────────
    STEP 4: Publish Fusion State 
    ────────────────────────────────────────────── */
-function _publishFusionState(fusionResult, fix) {
-    window._predictedPosition = {
-        lat: fusionResult.lat,
-        lng: fusionResult.lng,
-        timestamp: fix.timestamp
-    };
-
-    if (fusionResult.isFrozen) {
-        // Don't mark stationary — freeze velocity to prevent DR drift,
-        // but let DR keep running on last good heading if available.
-        // Stationary flag kills DR loop; frozen flag just pauses prediction.
-        var lastVel = window.smoothedVelocity || { lat: 0, lng: 0 };
-        var lastSpeed = Math.sqrt(lastVel.lat * lastVel.lat + lastVel.lng * lastVel.lng);
-        
-        // Only zero velocity if we were actually stopped before glitch
-        if (lastSpeed < 0.5) {
-            window.smoothedVelocity = { lat: 0, lng: 0 };
-            window.isStationary = true;
-            window.stationaryLockPosition = { lat: fusionResult.lat, lng: fusionResult.lng };
+    function _publishFusionState(fusionResult, fix) {
+        window._predictedPosition = {
+            lat: fusionResult.lat,
+            lng: fusionResult.lng,
+            timestamp: fix.timestamp
+        };
+    
+        if (fusionResult.isFrozen) {
+            // Don't mark stationary — freeze velocity to prevent DR drift,
+            // but let DR keep running on last good heading if available.
+            // Stationary flag kills DR loop; frozen flag just pauses prediction.
+            var lastVel = window.smoothedVelocity || { lat: 0, lng: 0 };
+            var lastSpeed = Math.sqrt(lastVel.lat * lastVel.lat + lastVel.lng * lastVel.lng);
+            
+            // Only zero velocity if we were actually stopped before glitch
+            if (lastSpeed < 0.5) {
+                window.smoothedVelocity = { lat: 0, lng: 0 };
+                window.isStationary = true;
+                window.stationaryLockPosition = { lat: fusionResult.lat, lng: fusionResult.lng };
+            } else {
+                // Keep last velocity so DR continues, but mark position as uncertain
+                window.isStationary = false;
+                window.stationaryLockPosition = null;
+            }
         } else {
-            // Keep last velocity so DR continues, but mark position as uncertain
+            var velDegPerSec = { lat: 0, lng: 0 };
+            try {
+                var rawVel = window.sensorFusion.getSmoothedVelocityDegPerSec();
+                if (rawVel && typeof rawVel.lat === 'number' && typeof rawVel.lng === 'number') {
+                    velDegPerSec = rawVel;
+                }
+            } catch (e) {}
+            
+            window.smoothedVelocity = velDegPerSec;
             window.isStationary = false;
             window.stationaryLockPosition = null;
         }
-    } else {
-        var velDegPerSec = { lat: 0, lng: 0 };
-        try {
-            var rawVel = window.sensorFusion.getSmoothedVelocityDegPerSec();
-            if (rawVel && typeof rawVel.lat === 'number' && typeof rawVel.lng === 'number') {
-                velDegPerSec = rawVel;
-            }
-        } catch (e) {}
-        
-        window.smoothedVelocity = velDegPerSec;
-        window.isStationary = false;
-        window.stationaryLockPosition = null;
+    
+        window._isKalmanConverged = fusionResult.isConverged;
+        window._kalmanBlendFactor = fusionResult.blendFactor;
+        window._isPositionFrozen = fusionResult.isFrozen || false;
     }
-
-    window._isKalmanConverged = fusionResult.isConverged;
-    window._kalmanBlendFactor = fusionResult.blendFactor;
-    window._isPositionFrozen = fusionResult.isFrozen || false;
-}
  
 /* ──────────────────────────────────────────────
    STEP 5: Build Render State 
    ────────────────────────────────────────────── */
    function _buildRenderState(fusionResult, fix, lastPos, timeDelta) {
-    var speedMPS = fusionResult.speedMPS;
-    var speedMPH = (typeof speedMPS === 'number' && !isNaN(speedMPS)) ? speedMPS * 2.23694 : 0;
+        var speedMPS = fusionResult.speedMPS;
+        var speedMPH = (typeof speedMPS === 'number' && !isNaN(speedMPS)) ? speedMPS * 2.23694 : 0;
+        
+        var heading = fusionResult.heading;
+        if (heading == null || typeof heading !== 'number' || isNaN(heading)) {
+            heading = fix.heading;
+        }
+        if (heading == null || typeof heading !== 'number' || isNaN(heading)) {
+            heading = (lastPos && typeof lastPos.heading === 'number' && !isNaN(lastPos.heading)) ? lastPos.heading : null;
+        }
     
-    var heading = fusionResult.heading;
-    if (heading == null || typeof heading !== 'number' || isNaN(heading)) {
-        heading = fix.heading;
+        // Use fused position for proximity, not raw fix
+        var fusedPosition = { lat: fusionResult.lat, lng: fusionResult.lng };
+        var proximity = _computeProximity(fusedPosition, speedMPH);
+    
+        if (speedMPH >= 1.0) {
+            if (typeof _clearInactivityTimer === 'function') _clearInactivityTimer();
+        } else {
+            if (typeof _startInactivityTimer === 'function') _startInactivityTimer();
+        }
+    
+        // Only clear GPS searching if we have a converged, non-frozen result
+        if (window.isGPSSearching && fusionResult.isConverged && !fusionResult.isFrozen) {
+            window.isGPSSearching = false;
+            if (typeof hideGPSSearchingState === 'function') hideGPSSearchingState();
+        }
+    
+        return {
+            position:        fusedPosition,
+            heading:         heading,
+            speedMPS:        speedMPS,
+            speedMPH:        speedMPH,
+            isConverged:     fusionResult.isConverged,
+            isFrozen:        fusionResult.isFrozen,
+            timestamp:       fix.timestamp,
+            mapState: {
+                speedMPH:     speedMPH,
+                modeSpeedMPH: speedMPH
+            },
+            closestLocation: proximity.closestLocation,
+            closestDistance: proximity.closestDistance
+        };
     }
-    if (heading == null || typeof heading !== 'number' || isNaN(heading)) {
-        heading = (lastPos && typeof lastPos.heading === 'number' && !isNaN(lastPos.heading)) ? lastPos.heading : null;
-    }
-
-    // Use fused position for proximity, not raw fix
-    var fusedPosition = { lat: fusionResult.lat, lng: fusionResult.lng };
-    var proximity = _computeProximity(fusedPosition, speedMPH);
-
-    if (speedMPH >= 1.0) {
-        if (typeof _clearInactivityTimer === 'function') _clearInactivityTimer();
-    } else {
-        if (typeof _startInactivityTimer === 'function') _startInactivityTimer();
-    }
-
-    // Only clear GPS searching if we have a converged, non-frozen result
-    if (window.isGPSSearching && fusionResult.isConverged && !fusionResult.isFrozen) {
-        window.isGPSSearching = false;
-        if (typeof hideGPSSearchingState === 'function') hideGPSSearchingState();
-    }
-
-    return {
-        position:        fusedPosition,
-        heading:         heading,
-        speedMPS:        speedMPS,
-        speedMPH:        speedMPH,
-        isConverged:     fusionResult.isConverged,
-        isFrozen:        fusionResult.isFrozen,
-        timestamp:       fix.timestamp,
-        mapState: {
-            speedMPH:     speedMPH,
-            modeSpeedMPH: speedMPH
-        },
-        closestLocation: proximity.closestLocation,
-        closestDistance: proximity.closestDistance
-    };
-}
  
 /* ──────────────────────────────────────────────
    STEP 6: Unified Render
@@ -4621,33 +4657,33 @@ function _publishFusionState(fusionResult, fix) {
    handles the between-fix smoothing without stacking more pans.
    ────────────────────────────────────────────── */
    function _scheduleUnifiedRender(renderState) {
-    // Cancel any pending render — new state always wins
-    if (window._nextLocationUpdateRAF) {
-        cancelAnimationFrame(window._nextLocationUpdateRAF);
-        window._nextLocationUpdateRAF = null;
-    }
-
-    if (window._mapUpdateScheduled) {
-        window._mapUpdateScheduled = false;
-    }
-
-    var generation = window._locationUpdateGeneration || 0;
-
-    window._mapUpdateScheduled = true;
-
-    window._nextLocationUpdateRAF = requestAnimationFrame(function() {
-        try {
-            // Drop stale renders — a newer generation has already processed
-            if (generation !== (window._locationUpdateGeneration || 0)) {
-                return;
-            }
-            _executeRender(renderState);
-        } finally {
-            window._mapUpdateScheduled = false;
+        // Cancel any pending render — new state always wins
+        if (window._nextLocationUpdateRAF) {
+            cancelAnimationFrame(window._nextLocationUpdateRAF);
             window._nextLocationUpdateRAF = null;
         }
-    });
-}
+    
+        if (window._mapUpdateScheduled) {
+            window._mapUpdateScheduled = false;
+        }
+    
+        var generation = window._locationUpdateGeneration || 0;
+    
+        window._mapUpdateScheduled = true;
+    
+        window._nextLocationUpdateRAF = requestAnimationFrame(function() {
+            try {
+                // Drop stale renders — a newer generation has already processed
+                if (generation !== (window._locationUpdateGeneration || 0)) {
+                    return;
+                }
+                _executeRender(renderState);
+            } finally {
+                window._mapUpdateScheduled = false;
+                window._nextLocationUpdateRAF = null;
+            }
+        });
+    }
 
 /* ──────────────────────────────────────────────
    Unified Render Executor
@@ -7961,21 +7997,35 @@ function getMarkerColor(tours) {
     }
 }
 
-let markersCreated = false;
-let activePopups = new Set();
-
-function recenterOnUser() {
-    if (userMarker && map) {
+    let markersCreated = false;
+    let activePopups = new Set();
+    
+    function recenterOnUser() {
+        if (!userMarker || !map) return;
+        // Validate the marker position before panning — same defensive check
+        // recenterMap/fullResetMap apply, so a stale marker can't pan the map
+        // to NaN or 0,0 on a rushed visibility return.
+        const ll = userMarker.getLatLng();
+        if (!ll || !isFinite(ll.lat) || !isFinite(ll.lng)) return;
+    
         map.closePopup();
-        map.panTo(userMarker.getLatLng(), {
-            animate: true,
-            duration: 0.5,
-            noZoom: true
-        });
         window.followUser = true;
         window.isMapInteracting = false;
+    
+        // followUser=true hands the viewport to dead reckoning, which snaps it
+        // to the user (animate:false) every frame in centered mode. If DR is
+        // already running, an animated panTo here races that snap and
+        // rubber-bands the map on return — so nudge DR to sync immediately
+        // instead. Only pan ourselves (original animated behavior) when DR
+        // isn't driving the viewport yet.
+        const dr = window.deadReckoning;
+        if (dr && typeof dr.isActive === 'function' && dr.isActive() &&
+            typeof dr.forceUpdate === 'function') {
+            dr.forceUpdate();
+        } else {
+            map.panTo(ll, { animate: true, duration: 0.5, noZoom: true });
+        }
     }
-}
         
 function createMarkersOnly() {
     if (!gameLocations || !Array.isArray(gameLocations) || gameLocations.length === 0) {
