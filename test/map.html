@@ -2974,28 +2974,38 @@ function startPositionUpdates() {
             window.positionWatchId = null;
         }
         const opts = getWatchOptions();
-
         window.positionWatchId = navigator.geolocation.watchPosition(
             handlePositionUpdate,
             handleLocationError,
             opts
         );
+        // Remember the options this watch was created with so the recheck
+        // below can tell whether the speed tier has actually changed, instead
+        // of tearing down/recreating the watch every tick.
+        window._activeWatchOptions = opts;
+
+        // watchPosition locks in maximumAge/timeout for its whole lifetime —
+        // it never re-reads getWatchOptions() on its own. Poll for a tier
+        // change and only recreate the watch when maximumAge actually differs
+        // (idempotent: clear-if-exists then set, same pattern as above), so a
+        // stationary->walking->driving transition isn't stuck on whatever
+        // tier was active when tracking started.
+        if (window._watchOptionsRecheckInterval) {
+            clearInterval(window._watchOptionsRecheckInterval);
+        }
+        window._watchOptionsRecheckInterval = setInterval(() => {
+            const latest = getWatchOptions();
+            if (latest.maximumAge !== window._activeWatchOptions?.maximumAge) {
+                startPositionUpdates();
+            }
+        }, 3000);
+
         if (!window._positionUpdatesListenersSetup) {
             window._positionUpdatesListenersSetup = true;
-
-            // Defined inside this guard (rather than above it) since they're
-            // only ever attached once, the first time this function runs —
-            // no point allocating two fresh closures on every subsequent
-            // restart call just to throw them away.
             const onlineHandler = () => {
                 if (window.onlineRestartTimeout) clearTimeout(window.onlineRestartTimeout);
                 window.onlineRestartTimeout = createTrackedTimeout(() => {
                     window.onlineRestartTimeout = null;
-                    // Delegate to startPositionUpdates() rather than duplicating
-                    // the watch/options setup inline — it already no-ops safely
-                    // when a watch exists, and it already routes failures
-                    // through handleLocationError, which this inline version
-                    // didn't.
                     if (window.positionWatchId == null) {
                         startPositionUpdates();
                     }
@@ -4212,7 +4222,7 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
 /* ═══════════════════════════════════════════════════════════════
    updateUserLocation  
    ─────────────────────────────────────────────────────────────*/
-   function updateUserLocation(position, forceUpdate) {
+  function updateUserLocation(position, forceUpdate) {
         if (forceUpdate === undefined) forceUpdate = false;
         var now = performance.now();
         if (!forceUpdate && now - (window._lastUpdateUserLocation || 0) < 8) {
@@ -4236,22 +4246,8 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
                 if (typeof hideGPSSearchingState === 'function') hideGPSSearchingState();
             }
         } else {
-            // Only arm the timeout on the *first* failed fix, and let it run to
-            // completion. The previous version cleared + rescheduled a fresh
-            // 30s timer on every failed fix, which meant a steady trickle of
-            // low-quality fixes (the exact situation you'd expect while GPS is
-            // struggling — tunnels, tree cover, urban canyon) kept pushing the
-            // deadline back indefinitely. That made this measure "30s since the
-            // last updateUserLocation call of any kind" instead of its intended
-            // "30s without a usable fix," so the searching indicator could go
-            // permanently unshown during exactly the conditions it exists for.
             if (!window._gpsTimeoutTimer) {
                 window._gpsTimeoutTimer = createTrackedTimeout(function() {
-                    // Null out on fire, matching the nulling convention used for
-                    // every other tracked timer id in this codebase
-                    // (_debounceTimeoutId, _orientationTestTimer, _graceTimerId) —
-                    // the previous version left a stale id sitting here after
-                    // firing, which this callback never cleaned up itself.
                     window._gpsTimeoutTimer = null;
                     if (!window.isGPSSearching) {
                         window.isGPSSearching = true;
@@ -4266,20 +4262,18 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
             _initializeUserLocationState(fix, fix.timestamp, forceUpdate);
             return;
         }
-        var timeDelta = (fix.timestamp - window.lastUpdateTime) / 1000;
-        // Clamp: negative clock skew → 0, huge gap → 30s max (prevents runaway prediction)
-        timeDelta = Math.max(0, Math.min(timeDelta, 30));
-        _handleGPSGap(fix, lastPos, timeDelta);
-        // Read the live stationary signal, not window.isStationary alone — same
-        // fix as getWatchOptions() and for the same reason: nothing in this
-        // codebase ever sets window.isStationary to true (only false, in
-        // _resetMapToPosition), so the block below was permanently dead. Its
-        // job — loosening the Kalman filter's velocity-state confidence right
-        // as real movement is detected — matters specifically during the
-        // hysteresis window in _updateStationaryState() where
-        // _lastStationaryState hasn't flipped to false yet but isDeviceMoving()
-        // already has, so falling back to window.isStationary only applies if
-        // sensorFusion itself isn't available yet.
+        // Raw gap, clamped only for negative clock skew — this is what decides
+        // *which recovery path* _handleGPSGap takes (medium-seed vs. full reset),
+        // and it also becomes the medium-gap velocity-seed dt so the seeded
+        // velocity reflects true average speed over the gap, not a speed inflated
+        // by dividing real displacement by an artificially shrunk time window.
+        var rawTimeDelta = (fix.timestamp - window.lastUpdateTime) / 1000;
+        rawTimeDelta = Math.max(0, rawTimeDelta);
+        // Separate clamp for the prediction/fusion math downstream (unchanged
+        // behavior): huge gap → 30s max, prevents runaway extrapolation in
+        // _runSensorFusion / _buildRenderState.
+        var timeDelta = Math.min(rawTimeDelta, 30);
+        _handleGPSGap(fix, lastPos, rawTimeDelta);
         var isStationaryFlag = window.sensorFusion ? window.sensorFusion._lastStationaryState : window.isStationary;
         if (isStationaryFlag && window.sensorFusion && window.sensorFusion.isDeviceMoving(fix.speedMPS)) {
             var kf = window.sensorFusion._kalmanFilter;
@@ -4296,7 +4290,6 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
         _publishFusionState(fusionResult, fix);
         var renderState = _buildRenderState(fusionResult, fix, lastPos, timeDelta);
         _scheduleUnifiedRender(renderState);
-        // Validate heading before storing — null/NaN propagates to DR and breaks it
         var validHeading = (typeof fusionResult.heading === 'number' && !isNaN(fusionResult.heading))
             ? fusionResult.heading
             : (lastPos.heading || null);
@@ -4352,45 +4345,46 @@ function _extractGPSFix(position, forceUpdate) {
 /* ──────────────────────────────────────────────
    STEP 2: Gap Handling & Velocity Seeding 
    ────────────────────────────────────────────── */
-function _handleGPSGap(fix, lastPos, timeDelta) {
-    if (!lastPos) return;
-
-    var kf = window.sensorFusion && window.sensorFusion._kalmanFilter;
-    if (!kf) return;
-
-    // Medium gap (10–300s): seed velocity from displacement, but only if actually moved
-    if (timeDelta > 10 && timeDelta < 300) {
-        var dt = timeDelta;
-        var cosLat = Math.cos(fix.lat * Math.PI / 180);
-        var vNorth = ((fix.lat - lastPos.lat) / dt) * 111111;
-        var vEast = ((fix.lng - lastPos.lng) / dt) * 111111 * cosLat;
-
-        var moved = Math.abs(vNorth) > 0.1 || Math.abs(vEast) > 0.1;
-
-        if (moved) {
-            kf.seedVelocity(vNorth, vEast, 4.0);
+    function _handleGPSGap(fix, lastPos, timeDelta) {
+        // NOTE: timeDelta here is the *raw*, unclamped gap (see updateUserLocation) —
+        // deliberately not the 30s-capped value used for fusion math. Both branch
+        // thresholds below (10s, 300s) need the true elapsed time to fire correctly;
+        // a pre-clamped value made the >=300s branch unreachable, since the clamp's
+        // ceiling sat below the branch's own floor.
+        if (!lastPos) return;
+        var kf = window.sensorFusion && window.sensorFusion._kalmanFilter;
+        if (!kf) return;
+        // Medium gap (10–300s): seed velocity from displacement, but only if actually moved
+        if (timeDelta > 10 && timeDelta < 300) {
+            var dt = timeDelta;
+            var cosLat = Math.cos(fix.lat * Math.PI / 180);
+            var vNorth = ((fix.lat - lastPos.lat) / dt) * 111111;
+            var vEast = ((fix.lng - lastPos.lng) / dt) * 111111 * cosLat;
+            var moved = Math.abs(vNorth) > 0.1 || Math.abs(vEast) > 0.1;
+            if (moved) {
+                kf.seedVelocity(vNorth, vEast, 4.0);
+                window.isStationary = false;
+                window.stationaryStartTime = null;
+                window.stationaryLockPosition = null;
+            }
+            // else: didn't move, leave stationary state as-is (might still be stationary)
+            return;
+        }
+        // Long gap (≥300s): full reset. Now actually reachable — previously
+        // timeDelta arrived here pre-clamped to a 30s ceiling, so this branch
+        // could never fire no matter how long GPS was actually lost.
+        if (timeDelta >= 300) {
+            kf.reset();
+            window.smoothedVelocity = { lat: 0, lng: 0 };
             window.isStationary = false;
             window.stationaryStartTime = null;
             window.stationaryLockPosition = null;
-        }
-        // else: didn't move, leave stationary state as-is (might still be stationary)
-        return;
-    }
-
-    // Long gap (≥300s): full reset
-    if (timeDelta >= 300) {
-        kf.reset();
-        window.smoothedVelocity = { lat: 0, lng: 0 };
-        window.isStationary = false;
-        window.stationaryStartTime = null;
-        window.stationaryLockPosition = null;
-
-        // Clear stale position buffer so velocity calc starts fresh
-        if (window.positionBuffer) {
-            window.positionBuffer.length = 0;
+            // Clear stale position buffer so velocity calc starts fresh
+            if (window.positionBuffer) {
+                window.positionBuffer.length = 0;
+            }
         }
     }
-}
  
 /* ──────────────────────────────────────────────
    STEP 3: Sensor Fusion 
