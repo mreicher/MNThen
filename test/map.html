@@ -3174,21 +3174,20 @@ function handlePositionUpdate(position) {
 /* ──────────────────────────────────────────────
    VISIBILITY CHANGE HANDLER
    ────────────────────────────────────────────── */
-   function handleVisibilityChange() {
+    function handleVisibilityChange() {
         if (document.hidden) {
-            // Tab/app going to background
             window.lastHiddenTime = Date.now();
             lastKnownPosition = userMarker?.getLatLng() ?? null;
             resetInactivityTimer(false);
     
             disposeMapLoop();
-            // disposeMapLoop() only reaches window-scoped RAF/timeout/interval
-            // handles — dead reckoning's animation loop is a closure-private id
-            // that's never exposed on window (same gap we found in initMap()),
-            // so without this it keeps running, invisibly, while backgrounded.
+    
+            // disposeMapLoop only reaches window-scoped handles. DR's RAF id
+            // is closure-private — without this it keeps running while hidden.
             if (window.deadReckoning && typeof window.deadReckoning.stop === 'function') {
                 window.deadReckoning.stop();
             }
+    
             window.isReWaking = false;
     
             if (window.visibilityDebounceTimer) {
@@ -3196,38 +3195,30 @@ function handlePositionUpdate(position) {
                 window.visibilityDebounceTimer = null;
             }
         } else {
-            // Tab/app returning to foreground
-            const awayMs = Date.now() - (window.lastHiddenTime || 0);
+            const awayMs    = Date.now() - (window.lastHiddenTime || 0);
             const threshold = CONFIG?.BACKGROUND_THRESHOLD ?? 30_000;
     
-            // Cancel any pending debounce
             if (window.visibilityDebounceTimer) {
                 clearTimeout(window.visibilityDebounceTimer);
                 window.visibilityDebounceTimer = null;
             }
     
-            // disposeMapLoop() runs unconditionally on every hide, regardless of
-            // how long the absence turns out to be, and it clears
-            // _idleProximityCheckInterval along with everything else. The only
-            // place that normally (re)starts it — initializeUserLocation — is
-            // gated by a one-shot `_proximityCheckStarted` latch that's never
-            // reset, so without this call idle proximity checking would die
-            // permanently after the very first tab switch, short or long.
-            // startIdleProximityCheck() has its own idempotent guard
-            // (no-ops if already running), so it's always safe to call here.
+            // disposeMapLoop kills _idleProximityCheckInterval on every hide.
+            // The only normal restart (initializeUserLocation) is gated by a
+            // one-shot latch that never resets, so without this call proximity
+            // checking dies permanently after the first tab switch.
+            // Idempotent — no-ops if already running.
             if (typeof startIdleProximityCheck === 'function') {
                 startIdleProximityCheck();
             }
     
             if (awayMs > threshold) {
-                // Debounce to handle rapid tab switches
+                // Long absence — debounced re-wake with fresh GPS fix.
                 window.visibilityDebounceTimer = createTrackedTimeout(() => {
                     window.visibilityDebounceTimer = null;
     
-                    // Recalculate time away to ensure freshness
                     const currentAwayMs = Date.now() - (window.lastHiddenTime || 0);
                     if (currentAwayMs <= threshold) return;
-    
                     if (window.isReWaking) return;
     
                     window.isReWaking = true;
@@ -3241,12 +3232,27 @@ function handlePositionUpdate(position) {
                         });
                 }, 500);
             } else {
-                // Short absence → immediate refresh
+                // Short absence — lightweight refresh. Deliberately does NOT
+                // re-center: if the user panned away before tabbing out, they
+                // want to see what they were looking at. The inactivity timer
+                // (reset below) owns eventual re-centering.
                 if (map && lastKnownPosition) {
                     map.invalidateSize({ pan: false });
                     userMarker?.setLatLng(lastKnownPosition);
                 }
             }
+    
+            // iOS PWA safety net — DOM can get wiped during suspension,
+            // leaving the marker cluster empty. Runs on every foreground
+            // return regardless of absence duration. The .getLayers().length
+            // check is a single property read when markers exist (normal
+            // case), so cost on non-wiped returns is negligible.
+            if (markerClusterGroup &&
+                typeof markerClusterGroup.getLayers === 'function' &&
+                markerClusterGroup.getLayers().length === 0) {
+                createMarkersOnly();
+            }
+    
             resetInactivityTimer(true);
         }
     }
@@ -3596,7 +3602,7 @@ function updateLocationAfterBackground() {
 /* ──────────────────────────────────────────────
    MAP INTERACTION & INACTIVITY HANDLERS
    ────────────────────────────────────────────── */
-    function setupMapInteractionHandlers() {
+  function setupMapInteractionHandlers() {
         if (!map || window._interactionHandlersSetup) return;
         window._interactionHandlersSetup = true;
     
@@ -3606,6 +3612,31 @@ function updateLocationAfterBackground() {
     
         const STATIONARY_SPEED_MPH = 1.0;
     
+        // Was bound to 'movestart'/'moveend'. Leaflet fires those on
+        // EVERY setView/panTo call, programmatic or not — including dead
+        // reckoning's per-frame viewport sync (per the codebase's own DR
+        // behavior confirmed elsewhere) and every animated re-center this app
+        // does (handleContinueClick, _handleInactivityReset, etc). That meant:
+        //   - DR's frame loop fired onInteractionEnd on every single frame it
+        //     was active, doing unnecessary work and timer churn.
+        //   - Any programmatic setView/panTo that wasn't guarded by
+        //     _programmaticFlyInProgress (several weren't, before recent fixes)
+        //     fired onInteractionStart and silently set followUser = false,
+        //     killing centered mode with no user action involved.
+        // 'dragstart'/'dragend' fire ONLY on an actual user pan gesture (mouse
+        // drag or touch drag), never from setView/panTo, so this is a strictly
+        // more accurate signal for "the user grabbed the map." This is the
+        // reason _programmaticFlyInProgress and noMoveStart guards exist
+        // elsewhere — this change removes most of the need for them at the
+        // pan level, though they still matter for zoom (see below) and are
+        // left in place as defense in depth.
+        //
+        // 'zoomstart'/'zoomend' are kept as-is: pinch-zoom and double-tap-zoom
+        // don't fire drag events, so this is still the only signal for
+        // user-initiated zoom. Programmatic zooms (e.g. proximity auto-zoom)
+        // still rely on the window._programmaticFlyInProgress guard to avoid
+        // being mistaken for user zoom — that guard is unchanged and still
+        // required.
         const onInteractionStart = () => {
             // FIX: Ignore programmatic moves (zoom transitions, recentering)
             // This prevents followUser from being toggled off automatically.
@@ -3630,7 +3661,7 @@ function updateLocationAfterBackground() {
             // If stationary, start the timer to re-center
             if (speedMPH < STATIONARY_SPEED_MPH) {
                 _startInactivityTimer();
-            } 
+            }
             // If moving, ensure dead reckoning is active
             else if (window.followUser && window.deadReckoning && typeof window.deadReckoning.isActive === 'function') {
                 if (!window.deadReckoning.isActive()) {
@@ -3639,43 +3670,58 @@ function updateLocationAfterBackground() {
             }
         };
     
-        map.on('movestart zoomstart', onInteractionStart);
-        map.on('moveend zoomend', onInteractionEnd);
+        // User-initiated pan only (was 'movestart'/'moveend' — see comment above).
+        map.on('dragstart', onInteractionStart);
+        map.on('dragend', onInteractionEnd);
+    
+        // User-initiated zoom (pinch, double-tap, zoom control). Unchanged —
+        // there's no drag-equivalent event for zoom gestures.
+        map.on('zoomstart', onInteractionStart);
+        map.on('zoomend', onInteractionEnd);
     }
-    
-    function _clearInactivityTimer() {
-        if (window.inactivityTimer) {
-            clearTimeout(window.inactivityTimer);
-            window.inactivityTimer = null;
-        }
-    }
-    
-    function _startInactivityTimer() {
-        if (window.inactivityTimer) return;
-        window.inactivityTimer = createTrackedTimeout(_handleInactivityReset, 30000);
-    }
-    
-    function _handleInactivityReset() {
-        const pos   = window.lastPosition;
-        const speed = pos ? pos.speedMPS * 2.23694 : 0;
-    
-        if (pos && speed < 0.5 && map && userMarker) {
-            // Re-enable following BEFORE panning so the GPS loop picks it up immediately
-            window.followUser       = true;
-            window.isMapInteracting = false;
-    
-            map.panTo([pos.lat, pos.lng], {
-                animate:       true,
-                duration:      1.0,
-                easeLinearity: 0.15,
-                noMoveStart:   true
-            });
-            userMarker.setLatLng([pos.lat, pos.lng]);
-            window.stationaryStartTime = Date.now();
-        }
-    
+
+function _clearInactivityTimer() {
+    if (window.inactivityTimer) {
+        clearTimeout(window.inactivityTimer);
         window.inactivityTimer = null;
     }
+}
+
+function _startInactivityTimer() {
+    if (window.inactivityTimer) return;
+    window.inactivityTimer = createTrackedTimeout(_handleInactivityReset, 30000);
+}
+
+function _handleInactivityReset() {
+    const pos   = window.lastPosition;
+    const speed = pos ? pos.speedMPS * 2.23694 : 0;
+
+    if (pos && speed < 0.5 && map && userMarker) {
+        // Re-enable following BEFORE panning so the GPS loop picks it up immediately
+        window.followUser       = true;
+        window.isMapInteracting = false;
+
+        // NOTE: now that pan interaction is detected via dragstart/dragend
+        // instead of movestart/moveend, this panTo no longer fires
+        // onInteractionStart at all (panTo isn't a drag), so the
+        // noMoveStart option below is technically no longer load-bearing
+        // for THIS call. Left in place as harmless defense in depth in
+        // case the event bindings above ever change back, and because
+        // noMoveStart is the correct top-level form for panTo regardless
+        // (see handleContinueClick's setView comment for why setView needs
+        // it nested under `pan` instead — panTo self-nests it for you).
+        map.panTo([pos.lat, pos.lng], {
+            animate:       true,
+            duration:      1.0,
+            easeLinearity: 0.15,
+            noMoveStart:   true
+        });
+        userMarker.setLatLng([pos.lat, pos.lng]);
+        window.stationaryStartTime = Date.now();
+    }
+
+    window.inactivityTimer = null;
+}
         
 /* ──────────────────────────────────────────────
    LOCATION DATA PRELOADING
@@ -4733,61 +4779,57 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
 /* ──────────────────────────────────────────────
    Unified Render Executor
    ────────────────────────────────────────────── */
-     function _executeRender(state) {
-        if (!state || window.isMapInteracting) {
-            window.lastMapUpdateTime = Date.now();
-            return;
-        }
-    
-        // Validate position before any render operations
-        if (typeof state.position?.lat !== 'number' || typeof state.position?.lng !== 'number' ||
-            isNaN(state.position.lat) || isNaN(state.position.lng)) {
-            console.warn('[Render] Invalid position, skipping');
-            window.lastMapUpdateTime = Date.now();
-            return;
-        }
-    
-        try {
-            var zoomResult = getSpeedBasedZoom(state.speedMPS, state.closestDistance);
-    
-            if (zoomResult !== null && map && zoomResult.zoom !== null && map.getZoom() !== zoomResult.zoom) {
-                // Set guard BEFORE any map operation.
-                // _isProximityZoomAnimating is the flag deadReckoning.frame()
-                // actually reads to pause itself during a zoom transition.
-                // _programmaticFlyInProgress alone does NOT gate the DR loop —
-                // only the drag/zoom interaction handlers — so without this,
-                // DR kept calling map.setView() every animation frame while
-                // Leaflet's own setZoom() animation was still in flight.
-                window._programmaticFlyInProgress = true;
-                window._isProximityZoomAnimating = true;
-                
-                // Use setZoom for the animation
-                map.setZoom(zoomResult.zoom, { 
-                    animate: true, 
-                    duration: 0.25, 
-                    noMoveStart: true 
-                });
-                
-                // IMPORTANT: Reset guard after animation completes
-                setTimeout(function() {
-                    window._programmaticFlyInProgress = false;
-                    window._isProximityZoomAnimating = false;
-                }, 300);
-            }
-        } catch (e) {
-            console.warn('[Render] Zoom error:', e);
-            // Ensure guard is cleared on error
-            window._programmaticFlyInProgress = false;
-            window._isProximityZoomAnimating = false;
-        }
-    
-        // Force DR update — but only if position is not frozen
-        if (window.deadReckoning && typeof window.deadReckoning.forceUpdate === 'function' && !state.isFrozen) {
-            window.deadReckoning.forceUpdate();
-        }
-    
+    function _executeRender(state) {
+    if (!state || window.isMapInteracting) {
         window.lastMapUpdateTime = Date.now();
+        return;
     }
+
+    // Validate position before any render operations
+    if (typeof state.position?.lat !== 'number' || typeof state.position?.lng !== 'number' ||
+        isNaN(state.position.lat) || isNaN(state.position.lng)) {
+        console.warn('[Render] Invalid position, skipping');
+        window.lastMapUpdateTime = Date.now();
+        return;
+    }
+
+    try {
+        var zoomResult = getSpeedBasedZoom(state.speedMPS, state.closestDistance);
+
+        if (zoomResult !== null && map && zoomResult.zoom !== null && map.getZoom() !== zoomResult.zoom) {
+            window._programmaticFlyInProgress = true;
+            window._isProximityZoomAnimating = true;
+
+            map.setZoom(zoomResult.zoom, {
+                animate: true,
+                duration: 0.25,
+                // noMoveStart must be nested under `pan` for setZoom/setView —
+                // top-level is silently ignored (Leaflet 1.9.4). Was previously
+                // top-level here, so movestart wasn't actually suppressed.
+                pan: { noMoveStart: true }
+            });
+
+            // Tracked (not raw setTimeout) so disposeMapLoop can cancel this
+            // if teardown happens mid-animation, instead of it firing later
+            // against re-initialized state.
+            createTrackedTimeout(function() {
+                window._programmaticFlyInProgress = false;
+                window._isProximityZoomAnimating = false;
+            }, 300);
+        }
+    } catch (e) {
+        console.warn('[Render] Zoom error:', e);
+        window._programmaticFlyInProgress = false;
+        window._isProximityZoomAnimating = false;
+    }
+
+    // Force DR update — but only if position is not frozen
+    if (window.deadReckoning && typeof window.deadReckoning.forceUpdate === 'function' && !state.isFrozen) {
+        window.deadReckoning.forceUpdate();
+    }
+
+    window.lastMapUpdateTime = Date.now();
+}
         
 /* ──────────────────────────────────────────────
   Dead Reckoning Control 
@@ -4903,218 +4945,295 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
    init and jump recovery. Seeds DR with position
    and velocity, starts DR loop.
    ────────────────────────────────────────────── */
-       function _resetMapToPosition(newPosition, options) {
-        options = options || {};
-        if (!map || !userMarker || !newPosition) return;
-    
-        // Validate newPosition before any state mutation
-        if (typeof newPosition.lat !== 'number' || typeof newPosition.lng !== 'number' ||
-            isNaN(newPosition.lat) || isNaN(newPosition.lng)) {
-            console.warn('[Reset] Invalid position, aborting');
-            return;
-        }
-    
-        var currentTime = options.currentTime != null ? options.currentTime : Date.now();
-        var resetType = options.resetType || 'jump';
-        var forceUpdate = !!options.forceUpdate;
-        var clearStationary = options.clearStationary !== false;
-        var prevPos = window.lastPosition || null;
-        var prevTime = window.lastUpdateTime || null;
-        var isInit = resetType === 'init';
-    
-        // Shared factory for the single-entry position buffer used by both
-        // the init and non-init paths (was duplicated verbatim before).
-        function makeBufferEntry() {
-            return {
-                lat: newPosition.lat,
-                lng: newPosition.lng,
-                accuracy: newPosition.accuracy || 20,
-                timestamp: currentTime,
-                heading: newPosition.heading || null,
-                speedMPS: (typeof newPosition.speedMPS === 'number' && !isNaN(newPosition.speedMPS))
-                    ? Math.max(0, newPosition.speedMPS)
-                    : 0
-            };
-        }
-    
-        if (isInit) {
-            if (typeof setupMapInteractionHandlers === 'function') setupMapInteractionHandlers();
-            // Use seedPositionBuffer with explicit count=1 for consistency
-            if (typeof seedPositionBuffer === 'function') {
-                seedPositionBuffer(newPosition, 1);
-            } else {
-                window.positionBuffer = [makeBufferEntry()];
-            }
-            window.stationaryStartTime = currentTime;
-            window.isMapInteracting = false;
-            window.lastInteractionTime = currentTime;
-            window.blockSpeedZoom = false;
-            window.zoomedInState = false;
-            window._lastCenteredMode = false;
-            window._viewportSafetyEnforced = false;
-            window.followUser = true;
+  function _resetMapToPosition(newPosition, options) {
+    options = options || {};
+    if (!map || !userMarker || !newPosition) return;
+ 
+    // Validate newPosition before any state mutation
+    if (typeof newPosition.lat !== 'number' || typeof newPosition.lng !== 'number' ||
+        isNaN(newPosition.lat) || isNaN(newPosition.lng)) {
+        console.warn('[Reset] Invalid position, aborting');
+        return;
+    }
+ 
+    var currentTime = options.currentTime != null ? options.currentTime : Date.now();
+    var resetType = options.resetType || 'jump';
+    var forceUpdate = !!options.forceUpdate;
+    var clearStationary = options.clearStationary !== false;
+    var prevPos = window.lastPosition || null;
+    var prevTime = window.lastUpdateTime || null;
+    var isInit = resetType === 'init';
+ 
+    // ── NEW: 'wake' path ──────────────────────────────────────────────
+    // This is the reset you should fire when the app returns from a
+    // backgrounded/suspended state (visibilitychange -> visible, iOS/Android
+    // resume lifecycle event, etc).
+    //
+    // Root cause of the "doesn't snap" bug: previously, map.setView(...) was
+    // ONLY ever called when resetType === 'init'. Every other resetType
+    // (including whatever the default 'jump' path was being used for on
+    // resume) moved userMarker but left the map VIEWPORT untouched. The dot
+    // teleported correctly; the camera didn't. Any subsequent dead-reckoning
+    // tick or stray Leaflet event then nudges the view toward the marker,
+    // which is exactly the "slide/float instead of snap" symptom.
+    //
+    // isWake gets the same forced, unanimated setView() treatment as init,
+    // but (unlike init) it does NOT recompute a speed-based zoom — resuming
+    // shouldn't change how zoomed in the user was, only correct the center.
+    var isWake = resetType === 'wake';
+ 
+    // Backwards compatible: existing callers using 'init' or the default
+    // 'jump' behave exactly as before. Only 'wake' (new) or an explicit
+    // options.forceRecenter opt-in trigger the forced recenter.
+    var shouldRecenterMap = isInit || isWake || options.forceRecenter === true;
+ 
+    // Shared factory for the single-entry position buffer used by both
+    // the init and non-init paths (was duplicated verbatim before).
+    function makeBufferEntry() {
+        return {
+            lat: newPosition.lat,
+            lng: newPosition.lng,
+            accuracy: newPosition.accuracy || 20,
+            timestamp: currentTime,
+            heading: newPosition.heading || null,
+            speedMPS: (typeof newPosition.speedMPS === 'number' && !isNaN(newPosition.speedMPS))
+                ? Math.max(0, newPosition.speedMPS)
+                : 0
+        };
+    }
+ 
+    if (isInit) {
+        if (typeof setupMapInteractionHandlers === 'function') setupMapInteractionHandlers();
+        // Use seedPositionBuffer with explicit count=1 for consistency
+        if (typeof seedPositionBuffer === 'function') {
+            seedPositionBuffer(newPosition, 1);
         } else {
-            if (clearStationary && window.stationaryCheckTimeout != null) {
-                clearTimeout(window.stationaryCheckTimeout);
-                window.stationaryCheckTimeout = null;
-            }
-            // Validate before direct assignment
             window.positionBuffer = [makeBufferEntry()];
-            window.stationaryStartTime = null;
         }
-    
-        window.lastPosition = newPosition;
-        window.lastUpdateTime = currentTime;
-        window.lastUpdateTimestamp = currentTime;
-    
-        // Velocity from position delta
-        window.lastVelocity = { lat: 0, lng: 0 };
-        window.smoothedVelocity = { lat: 0, lng: 0 };
-        if (prevPos && prevTime && currentTime) {
-            var dtSec = (currentTime - prevTime) / 1000;
-            if (dtSec > 0 && dtSec < 120) {
-                var latVel = (newPosition.lat - prevPos.lat) / dtSec;
-                var lngVel = (newPosition.lng - prevPos.lng) / dtSec;
-                var cosLat = Math.cos(newPosition.lat * Math.PI / 180);
-                var latMPS = latVel * 111111;
-                var lngMPS = lngVel * 111111 * cosLat;
-                var speedMPS = Math.sqrt(latMPS * latMPS + lngMPS * lngMPS);
-                if (speedMPS < 100) {
-                    window.lastVelocity = { lat: latVel, lng: lngVel };
-                    window.smoothedVelocity = { lat: latVel, lng: lngVel };
-                }
-            }
+        window.stationaryStartTime = currentTime;
+        window.isMapInteracting = false;
+        window.lastInteractionTime = currentTime;
+        window.blockSpeedZoom = false;
+        window.zoomedInState = false;
+        window._lastCenteredMode = false;
+        window._viewportSafetyEnforced = false;
+        window.followUser = true;
+    } else {
+        if (clearStationary && window.stationaryCheckTimeout != null) {
+            clearTimeout(window.stationaryCheckTimeout);
+            window.stationaryCheckTimeout = null;
         }
-    
-        // Kalman reset: init, >30s gap, or >500m jump
-        if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
-            var kf = window.sensorFusion._kalmanFilter;
-            var shouldResetKalman = isInit;
-    
-            if (!shouldResetKalman && prevTime && currentTime) {
-                var gapSec = (currentTime - prevTime) / 1000;
-                if (gapSec > 30) shouldResetKalman = true;
-    
-                if (!shouldResetKalman && prevPos) {
-                    var jumpLat = Math.abs(newPosition.lat - prevPos.lat) * 111111;
-                    var jumpLng = Math.abs(newPosition.lng - prevPos.lng) * 111111 *
-                        Math.cos(newPosition.lat * Math.PI / 180);
-                    if (Math.sqrt(jumpLat * jumpLat + jumpLng * jumpLng) > 500) {
-                        shouldResetKalman = true;
-                    }
-                }
-            }
-    
-            if (shouldResetKalman) {
-                // Guard against a throwing third-party filter leaving lastPosition/
-                // lastUpdateTime updated but the filter itself in a broken state.
-                try {
-                    kf.reset();
-                    // Also clear sensorFusion smoothed state to prevent stale heading/speed
-                    if (typeof window.sensorFusion.resetState === 'function') {
-                        window.sensorFusion.resetState();
-                    }
-                } catch (e) {
-                    console.warn('[Reset] Kalman/sensorFusion reset failed', e);
-                }
-            }
-        }
-    
-        window.isStationary = false;
-        window.stationaryLockPosition = null;
-    
-        var targetZoom = map.getZoom();
-    
-        if (isInit) {
-            var intelligentZoom = (typeof getSpeedBasedZoom === 'function')
-                ? getSpeedBasedZoom(newPosition.speedMPS)
-                : -1;
-            targetZoom = (typeof intelligentZoom === 'number' && intelligentZoom > 0)
-                ? intelligentZoom
-                : 17;
-        }
-    
-        if (window.zoomController && typeof window.zoomController.getState === 'function') {
-            var zcState = window.zoomController.getState();
-            if (zcState && zcState.lockedUntil > currentTime) {
-                targetZoom = zcState.level;
-            }
-        }
-    
-        if (isInit) {
-            // ── pan.noMoveStart suppresses the synchronous 'movestart'
-            // event that Leaflet fires on every setView. Without it, the
-            // onInteractionStart handler (registered by setupMapInteractionHandlers
-            // on 'movestart') runs immediately and sets followUser = false,
-            // which causes dead reckoning to enter its non-centered branch
-            // (marker moves, viewport stays) — the "floating off screen" bug.
-            //
-            // NOTE: noMoveStart must be nested inside `pan`, not at the top
-            // level. Leaflet 1.9.4's setView reads it from
-            // options.pan.noMoveStart when calling _resetView; a top-level
-            // noMoveStart is silently ignored.
-            //
-            // CAVEAT: noMoveStart only suppresses 'movestart'. Leaflet still
-            // fires 'zoomstart' synchronously whenever the zoom level changes,
-            // regardless of this option. If a zoom level change is involved
-            // (e.g. targetZoom !== currentZoom) and any handler treats
-            // 'zoomstart' as user interaction, the same followUser-clobbering
-            // bug can occur through that path. That's exactly what the
-            // defensive re-assertion below guards against — it is not
-            // redundant with this option, it covers a different event.
-            try {
-                map.setView([newPosition.lat, newPosition.lng], targetZoom, {
-                    animate: false,
-                    pan: { noMoveStart: true }
-                });
-            } catch (e) {
-                console.warn('[Reset] map.setView failed, retrying without pan options', e);
-                try {
-                    map.setView([newPosition.lat, newPosition.lng], targetZoom, { animate: false });
-                } catch (e2) {
-                    console.warn('[Reset] map.setView fallback also failed', e2);
-                }
-            }
-        }
-    
-        userMarker.setLatLng([newPosition.lat, newPosition.lng]);
-    
-        if (window.deadReckoning) {
-            if (typeof window.deadReckoning.invalidateMarkerCache === 'function') {
-                window.deadReckoning.invalidateMarkerCache();
-            }
-            if (typeof window.deadReckoning.start === 'function') {
-                window.deadReckoning.start();
-            }
-            if (!isInit && typeof window.deadReckoning.forceUpdate === 'function') {
-                window.deadReckoning.forceUpdate();
-            }
-        }
-    
-        // ── Defensive re-assertion for the init path ──
-        // Guarantees followUser/isMapInteracting are correct going into dead
-        // reckoning's first requestAnimationFrame, even if:
-        //   (a) a zoomstart handler flipped them (noMoveStart doesn't cover
-        //       zoomstart — see caveat above), or
-        //   (b) a future Leaflet version or code path reintroduces a
-        //       synchronous movestart between setView and here.
-        // Runs synchronously before DR's first rAF callback, so there is no race.
-        if (isInit) {
-            window.followUser = true;
-            window.isMapInteracting = false;
-        }
-    
-        if (isInit) {
-            if (typeof updateDistanceBox === 'function') updateDistanceBox(forceUpdate);
-            if (typeof updateAccuracyIndicator === 'function') updateAccuracyIndicator(newPosition.accuracy);
-        } else {
-            if (typeof isSignificantMovement === 'function' &&
-                isSignificantMovement(newPosition) &&
-                typeof resetInactivityTimer === 'function') {
-                resetInactivityTimer(false);
+        // Validate before direct assignment
+        window.positionBuffer = [makeBufferEntry()];
+        window.stationaryStartTime = null;
+        // NOTE: left as null (same as the pre-existing 'jump' behavior) to
+        // keep this change minimal. If your stationary-detection code treats
+        // "just started" and "never started" differently, you may want
+        // isWake to set this to currentTime instead — check whatever
+        // function reads stationaryStartTime before flipping this.
+    }
+ 
+    window.lastPosition = newPosition;
+    window.lastUpdateTime = currentTime;
+    window.lastUpdateTimestamp = currentTime;
+ 
+    // Velocity from position delta
+    window.lastVelocity = { lat: 0, lng: 0 };
+    window.smoothedVelocity = { lat: 0, lng: 0 };
+    if (prevPos && prevTime && currentTime) {
+        var dtSec = (currentTime - prevTime) / 1000;
+        if (dtSec > 0 && dtSec < 120) {
+            var latVel = (newPosition.lat - prevPos.lat) / dtSec;
+            var lngVel = (newPosition.lng - prevPos.lng) / dtSec;
+            var cosLat = Math.cos(newPosition.lat * Math.PI / 180);
+            var latMPS = latVel * 111111;
+            var lngMPS = lngVel * 111111 * cosLat;
+            var speedMPS = Math.sqrt(latMPS * latMPS + lngMPS * lngMPS);
+            if (speedMPS < 100) {
+                window.lastVelocity = { lat: latVel, lng: lngVel };
+                window.smoothedVelocity = { lat: latVel, lng: lngVel };
             }
         }
     }
+    // NOTE: a wake after any real backgrounding will almost always have
+    // dtSec >= 120 (or a huge lat/lng jump), so this block naturally no-ops
+    // and velocity stays zeroed. That's desired — we don't want a fake
+    // "teleport velocity" computed from stale pre-background coordinates.
+ 
+    // Kalman reset: init, >30s gap, or >500m jump
+    if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
+        var kf = window.sensorFusion._kalmanFilter;
+        var shouldResetKalman = isInit;
+ 
+        if (!shouldResetKalman && prevTime && currentTime) {
+            var gapSec = (currentTime - prevTime) / 1000;
+            if (gapSec > 30) shouldResetKalman = true;
+ 
+            if (!shouldResetKalman && prevPos) {
+                var jumpLat = Math.abs(newPosition.lat - prevPos.lat) * 111111;
+                var jumpLng = Math.abs(newPosition.lng - prevPos.lng) * 111111 *
+                    Math.cos(newPosition.lat * Math.PI / 180);
+                if (Math.sqrt(jumpLat * jumpLat + jumpLng * jumpLng) > 500) {
+                    shouldResetKalman = true;
+                }
+            }
+        }
+        // A wake reset will almost always trip gapSec > 30 on its own, so it
+        // already gets a Kalman reset under the existing logic — no change
+        // needed here, but worth knowing this is *why* it works.
+ 
+        if (shouldResetKalman) {
+            // Guard against a throwing third-party filter leaving lastPosition/
+            // lastUpdateTime updated but the filter itself in a broken state.
+            try {
+                kf.reset();
+                // Also clear sensorFusion smoothed state to prevent stale heading/speed
+                if (typeof window.sensorFusion.resetState === 'function') {
+                    window.sensorFusion.resetState();
+                }
+            } catch (e) {
+                console.warn('[Reset] Kalman/sensorFusion reset failed', e);
+            }
+        }
+    }
+ 
+    window.isStationary = false;
+    window.stationaryLockPosition = null;
+ 
+    var targetZoom = map.getZoom();
+ 
+    if (isInit) {
+        var intelligentZoom = (typeof getSpeedBasedZoom === 'function')
+            ? getSpeedBasedZoom(newPosition.speedMPS)
+            : -1;
+        targetZoom = (typeof intelligentZoom === 'number' && intelligentZoom > 0)
+            ? intelligentZoom
+            : 17;
+    }
+    // isWake deliberately does NOT recompute a speed-based zoom the way init
+    // does — we keep whatever zoom the user had before backgrounding and
+    // only correct the center. If you'd rather wake also re-intelligent-zoom
+    // like init, mirror the block above under `if (isInit || isWake)`.
+ 
+    if (window.zoomController && typeof window.zoomController.getState === 'function') {
+        var zcState = window.zoomController.getState();
+        if (zcState && zcState.lockedUntil > currentTime) {
+            targetZoom = zcState.level;
+        }
+    }
+ 
+    if (shouldRecenterMap) {
+        // Cancel any inactivity-recenter timer armed before this reset.
+        // setupMapInteractionHandlers() schedules a 30s ANIMATED panTo via
+        // _startInactivityTimer/_handleInactivityReset whenever the map goes
+        // stationary. That timer is unaffected by backgrounding (setTimeout
+        // just fires late/immediately on resume in most browsers), so a
+        // wake reset can otherwise land its synchronous snap at the same
+        // moment a leftover timer fires an animated pan on top of it —
+        // exactly the "snap then float" symptom. Clearing it here is
+        // idempotent and safe even if no timer is pending.
+        if (typeof _clearInactivityTimer === 'function') {
+            _clearInactivityTimer();
+        }
+ 
+        // Suppress onInteractionStart/onInteractionEnd side effects for the
+        // programmatic move below. noMoveStart (further down) only silences
+        // 'movestart'; it does NOT silence 'zoomstart'/'zoomend', so if
+        // targetZoom differs from the current zoom, setupMapInteractionHandlers'
+        // listeners will still fire. Without this flag, onInteractionEnd would
+        // see the map "stationary" right after snapping and immediately
+        // re-arm the animated inactivity timer above — reintroducing the
+        // exact bug this block just fixed. The later defensive reassertion
+        // of followUser/isMapInteracting is a second, independent safety net,
+        // not a replacement for this.
+        window._programmaticFlyInProgress = true;
+ 
+        // ── pan.noMoveStart suppresses the synchronous 'movestart'
+        // event that Leaflet fires on every setView. Without it, the
+        // onInteractionStart handler (registered by setupMapInteractionHandlers
+        // on 'movestart') runs immediately and sets followUser = false,
+        // which causes dead reckoning to enter its non-centered branch
+        // (marker moves, viewport stays) — the "floating off screen" bug.
+        //
+        // NOTE: noMoveStart must be nested inside `pan`, not at the top
+        // level. Leaflet 1.9.4's setView reads it from
+        // options.pan.noMoveStart when calling _resetView; a top-level
+        // noMoveStart is silently ignored.
+        //
+        // CAVEAT: noMoveStart only suppresses 'movestart'. Leaflet still
+        // fires 'zoomstart' synchronously whenever the zoom level changes,
+        // regardless of this option. If a zoom level change is involved
+        // (e.g. targetZoom !== currentZoom) and any handler treats
+        // 'zoomstart' as user interaction, the same followUser-clobbering
+        // bug can occur through that path. That's exactly what the
+        // defensive re-assertion below guards against — it is not
+        // redundant with this option, it covers a different event.
+        try {
+            map.setView([newPosition.lat, newPosition.lng], targetZoom, {
+                animate: false,
+                pan: { noMoveStart: true }
+            });
+        } catch (e) {
+            console.warn('[Reset] map.setView failed, retrying without pan options', e);
+            try {
+                map.setView([newPosition.lat, newPosition.lng], targetZoom, { animate: false });
+            } catch (e2) {
+                console.warn('[Reset] map.setView fallback also failed', e2);
+            }
+        }
+ 
+        // setView is synchronous (animate:false), so movestart/moveend and
+        // any zoomstart/zoomend it triggers have already fired by this line
+        // — safe to drop the flag immediately rather than deferring it.
+        // Cleared unconditionally (even if both setView attempts threw) so
+        // a real user interaction right after a failed reset is never
+        // silently ignored.
+        window._programmaticFlyInProgress = false;
+    }
+ 
+    userMarker.setLatLng([newPosition.lat, newPosition.lng]);
+ 
+    if (window.deadReckoning) {
+        if (typeof window.deadReckoning.invalidateMarkerCache === 'function') {
+            window.deadReckoning.invalidateMarkerCache();
+        }
+        if (typeof window.deadReckoning.start === 'function') {
+            window.deadReckoning.start();
+        }
+        if (!isInit && typeof window.deadReckoning.forceUpdate === 'function') {
+            window.deadReckoning.forceUpdate();
+        }
+        // isWake is not isInit, so it still gets forceUpdate() here — unchanged,
+        // and correct: we want dead reckoning to immediately reflect the fresh
+        // fix rather than interpolating from a stale pre-background state.
+    }
+ 
+    // ── Defensive re-assertion ──
+    // Guarantees followUser/isMapInteracting are correct going into dead
+    // reckoning's first requestAnimationFrame, even if:
+    //   (a) a zoomstart handler flipped them (noMoveStart doesn't cover
+    //       zoomstart — see caveat above), or
+    //   (b) a future Leaflet version or code path reintroduces a
+    //       synchronous movestart between setView and here.
+    // Runs synchronously before DR's first rAF callback, so there is no race.
+    // Extended from `isInit` to `shouldRecenterMap` so wake gets the same
+    // guarantee init always had.
+    if (shouldRecenterMap) {
+        window.followUser = true;
+        window.isMapInteracting = false;
+    }
+ 
+    if (isInit) {
+        if (typeof updateDistanceBox === 'function') updateDistanceBox(forceUpdate);
+        if (typeof updateAccuracyIndicator === 'function') updateAccuracyIndicator(newPosition.accuracy);
+    } else {
+        if (typeof isSignificantMovement === 'function' &&
+            isSignificantMovement(newPosition) &&
+            typeof resetInactivityTimer === 'function') {
+            resetInactivityTimer(false);
+        }
+    }
+}
             
 /* ──────────────────────────────────────────────
    _initializeUserLocationState — delegates to the
@@ -5124,6 +5243,19 @@ function _initializeUserLocationState(newPosition, currentTime, forceUpdate) {
     _resetMapToPosition(newPosition, {
         currentTime: currentTime,
         resetType: 'init',
+        forceUpdate: !!forceUpdate,
+        clearStationary: true
+    });
+}
+ 
+// Mirrors _initializeUserLocationState, but for returning from a
+// backgrounded/suspended app state rather than first load. Wire this into
+// your visibilitychange/resume handler with a freshly-obtained position fix
+// (don't replay a cached one — see notes above).
+function _wakeUserLocationState(newPosition, currentTime, forceUpdate) {
+    _resetMapToPosition(newPosition, {
+        currentTime: currentTime,
+        resetType: 'wake',
         forceUpdate: !!forceUpdate,
         clearStationary: true
     });
@@ -5490,19 +5622,17 @@ function getGeolocationOptions(speedMPS = 0) {
    handleLocationError — retry with exponential
    backoff, fast-fail on permission denied.
    ────────────────────────────────────────────── */
-  function handleLocationError(error) {
+function handleLocationError(error) {
     console.warn("Error getting user location:", error);
 
-    // Scoped retry state per error instance to prevent cross-talk
     var localRetryCount = error._retryCount || 0;
 
+    // Permission denied — no retry can fix this.
     if (error?.code === 1) {
-        retryCount = 0; // Reset global for future errors
+        retryCount = 0;
         if (typeof hideLoadingMessage === 'function') hideLoadingMessage();
         showPopup("Location Error", "Please allow access to your location to use this feature.");
-        if (typeof onLocationFailure === 'function') {
-            onLocationFailure(error);
-        }
+        if (typeof onLocationFailure === 'function') onLocationFailure(error);
         return;
     }
 
@@ -5515,7 +5645,11 @@ function getGeolocationOptions(speedMPS = 0) {
 
         console.log(`Retrying to get location (Attempt ${nextRetryCount} of ${maxRetries} in ${backoffMs}ms)`);
 
-        setTimeout(() => {
+        // Was raw setTimeout — survived disposeMapLoop teardown and
+        // could fire getCurrentPosition against re-initialized or
+        // torn-down state. createTrackedTimeout puts it in the Set
+        // that clearAllTrackedTimeouts sweeps on every dispose.
+        createTrackedTimeout(() => {
             if (!navigator.geolocation) {
                 console.warn('Geolocation API not available');
                 return;
@@ -5526,9 +5660,7 @@ function getGeolocationOptions(speedMPS = 0) {
                     console.log("Location retrieved successfully after retry");
                     if (typeof hideLoadingMessage === 'function') hideLoadingMessage();
                     updateUserLocation(position, true);
-                    retryCount = 0; // Reset global on success
-
-                    // Restart continuous tracking if it was stopped
+                    retryCount = 0;
                     if (typeof startPositionUpdates === 'function' && !window.positionWatchId) {
                         startPositionUpdates();
                     }
@@ -5566,9 +5698,7 @@ function getGeolocationOptions(speedMPS = 0) {
     }
 
     showPopup("Location Error", errorMessage);
-    if (typeof onLocationFailure === 'function') {
-        onLocationFailure(error);
-    }
+    if (typeof onLocationFailure === 'function') onLocationFailure(error);
 }
 
 /* ──────────────────────────────────────────────
@@ -5650,26 +5780,43 @@ function getGeolocationOptions(speedMPS = 0) {
 /* ──────────────────────────────────────────────
    recenterMap — soft pan to user, keep current zoom.
    ────────────────────────────────────────────── */
-   let recenterTimer;
+let recenterTimer;
 
 function recenterMap() {
     const btn = cachedElements?.recenterButton ?? document.getElementById('recenterButton');
     if (!btn || !userMarker?.getLatLng()) return;
+
+    const ll = userMarker.getLatLng();
+    if (!ll || !isFinite(ll.lat) || !isFinite(ll.lng)) return;
 
     btn.disabled = true;
     btn.style.backgroundColor = 'var(--primary-color)';
     btn.style.color = 'white';
 
     map.closePopup();
-    map.panTo(userMarker.getLatLng(), {
-        animate: true,
-        duration: 0.5,
-        easeLinearity: 0.25,
-        noZoom: true
-    });
 
-    followUser = true;
-    window.followUser = true;
+    window.followUser       = true;
+    window.isMapInteracting = false;
+
+    const dr = window.deadReckoning;
+    if (dr && typeof dr.isActive === 'function' && dr.isActive() &&
+        typeof dr.forceUpdate === 'function') {
+        // DR is running — let it snap the viewport (animate:false).
+        // An animated panTo here would be canceled by DR's
+        // _snapViewport on the very next frame.
+        dr.forceUpdate();
+    } else {
+        // DR is not running — snap directly.  noMoveStart prevents
+        // the synchronous movestart from flipping followUser back
+        // to false.
+        window._programmaticFlyInProgress = true;
+        map.panTo(ll, {
+            animate:     false,
+            noMoveStart: true
+        });
+        window._programmaticFlyInProgress = false;
+    }
+
     announceToScreenReader('Map re-centred on your location');
 
     clearTimeout(recenterTimer);
@@ -5682,9 +5829,7 @@ function recenterMap() {
 }
 
 function fullResetMap() {
-    const pos = window.lastPosition;
     const btn = cachedElements?.recenterButton ?? document.getElementById('recenterButton');
-    
     if (!btn || !userMarker?.getLatLng()) return;
 
     btn.disabled = true;
@@ -5697,15 +5842,34 @@ function fullResetMap() {
         window.zoomController.stop();
     }
 
-    map.setView(userMarker.getLatLng(), 17, {
-        animate: true,
-        duration: 0.5,
-        easeLinearity: 0.25
+    const ll = userMarker.getLatLng();
+    if (!ll || !isFinite(ll.lat) || !isFinite(ll.lng)) {
+        btn.disabled = false;
+        btn.style.backgroundColor = 'white';
+        btn.style.color = 'var(--primary-color)';
+        return;
+    }
+
+    // Set state BEFORE the map operation so the synchronous
+    // movestart (if any) sees the correct values.
+    window.followUser       = true;
+    window.isMapInteracting = false;
+
+    // Instant snap, not an animated pan.  DR's _snapViewport calls
+    // map.setView(animate:false) every frame in centered mode, which
+    // cancels any in-flight animated setView on the first frame —
+    // producing a visible stutter.  An instant snap is both simpler
+    // and what the user expects from a "recenter" button.
+    map.setView([ll.lat, ll.lng], 17, {
+        animate: false,
+        pan: { noMoveStart: true }
     });
 
-    window.followUser = true;
-    followUser = true;
-    window.isMapInteracting = false;
+    // Kick DR so it picks up the centered viewport immediately
+    // rather than waiting for the next GPS fix.
+    if (window.deadReckoning && typeof window.deadReckoning.forceUpdate === 'function') {
+        window.deadReckoning.forceUpdate();
+    }
 
     announceToScreenReader('Map re-centred on your location');
 
@@ -7464,44 +7628,40 @@ function showAdditionalInfo() {
 function handleContinueClick() {
     const FADE_DURATION_MS = 300;
 
-    // ── Hide overlay ─────────────────────────────────────────────────────────
+    // ── Hide overlay ──
     document.querySelector('.additional-info-overlay')?.classList.remove('show');
     document.body.classList.remove('additional-info-open');
 
-    // ── Resume audio if it was playing when popup opened ─────────────────────
+    // ── Resume audio ──
     if (window._audioWasPlayingWhenPopupOpened) {
         document.getElementById('locationAudio')?.play().catch(() => {});
         window._audioWasPlayingWhenPopupOpened = false;
     }
-
     try { localStorage.removeItem('audioPosition'); } catch (_) {}
 
-    // ── Cooldown ─────────────────────────────────────────────────────────────
+    // ── Cooldown ──
     if (window.cooldownManager) {
         const idToLeave = window.cooldownManager.currentLocationId || lastVisitedLocationId;
         if (idToLeave != null) {
             window.cooldownManager.leaveLocation(idToLeave);
-            console.log('[Cooldown] Started cooldown for location', idToLeave);
         }
     }
-
     if (window._lastProximityTriggerByLocation && lastVisitedLocationId != null) {
         delete window._lastProximityTriggerByLocation[lastVisitedLocationId];
     }
 
-    // ── Reset proximity + zoom state ─────────────────────────────────────────
-    window.isLocationHuntVisible       = false;
-    window.zoomedInState               = false;
-    window.isNearLocation              = false;
-    window.blockSpeedZoom              = false;
-    window.currentProximityLocationId  = null;
-    window._inProximityZone            = false;
-    window._proximityZoomActive        = false;
-
+    // ── Reset proximity + zoom state ──
+    window.isLocationHuntVisible      = false;
+    window.zoomedInState              = false;
+    window.isNearLocation             = false;
+    window.blockSpeedZoom             = false;
+    window.currentProximityLocationId = null;
+    window._inProximityZone           = false;
+    window._proximityZoomActive       = false;
     getSpeedBasedZoom.reset();
     clearStationaryState();
 
-    // ── Cancel countdown timers ──────────────────────────────────────────────
+    // ── Cancel countdown timers ──
     if (window._countdownVisibilityHandler) {
         document.removeEventListener('visibilitychange', window._countdownVisibilityHandler);
         window._countdownVisibilityHandler = null;
@@ -7519,42 +7679,62 @@ function handleContinueClick() {
         window.distanceBoxCountdownInterval = null;
     }
 
-    // ── Proximity zoom timestamps ─────────────────────────────────────────────
+    // ── Proximity zoom timestamps ──
     const now = Date.now();
-    window.lastProximityZoomOutTime        = now;
-    window.lastProximityZoomOutLocationId  = lastVisitedLocationId;
-    window.lastProximityZoomInTime         = now - 2000;
-    window.lastProximityZoomTime           = now;
-    window._didPrefetch19                  = false;
+    window.lastProximityZoomOutTime       = now;
+    window.lastProximityZoomOutLocationId = lastVisitedLocationId;
+    window.lastProximityZoomInTime        = now - 2000;
+    window.lastProximityZoomTime          = now;
+    window._didPrefetch19                 = false;
 
-    // ── Re-center map on user ────────────────────────────────────────────────
-    const userLL        = window.userMarker?.getLatLng?.();
-    const centerLatLng  = userLL ?? (window.lastPosition
+    // ── Re-center map on user ──
+    const userLL       = window.userMarker?.getLatLng?.();
+    const centerLatLng = userLL ?? (window.lastPosition
         ? { lat: window.lastPosition.lat, lng: window.lastPosition.lng }
         : null);
+    const isRecentering = !!(map && centerLatLng);
 
-    if (map && centerLatLng) {
-        window.isMapInteracting      = false;
-        window.followUser            = true;
-        window._blockAutoMapUpdates  = true;
+    if (isRecentering) {
+        window.isMapInteracting           = false;
+        window.followUser                 = true;
+        window._programmaticFlyInProgress = true;
 
+        // noMoveStart nested under `pan` — top-level is silently
+        // ignored by Leaflet 1.9.4's setView (same quirk as
+        // _resetMapToPosition).
         map.setView(
             [centerLatLng.lat, centerLatLng.lng],
             map.getZoom(),
-            { animate: true, duration: 0.6, easeLinearity: 0.18 }
+            {
+                animate: true,
+                duration: 0.6,
+                easeLinearity: 0.18,
+                pan: { noMoveStart: true }
+            }
         );
 
+        // 650ms = 600ms pan + one frame buffer. Was 800ms, which
+        // left a 200ms window where user drags were silently
+        // swallowed by the _programmaticFlyInProgress guard.
         createTrackedTimeout(() => {
-            window._blockAutoMapUpdates = false;
-        }, 800);
+            window._programmaticFlyInProgress = false;
+        }, 650);
+
+        // Do NOT start DR here. _restoreFullTracking (called from
+        // finalizeModalClose at ~600ms) starts it via forceUpdate.
+        // Starting DR during the animated pan cancels the pan on
+        // the first frame — DR's _snapViewport uses animate:false.
+    } else {
+        // No animation to race — start DR immediately so the marker
+        // tracks the user during the modal fade.
+        window.deadReckoning?.start?.();
     }
 
-    // ── Resume navigation ────────────────────────────────────────────────────
-    window.deadReckoning?.start?.();
+    // ── Resume navigation ──
     ensureGPSActive();
     closeModalWithAnimation(FADE_DURATION_MS);
 }
-
+        
 function closeModalWithAnimation(fadeDuration) {
     const additionalInfoContainer = cachedElements.additionalInfoContainer || 
         document.querySelector('.additional-info-container');
@@ -8494,20 +8674,6 @@ function loadAllLocations() {
     resetInactivityTimer();
 }
 
-let visibilityTimeout;
-document.addEventListener('visibilitychange', function() {
-    if (!document.hidden) {
-        clearTimeout(visibilityTimeout);
-        visibilityTimeout = setTimeout(() => {
-            recenterOnUser();
-            // Safety net for iOS PWA recovery where DOM gets wiped
-            if (markerClusterGroup && markerClusterGroup.getLayers().length === 0) {
-                createMarkersOnly();
-            }
-        }, 300);
-    }
-});
-
 function returnToIndex() {
    const distanceBox = document.querySelector('#distanceBox'); 
    if (distanceBox) distanceBox.style.display = 'none';
@@ -8767,25 +8933,31 @@ function resetInactivityTimer(isExplicitInteraction = true) {
         clearTrackedTimeout(window.inactivityTimer);
         window.inactivityTimer = null;
     }
-    
+
     window.inactivityTimer = createTrackedTimeout(() => {
         if (!map || !userMarker) return;
-        
+
         map.closePopup();
-        if (!window.isMapInteracting) {  
-            window.followUser = true;                  
+        if (!window.isMapInteracting) {
+            window.followUser = true;
             window.isMapInteracting = false; // Ensure state is fully released
-            
+
             const userPos = userMarker.getLatLng();
             // isFinite prevents failure at exact 0 lat/lng coordinates
             if (userPos && isFinite(userPos.lat) && isFinite(userPos.lng)) {
-                map.panTo(userPos, { animate: true, duration: 0.5 });
+                // noMoveStart: top-level is correct for panTo (it nests it
+                // into setView's pan option itself). Now that interaction
+                // detection uses dragstart/dragend instead of movestart/
+                // moveend, this isn't load-bearing for followUser anymore,
+                // but it's cheap defense-in-depth against the synchronous
+                // movestart panTo still fires.
+                map.panTo(userPos, { animate: true, duration: 0.5, noMoveStart: true });
             }
         }
     }, CONFIG?.INACTIVITY_TIMEOUT ?? 300_000); // 5 min fallback if CONFIG failed to load
-    
+
     if (isExplicitInteraction) {
-        window.isMapInteracting = false;  
+        window.isMapInteracting = false;
     }
 }
 
