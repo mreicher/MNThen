@@ -792,9 +792,9 @@
             this._nugget              = 1e-12;
         }
     
-        update(lat, lng, accuracyMeters, timestampPerfNow, gpsSpeedMPS) {
+       update(lat, lng, accuracyMeters, timestampPerfNow, gpsSpeedMPS) {
             const R = this._measurementNoiseFromAccuracy(accuracyMeters);
-    
+         
             if (!isFinite(lat) || !isFinite(lng)) {
                 return this._makeResult(
                     this.x ? this.refLat : 0,
@@ -802,25 +802,31 @@
                     { isConverged: false, blendFactor: 0, updateCount: this._updateCount }
                 );
             }
-    
+         
             if (isFinite(gpsSpeedMPS) && gpsSpeedMPS >= 0) this._lastGPSSpeedMPS = gpsSpeedMPS;
-    
+         
             if (this.x === null) {
                 this._initialize(lat, lng, R, timestampPerfNow);
                 this._updateCount = 1;
                 return this._makeResult(lat, lng, { isConverged: false, blendFactor: 0, updateCount: this._updateCount });
             }
-    
+         
             const dt = (timestampPerfNow - this.lastTimestamp) / 1000;
-    
+         
             if (dt <= 0 || dt > 30) {
-                const seedVel = this._lastSeedVelocity;
+                // _initialize() prefers _pendingSeedVelocity (the gap-aware seed from
+                // scheduleVelocitySeed) over anything else, and consumes/nulls it.
+                // Previously this branch then unconditionally reapplied the stale
+                // pre-gap _lastSeedVelocity right on top, discarding that fresher
+                // estimate. Only fall back to it if there was nothing better.
+                const hadPendingSeed = !!this._pendingSeedVelocity;
+                const fallbackSeed = this._lastSeedVelocity;
                 this._initialize(lat, lng, R, timestampPerfNow);
-                if (seedVel) this.seedVelocity(seedVel.vNorth, seedVel.vEast, 4.0);
+                if (!hadPendingSeed && fallbackSeed) this.seedVelocity(fallbackSeed.vNorth, fallbackSeed.vEast, 4.0);
                 this._updateCount = 1;
                 return this._makeResult(lat, lng, { isConverged: false, blendFactor: 0, updateCount: this._updateCount });
             }
-    
+         
             if (this._isFrozen && this._frozenPosition) {
                 this._updateAccelNoise();
                 this._predict(dt);
@@ -831,29 +837,29 @@
                     isConverged: true, blendFactor: 1.0, updateCount: this._updateCount, isFrozen: true
                 });
             }
-    
+         
             this._updateAccelNoise();
-    
+         
             const localPre = this._toLocal(lat, lng);
             if (Math.abs(localPre.north) > this._maxRefShiftMeters ||
                 Math.abs(localPre.east)  > this._maxRefShiftMeters) {
                 this._shiftReference();
             }
-    
+         
             this._predict(dt);
             const local = this._toLocal(lat, lng);
             this._update(local.north, local.east, R);
-    
+         
             const pos = this._toGlobal(this.x[0], this.x[1]);
             this._pendingSeedVelocity = null;
             this._updateCount++;
             if (this.x) this._lastSeedVelocity = { vNorth: this.x[2], vEast: this.x[3] };
-    
+         
             const speedMPS = this.x ? Math.sqrt(this.x[2]*this.x[2] + this.x[3]*this.x[3]) : 0;
             const convergenceThreshold = speedMPS > 15 ? 2 : 4;
             const isConverged = this._updateCount >= convergenceThreshold && this.P && this.P[0][0] < 200;
             const blendFactor = Math.min(1.0, this._updateCount / convergenceThreshold);
-    
+         
             return this._makeResult(pos.lat, pos.lng, { isConverged, blendFactor, updateCount: this._updateCount });
         }
     
@@ -894,7 +900,23 @@
             this._updateCount = 0; this._isFrozen = false; this._frozenPosition = null;
         }
     
-        freeze(lat, lng) { this._isFrozen = true;  this._frozenPosition = { lat, lng }; }
+        freeze(lat, lng) {
+            this._isFrozen = true;
+            this._frozenPosition = { lat, lng };
+            // Previously left velocity/covariance untouched and let a few update
+            // cycles against the frozen point decay it toward zero on their own.
+            // Zero it immediately instead — no window where a reader sees residual
+            // motion right at the moment we've declared the position locked.
+            if (this.x) {
+                this.x[2] = 0; this.x[3] = 0;
+                if (this.P) {
+                    this.P[2][2] = 0.5; this.P[3][3] = 0.5;
+                    this.P[0][2] = 0; this.P[2][0] = 0;
+                    this.P[1][3] = 0; this.P[3][1] = 0;
+                }
+            }
+        }
+        
         unfreeze()       { this._isFrozen = false; this._frozenPosition = null; }
         isFrozen()       { return this._isFrozen; }
     
@@ -952,17 +974,19 @@
         this._pendingSeedVelocity = null; // consumed here, not left for the next update() cycle
     }
     
-        _updateAccelNoise() {
+       _updateAccelNoise() {
             if (!this.x) return;
             const kalmanSpeed = Math.sqrt(this.x[2]*this.x[2] + this.x[3]*this.x[3]);
             const speed = Math.max(kalmanSpeed, (this._lastGPSSpeedMPS || 0) * 0.9);
             this._currentSpeedMPS = speed;
-            if      (speed < 0.1)  { this.accelNoise = 0.5; return; }
+            // Was a hard cutoff at 0.1 (0.5 flat below it, 1.0 flat from 0.1–0.5) —
+            // a 2x step landing right in the stop/start speed range. Continuous
+            // ramp from 0.5 at speed=0 up to 1.0 at speed=0.5 instead.
             if      (speed >= 15)  { this.accelNoise = 8.0; }
             else if (speed >= 8)   { this.accelNoise = 3.0 + (speed - 8) * (5.0 / 7); }
             else if (speed >= 2)   { this.accelNoise = 3.0; }
             else if (speed >= 0.5) { this.accelNoise = 1.0 + (speed - 0.5) * (2.0 / 1.5); }
-            else                   { this.accelNoise = 1.0; }
+            else                   { this.accelNoise = 0.5 + speed * 1.0; }
         }
     
         _predict(dt) {
@@ -1312,51 +1336,61 @@ class SensorFusionManager {
         return { lat: (rawLat - this._rawLat) / dtSec, lng: (rawLng - this._rawLng) / dtSec };
     }
 
-    _updateStationaryState(gpsSpeedMPS, kalmanSpeedMPS, rawLat, rawLng) {
-            const speed = Math.max(gpsSpeedMPS || 0, kalmanSpeedMPS || 0);
-            const accelMoving = this._accelAvailable && this._isMoving;
-        
-            // Streaks, not samples. GPS speed at rest flickers 0–0.6 m/s, so
-            // a single threshold crossing proves nothing. The ambiguous band
-            // (0.35–0.6 with no accelerometer vote) deliberately changes
-            // nothing — hold current state until the evidence is clear.
-            if (speed > 0.6 || accelMoving) {
-                this._moveStreak = (this._moveStreak || 0) + 1;
-                this._stillStreak = 0;
-            } else if (speed < 0.35) {
-                this._stillStreak = (this._stillStreak || 0) + 1;
-                this._moveStreak = 0;
-            }
-        
-            // Asymmetric hysteresis: harder to leave stationary than to enter.
-            //   Entering: 3 consecutive quiet fixes  (~3s at 1Hz GPS)
-            //   Leaving:  2 consecutive moving fixes (~1–2s, accel-accelerated)
-            const isStationary = this._lastStationaryState
-                ? (this._moveStreak || 0) < 2
-                : (this._stillStreak || 0) >= 3;
-        
-            if (isStationary && !this._lastStationaryState) {
-                // Transition to stationary — freeze at the smoothed position.
-                const freezeLat = this._lastKalmanLat != null ? this._lastKalmanLat : rawLat;
-                const freezeLng = this._lastKalmanLng != null ? this._lastKalmanLng : rawLng;
-                if (this._kalmanFilter && freezeLat != null && freezeLng != null) {
-                    this._kalmanFilter.freeze(freezeLat, freezeLng);
-                }
-                this._stationaryPosition = (freezeLat != null && freezeLng != null)
-                    ? { lat: freezeLat, lng: freezeLng }
-                    : null;
-                this._stationarySamples = [];
-            } else if (!isStationary && this._lastStationaryState) {
-                // Transition to moving — hysteresis satisfied, release.
-                if (this._kalmanFilter) this._kalmanFilter.unfreeze();
-                this._stationaryPosition = null;
-                this._stationarySamples = [];
-            }
-        
-            this._lastStationaryState = isStationary;
-            return isStationary;
+   _updateStationaryState(gpsSpeedMPS, kalmanSpeedMPS, rawLat, rawLng) {
+        const speed = Math.max(gpsSpeedMPS || 0, kalmanSpeedMPS || 0);
+        const accelMoving = this._accelAvailable && this._isMoving;
+     
+        if (speed > 0.6 || accelMoving) {
+            this._moveStreak = (this._moveStreak || 0) + 1;
+            this._stillStreak = 0;
+        } else if (speed < 0.35) {
+            this._stillStreak = (this._stillStreak || 0) + 1;
+            this._moveStreak = 0;
         }
-
+     
+        const isStationary = this._lastStationaryState
+            ? (this._moveStreak || 0) < 2
+            : (this._stillStreak || 0) >= 3;
+     
+        if (isStationary && !this._lastStationaryState) {
+            const freezeLat = this._lastKalmanLat != null ? this._lastKalmanLat : rawLat;
+            const freezeLng = this._lastKalmanLng != null ? this._lastKalmanLng : rawLng;
+            if (this._kalmanFilter && freezeLat != null && freezeLng != null) {
+                this._kalmanFilter.freeze(freezeLat, freezeLng);
+            }
+            this._stationaryPosition = (freezeLat != null && freezeLng != null)
+                ? { lat: freezeLat, lng: freezeLng }
+                : null;
+            this._stationarySamples = [];
+        } else if (!isStationary && this._lastStationaryState) {
+            if (this._kalmanFilter) {
+                this._kalmanFilter.unfreeze();
+                // kf.update() only auto-seeds velocity on a true (re)init
+                // (kf._justInitialized) — freeze/unfreeze never sets that, so
+                // without this, every ordinary stop-and-go left the filter to
+                // rebuild velocity from zero fix by fix. Same priority as the
+                // init-time seed: GPS speed+heading first, raw delta as fallback.
+                let seeded = false;
+                if (gpsSpeedMPS != null && gpsSpeedMPS > 0.3 && this._rawHeadingDeg != null && isFinite(this._rawHeadingDeg)) {
+                    const hr = this._rawHeadingDeg * Math.PI / 180;
+                    this._kalmanFilter.seedVelocity(gpsSpeedMPS * Math.cos(hr), gpsSpeedMPS * Math.sin(hr), 1.5);
+                    seeded = true;
+                }
+                if (!seeded) {
+                    const cosLat = Math.cos(rawLat * Math.PI / 180);
+                    const vN = this._gpsVelocityDegPerSec.lat * 111111;
+                    const vE = this._gpsVelocityDegPerSec.lng * 111111 * cosLat;
+                    if (Math.sqrt(vN * vN + vE * vE) > 0.3) this._kalmanFilter.seedVelocity(vN, vE, 1.5);
+                }
+            }
+            this._stationaryPosition = null;
+            this._stationarySamples = [];
+        }
+     
+        this._lastStationaryState = isStationary;
+        return isStationary;
+    }
+    
     _getHybridVelocity() {
         if (!this._kalmanFilter || !this._kalmanFilter.x) return { vNorth: 0, vEast: 0 };
         const speed = this._filteredSpeedMPS || 0;
@@ -1388,16 +1422,14 @@ class SensorFusionManager {
         if (!isFinite(rawLat) || !isFinite(rawLng) || !this._kalmanFilter) {
             return { lat: rawLat || 0, lng: rawLng || 0, vNorth: 0, vEast: 0, speedMPS: 0 };
         }
-    
+     
         const kf = this._kalmanFilter;
         const perfNow = this._toPerfNow(timestampMs);
-    
-        // Snapshot prior raw state before overwriting — the position-delta
-        // velocity seed below needs it for a nonzero dt.
+     
         const prevRawLat       = this._rawLat;
         const prevRawLng       = this._rawLng;
         const prevRawTimestamp = this._rawTimestamp;
-    
+     
         const gpsVel = this._computeGPSVelocity(rawLat, rawLng, timestampMs);
         this._gpsVelocityDegPerSec = gpsVel;
         this._rawLat        = rawLat;
@@ -1405,12 +1437,7 @@ class SensorFusionManager {
         this._rawSpeedMPS   = gpsSpeedMPS;
         this._rawHeadingDeg = gpsHeadingDeg;
         this._rawTimestamp  = timestampMs;
-    
-        // Gap recovery: after a >10s pause, seed velocity from the position
-        // delta. Runs before kf.update() so it reads the pre-update timestamp.
-        // Gated on the displacement exceeding GPS noise — a sub-accuracy "move"
-        // is jitter, and seeding velocity from it makes dead reckoning drift on
-        // a bogus vector when returning from background on poor accuracy.
+     
         if (kf.lastTimestamp != null && kf.x != null) {
             const dtMs = perfNow - kf.lastTimestamp;
             if (dtMs > 10000 && window.lastPosition?.lat != null && window.lastPosition?.lng != null) {
@@ -1422,16 +1449,11 @@ class SensorFusionManager {
                 }
             }
         }
-    
+     
         const kfResult = kf.update(rawLat, rawLng, accuracyMeters, perfNow, gpsSpeedMPS);
-    
-        // updateCount === 1 means kf.update() just (re)initialized this tick —
-        // first init or any reset path (_handleGPSGap, _resetMapToPosition,
-        // _runSensorFusion's jump guard).
+     
         if (kfResult.updateCount === 1) { this._convergenceStage = 0; }
-    
-        // Consume a pending velocity seed AFTER update(), in priority order:
-        // GPS speed+heading → gap-recovery seed → raw position delta → last seed.
+     
         if (kf._justInitialized) {
             let seeded = false;
             if (gpsSpeedMPS != null && gpsSpeedMPS > 0.3 && gpsHeadingDeg != null && isFinite(gpsHeadingDeg)) {
@@ -1459,31 +1481,27 @@ class SensorFusionManager {
             }
             kf._justInitialized = false;
         }
-    
+     
         this._filteredSpeedMPS = kf.getSpeedMPS();
         const isStationary = this._updateStationaryState(gpsSpeedMPS, this._filteredSpeedMPS, rawLat, rawLng);
-    
+     
         if      (kfResult.isConverged && this._convergenceStage < 2)      { this._convergenceStage = 2; }
         else if (kfResult.updateCount >= 3 && this._convergenceStage < 1) { this._convergenceStage = 1; }
         if (gpsSpeedMPS > 1.0 && kfResult.updateCount >= 2) { this._convergenceStage = Math.max(this._convergenceStage, 1); }
-    
+     
         let resultLat, resultLng, resultVNorth, resultVEast, resultSpeed;
         let blendFactor = kfResult.blendFactor;
         let holdStill = false;
-    
+     
         if (isStationary && this._stationaryPosition) {
             resultLat = this._stationaryPosition.lat; resultLng = this._stationaryPosition.lng;
             resultVNorth = 0; resultVEast = 0; resultSpeed = 0; blendFactor = 1.0;
-            // Keep filtered speed consistent with the frozen position, so callers
-            // (dead reckoning) don't see a lingering nonzero speed while frozen.
             this._filteredSpeedMPS = 0;
+            // Was missing here — position was frozen but _rawVelocity below still
+            // carried raw GPS-delta noise, which getSmoothedVelocityDegPerSec()
+            // can hand to callers pre-convergence despite the frozen position.
+            holdStill = true;
         } else if (this._convergenceStage === 0) {
-            // Pre-convergence the raw fix is shown unfiltered, which bounces the
-            // marker on poor accuracy. If we have a trusted position and this fix
-            // lands near it (didn't really move — just noisy GPS), hold the
-            // trusted position until the filter converges. First init (no trusted
-            // position) and a real move (fix far away) both fall through to the
-            // raw fix — unchanged behavior.
             let holdLat = null, holdLng = null;
             if (this._lastKalmanLat != null && this._lastKalmanLng != null) {
                 const cosLatH = Math.cos(this._lastKalmanLat * Math.PI / 180);
@@ -1508,13 +1526,11 @@ class SensorFusionManager {
             resultLat = kfResult.lat; resultLng = kfResult.lng;
             resultVNorth = kfResult.vNorth; resultVEast = kfResult.vEast; resultSpeed = kfResult.speedMPS;
         }
-    
+     
         this._lastKalmanLat = resultLat; this._lastKalmanLng = resultLng;
         this._lastKalmanTimestamp = perfNow;
-        // Zero the velocity dead reckoning reads between fixes while holding, so
-        // it doesn't extrapolate the marker off the held position.
         this._rawVelocity = holdStill ? { lat: 0, lng: 0 } : gpsVel;
-    
+     
         return {
             lat: resultLat, lng: resultLng,
             vNorth: resultVNorth, vEast: resultVEast, speedMPS: resultSpeed,
@@ -1693,6 +1709,7 @@ window.sensorFusion = new SensorFusionManager().init();
     let _centeredLat = null;
     let _centeredLng = null;
     let _panRemainder = { x: 0, y: 0 }; // sub-pixel carry for _snapViewport
+    let _wasMoving = false;
 
     const _now = () => performance.now();
 
@@ -1854,110 +1871,124 @@ window.sensorFusion = new SensorFusionManager().init();
         }
     }
 
-    function frame(now) {
-        _rafId = null;
-        const lastPos = window.lastPosition;
-        if (!lastPos || window.isLocationHuntVisible) { _active = false; return; }
-    
-        const speedMPS   = _getSpeedMPS();
-        const stationary = _isStationary();
-        const centered   = _isCenteredMode();
-    
-        if (!centered && stationary && speedMPS < CFG.MIN_SPEED_MPS) { _active = false; return; }
-    
-        const isInteracting = window.isMapInteracting || window._isProximityZoomAnimating || window._gpsCenteredPanJustOccurred;
-            if (isInteracting) {
-              // Viewport is moving under someone else's control (drag, pinch,
-              // proximity zoom) — drop the sub-pixel carry so the next auto-pan
-              // starts clean.
-              _panRemainder.x = 0;
-              _panRemainder.y = 0;
-              _interactionEndTime = now + CFG.INTERACTION_FADE_MS;
-              _lastFrameTime = now;
-              _rafId = requestAnimationFrame(frame);
-              return;
-            }
-        
-        if (now < _interactionEndTime) { _lastFrameTime = now; _rafId = requestAnimationFrame(frame); return; }
-    
-        const dtMs = now - _lastFrameTime;
-        if (dtMs < CFG.MIN_DT_MS) { _rafId = requestAnimationFrame(frame); return; }
-        _lastFrameTime = now;
-    
-        const kp = _getKalmanPos(), rp = _getRawPos();
-        let oLat, oLng, oTs;
-        if      (kp?.timestamp != null) { oLat = kp.lat; oLng = kp.lng; oTs = kp.timestamp; }
-        else if (rp?.timestamp != null) { oLat = rp.lat; oLng = rp.lng; oTs = rp.timestamp; }
-        else                            { oLat = lastPos.lat; oLng = lastPos.lng; oTs = window.lastUpdateTimestamp || now; }
-    
-        const hdg = _getHeading();
-        
-        if (_lastHeadingDeg != null && hdg != null) {
-            let d = hdg - _lastHeadingDeg;
-            if (d >  180) d -= 360;
-            if (d < -180) d += 360;
-            _headingChangeRate = _headingChangeRate * 0.7 + (Math.abs(d) / (Math.max(dtMs, 16) / 1000)) * 0.3;
+   function frame(now) {
+    _rafId = null;
+    const lastPos = window.lastPosition;
+    if (!lastPos || window.isLocationHuntVisible) { _active = false; return; }
+ 
+    const speedMPS   = _getSpeedMPS();
+    const stationary = _isStationary();
+    const centered   = _isCenteredMode();
+ 
+    // Stationary -> moving transition: prime the filter with the last known
+    // good speed/heading instead of letting it ramp up from zero. Previously
+    // this only happened inside _start(), which is a no-op once the loop is
+    // already active — i.e. it never fired during a normal stop-and-go while
+    // centered, since the loop doesn't stop in that mode.
+    const movingNow = speedMPS >= CFG.MIN_SPEED_MPS;
+    if (movingNow && !_wasMoving) _seedVelocityOnResume();
+    _wasMoving = movingNow;
+ 
+    if (!centered && stationary && speedMPS < CFG.MIN_SPEED_MPS) { _active = false; return; }
+ 
+    const isInteracting = window.isMapInteracting || window._isProximityZoomAnimating || window._gpsCenteredPanJustOccurred;
+        if (isInteracting) {
+          _panRemainder.x = 0;
+          _panRemainder.y = 0;
+          _interactionEndTime = now + CFG.INTERACTION_FADE_MS;
+          _lastFrameTime = now;
+          _rafId = requestAnimationFrame(frame);
+          return;
         }
-        if (hdg != null) _lastHeadingDeg = hdg;
-    
-        const vel = _getVelocity();
-        const vm = Math.sqrt(vel.lat*vel.lat + vel.lng*vel.lng);
-        if (vm > 0.001) { _lastGoodVelocity = { lat: vel.lat, lng: vel.lng }; _lastGoodSpeedMPS = speedMPS; }
-    
-        let pLat, pLng;
-        const rawAge = Math.max(0, (now - oTs) / 1000);
-        const hor    = _getPredictHorizon(speedMPS, _headingChangeRate);
-        const pDt    = Math.min(rawAge, hor);
-    
-        if (pDt <= 0 || speedMPS < CFG.LOW_SPEED_CUTOFF_MPS || stationary) {
-            pLat = oLat; pLng = oLng;
-        } else {
-            pLat = oLat + vel.lat * pDt;
-            pLng = oLng + vel.lng * pDt;
-            const jN = Math.abs(pLat - oLat) * 111111;
-            const jE = Math.abs(pLng - oLng) * 111111 * Math.cos(oLat * Math.PI / 180);
-            if (jN > 150 || jE > 150) { pLat = oLat; pLng = oLng; }
-        }
-    
-        _lastPredictedPos = { lat: pLat, lng: pLng };
-    
-        const HOLD_SPEED_MPS = CFG.MIN_SPEED_MPS; 
-        const HOLD_DEADBAND_M = 0.15;
-        
-        const prevHeld = window.__drHeld;
-        let hLat = pLat, hLng = pLng;
-    
-        if (speedMPS < HOLD_SPEED_MPS && prevHeld) {
-            const cosLat = Math.cos(pLat * Math.PI / 180);
-            const errN = (pLat - prevHeld.lat) * 111111;
-            const errE = (pLng - prevHeld.lng) * 111111 * cosLat;
-            const errDist = Math.sqrt(errN * errN + errE * errE);
-            if (errDist < HOLD_DEADBAND_M) {
-                hLat = prevHeld.lat;
-                hLng = prevHeld.lng;
-            }
-        }
-        window.__drHeld = { lat: hLat, lng: hLng };
-    
-        if (!map || window._isProximityZoomAnimating) {
-            _setMarkerPosition(hLat, hLng);
-            _rafId = requestAnimationFrame(frame);
-            return;
-        }
-    
-        if (window.followUser && centered) {
-            _snapViewport(hLat, hLng);
-            const c = map.getCenter();
-            _setMarkerPosition(c.lat, c.lng);
-        } else if (window.followUser) {
-            _setMarkerPosition(hLat, hLng);
-            _snapViewport(hLat, hLng);
-        } else {
-            _setMarkerPosition(hLat, hLng);
-        }
-    
-        _rafId = requestAnimationFrame(frame);
+ 
+    if (now < _interactionEndTime) { _lastFrameTime = now; _rafId = requestAnimationFrame(frame); return; }
+ 
+    const dtMs = now - _lastFrameTime;
+    if (dtMs < CFG.MIN_DT_MS) { _rafId = requestAnimationFrame(frame); return; }
+    _lastFrameTime = now;
+ 
+    const kp = _getKalmanPos(), rp = _getRawPos();
+    let oLat, oLng, oTs;
+    if      (kp?.timestamp != null) { oLat = kp.lat; oLng = kp.lng; oTs = kp.timestamp; }
+    else if (rp?.timestamp != null) { oLat = rp.lat; oLng = rp.lng; oTs = rp.timestamp; }
+    else                            { oLat = lastPos.lat; oLng = lastPos.lng; oTs = window.lastUpdateTimestamp || now; }
+ 
+    const hdg = _getHeading();
+ 
+    if (_lastHeadingDeg != null && hdg != null) {
+        let d = hdg - _lastHeadingDeg;
+        if (d >  180) d -= 360;
+        if (d < -180) d += 360;
+        _headingChangeRate = _headingChangeRate * 0.7 + (Math.abs(d) / (Math.max(dtMs, 16) / 1000)) * 0.3;
     }
+    if (hdg != null) _lastHeadingDeg = hdg;
+ 
+    const vel = _getVelocity();
+    // Was gated on the raw degrees/sec vector magnitude against a threshold
+    // (0.001) that's calibrated for m/s — that combination is only true above
+    // ~110 m/s, so this never fired at real-world speeds and _lastGoodSpeedMPS
+    // stayed 0 forever, permanently disabling _seedVelocityOnResume(). Gate on
+    // speedMPS (already real-world units) instead, matching the 0.3 floor
+    // _seedVelocityOnResume() itself uses.
+    if (speedMPS > 0.3) { _lastGoodVelocity = { lat: vel.lat, lng: vel.lng }; _lastGoodSpeedMPS = speedMPS; }
+ 
+    let pLat, pLng;
+    const rawAge = Math.max(0, (now - oTs) / 1000);
+    const hor    = _getPredictHorizon(speedMPS, _headingChangeRate);
+    const pDt    = Math.min(rawAge, hor);
+ 
+    if (pDt <= 0 || speedMPS < CFG.LOW_SPEED_CUTOFF_MPS || stationary) {
+        pLat = oLat; pLng = oLng;
+    } else {
+        pLat = oLat + vel.lat * pDt;
+        pLng = oLng + vel.lng * pDt;
+        const jN = Math.abs(pLat - oLat) * 111111;
+        const jE = Math.abs(pLng - oLng) * 111111 * Math.cos(oLat * Math.PI / 180);
+        if (jN > 150 || jE > 150) { pLat = oLat; pLng = oLng; }
+    }
+ 
+    _lastPredictedPos = { lat: pLat, lng: pLng };
+ 
+    const HOLD_SPEED_MPS = CFG.MIN_SPEED_MPS;
+    // Was 0.15m — tighter than typical filtered-position jitter at a stop,
+    // so the hold almost never engaged and raw noise passed straight to the
+    // marker. That's the rubberbanding right as you come to a stop.
+    const HOLD_DEADBAND_M = 1.0;
+ 
+    const prevHeld = window.__drHeld;
+    let hLat = pLat, hLng = pLng;
+ 
+    if (speedMPS < HOLD_SPEED_MPS && prevHeld) {
+        const cosLat = Math.cos(pLat * Math.PI / 180);
+        const errN = (pLat - prevHeld.lat) * 111111;
+        const errE = (pLng - prevHeld.lng) * 111111 * cosLat;
+        const errDist = Math.sqrt(errN * errN + errE * errE);
+        if (errDist < HOLD_DEADBAND_M) {
+            hLat = prevHeld.lat;
+            hLng = prevHeld.lng;
+        }
+    }
+    window.__drHeld = { lat: hLat, lng: hLng };
+ 
+    if (!map || window._isProximityZoomAnimating) {
+        _setMarkerPosition(hLat, hLng);
+        _rafId = requestAnimationFrame(frame);
+        return;
+    }
+ 
+    if (window.followUser && centered) {
+        _snapViewport(hLat, hLng);
+        const c = map.getCenter();
+        _setMarkerPosition(c.lat, c.lng);
+    } else if (window.followUser) {
+        _setMarkerPosition(hLat, hLng);
+        _snapViewport(hLat, hLng);
+    } else {
+        _setMarkerPosition(hLat, hLng);
+    }
+ 
+    _rafId = requestAnimationFrame(frame);
+}
 
     // --- Returns true/false so callers know whether the
     // continuous predictive loop actually launched. ---
@@ -1982,6 +2013,7 @@ window.sensorFusion = new SensorFusionManager().init();
           _centeredLat = null; _centeredLng = null;
           _panRemainder.x = 0; _panRemainder.y = 0;
           window.__drHeld = null;
+          _wasMoving = false;
           const el = _getMarkerEl();
           if (el) { el.style.willChange = ''; el.style.transition = ''; _markerTransSet = false; }
         },
@@ -1995,10 +2027,11 @@ window.sensorFusion = new SensorFusionManager().init();
         // non-centered), it now does a one-shot direct sync instead of
         // silently doing nothing. DR remains the single writer of marker
         // and viewport state either way — no dual-write with _executeRender. ---
-        forceUpdate() {
+       forceUpdate() {
             if (_active) {
                 _lastFrameTime = 0;
-                if (_rafId == null) _rafId = requestAnimationFrame(frame);
+                if (_rafId != null) { cancelAnimationFrame(_rafId); }
+                _rafId = requestAnimationFrame(frame);
                 return;
             }
             const started = _start();
@@ -5053,17 +5086,16 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
    init and jump recovery. Seeds DR with position
    and velocity, starts DR loop.
    ────────────────────────────────────────────── */
-  function _resetMapToPosition(newPosition, options) {
+ function _resetMapToPosition(newPosition, options) {
     options = options || {};
     if (!map || !userMarker || !newPosition) return;
- 
-    // Validate newPosition before any state mutation
+
     if (typeof newPosition.lat !== 'number' || typeof newPosition.lng !== 'number' ||
         isNaN(newPosition.lat) || isNaN(newPosition.lng)) {
         console.warn('[Reset] Invalid position, aborting');
         return;
     }
- 
+
     var currentTime = options.currentTime != null ? options.currentTime : Date.now();
     var resetType = options.resetType || 'jump';
     var forceUpdate = !!options.forceUpdate;
@@ -5071,32 +5103,9 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
     var prevPos = window.lastPosition || null;
     var prevTime = window.lastUpdateTime || null;
     var isInit = resetType === 'init';
- 
-    // ── NEW: 'wake' path ──────────────────────────────────────────────
-    // This is the reset you should fire when the app returns from a
-    // backgrounded/suspended state (visibilitychange -> visible, iOS/Android
-    // resume lifecycle event, etc).
-    //
-    // Root cause of the "doesn't snap" bug: previously, map.setView(...) was
-    // ONLY ever called when resetType === 'init'. Every other resetType
-    // (including whatever the default 'jump' path was being used for on
-    // resume) moved userMarker but left the map VIEWPORT untouched. The dot
-    // teleported correctly; the camera didn't. Any subsequent dead-reckoning
-    // tick or stray Leaflet event then nudges the view toward the marker,
-    // which is exactly the "slide/float instead of snap" symptom.
-    //
-    // isWake gets the same forced, unanimated setView() treatment as init,
-    // but (unlike init) it does NOT recompute a speed-based zoom — resuming
-    // shouldn't change how zoomed in the user was, only correct the center.
     var isWake = resetType === 'wake';
- 
-    // Backwards compatible: existing callers using 'init' or the default
-    // 'jump' behave exactly as before. Only 'wake' (new) or an explicit
-    // options.forceRecenter opt-in trigger the forced recenter.
     var shouldRecenterMap = isInit || isWake || options.forceRecenter === true;
- 
-    // Shared factory for the single-entry position buffer used by both
-    // the init and non-init paths (was duplicated verbatim before).
+
     function makeBufferEntry() {
         return {
             lat: newPosition.lat,
@@ -5109,10 +5118,9 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
                 : 0
         };
     }
- 
+
     if (isInit) {
         if (typeof setupMapInteractionHandlers === 'function') setupMapInteractionHandlers();
-        // Use seedPositionBuffer with explicit count=1 for consistency
         if (typeof seedPositionBuffer === 'function') {
             seedPositionBuffer(newPosition, 1);
         } else {
@@ -5131,24 +5139,30 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
             clearTimeout(window.stationaryCheckTimeout);
             window.stationaryCheckTimeout = null;
         }
-        // Validate before direct assignment
         window.positionBuffer = [makeBufferEntry()];
-        window.stationaryStartTime = null;
-        // NOTE: left as null (same as the pre-existing 'jump' behavior) to
-        // keep this change minimal. If your stationary-detection code treats
-        // "just started" and "never started" differently, you may want
-        // isWake to set this to currentTime instead — check whatever
-        // function reads stationaryStartTime before flipping this.
+        // Wake gets a fresh stationary anchor, like init: we don't know what
+        // happened while backgrounded, so "now" is the start of the clock.
+        // Plain jumps keep null — that's owned by the stationary-check timer.
+        window.stationaryStartTime = isWake ? currentTime : null;
     }
- 
+
     window.lastPosition = newPosition;
     window.lastUpdateTime = currentTime;
     window.lastUpdateTimestamp = currentTime;
- 
-    // Velocity from position delta
+
+    // Wake never derives velocity from the pre/post-background delta, even
+    // for short backgrounding stints. That delta is a GPS reacquisition
+    // jump, not real travel, and was the main source of the post-resume
+    // slide/bounce (previously this only got zeroed by luck, via the dtSec
+    // gate below, when the background stint happened to be long).
+    // For everything else, smoothedVelocity is now an actual EMA against
+    // the previous smoothed value instead of a raw copy of the instant
+    // two-point velocity — a single noisy GPS sample (common right as you
+    // slow down) can no longer spike it and cause DR rubberbanding.
+    var prevSmoothed = window.smoothedVelocity || { lat: 0, lng: 0 };
     window.lastVelocity = { lat: 0, lng: 0 };
     window.smoothedVelocity = { lat: 0, lng: 0 };
-    if (prevPos && prevTime && currentTime) {
+    if (!isWake && prevPos && prevTime && currentTime) {
         var dtSec = (currentTime - prevTime) / 1000;
         if (dtSec > 0 && dtSec < 120) {
             var latVel = (newPosition.lat - prevPos.lat) / dtSec;
@@ -5159,24 +5173,25 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
             var speedMPS = Math.sqrt(latMPS * latMPS + lngMPS * lngMPS);
             if (speedMPS < 100) {
                 window.lastVelocity = { lat: latVel, lng: lngVel };
-                window.smoothedVelocity = { lat: latVel, lng: lngVel };
+                var alpha = 0.35; // tune: higher = more responsive, lower = smoother
+                window.smoothedVelocity = {
+                    lat: alpha * latVel + (1 - alpha) * prevSmoothed.lat,
+                    lng: alpha * lngVel + (1 - alpha) * prevSmoothed.lng
+                };
             }
         }
     }
-    // NOTE: a wake after any real backgrounding will almost always have
-    // dtSec >= 120 (or a huge lat/lng jump), so this block naturally no-ops
-    // and velocity stays zeroed. That's desired — we don't want a fake
-    // "teleport velocity" computed from stale pre-background coordinates.
- 
-    // Kalman reset: init, >30s gap, or >500m jump
+
     if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
         var kf = window.sensorFusion._kalmanFilter;
-        var shouldResetKalman = isInit;
- 
+        // Wake always resets outright now, same reasoning as velocity above —
+        // don't let the filter fuse a fake teleport as plausible motion.
+        var shouldResetKalman = isInit || isWake;
+
         if (!shouldResetKalman && prevTime && currentTime) {
             var gapSec = (currentTime - prevTime) / 1000;
             if (gapSec > 30) shouldResetKalman = true;
- 
+
             if (!shouldResetKalman && prevPos) {
                 var jumpLat = Math.abs(newPosition.lat - prevPos.lat) * 111111;
                 var jumpLng = Math.abs(newPosition.lng - prevPos.lng) * 111111 *
@@ -5186,16 +5201,10 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
                 }
             }
         }
-        // A wake reset will almost always trip gapSec > 30 on its own, so it
-        // already gets a Kalman reset under the existing logic — no change
-        // needed here, but worth knowing this is *why* it works.
- 
+
         if (shouldResetKalman) {
-            // Guard against a throwing third-party filter leaving lastPosition/
-            // lastUpdateTime updated but the filter itself in a broken state.
             try {
                 kf.reset();
-                // Also clear sensorFusion smoothed state to prevent stale heading/speed
                 if (typeof window.sensorFusion.resetState === 'function') {
                     window.sensorFusion.resetState();
                 }
@@ -5204,12 +5213,11 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
             }
         }
     }
- 
+
     window.isStationary = false;
     window.stationaryLockPosition = null;
- 
+
     var targetZoom = map.getZoom();
- 
     if (isInit) {
         var intelligentZoom = (typeof getSpeedBasedZoom === 'function')
             ? getSpeedBasedZoom(newPosition.speedMPS)
@@ -5218,64 +5226,25 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
             ? intelligentZoom
             : 17;
     }
-    // isWake deliberately does NOT recompute a speed-based zoom the way init
-    // does — we keep whatever zoom the user had before backgrounding and
-    // only correct the center. If you'd rather wake also re-intelligent-zoom
-    // like init, mirror the block above under `if (isInit || isWake)`.
- 
+    // Wake deliberately skips speed-based rezoom — resuming shouldn't change
+    // how zoomed in the user was, only correct the center.
+
     if (window.zoomController && typeof window.zoomController.getState === 'function') {
         var zcState = window.zoomController.getState();
         if (zcState && zcState.lockedUntil > currentTime) {
             targetZoom = zcState.level;
         }
     }
- 
+
+    // Marker moves before the map recenters, so it's already correct if any
+    // synchronous moveend/zoomend handler triggered by setView below reads it.
+    userMarker.setLatLng([newPosition.lat, newPosition.lng]);
+
     if (shouldRecenterMap) {
-        // Cancel any inactivity-recenter timer armed before this reset.
-        // setupMapInteractionHandlers() schedules a 30s ANIMATED panTo via
-        // _startInactivityTimer/_handleInactivityReset whenever the map goes
-        // stationary. That timer is unaffected by backgrounding (setTimeout
-        // just fires late/immediately on resume in most browsers), so a
-        // wake reset can otherwise land its synchronous snap at the same
-        // moment a leftover timer fires an animated pan on top of it —
-        // exactly the "snap then float" symptom. Clearing it here is
-        // idempotent and safe even if no timer is pending.
         if (typeof _clearInactivityTimer === 'function') {
             _clearInactivityTimer();
         }
- 
-        // Suppress onInteractionStart/onInteractionEnd side effects for the
-        // programmatic move below. noMoveStart (further down) only silences
-        // 'movestart'; it does NOT silence 'zoomstart'/'zoomend', so if
-        // targetZoom differs from the current zoom, setupMapInteractionHandlers'
-        // listeners will still fire. Without this flag, onInteractionEnd would
-        // see the map "stationary" right after snapping and immediately
-        // re-arm the animated inactivity timer above — reintroducing the
-        // exact bug this block just fixed. The later defensive reassertion
-        // of followUser/isMapInteracting is a second, independent safety net,
-        // not a replacement for this.
         window._programmaticFlyInProgress = true;
- 
-        // ── pan.noMoveStart suppresses the synchronous 'movestart'
-        // event that Leaflet fires on every setView. Without it, the
-        // onInteractionStart handler (registered by setupMapInteractionHandlers
-        // on 'movestart') runs immediately and sets followUser = false,
-        // which causes dead reckoning to enter its non-centered branch
-        // (marker moves, viewport stays) — the "floating off screen" bug.
-        //
-        // NOTE: noMoveStart must be nested inside `pan`, not at the top
-        // level. Leaflet 1.9.4's setView reads it from
-        // options.pan.noMoveStart when calling _resetView; a top-level
-        // noMoveStart is silently ignored.
-        //
-        // CAVEAT: noMoveStart only suppresses 'movestart'. Leaflet still
-        // fires 'zoomstart' synchronously whenever the zoom level changes,
-        // regardless of this option. If a zoom level change is involved
-        // (e.g. targetZoom !== currentZoom) and any handler treats
-        // 'zoomstart' as user interaction, the same followUser-clobbering
-        // bug can occur through that path. That's exactly what the
-        // defensive re-assertion below guards against — it is not
-        // redundant with this option, it covers a different event.
         try {
             map.setView([newPosition.lat, newPosition.lng], targetZoom, {
                 animate: false,
@@ -5289,18 +5258,9 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
                 console.warn('[Reset] map.setView fallback also failed', e2);
             }
         }
- 
-        // setView is synchronous (animate:false), so movestart/moveend and
-        // any zoomstart/zoomend it triggers have already fired by this line
-        // — safe to drop the flag immediately rather than deferring it.
-        // Cleared unconditionally (even if both setView attempts threw) so
-        // a real user interaction right after a failed reset is never
-        // silently ignored.
         window._programmaticFlyInProgress = false;
     }
- 
-    userMarker.setLatLng([newPosition.lat, newPosition.lng]);
- 
+
     if (window.deadReckoning) {
         if (typeof window.deadReckoning.invalidateMarkerCache === 'function') {
             window.deadReckoning.invalidateMarkerCache();
@@ -5311,26 +5271,16 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
         if (!isInit && typeof window.deadReckoning.forceUpdate === 'function') {
             window.deadReckoning.forceUpdate();
         }
-        // isWake is not isInit, so it still gets forceUpdate() here — unchanged,
-        // and correct: we want dead reckoning to immediately reflect the fresh
-        // fix rather than interpolating from a stale pre-background state.
     }
- 
-    // ── Defensive re-assertion ──
-    // Guarantees followUser/isMapInteracting are correct going into dead
-    // reckoning's first requestAnimationFrame, even if:
-    //   (a) a zoomstart handler flipped them (noMoveStart doesn't cover
-    //       zoomstart — see caveat above), or
-    //   (b) a future Leaflet version or code path reintroduces a
-    //       synchronous movestart between setView and here.
-    // Runs synchronously before DR's first rAF callback, so there is no race.
-    // Extended from `isInit` to `shouldRecenterMap` so wake gets the same
-    // guarantee init always had.
+
+    // Belt-and-suspenders: guarantees followUser/isMapInteracting are correct
+    // going into DR's first rAF tick even if a zoomstart handler (which
+    // noMoveStart does NOT cover) flipped them during setView above.
     if (shouldRecenterMap) {
         window.followUser = true;
         window.isMapInteracting = false;
     }
- 
+
     if (isInit) {
         if (typeof updateDistanceBox === 'function') updateDistanceBox(forceUpdate);
         if (typeof updateAccuracyIndicator === 'function') updateAccuracyIndicator(newPosition.accuracy);
