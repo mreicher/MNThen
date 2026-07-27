@@ -8400,35 +8400,83 @@ function showNavigationTips() {
 }
 
 function startHunt() {
-    gameLocations = [...locations].sort((a, b) => a.id - b.id);
+    // ── Guard: locations data must be loaded before we can proceed ──
+    const locationsData = window.locations;
+    if (!Array.isArray(locationsData) || locationsData.length === 0) {
+        console.warn('[Hunt] locations data not loaded yet. Scheduling retry.');
+        window._huntStarted = false;
+
+        // Self-retry: locations_main.js (defer) will have executed
+        // within a few hundred ms of DOMContentLoaded. Three attempts
+        // at escalating intervals covers slow networks without
+        // spinning indefinitely. Uses createTrackedTimeout so the
+        // retries are swept by disposeMapLoop() / clearAllTrackedTimeouts()
+        // if the user navigates away mid-retry — no orphaned timers.
+        const attempt = (window._huntRetryCount || 0) + 1;
+        window._huntRetryCount = attempt;
+        if (attempt <= 3) {
+            createTrackedTimeout(() => {
+                if (!window._huntStarted) startHunt();
+            }, 500 * attempt);  // 500ms, 1000ms, 1500ms
+        } else {
+            console.error('[Hunt] locations data never loaded after 3 retries. Giving up.');
+            window._huntRetryCount = 0;
+        }
+        return;
+    }
+
+    // Reset retry counter on success
+    window._huntRetryCount = 0;
+
+    // ── Build sorted location list ──
+    gameLocations = [...locationsData].sort((a, b) => (a.id ?? 0) - (b.id ?? 0));
     window.gameLocations = gameLocations;
     lastVisitedLocationId = null;
-    loadAllLocations();
 
-    // iOS PWA Recovery — do this before starting proximity checks
-    var recovered = false;
+    // ── Render markers + distance box ──
+    if (typeof loadAllLocations === 'function') {
+        loadAllLocations();
+    } else {
+        console.warn('[Hunt] loadAllLocations not available — markers will not render.');
+    }
+
+    // ── iOS PWA session recovery ──
+    // If the app was suspended mid-location (common on iOS where the
+    // OS kills background tabs aggressively), restore the user to the
+    // location they were viewing instead of dropping them on the map.
+    let recovered = false;
     try {
         const activeLocationId = localStorage.getItem('activeLocationId');
         if (activeLocationId) {
-            const location = gameLocations.find(loc => String(loc.id) === String(activeLocationId));
+            const location = gameLocations.find(
+                loc => loc && String(loc.id) === String(activeLocationId)
+            );
             if (location) {
                 recovered = true;
+                // Defer to next frame so the map and marker cluster
+                // have finished their initial layout pass.
                 requestAnimationFrame(() => {
                     if (typeof showLocationHunt === 'function') {
                         showLocationHunt(location);
                     }
                 });
             } else {
+                // Stale ID — location was removed from the dataset.
+                // Clean up so we don't retry this every launch.
                 localStorage.removeItem('activeLocationId');
                 localStorage.removeItem('audioPosition');
             }
         }
     } catch (e) {
-        console.warn('[Recovery] Failed to restore session:', e);
+        // localStorage can throw in private browsing / quota-exceeded
+        // scenarios. Non-fatal — just skip recovery.
+        console.warn('[Hunt] Session recovery failed:', e);
     }
 
-    // Only start proximity checks if not recovering into a location
-    if (!recovered) {
+    // ── Start proximity monitoring ──
+    // Skip if we recovered into a location — proximity checks would
+    // immediately re-trigger the same location and fight the recovery.
+    if (!recovered && typeof startIdleProximityCheck === 'function') {
         startIdleProximityCheck();
     }
 }
@@ -9319,69 +9367,81 @@ function optimizeImages(root = document) {
 }
         
 function setupImageOptimizationObserver() {
-  if (typeof MutationObserver === 'undefined') return;
-  
-  const pendingRoots = new Set();
-  let rafId = null;
-
-  const processPending = () => {
-    rafId = null;
-    pendingRoots.forEach(root => optimizeImages(root));
-    pendingRoots.clear();
-  };
-
-  const observer = new MutationObserver((mutations) => {
-    for (const mutation of mutations) {
-      if (mutation.type !== 'childList' || mutation.addedNodes.length === 0) continue;
-      
-      for (const node of mutation.addedNodes) {
-        if (node.nodeType !== Node.ELEMENT_NODE) continue;
-        
-        if (node.tagName === 'IMG') {
-          // Scan the parent to catch the newly added IMG
-          pendingRoots.add(node.parentElement || document.body);
-        } else if (node.querySelector('img')) {
-          // Only scan containers if they actually contain images
-          pendingRoots.add(node);
+      if (typeof MutationObserver === 'undefined') return;
+    
+      const pendingRoots = new Set();
+      let rafId = null;
+    
+      const processPending = () => {
+        rafId = null;
+        pendingRoots.forEach(root => {
+          // Defense-in-depth: skip if the root itself is a Leaflet container
+          // (shouldn't happen given the callback guards, but cheap insurance).
+          if (root.closest && root.closest('.leaflet-container')) return;
+          optimizeImages(root);
+        });
+        pendingRoots.clear();
+      };
+    
+      const observer = new MutationObserver((mutations) => {
+        for (const mutation of mutations) {
+          if (mutation.type !== 'childList' || mutation.addedNodes.length === 0) continue;
+    
+          for (const node of mutation.addedNodes) {
+            if (node.nodeType !== Node.ELEMENT_NODE) continue;
+    
+            // ── SKIP LEAFLET INTERNALS ──────────────────────────────────
+            // Leaflet creates/destroys hundreds of <img> tiles during
+            // pan/zoom. Processing them causes:
+            //   1. CPU waste: querySelectorAll on the tile pane every frame
+            //   2. Layout breakage: optimizeImages sets width/height/
+            //      aspectRatio/loading="lazy" on tiles, conflicting with
+            //      Leaflet's own positioning (transform-based, not
+            //      attribute-based).
+            // Leaflet tiles carry the class "leaflet-tile"; all map
+            // internals live under ".leaflet-pane" or ".leaflet-container".
+            if (node.classList && node.classList.contains('leaflet-tile')) continue;
+            if (node.closest && node.closest('.leaflet-pane')) continue;
+    
+            if (node.tagName === 'IMG') {
+              pendingRoots.add(node.parentElement || document.body);
+            } else if (node.querySelector && node.querySelector('img')) {
+              pendingRoots.add(node);
+            }
+          }
         }
-      }
+    
+        // Batch all mutations into a single DOM scan per frame
+        if (pendingRoots.size > 0 && rafId === null) {
+          rafId = requestAnimationFrame(processPending);
+        }
+      });
+    
+      observer.observe(document.body, {
+        childList: true,
+        subtree: true
+      });
+    
+      return {
+        observer,
+        destroy: () => {
+          if (rafId) cancelAnimationFrame(rafId);
+          pendingRoots.clear();
+          observer.disconnect();
+        }
+      };
     }
-
-    // Batch all mutations into a single DOM scan per frame
-    if (pendingRoots.size > 0 && rafId === null) {
-      rafId = requestAnimationFrame(processPending);
+    
+    // Initialize on DOM ready
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', () => {
+        optimizeImages();
+        window.imageOptimizerHandle = setupImageOptimizationObserver();
+      });
+    } else {
+      optimizeImages();
+      window.imageOptimizerHandle = setupImageOptimizationObserver();
     }
-  });
-  
-  observer.observe(document.body, {
-    childList: true,
-    subtree: true
-  });
-  
-  return {
-    observer,
-    destroy: () => {
-      if (rafId) cancelAnimationFrame(rafId);
-      pendingRoots.clear();
-      observer.disconnect();
-    }
-  };
-}
-
-// Initialize on DOM ready
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', () => {
-    optimizeImages();
-    // Stored so destroy()/observer are actually reachable — previously the
-    // return value was discarded at both call sites, meaning the observer
-    // could never be torn down (relevant for SPA-style page teardown
-    // without a full navigation).
-    window.imageOptimizerHandle = setupImageOptimizationObserver();
-  });
-} else {
-  optimizeImages();
-  window.imageOptimizerHandle = setupImageOptimizationObserver();
-}
 
 /* EVENT LISTENER SETUP */
 
