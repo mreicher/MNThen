@@ -597,6 +597,14 @@
                     return null;
                 }
     
+                // Dedup: if this exact element+event+handler+options combo is
+                // already tracked and active, return the existing entry instead
+                // of attaching a second DOM listener and growing the registry
+                // further. Without this, any code path that re-registers "the
+                // same" listener over a long session (reconnect loops, repeated
+                // setup calls) leaked both a duplicate listener AND a duplicate
+                // registry entry indefinitely — the registry only ever grew,
+                // never shrank, until full page-unload disposal.
                 const existing = listenerRegistry.find(e =>
                     e.active &&
                     e.element === element &&
@@ -612,7 +620,10 @@
                 return entry;
             },
     
-            // Remove a single tracked listener before full disposal.
+            // NEW — remove a single tracked listener before full disposal.
+            // Purely additive: existing callers that never call this are
+            // unaffected, and dispose() still works exactly as before for
+            // whatever's left in the registry at teardown time.
             untrack(entry) {
                 if (!entry || !entry.active) return false;
                 try {
@@ -704,6 +715,10 @@
             createTrackedInterval: timerSubsystem.createInterval.bind(timerSubsystem),
             clearTrackedTimer:     timerSubsystem.clear.bind(timerSubsystem),
             trackEventListener:    listenerSubsystem.track.bind(listenerSubsystem),
+    
+            // Companion to trackEventListener. Pass the entry it returned
+            // to remove that one listener early instead of waiting for full
+            // disposal. Additive; nothing existing needs to change to keep working.
             untrackEventListener: listenerSubsystem.untrack.bind(listenerSubsystem),
     
             registerCleanupTask(fn) {
@@ -799,6 +814,11 @@
             const dt = (timestampPerfNow - this.lastTimestamp) / 1000;
          
             if (dt <= 0 || dt > 30) {
+                // _initialize() prefers _pendingSeedVelocity (the gap-aware seed from
+                // scheduleVelocitySeed) over anything else, and consumes/nulls it.
+                // Previously this branch then unconditionally reapplied the stale
+                // pre-gap _lastSeedVelocity right on top, discarding that fresher
+                // estimate. Only fall back to it if there was nothing better.
                 const hadPendingSeed = !!this._pendingSeedVelocity;
                 const fallbackSeed = this._lastSeedVelocity;
                 this._initialize(lat, lng, R, timestampPerfNow);
@@ -941,6 +961,11 @@
         // Initial velocity-covariance seed. The variance must reflect how well we
         // actually know the initial velocity (which is seeded to [0,0] when there is
         // no directional hint):
+        //   - hint present  -> moderate variance, trust the seeded velocity.
+        //   - GPS moving, no hint -> LARGE variance: we know we are moving but not the
+        //     direction, so let the first fixes snap velocity to the truth (no lag).
+        //   - stationary -> SMALL variance: pin velocity near zero so GPS scatter
+        //     cannot manufacture phantom motion (no jitter while standing still).
         const v0 = hasVelocityHint ? 2.25 : (this._lastGPSSpeedMPS > 0.3 ? 225.0 : 0.5);
         this.P = [[R2,0,0,0],[0,R2,0,0],[0,0,v0,0],[0,0,0,v0]];
         this.lastTimestamp = timestampPerfNow;
@@ -954,7 +979,9 @@
             const kalmanSpeed = Math.sqrt(this.x[2]*this.x[2] + this.x[3]*this.x[3]);
             const speed = Math.max(kalmanSpeed, (this._lastGPSSpeedMPS || 0) * 0.9);
             this._currentSpeedMPS = speed;
-
+            // Was a hard cutoff at 0.1 (0.5 flat below it, 1.0 flat from 0.1–0.5) —
+            // a 2x step landing right in the stop/start speed range. Continuous
+            // ramp from 0.5 at speed=0 up to 1.0 at speed=0.5 instead.
             if      (speed >= 15)  { this.accelNoise = 8.0; }
             else if (speed >= 8)   { this.accelNoise = 3.0 + (speed - 8) * (5.0 / 7); }
             else if (speed >= 2)   { this.accelNoise = 3.0; }
@@ -1057,6 +1084,9 @@
 /* ═══════════════════════════════════════════════════════════════
    SENSOR FUSION MANAGER
    ═══════════════════════════════════════════════════════════════ */
+// Circular interpolation between two headings in degrees — a plain lerp
+// would take the wrong way around at the 0/360 wrap (e.g. blending 350°
+// toward 10° should pass through 0°, not swing back through 180°).
 function _blendHeadingDeg(a, b, t) {
     let diff = b - a;
     diff = ((diff + 180) % 360 + 360) % 360 - 180; // normalize to [-180, 180]
@@ -1114,6 +1144,10 @@ class SensorFusionManager {
         this._initDeviceOrientation();
         this._initAccelerometer();
         this._initKalmanFilter();
+
+        // Guaranteed cleanup on page hide/unload — fires even on mobile Safari
+        // where beforeunload is unreliable. destroy() removes listeners directly,
+        // so this is the safety net for when the app forgets to call destroy().
         this._pageHideHandler = () => this.destroy();
         window.addEventListener('pagehide', this._pageHideHandler, { once: true });
 
@@ -1121,6 +1155,11 @@ class SensorFusionManager {
     }
 
     getCurrentStateAgeMs() {
+        // _lastKalmanTimestamp is already in performance.now() space, but
+        // _rawTimestamp is a wall-clock (Date.now()-based) timestamp from the
+        // Geolocation API and must be converted before comparing against
+        // performance.now() — otherwise this mixes two different epochs and
+        // returns a nonsense (usually hugely negative) value.
         const lastTime = this._lastKalmanTimestamp || (this._rawTimestamp ? this._toPerfNow(this._rawTimestamp) : 0);
         return lastTime ? (performance.now() - lastTime) : 0;
     }
@@ -1300,6 +1339,11 @@ class SensorFusionManager {
 _updateStationaryState(gpsSpeedMPS, kalmanSpeedMPS, rawLat, rawLng) {
     const speed = Math.max(gpsSpeedMPS || 0, kalmanSpeedMPS || 0);
     const accelMoving = this._accelAvailable && this._isMoving;
+
+    // Single crossover -- no dead zone. The asymmetric hysteresis (2
+    // consecutive "moving" samples to leave stationary, 3 consecutive
+    // "still" samples to enter it) still lives below and still does the
+    // actual debouncing.
     const MOVING_SPEED_MPS = 0.45;
     if (speed >= MOVING_SPEED_MPS || accelMoving) {
         this._moveStreak = (this._moveStreak || 0) + 1;
@@ -1453,6 +1497,9 @@ _updateStationaryState(gpsSpeedMPS, kalmanSpeedMPS, rawLat, rawLng) {
             resultLat = this._stationaryPosition.lat; resultLng = this._stationaryPosition.lng;
             resultVNorth = 0; resultVEast = 0; resultSpeed = 0; blendFactor = 1.0;
             this._filteredSpeedMPS = 0;
+            // Was missing here — position was frozen but _rawVelocity below still
+            // carried raw GPS-delta noise, which getSmoothedVelocityDegPerSec()
+            // can hand to callers pre-convergence despite the frozen position.
             holdStill = true;
         } else if (this._convergenceStage === 0) {
             let holdLat = null, holdLng = null;
@@ -1495,7 +1542,12 @@ _updateStationaryState(gpsSpeedMPS, kalmanSpeedMPS, rawLat, rawLng) {
 
   getSmoothedVelocityDegPerSec() {
     if (this._convergenceStage < 2) {
-
+        // Pre-convergence, DR was riding directly on raw, unsmoothed GPS
+        // noise for its predictive extrapolation. A single noisy early fix
+        // could imply an implausible instantaneous speed and send the
+        // marker darting ahead before snapping back next fix. Reject
+        // physically-impossible spikes and lightly damp against the
+        // previous sample; behavior once converged is unchanged.
         const raw = this._rawVelocity || { lat: 0, lng: 0 };
         const cosLatGuard = Math.cos((this._lastKalmanLat || this._rawLat || 0) * Math.PI / 180) || 1;
         const rawSpeedMPS = Math.sqrt(
@@ -1565,6 +1617,10 @@ _updateStationaryState(gpsSpeedMPS, kalmanSpeedMPS, rawLat, rawLng) {
         return (gpsSpeedMPS || 0) > 0.5;
     }
 
+    // Same hard-cutoff bug as getFilteredHeading/_getHybridVelocity had
+    // (switched abruptly at speed > 5.0), plus speedMPS || this._filteredSpeedMPS
+    // discarded a legitimate 0 via falsy-OR. Fixed the same way: blend across
+    // the shared HEADING_BLEND_LOW/HIGH band, ?? instead of || for the 0 case.
     getHeading(gpsHeading, speedMPS) {
         const speed = speedMPS ?? this._filteredSpeedMPS ?? 0;
         const hasGpsHeading = gpsHeading != null && isFinite(gpsHeading);
@@ -1588,6 +1644,7 @@ _updateStationaryState(gpsSpeedMPS, kalmanSpeedMPS, rawLat, rawLng) {
         this._lastKalmanTimestamp = null;
         this._preConvergenceVelocity = null;
     
+        // Stationary detection — full restart
         this._lastStationaryState = false;
         this._stationaryPosition = null;
         this._stationarySamples = [];
@@ -1595,7 +1652,9 @@ _updateStationaryState(gpsSpeedMPS, kalmanSpeedMPS, rawLat, rawLng) {
         this._unfreezeCounter = 0;
         this._moveStreak = 0;
         this._stillStreak = 0;
-
+    
+        // Raw input snapshots — prevents _computeGPSVelocity from
+        // computing a bogus vector across the reset boundary.
         this._rawLat = null;
         this._rawLng = null;
         this._rawSpeedMPS = null;
@@ -1603,7 +1662,8 @@ _updateStationaryState(gpsSpeedMPS, kalmanSpeedMPS, rawLat, rawLng) {
         this._rawTimestamp = null;
         this._rawVelocity = { lat: 0, lng: 0 };
         this._gpsVelocityDegPerSec = { lat: 0, lng: 0 };
-
+    
+        // Smoothed heading — re-initializes from next compass reading.
         this._smoothedHeading = null;
         this._lastCompassHeading = null;
         this._compassStableCount = 0;
@@ -1774,48 +1834,46 @@ window.sensorFusion = new SensorFusionManager().init();
     userMarker.setLatLng([lat, lng]);
 }
 
-    function _snapViewport(lat, lng) {
-    if (!map) return;
+ function _snapViewport(lat, lng) {
+  if (!map) return;
+  if (window._mapAnimating) return;
 
-    const currentZoom = map.getZoom();
-    if (_lastSnapZoom !== null && currentZoom !== _lastSnapZoom) {
-        _panRemainder.x = 0;
-        _panRemainder.y = 0;
-        _centeredLat = lat;
-        _centeredLng = lng;
-        _lastSnapZoom = currentZoom;
-        map.setView([lat, lng], currentZoom, { animate: false, pan: { noMoveStart: true } });
-        return;
-    }
-    _lastSnapZoom = currentZoom;
-
-    const target = map.latLngToContainerPoint([lat, lng]);
-    const size = map.getSize();
-    const dx = target.x - size.x / 2;
-    const dy = target.y - size.y / 2;
-
-    if (Math.abs(dx) > size.x * 0.25 || Math.abs(dy) > size.y * 0.25) {
-        _panRemainder.x = 0;
-        _panRemainder.y = 0;
-        _centeredLat = lat;
-        _centeredLng = lng;
-        map.setView([lat, lng], map.getZoom(), { animate: false, pan: { noMoveStart: true } });
-        return;
-    }
-
-    _panRemainder.x += dx;
-    _panRemainder.y += dy;
-    const px = Math.round(_panRemainder.x);
-    const py = Math.round(_panRemainder.y);
-    if (px === 0 && py === 0) return;
-    _panRemainder.x -= px;
-    _panRemainder.y -= py;
+  const currentZoom = map.getZoom();
+  if (_lastSnapZoom !== null && currentZoom !== _lastSnapZoom) {
     _centeredLat = lat;
     _centeredLng = lng;
+    _lastSnapZoom = currentZoom;
+    map.setView([lat, lng], currentZoom, { animate: false, pan: { noMoveStart: true } });
+    return;
+  }
+  _lastSnapZoom = currentZoom;
 
-    map.panBy([px, py], { animate: false, noMoveStart: true });
+  const target = map.latLngToContainerPoint([lat, lng]);
+  const size   = map.getSize();
+  const dx = target.x - size.x / 2;
+  const dy = target.y - size.y / 2;
+
+  if (Math.abs(dx) > size.x * 0.25 || Math.abs(dy) > size.y * 0.25) {
+    _centeredLat = lat;
+    _centeredLng = lng;
+    map.setView([lat, lng], currentZoom, { animate: false, pan: { noMoveStart: true } });
+    return;
+  }
+
+  // dx/dy are measured fresh every frame, so they already include any
+  // sub-pixel leftover from the previous pan. Panning by the rounded
+  // error keeps the residual bounded at 0.5px — no accumulator needed.
+  // (The old _panRemainder double-counted that leftover and produced a
+  // self-sustaining ±1px pan every frame — the whole-map shake.)
+  const px = Math.round(dx);
+  const py = Math.round(dy);
+  if (px === 0 && py === 0) return;
+
+  _centeredLat = lat;
+  _centeredLng = lng;
+  map.panBy([px, py], { animate: false, noMoveStart: true });
 }
-
+      
     function _seedVelocityOnResume() {
         if (!window.sensorFusion || !_lastGoodSpeedMPS || _lastHeadingDeg == null) return;
         const kf = window.sensorFusion._kalmanFilter;
@@ -1834,6 +1892,10 @@ window.sensorFusion = new SensorFusionManager().init();
         return null;
     }
 
+    // --- NEW: one-shot marker/viewport sync used when the predictive rAF loop
+    // is not going to run (e.g. stationary, first fix, non-centered + below
+    // speed threshold). This is what closes the "marker never updates" gap
+    // without introducing a second competing writer alongside frame(). ---
     function _immediateSync() {
         if (window.isLocationHuntVisible) return;
         const pos = _resolveBestKnownPosition();
@@ -1862,6 +1924,11 @@ window.sensorFusion = new SensorFusionManager().init();
     const stationary = _isStationary();
     const centered   = _isCenteredMode();
  
+    // Stationary -> moving transition: prime the filter with the last known
+    // good speed/heading instead of letting it ramp up from zero. Previously
+    // this only happened inside _start(), which is a no-op once the loop is
+    // already active — i.e. it never fired during a normal stop-and-go while
+    // centered, since the loop doesn't stop in that mode.
     const movingNow = speedMPS >= CFG.MIN_SPEED_MPS;
     if (movingNow && !_wasMoving) _seedVelocityOnResume();
     _wasMoving = movingNow;
@@ -1901,7 +1968,12 @@ window.sensorFusion = new SensorFusionManager().init();
     if (hdg != null) _lastHeadingDeg = hdg;
  
     const vel = _getVelocity();
-
+    // Was gated on the raw degrees/sec vector magnitude against a threshold
+    // (0.001) that's calibrated for m/s — that combination is only true above
+    // ~110 m/s, so this never fired at real-world speeds and _lastGoodSpeedMPS
+    // stayed 0 forever, permanently disabling _seedVelocityOnResume(). Gate on
+    // speedMPS (already real-world units) instead, matching the 0.3 floor
+    // _seedVelocityOnResume() itself uses.
     if (speedMPS > 0.3) { _lastGoodVelocity = { lat: vel.lat, lng: vel.lng }; _lastGoodSpeedMPS = speedMPS; }
  
     let pLat, pLng;
@@ -1922,6 +1994,9 @@ window.sensorFusion = new SensorFusionManager().init();
     _lastPredictedPos = { lat: pLat, lng: pLng };
  
     const HOLD_SPEED_MPS = CFG.MIN_SPEED_MPS;
+    // Was 0.15m — tighter than typical filtered-position jitter at a stop,
+    // so the hold almost never engaged and raw noise passed straight to the
+    // marker. That's the rubberbanding right as you come to a stop.
     const HOLD_DEADBAND_M = 1.0;
  
     const prevHeld = window.__drHeld;
@@ -1959,7 +2034,7 @@ window.sensorFusion = new SensorFusionManager().init();
     _rafId = requestAnimationFrame(frame);
 }
 
-    function _start() {
+   function _start() {
         if (_active) return true;
     
         // Wake guard — _executeRender's RAF calls forceUpdate() → _start()
@@ -2003,6 +2078,11 @@ window.sensorFusion = new SensorFusionManager().init();
 
         onMovementResumed: _start,
 
+        // --- If DR declines to run its
+        // continuous loop (stationary / first fix / below speed threshold,
+        // non-centered), it now does a one-shot direct sync instead of
+        // silently doing nothing. DR remains the single writer of marker
+        // and viewport state either way — no dual-write with _executeRender. ---
        forceUpdate() {
             if (_active) {
                 _lastFrameTime = 0;
@@ -2097,6 +2177,13 @@ function announceToScreenReader(message, priority = 'polite') {
         cachedElements?.accessibilityAnnouncements;
 
     if (!element) return;
+
+    // Dedupe per priority/element, not globally. proximityAnnouncements and
+    // accessibilityAnnouncements are two independent ARIA live regions —
+    // comparing against a single shared accessibilityState.lastAnnouncement
+    // meant an announcement on one channel could silently suppress the same
+    // text on the other, dropping a real announcement a screen reader user
+    // was supposed to hear.
     if (message === _lastAnnouncementByPriority[priority]) return;
 
     element.textContent = message;
@@ -2147,6 +2234,9 @@ const trackedTimeouts = new Set();
     // clearTimeout(window[key]), which cancels it at the browser level but
     // can't remove it from trackedTimeouts (that only happens inside
     // wrappedCallback, which never runs if the timeout was cancelled early).
+    // Using this instead keeps the Set accurate immediately rather than
+    // leaving stale ids until the next full sweep. Safe to call with any id,
+    // tracked or not, or already fired — clearTimeout on those is a no-op.
     function clearTrackedTimeout(id) {
         clearTimeout(id);
         trackedTimeouts.delete(id);
@@ -2162,6 +2252,12 @@ const trackedTimeouts = new Set();
    ────────────────────────────────────────────── */
     function initMap() {
         // ── Guard: full teardown if re-initializing ──
+        // disposeMapLoop() only clears window-scoped RAF/timeout/interval handles
+        // (see its rafHandles/timeoutHandles/intervalHandles lists) — it does NOT
+        // stop dead reckoning, whose animation-frame id is a closure-private
+        // variable inside deadReckoning and is never exposed on window. Without
+        // this explicit stop, DR keeps extrapolating and writing to `userMarker`
+        // and `map` straight through the teardown/recreate below.
         if (typeof disposeMapLoop === 'function') disposeMapLoop();
         if (window.deadReckoning && typeof window.deadReckoning.stop === 'function') {
             window.deadReckoning.stop();   // also clears _drOwnsMarker / _drLastOwnsTime
@@ -2175,12 +2271,23 @@ const trackedTimeouts = new Set();
             try { markerClusterGroup.clearLayers(); } catch (e) {}
             markerClusterGroup = null;
         }
-
+        // userMarker wasn't being torn down like the layers above — it was left
+        // pointing at the old (now-detached) marker instance until reassigned
+        // further down. Every marker-write path (dead reckoning's
+        // _setMarkerPosition, scheduleMarkerUpdate) gates on
+        // `typeof userMarker !== 'undefined' && userMarker` being truthy, so a
+        // stale-but-truthy reference here means those gates pass when they
+        // shouldn't, during the window before the new marker exists.
         if (userMarker) {
             try { userMarker.remove(); } catch (e) {}
             userMarker = null;
         }
     
+        // Render-state globals consumed by the GPS render scheduler
+        // (_scheduleMapUpdate / _executeRender). disposeMapLoop cancels the
+        // pending RAF but leaves this state pointing at the old map/position —
+        // clear it so nothing can act on stale state if it's read before the
+        // next real GPS update arrives.
         window._currentMapState    = null;
         window._currentRenderState = null;
         window._currentSpeedTier   = null;
@@ -3255,7 +3362,7 @@ function handlePositionUpdate(position) {
 /* ──────────────────────────────────────────────
    VISIBILITY CHANGE HANDLER
    ────────────────────────────────────────────── */
-   function handleVisibilityChange() {
+  function handleVisibilityChange() {
     if (document.hidden) {
         window.lastHiddenTime = Date.now();
         lastKnownPosition = userMarker?.getLatLng() ?? null;
@@ -3690,83 +3797,64 @@ function updateLocationAfterBackground() {
 /* ──────────────────────────────────────────────
    MAP INTERACTION & INACTIVITY HANDLERS
    ────────────────────────────────────────────── */
-  function setupMapInteractionHandlers() {
-        if (!map || window._interactionHandlersSetup) return;
-        window._interactionHandlersSetup = true;
-    
-        if (typeof window.isMapInteracting === 'undefined') {
-            window.isMapInteracting = false;
-        }
-    
-        const STATIONARY_SPEED_MPH = 1.0;
-    
-        // Was bound to 'movestart'/'moveend'. Leaflet fires those on
-        // EVERY setView/panTo call, programmatic or not — including dead
-        // reckoning's per-frame viewport sync (per the codebase's own DR
-        // behavior confirmed elsewhere) and every animated re-center this app
-        // does (handleContinueClick, _handleInactivityReset, etc). That meant:
-        //   - DR's frame loop fired onInteractionEnd on every single frame it
-        //     was active, doing unnecessary work and timer churn.
-        //   - Any programmatic setView/panTo that wasn't guarded by
-        //     _programmaticFlyInProgress (several weren't, before recent fixes)
-        //     fired onInteractionStart and silently set followUser = false,
-        //     killing centered mode with no user action involved.
-        // 'dragstart'/'dragend' fire ONLY on an actual user pan gesture (mouse
-        // drag or touch drag), never from setView/panTo, so this is a strictly
-        // more accurate signal for "the user grabbed the map." This is the
-        // reason _programmaticFlyInProgress and noMoveStart guards exist
-        // elsewhere — this change removes most of the need for them at the
-        // pan level, though they still matter for zoom (see below) and are
-        // left in place as defense in depth.
-        //
-        // 'zoomstart'/'zoomend' are kept as-is: pinch-zoom and double-tap-zoom
-        // don't fire drag events, so this is still the only signal for
-        // user-initiated zoom. Programmatic zooms (e.g. proximity auto-zoom)
-        // still rely on the window._programmaticFlyInProgress guard to avoid
-        // being mistaken for user zoom — that guard is unchanged and still
-        // required.
-        const onInteractionStart = () => {
-            // FIX: Ignore programmatic moves (zoom transitions, recentering)
-            // This prevents followUser from being toggled off automatically.
-            if (window._programmaticFlyInProgress) {
-                return;
-            }
-    
-            window.followUser = false;
-            window.isMapInteracting = true;
-            _clearInactivityTimer();
-        };
-    
-        const onInteractionEnd = () => {
-            // Guard: Do not allow interaction end to reset flags if we are mid-animation.
-            if (window._programmaticFlyInProgress) return;
-    
-            window.isMapInteracting = false;
-            const speedMPH = window.lastPosition?.speedMPS
-                ? window.lastPosition.speedMPS * 2.23694
-                : 0;
-    
-            // If stationary, start the timer to re-center
-            if (speedMPH < STATIONARY_SPEED_MPH) {
-                _startInactivityTimer();
-            }
-            // If moving, ensure dead reckoning is active
-            else if (window.followUser && window.deadReckoning && typeof window.deadReckoning.isActive === 'function') {
-                if (!window.deadReckoning.isActive()) {
-                    window.deadReckoning.start();
-                }
-            }
-        };
-    
-        // User-initiated pan only (was 'movestart'/'moveend' — see comment above).
-        map.on('dragstart', onInteractionStart);
-        map.on('dragend', onInteractionEnd);
-    
-        // User-initiated zoom (pinch, double-tap, zoom control). Unchanged —
-        // there's no drag-equivalent event for zoom gestures.
-        map.on('zoomstart', onInteractionStart);
-        map.on('zoomend', onInteractionEnd);
+ function setupMapInteractionHandlers() {
+    if (!map || window._interactionHandlersSetup) return;
+    window._interactionHandlersSetup = true;
+
+    if (typeof window.isMapInteracting === 'undefined') {
+        window.isMapInteracting = false;
     }
+
+    const STATIONARY_SPEED_MPH = 1.0;
+
+    const onInteractionStart = () => {
+        if (window._programmaticFlyInProgress) {
+            return;
+        }
+        window.followUser = false;
+        window.isMapInteracting = true;
+        _clearInactivityTimer();
+    };
+
+    const onInteractionEnd = () => {
+        if (window._programmaticFlyInProgress) return;
+
+        window.isMapInteracting = false;
+        const speedMPH = window.lastPosition?.speedMPS
+            ? window.lastPosition.speedMPS * 2.23694
+            : 0;
+
+        if (speedMPH < STATIONARY_SPEED_MPH) {
+            _startInactivityTimer();
+        }
+        else if (window.followUser && window.deadReckoning && typeof window.deadReckoning.isActive === 'function') {
+            if (!window.deadReckoning.isActive()) {
+                window.deadReckoning.start();
+            }
+        }
+    };
+
+    // User-initiated pan only.
+    map.on('dragstart', onInteractionStart);
+    map.on('dragend', onInteractionEnd);
+
+    // User-initiated zoom (pinch, double-tap, zoom control).
+    map.on('zoomstart', onInteractionStart);
+    map.on('zoomend', onInteractionEnd);
+
+    // Separate from the interaction handlers above — this tracks "is any
+    // zoom transition visually playing right now", regardless of whether it
+    // was user- or code-initiated. getZoom() reports the target zoom the
+    // instant an animated zoom starts, while the CSS scale transition is
+    // still playing for ~250ms after. DR was computing latLngToContainerPoint
+    // against that already-updated logical zoom while the actual on-screen
+    // scale hadn't caught up yet, and correcting against a moving target —
+    // that fight is a large part of what reads as shaking. zoomstart/zoomend
+    // fire reliably even under noMoveStart/_programmaticFlyInProgress (only
+    // movestart gets suppressed by those), so this is a safe, simple signal.
+    map.on('zoomstart', () => { window._mapAnimating = true; });
+    map.on('zoomend',   () => { window._mapAnimating = false; });
+}
 
 function _clearInactivityTimer() {
     if (window.inactivityTimer) {
@@ -3785,25 +3873,26 @@ function _handleInactivityReset() {
     const speed = pos ? pos.speedMPS * 2.23694 : 0;
 
     if (pos && speed < 0.5 && map && userMarker) {
-        // Re-enable following BEFORE panning so the GPS loop picks it up immediately
         window.followUser       = true;
         window.isMapInteracting = false;
 
-        // NOTE: now that pan interaction is detected via dragstart/dragend
-        // instead of movestart/moveend, this panTo no longer fires
-        // onInteractionStart at all (panTo isn't a drag), so the
-        // noMoveStart option below is technically no longer load-bearing
-        // for THIS call. Left in place as harmless defense in depth in
-        // case the event bindings above ever change back, and because
-        // noMoveStart is the correct top-level form for panTo regardless
-        // (see handleContinueClick's setView comment for why setView needs
-        // it nested under `pan` instead — panTo self-nests it for you).
+        // Same problem as zoom, different trigger: followUser flips true
+        // here, DR's rAF loop picks that up on its very next frame — while
+        // this 1s panTo is still animating — and starts issuing its own
+        // panBy corrections on top of Leaflet's own transition. noMoveStart
+        // suppresses 'movestart' at the source, so DR can't learn "an
+        // animation just began" from that event the way it can for zoom;
+        // set the flag explicitly here instead, and clear it on a timeout
+        // slightly past the animation's own duration.
+        window._mapAnimating = true;
         map.panTo([pos.lat, pos.lng], {
             animate:       true,
             duration:      1.0,
             easeLinearity: 0.15,
             noMoveStart:   true
         });
+        createTrackedTimeout(() => { window._mapAnimating = false; }, 1050);
+
         userMarker.setLatLng([pos.lat, pos.lng]);
         window.stationaryStartTime = Date.now();
     }
@@ -4583,45 +4672,89 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
 /* ──────────────────────────────────────────────
    STEP 2: Gap Handling & Velocity Seeding 
    ────────────────────────────────────────────── */
-    function _handleGPSGap(fix, lastPos, timeDelta) {
+  function _handleGPSGap(fix, lastPos, timeDelta) {
+    if (!lastPos) return;
+    var kf = window.sensorFusion && window.sensorFusion._kalmanFilter;
+    if (!kf) return;
 
-        if (!lastPos) return;
-        var kf = window.sensorFusion && window.sensorFusion._kalmanFilter;
-        if (!kf) return;
-        // Medium gap (10–300s): seed velocity from displacement, but only if actually moved
-        if (timeDelta > 10 && timeDelta < 300) {
-            var dt = timeDelta;
-            var cosLat = Math.cos(fix.lat * Math.PI / 180);
-            var vNorth = ((fix.lat - lastPos.lat) / dt) * 111111;
-            var vEast = ((fix.lng - lastPos.lng) / dt) * 111111 * cosLat;
-            var moved = Math.abs(vNorth) > 0.1 || Math.abs(vEast) > 0.1;
-            if (moved) {
-                kf.seedVelocity(vNorth, vEast, 4.0);
-                window.isStationary = false;
-                window.stationaryStartTime = null;
-                window.stationaryLockPosition = null;
+    // Medium gap (10-300s): seed velocity from displacement, but only if actually moved
+    if (timeDelta > 10 && timeDelta < 300) {
+        var dt = timeDelta;
+        var cosLat = Math.cos(fix.lat * Math.PI / 180);
+        var dN = (fix.lat - lastPos.lat) * 111111;
+        var dE = (fix.lng - lastPos.lng) * 111111 * cosLat;
+
+        // Was a flat 0.1 m/s velocity threshold — ordinary GPS wander (1-2m)
+        // over a 10s gap clears that on its own, a false "moved" from pure
+        // noise. Use the same accuracy-aware distance floor sensorFusion's
+        // own gap-recovery seed already uses, instead of a separate, weaker
+        // check for what's conceptually the same decision.
+        var distMoved = Math.sqrt(dN * dN + dE * dE);
+        var noiseFloorM = Math.max((fix.accuracy || 20) * 2, 10);
+        var moved = distMoved > noiseFloorM;
+
+        if (moved) {
+            var vNorth = dN / dt;
+            var vEast = dE / dt;
+
+            // If the filter was frozen going into this gap, seedVelocity()
+            // alone is a no-op — kf.update()'s frozen branch re-measures the
+            // old frozen point regardless of velocity, so the real fix would
+            // still get discarded next update. Unfreeze first. Also clear
+            // sensorFusion's own stationary bookkeeping, not just the
+            // app-level flags below — its outer stationary-check in
+            // smoothPosition() can still override back to the stale frozen
+            // position even after the filter itself is unfrozen.
+            if (typeof kf.isFrozen === 'function' && kf.isFrozen()) {
+                kf.unfreeze();
             }
-            // else: didn't move, leave stationary state as-is (might still be stationary)
-            return;
-        }
-        // Long gap (≥300s): full reset. Now actually reachable — previously
-        // timeDelta arrived here pre-clamped to a 30s ceiling, so this branch
-        // could never fire no matter how long GPS was actually lost.
-        if (timeDelta >= 300) {
-            kf.reset();
-            window.smoothedVelocity = { lat: 0, lng: 0 };
+            kf.seedVelocity(vNorth, vEast, 4.0);
+
             window.isStationary = false;
             window.stationaryStartTime = null;
             window.stationaryLockPosition = null;
-            // Clear stale position buffer so velocity calc starts fresh
-            if (window.positionBuffer) {
-                window.positionBuffer.length = 0;
+            if (window.sensorFusion) {
+                window.sensorFusion._lastStationaryState = false;
+                window.sensorFusion._stationaryPosition = null;
+                window.sensorFusion._stationarySamples = [];
             }
         }
+        // else: didn't move, leave stationary state as-is (might still be stationary)
+        return;
     }
+
+    // Long gap (>=300s): full reset. Now actually reachable — previously
+    // timeDelta arrived here pre-clamped to a 30s ceiling, so this branch
+    // could never fire no matter how long GPS was actually lost.
+    if (timeDelta >= 300) {
+        kf.reset();
+        // kf.reset() only resets the Kalman filter's own internal state.
+        // sensorFusion's wrapper-level bookkeeping (_lastStationaryState,
+        // _stationaryPosition, move/still streaks, _rawLat/_rawLng, the
+        // convergence stage) isn't touched by that and was being left stale
+        // here — risking the very next fix being silently overridden by a
+        // frozen position from before the gap. Same reset()+resetState()
+        // pairing used everywhere else in this codebase for a Kalman reset.
+        if (window.sensorFusion && typeof window.sensorFusion.resetState === 'function') {
+            try {
+                window.sensorFusion.resetState();
+            } catch (e) {
+                console.warn('[GPSGap] sensorFusion.resetState failed', e);
+            }
+        }
+        window.smoothedVelocity = { lat: 0, lng: 0 };
+        window.isStationary = false;
+        window.stationaryStartTime = null;
+        window.stationaryLockPosition = null;
+        // Clear stale position buffer so velocity calc starts fresh
+        if (window.positionBuffer) {
+            window.positionBuffer.length = 0;
+        }
+    }
+}
  
 /* ──────────────────────────────────────────────
-   Sensor Fusion 
+   STEP 3: Sensor Fusion 
    ────────────────────────────────────────────── */
     function _runSensorFusion(fix, lastPos, timeDelta, forceUpdate) {
         if (!window.sensorFusion) {
@@ -4729,7 +4862,7 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
     }
  
 /* ──────────────────────────────────────────────
-   Publish Fusion State 
+   STEP 4: Publish Fusion State 
    ────────────────────────────────────────────── */
    function _publishFusionState(fusionResult, fix) {
         window._predictedPosition = {
@@ -4771,7 +4904,7 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
     }
         
 /* ──────────────────────────────────────────────
-   Build Render State 
+   STEP 5: Build Render State 
    ────────────────────────────────────────────── */
    function _buildRenderState(fusionResult, fix, lastPos, timeDelta) {
         var speedMPS = fusionResult.speedMPS;
@@ -4819,7 +4952,7 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
     }
  
 /* ──────────────────────────────────────────────
-   Unified Render
+   STEP 6: Unified Render
    In centered mode the GPS update path only moves the
    marker — the viewport is owned exclusively by the dead reckoning RAF
    loop via _snapViewportToPosition (animate:false).  This eliminates
@@ -5035,6 +5168,10 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
     }
 
     // ── Animation flags ──
+    // clearAllTrackedTimeouts above killed the timeouts that clear these
+    // (handleContinueClick's 650ms, _executeRender's 300ms). Without
+    // this reset, a tab-away mid-animation leaves them true and
+    // handleInteractionStart silently ignores every user drag.
     window._programmaticFlyInProgress = false;
     window._isProximityZoomAnimating = false;
 
@@ -5114,6 +5251,15 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
     window.lastUpdateTime = currentTime;
     window.lastUpdateTimestamp = currentTime;
 
+    // Wake never derives velocity from the pre/post-background delta, even
+    // for short backgrounding stints. That delta is a GPS reacquisition
+    // jump, not real travel, and was the main source of the post-resume
+    // slide/bounce (previously this only got zeroed by luck, via the dtSec
+    // gate below, when the background stint happened to be long).
+    // For everything else, smoothedVelocity is now an actual EMA against
+    // the previous smoothed value instead of a raw copy of the instant
+    // two-point velocity — a single noisy GPS sample (common right as you
+    // slow down) can no longer spike it and cause DR rubberbanding.
     var prevSmoothed = window.smoothedVelocity || { lat: 0, lng: 0 };
     window.lastVelocity = { lat: 0, lng: 0 };
     window.smoothedVelocity = { lat: 0, lng: 0 };
@@ -5284,9 +5430,11 @@ function _cleanupProximityZoomState() {
     }
 }
 
-/* beforeunload cleanup — destroys sensor fusion,
+/* ──────────────────────────────────────────────
+   beforeunload cleanup — destroys sensor fusion,
    stops dead reckoning, and closes audio context.
-   Mobile fallback lives in pagehide handlers. */
+   Mobile fallback lives in pagehide handlers.
+   ────────────────────────────────────────────── */
 if (typeof window !== 'undefined') {
     var _doCleanup = function() {
         try {
@@ -5461,6 +5609,11 @@ function updateDistanceBox(forceUpdate = false, precalcUserPos = null, precalcCl
                             lastDisplayedText = arrivedText;
                         }
                         window.currentlyArrived = true;
+
+                        // Don't call handleProximityAndAutoOpen here — it's already called
+                        // at the top of this function every GPS tick. Double-calling it
+                        // causes debounce stamp confusion and potential double-open.
+
                         _stopCountdown();
 
                         if (window._cooldownExpiryTimeout) {
@@ -5566,6 +5719,9 @@ function updateDistanceBox(forceUpdate = false, precalcUserPos = null, precalcCl
         
 /* ──────────────────────────────────────────────
    calculateDistance — haversine formula.
+   Supports two signatures:
+     calculateDistance(lat1, lng1, lat2, lng2)
+     calculateDistance({lat, lng}, {lat, lng})
    Returns meters, or Infinity on invalid input.
    ────────────────────────────────────────────── */
 function calculateDistance(pos1OrLat, pos2OrLng, lat2, lng2) {
@@ -5809,7 +5965,9 @@ function recenterMap() {
         // _snapViewport on the very next frame.
         dr.forceUpdate();
     } else {
-        // DR is not running — snap directly.  
+        // DR is not running — snap directly.  noMoveStart prevents
+        // the synchronous movestart from flipping followUser back
+        // to false.
         window._programmaticFlyInProgress = true;
         map.panTo(ll, {
             animate:     false,
@@ -7445,7 +7603,8 @@ function initAudioPlayer() {
         }
     });
 
-    // Added touch scrubbing support. 
+    // Added touch scrubbing support. The setProgress function 
+    // already handled e.touches, but the events were never bound!
     if (progressContainer) {
         progressContainer.addEventListener('click', setProgress);
         
@@ -7698,6 +7857,13 @@ function handleContinueClick() {
         window.isMapInteracting           = false;
         window.followUser                 = true;
         window._programmaticFlyInProgress = true;
+        // DR's _snapViewport checks this before touching the viewport —
+        // without it, _restoreFullTracking's forceUpdate() at ~600ms
+        // (right at this animation's tail) could land a frame or two
+        // before the pan has actually settled on screen and fight it,
+        // same class of shaking this file already fixed once via the
+        // 650ms _programmaticFlyInProgress timing below.
+        window._mapAnimating              = true;
 
         // noMoveStart nested under `pan` — top-level is silently
         // ignored by Leaflet 1.9.4's setView (same quirk as
@@ -7718,6 +7884,7 @@ function handleContinueClick() {
         // swallowed by the _programmaticFlyInProgress guard.
         createTrackedTimeout(() => {
             window._programmaticFlyInProgress = false;
+            window._mapAnimating              = false;
         }, 650);
 
         // Do NOT start DR here. _restoreFullTracking (called from
@@ -7818,10 +7985,26 @@ function clearStationaryState() {
     window.isStationary = false;
     window.stationaryLockPosition = null;
     window.stationaryStartTime = null;
-
     if (window.stationaryCheckTimeout) {
         clearTimeout(window.stationaryCheckTimeout);
         window.stationaryCheckTimeout = null;
+    }
+
+    // window.isStationary is only the fallback — when window.sensorFusion
+    // exists, DR and smoothPosition() key off sensorFusion's own
+    // _lastStationaryState/_stationaryPosition instead. Without this,
+    // the Kalman filter could still be frozen here, and smoothPosition()
+    // would keep returning the old frozen position until the normal
+    // 2-consecutive-fix hysteresis caught up on its own — a stuck-then-jump
+    // right after whatever called this (e.g. handleContinueClick's recenter).
+    if (window.sensorFusion) {
+        const kf = window.sensorFusion._kalmanFilter;
+        if (kf && typeof kf.isFrozen === 'function' && kf.isFrozen()) {
+            kf.unfreeze();
+        }
+        window.sensorFusion._lastStationaryState = false;
+        window.sensorFusion._stationaryPosition = null;
+        window.sensorFusion._stationarySamples = [];
     }
 
     if (window.positionBuffer?.length > 0) {
@@ -7833,7 +8016,6 @@ function clearStationaryState() {
     } else if (!window.positionBuffer) {
         window.positionBuffer = [];
     }
-
     window.lastUpdateTime = null;
 }
         
@@ -7866,8 +8048,19 @@ function _restoreFullTracking() {
     window.followUser = true;
     window.isMapInteracting = false;
     window.isLocationHuntVisible = false;
-
     if (window.lastPosition?.lat !== undefined && window.lastPosition?.lng !== undefined) {
+        // clearStationaryState() (earlier in this same modal-close flow)
+        // nulls window.lastUpdateTime but leaves window.lastPosition in
+        // place. If that null survives to here, updateUserLocation's
+        // rawTimeDelta = (fix.timestamp - window.lastUpdateTime) / 1000
+        // coerces null to 0, turning "however long the popup was open"
+        // into a multi-decade fake gap — which _handleGPSGap almost
+        // certainly treats as a catastrophic absence and resets state that
+        // didn't need resetting. Restore it from the position's own
+        // timestamp (the real, meaningful measure of staleness) if missing.
+        if (!window.lastUpdateTime) {
+            window.lastUpdateTime = window.lastPosition.timestamp || Date.now();
+        }
 
         const seedPosition = {
             lat: window.lastPosition.lat,
@@ -7877,14 +8070,12 @@ function _restoreFullTracking() {
             timestamp: Date.now(),
             speedMPS: window.lastPosition.speedMPS || 0
         };
-
         // Fallback if seedPositionBuffer is unavailable
         if (typeof seedPositionBuffer === 'function') {
             seedPositionBuffer(seedPosition, 5);
         } else {
             window.positionBuffer = [seedPosition];
         }
-
         const restorationPosition = {
             coords: {
                 latitude: seedPosition.lat,
@@ -7895,7 +8086,6 @@ function _restoreFullTracking() {
             },
             timestamp: seedPosition.timestamp
         };
-
         // forceUpdate=false prevents map jumps
         updateUserLocation(restorationPosition, false);
     }
@@ -8569,7 +8759,8 @@ function getMarkerColor(tours) {
         // to the user (animate:false) every frame in centered mode. If DR is
         // already running, an animated panTo here races that snap and
         // rubber-bands the map on return — so nudge DR to sync immediately
-        // instead. 
+        // instead. Only pan ourselves (original animated behavior) when DR
+        // isn't driving the viewport yet.
         const dr = window.deadReckoning;
         if (dr && typeof dr.isActive === 'function' && dr.isActive() &&
             typeof dr.forceUpdate === 'function') {
@@ -8627,7 +8818,7 @@ function createMarkersOnly() {
             bubblingMouseEvents: false
         });
         
-        // Image dimensions are explicitly set to prevent layout reflow jitter
+        // 1. Image dimensions are explicitly set to prevent layout reflow jitter
         const popupContent = `
             <div class="popup-content">
                 <img loading="eager" 
@@ -8649,7 +8840,7 @@ function createMarkersOnly() {
             </div>
         `;
         
-        // Explicitly enable autoPan and give it breathing room from the viewport edge
+        // 2. Explicitly enable autoPan and give it breathing room from the viewport edge
         locationMarker.bindPopup(popupContent, {
             offset: L.point(0, -25),
             className: 'custom-popup',
@@ -8661,7 +8852,7 @@ function createMarkersOnly() {
             autoPanPadding: L.point(20, 20) 
         });
         
-        // Suspend Dead Reckoning when the popup opens to prevent viewport tug-of-war
+        // 3. Suspend Dead Reckoning when the popup opens to prevent viewport tug-of-war
         locationMarker.on('popupopen', function(e) {
             activePopups.add(locationMarker);
             attachPopupEventListeners(e.popup._contentNode, location);
@@ -8838,7 +9029,7 @@ function showNavigationModal(destinationLat, destinationLng) {
        });
    };
    
-   // Added keepOverflowHidden parameter to prevent scroll-lock race condition
+   // FIX 1: Added keepOverflowHidden parameter to prevent scroll-lock race condition
    const closeModal = (keepOverflowHidden = false) => {
        if (!keepOverflowHidden) {
            document.body.style.overflow = '';
@@ -8909,7 +9100,7 @@ function showNavigationModal(destinationLat, destinationLng) {
            reminderModal.querySelector(".reminder-content").style.transform = "translateY(20px)";
            setTimeout(() => {
                reminderModal.remove();
-               // Use window.location.href instead of window.open for reliable mobile deep-linking
+               // FIX 2: Use window.location.href instead of window.open for reliable mobile deep-linking
                window.location.href = navigationUrl;
                document.body.focus();
            }, 300);
@@ -8956,7 +9147,7 @@ function showNavigationModal(destinationLat, destinationLng) {
            }
        }
        
-       // Pass true to keep overflow hidden while the reminder modal opens
+       // FIX 1 Applied: Pass true to keep overflow hidden while the reminder modal opens
        closeModal(true);
        showReminderModal(navigationUrl);
    };
@@ -9341,6 +9532,7 @@ function returnToIndex() {
     popupDiv.classList.add('is-open');
     setTimeout(() => cancelBtn.focus({ preventScroll: true }), 400); // safe default
 
+    // ================= ACKNOWLEDGEMENTS =================
     function openCredits() {
         if (document.getElementById('creditsModal')) return;
 
@@ -9423,6 +9615,10 @@ function returnToIndex() {
     
 function isSignificantMovement(newPosition) {
     const now = Date.now();
+
+    // Raw-fix tracker lives on the function itself, so this stays a drop-in
+    // replacement — no new top-level declarations required. It re-seeds on the
+    // first call after any reset that nulls lastPositionForJitter.
     const track = isSignificantMovement._track || (isSignificantMovement._track = {});
 
     // First fix: seed the anchor and the tracker, treat as significant.
@@ -9442,6 +9638,8 @@ function isSignificantMovement(newPosition) {
     }
 
     // ── Spike guard (opt-in) ──
+    // Active only if you define CONFIG.MAX_PLAUSIBLE_SPEED. Without it, this
+    // block is skipped and the function behaves exactly like your original.
     const maxSpeed = CONFIG.MAX_PLAUSIBLE_SPEED;
     if (track.pos && maxSpeed != null) {
         const fixDelta = Math.max(now - track.time, 1) / 1000;   // seconds since previous fix
@@ -9514,7 +9712,8 @@ function optimizeImages(root = document) {
     return;
   }
 
-  // These used to diverge (visibility:hidden
+  // Shared by both the "already known broken at process-time" and
+  // "failed to load later" paths. These used to diverge (visibility:hidden
   // vs opacity:0.5) purely based on *when* the browser happened to notice
   // the failure, not on any real difference in the two cases — unified here
   // on visibility:hidden. The distinct data-optimized values ('error-broken'
@@ -9645,6 +9844,7 @@ function setupImageOptimizationObserver() {
         rafId = null;
         pendingRoots.forEach(root => {
           // Defense-in-depth: skip if the root itself is a Leaflet container
+          // (shouldn't happen given the callback guards, but cheap insurance).
           if (root.closest && root.closest('.leaflet-container')) return;
           optimizeImages(root);
         });
@@ -9658,8 +9858,16 @@ function setupImageOptimizationObserver() {
           for (const node of mutation.addedNodes) {
             if (node.nodeType !== Node.ELEMENT_NODE) continue;
     
+            // ── SKIP LEAFLET INTERNALS ──────────────────────────────────
             // Leaflet creates/destroys hundreds of <img> tiles during
-            // pan/zoom.
+            // pan/zoom. Processing them causes:
+            //   1. CPU waste: querySelectorAll on the tile pane every frame
+            //   2. Layout breakage: optimizeImages sets width/height/
+            //      aspectRatio/loading="lazy" on tiles, conflicting with
+            //      Leaflet's own positioning (transform-based, not
+            //      attribute-based).
+            // Leaflet tiles carry the class "leaflet-tile"; all map
+            // internals live under ".leaflet-pane" or ".leaflet-container".
             if (node.classList && node.classList.contains('leaflet-tile')) continue;
             if (node.closest && node.closest('.leaflet-pane')) continue;
     
@@ -9704,8 +9912,9 @@ function setupImageOptimizationObserver() {
     }
 
 /* EVENT LISTENER SETUP */
+
 function handleInteractionStart() {
-    // The map is moving programmatically. 
+    // CRITICAL: The map is moving programmatically. 
     // Ignore this to keep followUser = true and isMapInteracting = false.
     if (window._programmaticFlyInProgress) {
         return;
@@ -9743,6 +9952,8 @@ function setupMapEvents() {
 
     try {
         // We only listen for drag/zoom events. 
+        // By relying on these specific events, we ignore internal 'move' 
+        // events generated by setView/panTo during programmatic updates.
         map.on('dragstart zoomstart', handleInteractionStart);
         map.on('dragend zoomend', handleInteractionEnd);
     } catch (error) {
