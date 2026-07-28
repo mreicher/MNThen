@@ -597,14 +597,6 @@
                     return null;
                 }
     
-                // Dedup: if this exact element+event+handler+options combo is
-                // already tracked and active, return the existing entry instead
-                // of attaching a second DOM listener and growing the registry
-                // further. Without this, any code path that re-registers "the
-                // same" listener over a long session (reconnect loops, repeated
-                // setup calls) leaked both a duplicate listener AND a duplicate
-                // registry entry indefinitely — the registry only ever grew,
-                // never shrank, until full page-unload disposal.
                 const existing = listenerRegistry.find(e =>
                     e.active &&
                     e.element === element &&
@@ -620,10 +612,7 @@
                 return entry;
             },
     
-            // NEW — remove a single tracked listener before full disposal.
-            // Purely additive: existing callers that never call this are
-            // unaffected, and dispose() still works exactly as before for
-            // whatever's left in the registry at teardown time.
+            // Remove a single tracked listener before full disposal.
             untrack(entry) {
                 if (!entry || !entry.active) return false;
                 try {
@@ -715,10 +704,6 @@
             createTrackedInterval: timerSubsystem.createInterval.bind(timerSubsystem),
             clearTrackedTimer:     timerSubsystem.clear.bind(timerSubsystem),
             trackEventListener:    listenerSubsystem.track.bind(listenerSubsystem),
-    
-            // Companion to trackEventListener. Pass the entry it returned
-            // to remove that one listener early instead of waiting for full
-            // disposal. Additive; nothing existing needs to change to keep working.
             untrackEventListener: listenerSubsystem.untrack.bind(listenerSubsystem),
     
             registerCleanupTask(fn) {
@@ -814,11 +799,6 @@
             const dt = (timestampPerfNow - this.lastTimestamp) / 1000;
          
             if (dt <= 0 || dt > 30) {
-                // _initialize() prefers _pendingSeedVelocity (the gap-aware seed from
-                // scheduleVelocitySeed) over anything else, and consumes/nulls it.
-                // Previously this branch then unconditionally reapplied the stale
-                // pre-gap _lastSeedVelocity right on top, discarding that fresher
-                // estimate. Only fall back to it if there was nothing better.
                 const hadPendingSeed = !!this._pendingSeedVelocity;
                 const fallbackSeed = this._lastSeedVelocity;
                 this._initialize(lat, lng, R, timestampPerfNow);
@@ -961,11 +941,6 @@
         // Initial velocity-covariance seed. The variance must reflect how well we
         // actually know the initial velocity (which is seeded to [0,0] when there is
         // no directional hint):
-        //   - hint present  -> moderate variance, trust the seeded velocity.
-        //   - GPS moving, no hint -> LARGE variance: we know we are moving but not the
-        //     direction, so let the first fixes snap velocity to the truth (no lag).
-        //   - stationary -> SMALL variance: pin velocity near zero so GPS scatter
-        //     cannot manufacture phantom motion (no jitter while standing still).
         const v0 = hasVelocityHint ? 2.25 : (this._lastGPSSpeedMPS > 0.3 ? 225.0 : 0.5);
         this.P = [[R2,0,0,0],[0,R2,0,0],[0,0,v0,0],[0,0,0,v0]];
         this.lastTimestamp = timestampPerfNow;
@@ -979,9 +954,7 @@
             const kalmanSpeed = Math.sqrt(this.x[2]*this.x[2] + this.x[3]*this.x[3]);
             const speed = Math.max(kalmanSpeed, (this._lastGPSSpeedMPS || 0) * 0.9);
             this._currentSpeedMPS = speed;
-            // Was a hard cutoff at 0.1 (0.5 flat below it, 1.0 flat from 0.1–0.5) —
-            // a 2x step landing right in the stop/start speed range. Continuous
-            // ramp from 0.5 at speed=0 up to 1.0 at speed=0.5 instead.
+
             if      (speed >= 15)  { this.accelNoise = 8.0; }
             else if (speed >= 8)   { this.accelNoise = 3.0 + (speed - 8) * (5.0 / 7); }
             else if (speed >= 2)   { this.accelNoise = 3.0; }
@@ -1084,9 +1057,6 @@
 /* ═══════════════════════════════════════════════════════════════
    SENSOR FUSION MANAGER
    ═══════════════════════════════════════════════════════════════ */
-// Circular interpolation between two headings in degrees — a plain lerp
-// would take the wrong way around at the 0/360 wrap (e.g. blending 350°
-// toward 10° should pass through 0°, not swing back through 180°).
 function _blendHeadingDeg(a, b, t) {
     let diff = b - a;
     diff = ((diff + 180) % 360 + 360) % 360 - 180; // normalize to [-180, 180]
@@ -1144,10 +1114,6 @@ class SensorFusionManager {
         this._initDeviceOrientation();
         this._initAccelerometer();
         this._initKalmanFilter();
-
-        // Guaranteed cleanup on page hide/unload — fires even on mobile Safari
-        // where beforeunload is unreliable. destroy() removes listeners directly,
-        // so this is the safety net for when the app forgets to call destroy().
         this._pageHideHandler = () => this.destroy();
         window.addEventListener('pagehide', this._pageHideHandler, { once: true });
 
@@ -1155,11 +1121,6 @@ class SensorFusionManager {
     }
 
     getCurrentStateAgeMs() {
-        // _lastKalmanTimestamp is already in performance.now() space, but
-        // _rawTimestamp is a wall-clock (Date.now()-based) timestamp from the
-        // Geolocation API and must be converted before comparing against
-        // performance.now() — otherwise this mixes two different epochs and
-        // returns a nonsense (usually hugely negative) value.
         const lastTime = this._lastKalmanTimestamp || (this._rawTimestamp ? this._toPerfNow(this._rawTimestamp) : 0);
         return lastTime ? (performance.now() - lastTime) : 0;
     }
@@ -1336,60 +1297,55 @@ class SensorFusionManager {
         return { lat: (rawLat - this._rawLat) / dtSec, lng: (rawLng - this._rawLng) / dtSec };
     }
 
-   _updateStationaryState(gpsSpeedMPS, kalmanSpeedMPS, rawLat, rawLng) {
-        const speed = Math.max(gpsSpeedMPS || 0, kalmanSpeedMPS || 0);
-        const accelMoving = this._accelAvailable && this._isMoving;
-     
-        if (speed > 0.6 || accelMoving) {
-            this._moveStreak = (this._moveStreak || 0) + 1;
-            this._stillStreak = 0;
-        } else if (speed < 0.35) {
-            this._stillStreak = (this._stillStreak || 0) + 1;
-            this._moveStreak = 0;
-        }
-     
-        const isStationary = this._lastStationaryState
-            ? (this._moveStreak || 0) < 2
-            : (this._stillStreak || 0) >= 3;
-     
-        if (isStationary && !this._lastStationaryState) {
-            const freezeLat = this._lastKalmanLat != null ? this._lastKalmanLat : rawLat;
-            const freezeLng = this._lastKalmanLng != null ? this._lastKalmanLng : rawLng;
-            if (this._kalmanFilter && freezeLat != null && freezeLng != null) {
-                this._kalmanFilter.freeze(freezeLat, freezeLng);
-            }
-            this._stationaryPosition = (freezeLat != null && freezeLng != null)
-                ? { lat: freezeLat, lng: freezeLng }
-                : null;
-            this._stationarySamples = [];
-        } else if (!isStationary && this._lastStationaryState) {
-            if (this._kalmanFilter) {
-                this._kalmanFilter.unfreeze();
-                // kf.update() only auto-seeds velocity on a true (re)init
-                // (kf._justInitialized) — freeze/unfreeze never sets that, so
-                // without this, every ordinary stop-and-go left the filter to
-                // rebuild velocity from zero fix by fix. Same priority as the
-                // init-time seed: GPS speed+heading first, raw delta as fallback.
-                let seeded = false;
-                if (gpsSpeedMPS != null && gpsSpeedMPS > 0.3 && this._rawHeadingDeg != null && isFinite(this._rawHeadingDeg)) {
-                    const hr = this._rawHeadingDeg * Math.PI / 180;
-                    this._kalmanFilter.seedVelocity(gpsSpeedMPS * Math.cos(hr), gpsSpeedMPS * Math.sin(hr), 1.5);
-                    seeded = true;
-                }
-                if (!seeded) {
-                    const cosLat = Math.cos(rawLat * Math.PI / 180);
-                    const vN = this._gpsVelocityDegPerSec.lat * 111111;
-                    const vE = this._gpsVelocityDegPerSec.lng * 111111 * cosLat;
-                    if (Math.sqrt(vN * vN + vE * vE) > 0.3) this._kalmanFilter.seedVelocity(vN, vE, 1.5);
-                }
-            }
-            this._stationaryPosition = null;
-            this._stationarySamples = [];
-        }
-     
-        this._lastStationaryState = isStationary;
-        return isStationary;
+_updateStationaryState(gpsSpeedMPS, kalmanSpeedMPS, rawLat, rawLng) {
+    const speed = Math.max(gpsSpeedMPS || 0, kalmanSpeedMPS || 0);
+    const accelMoving = this._accelAvailable && this._isMoving;
+    const MOVING_SPEED_MPS = 0.45;
+    if (speed >= MOVING_SPEED_MPS || accelMoving) {
+        this._moveStreak = (this._moveStreak || 0) + 1;
+        this._stillStreak = 0;
+    } else {
+        this._stillStreak = (this._stillStreak || 0) + 1;
+        this._moveStreak = 0;
     }
+
+    const isStationary = this._lastStationaryState
+        ? (this._moveStreak || 0) < 2
+        : (this._stillStreak || 0) >= 3;
+
+    if (isStationary && !this._lastStationaryState) {
+        const freezeLat = this._lastKalmanLat != null ? this._lastKalmanLat : rawLat;
+        const freezeLng = this._lastKalmanLng != null ? this._lastKalmanLng : rawLng;
+        if (this._kalmanFilter && freezeLat != null && freezeLng != null) {
+            this._kalmanFilter.freeze(freezeLat, freezeLng);
+        }
+        this._stationaryPosition = (freezeLat != null && freezeLng != null)
+            ? { lat: freezeLat, lng: freezeLng }
+            : null;
+        this._stationarySamples = [];
+    } else if (!isStationary && this._lastStationaryState) {
+        if (this._kalmanFilter) {
+            this._kalmanFilter.unfreeze();
+            let seeded = false;
+            if (gpsSpeedMPS != null && gpsSpeedMPS > 0.3 && this._rawHeadingDeg != null && isFinite(this._rawHeadingDeg)) {
+                const hr = this._rawHeadingDeg * Math.PI / 180;
+                this._kalmanFilter.seedVelocity(gpsSpeedMPS * Math.cos(hr), gpsSpeedMPS * Math.sin(hr), 1.5);
+                seeded = true;
+            }
+            if (!seeded) {
+                const cosLat = Math.cos(rawLat * Math.PI / 180);
+                const vN = this._gpsVelocityDegPerSec.lat * 111111;
+                const vE = this._gpsVelocityDegPerSec.lng * 111111 * cosLat;
+                if (Math.sqrt(vN * vN + vE * vE) > 0.3) this._kalmanFilter.seedVelocity(vN, vE, 1.5);
+            }
+        }
+        this._stationaryPosition = null;
+        this._stationarySamples = [];
+    }
+
+    this._lastStationaryState = isStationary;
+    return isStationary;
+}
     
     _getHybridVelocity() {
         if (!this._kalmanFilter || !this._kalmanFilter.x) return { vNorth: 0, vEast: 0 };
@@ -1497,9 +1453,6 @@ class SensorFusionManager {
             resultLat = this._stationaryPosition.lat; resultLng = this._stationaryPosition.lng;
             resultVNorth = 0; resultVEast = 0; resultSpeed = 0; blendFactor = 1.0;
             this._filteredSpeedMPS = 0;
-            // Was missing here — position was frozen but _rawVelocity below still
-            // carried raw GPS-delta noise, which getSmoothedVelocityDegPerSec()
-            // can hand to callers pre-convergence despite the frozen position.
             holdStill = true;
         } else if (this._convergenceStage === 0) {
             let holdLat = null, holdLng = null;
@@ -1540,13 +1493,39 @@ class SensorFusionManager {
         };
     }
 
-    getSmoothedVelocityDegPerSec() {
-        if (this._convergenceStage < 2) return this._rawVelocity;
-        const vel = this._getHybridVelocity();
-        if (!this._kalmanFilter) return { lat: 0, lng: 0 };
-        const cosLat = Math.cos((this._lastKalmanLat || this._rawLat || 0) * Math.PI / 180);
-        return { lat: vel.vNorth / 111111, lng: vel.vEast / (111111 * cosLat) };
+  getSmoothedVelocityDegPerSec() {
+    if (this._convergenceStage < 2) {
+
+        const raw = this._rawVelocity || { lat: 0, lng: 0 };
+        const cosLatGuard = Math.cos((this._lastKalmanLat || this._rawLat || 0) * Math.PI / 180) || 1;
+        const rawSpeedMPS = Math.sqrt(
+            (raw.lat * 111111) ** 2 + (raw.lng * 111111 * cosLatGuard) ** 2
+        );
+
+        const MAX_PLAUSIBLE_PRECONVERGENCE_MPS = 45; // ~100 mph safety ceiling
+        let damped = raw;
+        if (rawSpeedMPS > MAX_PLAUSIBLE_PRECONVERGENCE_MPS) {
+            const scale = MAX_PLAUSIBLE_PRECONVERGENCE_MPS / rawSpeedMPS;
+            damped = { lat: raw.lat * scale, lng: raw.lng * scale };
+        }
+
+        if (this._preConvergenceVelocity) {
+            const alpha = 0.6; // favor the new sample, shave off single-fix spikes
+            damped = {
+                lat: alpha * damped.lat + (1 - alpha) * this._preConvergenceVelocity.lat,
+                lng: alpha * damped.lng + (1 - alpha) * this._preConvergenceVelocity.lng
+            };
+        }
+        this._preConvergenceVelocity = damped;
+        return damped;
     }
+
+    this._preConvergenceVelocity = null;
+    const vel = this._getHybridVelocity();
+    if (!this._kalmanFilter) return { lat: 0, lng: 0 };
+    const cosLat = Math.cos((this._lastKalmanLat || this._rawLat || 0) * Math.PI / 180);
+    return { lat: vel.vNorth / 111111, lng: vel.vEast / (111111 * cosLat) };
+}
 
     getFilteredSpeedMPS() { return this._filteredSpeedMPS || 0; }
 
@@ -1586,10 +1565,6 @@ class SensorFusionManager {
         return (gpsSpeedMPS || 0) > 0.5;
     }
 
-    // Same hard-cutoff bug as getFilteredHeading/_getHybridVelocity had
-    // (switched abruptly at speed > 5.0), plus speedMPS || this._filteredSpeedMPS
-    // discarded a legitimate 0 via falsy-OR. Fixed the same way: blend across
-    // the shared HEADING_BLEND_LOW/HIGH band, ?? instead of || for the 0 case.
     getHeading(gpsHeading, speedMPS) {
         const speed = speedMPS ?? this._filteredSpeedMPS ?? 0;
         const hasGpsHeading = gpsHeading != null && isFinite(gpsHeading);
@@ -1611,8 +1586,8 @@ class SensorFusionManager {
         this._lastKalmanLat = null;
         this._lastKalmanLng = null;
         this._lastKalmanTimestamp = null;
+        this._preConvergenceVelocity = null;
     
-        // Stationary detection — full restart
         this._lastStationaryState = false;
         this._stationaryPosition = null;
         this._stationarySamples = [];
@@ -1620,9 +1595,7 @@ class SensorFusionManager {
         this._unfreezeCounter = 0;
         this._moveStreak = 0;
         this._stillStreak = 0;
-    
-        // Raw input snapshots — prevents _computeGPSVelocity from
-        // computing a bogus vector across the reset boundary.
+
         this._rawLat = null;
         this._rawLng = null;
         this._rawSpeedMPS = null;
@@ -1630,8 +1603,7 @@ class SensorFusionManager {
         this._rawTimestamp = null;
         this._rawVelocity = { lat: 0, lng: 0 };
         this._gpsVelocityDegPerSec = { lat: 0, lng: 0 };
-    
-        // Smoothed heading — re-initializes from next compass reading.
+
         this._smoothedHeading = null;
         this._lastCompassHeading = null;
         this._compassStableCount = 0;
@@ -1695,6 +1667,7 @@ window.sensorFusion = new SensorFusionManager().init();
     let _headingChangeRate = 0;
     let _interactionEndTime = 0;
     let _markerEl          = null;
+    let _markerPrepped = false;
     let _markerTransSet    = false;
     let _lastPredictedPos  = null;
 
@@ -1709,6 +1682,7 @@ window.sensorFusion = new SensorFusionManager().init();
     let _centeredLat = null;
     let _centeredLng = null;
     let _panRemainder = { x: 0, y: 0 }; // sub-pixel carry for _snapViewport
+    let _lastSnapZoom = null;
     let _wasMoving = false;
 
     const _now = () => performance.now();
@@ -1781,54 +1755,66 @@ window.sensorFusion = new SensorFusionManager().init();
         return _markerEl;
     }
 
-    function _setMarkerPosition(lat, lng) {
-        if (typeof userMarker !== 'undefined' && userMarker) {
-            var el = userMarker.getElement ? userMarker.getElement() : null;
-            if (el) {
-                el.style.transition = 'none';
-                var icon = el.querySelector('.user-marker-icon');
-                if (icon) icon.style.transition = 'none';
-            }
-            userMarker.setLatLng([lat, lng]);
-        }
+   function _setMarkerPosition(lat, lng) {
+    if (typeof userMarker === 'undefined' || !userMarker) return;
+
+    const el = _getMarkerEl();
+
+    if (el && !_markerPrepped) {
+        el.style.transition = 'none';
+        const icon = el.querySelector('.user-marker-icon');
+        if (icon) icon.style.transition = 'none';
+        _markerPrepped = true;
     }
 
+    if (el && el.style.willChange !== 'transform') {
+        el.style.willChange = 'transform';
+    }
+
+    userMarker.setLatLng([lat, lng]);
+}
+
     function _snapViewport(lat, lng) {
-          if (!map) return;
-        
-          const target = map.latLngToContainerPoint([lat, lng]);
-          const size = map.getSize();
-          const dx = target.x - size.x / 2;
-          const dy = target.y - size.y / 2;
-        
-          // Discontinuity (GPS teleport, recenter, first frame after a drag):
-          // hard-reset instead of gliding. Also clears any stale accumulator.
-          if (Math.abs(dx) > size.x * 0.25 || Math.abs(dy) > size.y * 0.25) {
-            _panRemainder.x = 0;
-            _panRemainder.y = 0;
-            _centeredLat = lat;
-            _centeredLng = lng;
-            map.setView([lat, lng], map.getZoom(), { animate: false, pan: { noMoveStart: true } });
-            return;
-          }
-        
-          // Accumulate sub-pixel motion, pan by whole pixels only. Remainder
-          // stays bounded to ±0.5px by construction — average velocity exact,
-          // no deadband snap.
-          _panRemainder.x += dx;
-          _panRemainder.y += dy;
-          const px = Math.round(_panRemainder.x);
-          const py = Math.round(_panRemainder.y);
-          if (px === 0 && py === 0) return;
-          _panRemainder.x -= px;
-          _panRemainder.y -= py;
-          _centeredLat = lat;
-          _centeredLng = lng;
-        
-          // Raw pane transform — same mechanism Leaflet's own animated pan
-          // uses per frame. No _resetView, no viewreset, no tile churn.
-          map.panBy([px, py], { animate: false, noMoveStart: true });
-        }
+    if (!map) return;
+
+    const currentZoom = map.getZoom();
+    if (_lastSnapZoom !== null && currentZoom !== _lastSnapZoom) {
+        _panRemainder.x = 0;
+        _panRemainder.y = 0;
+        _centeredLat = lat;
+        _centeredLng = lng;
+        _lastSnapZoom = currentZoom;
+        map.setView([lat, lng], currentZoom, { animate: false, pan: { noMoveStart: true } });
+        return;
+    }
+    _lastSnapZoom = currentZoom;
+
+    const target = map.latLngToContainerPoint([lat, lng]);
+    const size = map.getSize();
+    const dx = target.x - size.x / 2;
+    const dy = target.y - size.y / 2;
+
+    if (Math.abs(dx) > size.x * 0.25 || Math.abs(dy) > size.y * 0.25) {
+        _panRemainder.x = 0;
+        _panRemainder.y = 0;
+        _centeredLat = lat;
+        _centeredLng = lng;
+        map.setView([lat, lng], map.getZoom(), { animate: false, pan: { noMoveStart: true } });
+        return;
+    }
+
+    _panRemainder.x += dx;
+    _panRemainder.y += dy;
+    const px = Math.round(_panRemainder.x);
+    const py = Math.round(_panRemainder.y);
+    if (px === 0 && py === 0) return;
+    _panRemainder.x -= px;
+    _panRemainder.y -= py;
+    _centeredLat = lat;
+    _centeredLng = lng;
+
+    map.panBy([px, py], { animate: false, noMoveStart: true });
+}
 
     function _seedVelocityOnResume() {
         if (!window.sensorFusion || !_lastGoodSpeedMPS || _lastHeadingDeg == null) return;
@@ -1848,10 +1834,6 @@ window.sensorFusion = new SensorFusionManager().init();
         return null;
     }
 
-    // --- NEW: one-shot marker/viewport sync used when the predictive rAF loop
-    // is not going to run (e.g. stationary, first fix, non-centered + below
-    // speed threshold). This is what closes the "marker never updates" gap
-    // without introducing a second competing writer alongside frame(). ---
     function _immediateSync() {
         if (window.isLocationHuntVisible) return;
         const pos = _resolveBestKnownPosition();
@@ -1880,11 +1862,6 @@ window.sensorFusion = new SensorFusionManager().init();
     const stationary = _isStationary();
     const centered   = _isCenteredMode();
  
-    // Stationary -> moving transition: prime the filter with the last known
-    // good speed/heading instead of letting it ramp up from zero. Previously
-    // this only happened inside _start(), which is a no-op once the loop is
-    // already active — i.e. it never fired during a normal stop-and-go while
-    // centered, since the loop doesn't stop in that mode.
     const movingNow = speedMPS >= CFG.MIN_SPEED_MPS;
     if (movingNow && !_wasMoving) _seedVelocityOnResume();
     _wasMoving = movingNow;
@@ -1924,12 +1901,7 @@ window.sensorFusion = new SensorFusionManager().init();
     if (hdg != null) _lastHeadingDeg = hdg;
  
     const vel = _getVelocity();
-    // Was gated on the raw degrees/sec vector magnitude against a threshold
-    // (0.001) that's calibrated for m/s — that combination is only true above
-    // ~110 m/s, so this never fired at real-world speeds and _lastGoodSpeedMPS
-    // stayed 0 forever, permanently disabling _seedVelocityOnResume(). Gate on
-    // speedMPS (already real-world units) instead, matching the 0.3 floor
-    // _seedVelocityOnResume() itself uses.
+
     if (speedMPS > 0.3) { _lastGoodVelocity = { lat: vel.lat, lng: vel.lng }; _lastGoodSpeedMPS = speedMPS; }
  
     let pLat, pLng;
@@ -1950,9 +1922,6 @@ window.sensorFusion = new SensorFusionManager().init();
     _lastPredictedPos = { lat: pLat, lng: pLng };
  
     const HOLD_SPEED_MPS = CFG.MIN_SPEED_MPS;
-    // Was 0.15m — tighter than typical filtered-position jitter at a stop,
-    // so the hold almost never engaged and raw noise passed straight to the
-    // marker. That's the rubberbanding right as you come to a stop.
     const HOLD_DEADBAND_M = 1.0;
  
     const prevHeld = window.__drHeld;
@@ -2012,21 +1981,17 @@ window.sensorFusion = new SensorFusionManager().init();
           _active = false; _panPending = false; _panTarget = null;
           _centeredLat = null; _centeredLng = null;
           _panRemainder.x = 0; _panRemainder.y = 0;
+           _lastSnapZoom = null;
           window.__drHeld = null;
           _wasMoving = false;
           const el = _getMarkerEl();
-          if (el) { el.style.willChange = ''; el.style.transition = ''; _markerTransSet = false; }
+          if (el) { el.style.willChange = ''; el.style.transition = ''; _markerTransSet = false; _markerPrepped = false;}
         },
 
         isActive() { return _active; },
 
         onMovementResumed: _start,
 
-        // --- If DR declines to run its
-        // continuous loop (stationary / first fix / below speed threshold,
-        // non-centered), it now does a one-shot direct sync instead of
-        // silently doing nothing. DR remains the single writer of marker
-        // and viewport state either way — no dual-write with _executeRender. ---
        forceUpdate() {
             if (_active) {
                 _lastFrameTime = 0;
@@ -2041,7 +2006,7 @@ window.sensorFusion = new SensorFusionManager().init();
         },
 
         getPredictedPosition()  { return _lastPredictedPos; },
-        invalidateMarkerCache() { _markerEl = null; _markerTransSet = false; }
+        invalidateMarkerCache() { _markerEl = null; _markerTransSet = false; _markerPrepped = false; }
     };
 
     _start();
@@ -2121,13 +2086,6 @@ function announceToScreenReader(message, priority = 'polite') {
         cachedElements?.accessibilityAnnouncements;
 
     if (!element) return;
-
-    // Dedupe per priority/element, not globally. proximityAnnouncements and
-    // accessibilityAnnouncements are two independent ARIA live regions —
-    // comparing against a single shared accessibilityState.lastAnnouncement
-    // meant an announcement on one channel could silently suppress the same
-    // text on the other, dropping a real announcement a screen reader user
-    // was supposed to hear.
     if (message === _lastAnnouncementByPriority[priority]) return;
 
     element.textContent = message;
@@ -2178,9 +2136,6 @@ const trackedTimeouts = new Set();
     // clearTimeout(window[key]), which cancels it at the browser level but
     // can't remove it from trackedTimeouts (that only happens inside
     // wrappedCallback, which never runs if the timeout was cancelled early).
-    // Using this instead keeps the Set accurate immediately rather than
-    // leaving stale ids until the next full sweep. Safe to call with any id,
-    // tracked or not, or already fired — clearTimeout on those is a no-op.
     function clearTrackedTimeout(id) {
         clearTimeout(id);
         trackedTimeouts.delete(id);
@@ -2196,17 +2151,11 @@ const trackedTimeouts = new Set();
    ────────────────────────────────────────────── */
     function initMap() {
         // ── Guard: full teardown if re-initializing ──
-        // disposeMapLoop() only clears window-scoped RAF/timeout/interval handles
-        // (see its rafHandles/timeoutHandles/intervalHandles lists) — it does NOT
-        // stop dead reckoning, whose animation-frame id is a closure-private
-        // variable inside deadReckoning and is never exposed on window. Without
-        // this explicit stop, DR keeps extrapolating and writing to `userMarker`
-        // and `map` straight through the teardown/recreate below.
         if (typeof disposeMapLoop === 'function') disposeMapLoop();
         if (window.deadReckoning && typeof window.deadReckoning.stop === 'function') {
             window.deadReckoning.stop();   // also clears _drOwnsMarker / _drLastOwnsTime
         }
-
+    
         if (map) {
             try { map.remove(); } catch (e) { console.warn('[Map] Remove failed:', e.message); }
             map = null;
@@ -2215,23 +2164,12 @@ const trackedTimeouts = new Set();
             try { markerClusterGroup.clearLayers(); } catch (e) {}
             markerClusterGroup = null;
         }
-        // userMarker wasn't being torn down like the layers above — it was left
-        // pointing at the old (now-detached) marker instance until reassigned
-        // further down. Every marker-write path (dead reckoning's
-        // _setMarkerPosition, scheduleMarkerUpdate) gates on
-        // `typeof userMarker !== 'undefined' && userMarker` being truthy, so a
-        // stale-but-truthy reference here means those gates pass when they
-        // shouldn't, during the window before the new marker exists.
+
         if (userMarker) {
             try { userMarker.remove(); } catch (e) {}
             userMarker = null;
         }
-
-        // Render-state globals consumed by the GPS render scheduler
-        // (_scheduleMapUpdate / _executeRender). disposeMapLoop cancels the
-        // pending RAF but leaves this state pointing at the old map/position —
-        // clear it so nothing can act on stale state if it's read before the
-        // next real GPS update arrives.
+    
         window._currentMapState    = null;
         window._currentRenderState = null;
         window._currentSpeedTier   = null;
@@ -2261,9 +2199,9 @@ const trackedTimeouts = new Set();
         }).setView([46.392410, -94.636230], 9);
         
         L.control.attribution({ prefix: false }).addTo(map); 
-
+    
         // ── Tile layer with required OSM attribution ──
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        const tiles = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
             minZoom: 7,
             maxZoom: 19,
             attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
@@ -2272,6 +2210,16 @@ const trackedTimeouts = new Set();
             keepBuffer: 2,
             className: 'map-tiles'
         }).addTo(map);
+    
+        // Retry the occasional dropped tile (up to 3x, with backoff)
+        tiles.on('tileerror', function (e) {
+            const tile = e.tile;
+            tile._retries = tile._retries || 0;
+            if (tile._retries >= 3) return;
+            tile._retries++;
+            const src = tile._origSrc || (tile._origSrc = tile.src);
+            setTimeout(() => { tile.src = src; }, 300 * tile._retries);
+        });
         
         // ── Marker cluster ──
         markerClusterGroup = L.markerClusterGroup({
@@ -2614,15 +2562,21 @@ const trackedTimeouts = new Set();
 /* ──────────────────────────────────────────────
    LOADING MESSAGE — CSS-driven styles
    ────────────────────────────────────────────── */
-   let _loadingProgressInterval;
+let _loadingProgressInterval;
+let _loadingHideRequested = false;
 
 function showLoadingMessage() {
     if (document.getElementById('loadingMessage')) return;
+
+    _loadingHideRequested = false;
 
     // Branding beat: 5 seconds minimum. The splash dismisses the moment
     // GPS is ready, but never before this floor — enough time to read
     // the logo and both taglines, establishing a premium, polished feel.
     loadingMessageMinDisplayTime = Date.now() + 5000;
+
+    // Let assistive tech know the page is busy while the splash is up.
+    document.documentElement.setAttribute('aria-busy', 'true');
 
     const loadingMessage = document.createElement('div');
     loadingMessage.id = 'loadingMessage';
@@ -2634,6 +2588,8 @@ function showLoadingMessage() {
     logo.className = 'loading-logo';
     logo.src = 'https://mnthen.com/images/logo.webp';
     logo.alt = 'Minnesota Then Logo';
+    // If the logo fails (offline, CDN hiccup), don't leave a broken-image icon.
+    logo.addEventListener('error', () => { logo.style.display = 'none'; }, { once: true });
 
     const title = document.createElement('h1');
     title.className = 'loading-title';
@@ -2647,11 +2603,18 @@ function showLoadingMessage() {
     statusContainer.className = 'loading-status';
     const statusText = document.createElement('p');
     statusText.id = 'loadingStatusText';
+    statusText.setAttribute('role', 'status');
+    statusText.setAttribute('aria-live', 'polite');
     statusText.textContent = 'Acquiring precise location data...';
     statusContainer.appendChild(statusText);
 
     const progressTrack = document.createElement('div');
     progressTrack.className = 'loading-progress-track';
+    progressTrack.setAttribute('role', 'progressbar');
+    progressTrack.setAttribute('aria-label', 'Loading progress');
+    progressTrack.setAttribute('aria-valuemin', '0');
+    progressTrack.setAttribute('aria-valuemax', '100');
+    progressTrack.setAttribute('aria-valuenow', '0');
     const progressBar = document.createElement('div');
     progressBar.className = 'loading-progress-bar';
     progressBar.id = 'loadingProgressBar';
@@ -2688,17 +2651,23 @@ function showLoadingMessage() {
     _loadingProgressInterval = setInterval(() => {
         const t = performance.now() - startedAt;
         const progress = 90 * (1 - Math.exp(-t / 1500));
-        if (progressBar) progressBar.style.width = `${Math.min(progress, 90)}%`;
-        
+        const clamped = Math.min(progress, 90);
+        if (progressBar) progressBar.style.width = `${clamped}%`;
+        progressTrack.setAttribute('aria-valuenow', String(Math.round(clamped)));
+
         // One status string per second — predictable, professional pacing
         if (statusText) {
             const idx = Math.min(Math.floor(t / 1000), animations.length - 1);
             statusText.textContent = animations[idx];
         }
-        
+
         // Long-stop: if init never signals (silent failure), don't
-        // trap the user behind the splash forever.
-        if (t > 15000) tryHideLoadingMessage();
+        // trap the user behind the splash forever. Guarded so a stalled
+        // load doesn't stack up redundant hide requests every 100ms.
+        if (t > 15000 && !_loadingHideRequested) {
+            _loadingHideRequested = true;
+            tryHideLoadingMessage();
+        }
     }, 100);
 
     if (memoryManager?.registerCleanupTask) {
@@ -2735,6 +2704,8 @@ function fadeOutLoadingMessage() {
     const distanceBox = cachedElements.distanceBox || document.getElementById('distanceBox');
     if (distanceBox) distanceBox.classList.add('show');
 
+    document.documentElement.removeAttribute('aria-busy');
+
     loadingMessage.style.opacity = '0';
     createTrackedTimeout(() => { loadingMessage.remove(); }, 500);
 }
@@ -2742,7 +2713,7 @@ function fadeOutLoadingMessage() {
 function hideLoadingMessage() {
     tryHideLoadingMessage();
 }
-
+        
 /* ──────────────────────────────────────────────
    ACCURACY INDICATOR — CSS-driven
    ────────────────────────────────────────────── */
@@ -3604,7 +3575,7 @@ function updateLocationAfterBackground() {
             {
                 enableHighAccuracy: true,
                 timeout: 8000,
-                maximumAge: 10000
+                maximumAge: 0
             }
         );
 
@@ -4599,11 +4570,7 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
    STEP 2: Gap Handling & Velocity Seeding 
    ────────────────────────────────────────────── */
     function _handleGPSGap(fix, lastPos, timeDelta) {
-        // NOTE: timeDelta here is the *raw*, unclamped gap (see updateUserLocation) —
-        // deliberately not the 30s-capped value used for fusion math. Both branch
-        // thresholds below (10s, 300s) need the true elapsed time to fire correctly;
-        // a pre-clamped value made the >=300s branch unreachable, since the clamp's
-        // ceiling sat below the branch's own floor.
+
         if (!lastPos) return;
         var kf = window.sensorFusion && window.sensorFusion._kalmanFilter;
         if (!kf) return;
@@ -4640,7 +4607,7 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
     }
  
 /* ──────────────────────────────────────────────
-   STEP 3: Sensor Fusion 
+   Sensor Fusion 
    ────────────────────────────────────────────── */
     function _runSensorFusion(fix, lastPos, timeDelta, forceUpdate) {
         if (!window.sensorFusion) {
@@ -4748,9 +4715,9 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
     }
  
 /* ──────────────────────────────────────────────
-   STEP 4: Publish Fusion State 
+   Publish Fusion State 
    ────────────────────────────────────────────── */
-    function _publishFusionState(fusionResult, fix) {
+   function _publishFusionState(fusionResult, fix) {
         window._predictedPosition = {
             lat: fusionResult.lat,
             lng: fusionResult.lng,
@@ -4758,19 +4725,15 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
         };
     
         if (fusionResult.isFrozen) {
-            // Don't mark stationary — freeze velocity to prevent DR drift,
-            // but let DR keep running on last good heading if available.
-            // Stationary flag kills DR loop; frozen flag just pauses prediction.
-            var lastVel = window.smoothedVelocity || { lat: 0, lng: 0 };
-            var lastSpeed = Math.sqrt(lastVel.lat * lastVel.lat + lastVel.lng * lastVel.lng);
-            
-            // Only zero velocity if we were actually stopped before glitch
-            if (lastSpeed < 0.5) {
+            var lastSpeedMPS = (window.lastPosition && typeof window.lastPosition.speedMPS === 'number' && !isNaN(window.lastPosition.speedMPS))
+                ? window.lastPosition.speedMPS
+                : 0;
+    
+            if (lastSpeedMPS < 0.5) {
                 window.smoothedVelocity = { lat: 0, lng: 0 };
                 window.isStationary = true;
                 window.stationaryLockPosition = { lat: fusionResult.lat, lng: fusionResult.lng };
             } else {
-                // Keep last velocity so DR continues, but mark position as uncertain
                 window.isStationary = false;
                 window.stationaryLockPosition = null;
             }
@@ -4782,7 +4745,7 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
                     velDegPerSec = rawVel;
                 }
             } catch (e) {}
-            
+    
             window.smoothedVelocity = velDegPerSec;
             window.isStationary = false;
             window.stationaryLockPosition = null;
@@ -4792,9 +4755,9 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
         window._kalmanBlendFactor = fusionResult.blendFactor;
         window._isPositionFrozen = fusionResult.isFrozen || false;
     }
- 
+        
 /* ──────────────────────────────────────────────
-   STEP 5: Build Render State 
+   Build Render State 
    ────────────────────────────────────────────── */
    function _buildRenderState(fusionResult, fix, lastPos, timeDelta) {
         var speedMPS = fusionResult.speedMPS;
@@ -4842,7 +4805,7 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
     }
  
 /* ──────────────────────────────────────────────
-   STEP 6: Unified Render
+   Unified Render
    In centered mode the GPS update path only moves the
    marker — the viewport is owned exclusively by the dead reckoning RAF
    loop via _snapViewportToPosition (animate:false).  This eliminates
@@ -5058,10 +5021,6 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
     }
 
     // ── Animation flags ──
-    // clearAllTrackedTimeouts above killed the timeouts that clear these
-    // (handleContinueClick's 650ms, _executeRender's 300ms). Without
-    // this reset, a tab-away mid-animation leaves them true and
-    // handleInteractionStart silently ignores every user drag.
     window._programmaticFlyInProgress = false;
     window._isProximityZoomAnimating = false;
 
@@ -5141,15 +5100,6 @@ function _computeProximity(newPosition, speedMPH, currentTime) {
     window.lastUpdateTime = currentTime;
     window.lastUpdateTimestamp = currentTime;
 
-    // Wake never derives velocity from the pre/post-background delta, even
-    // for short backgrounding stints. That delta is a GPS reacquisition
-    // jump, not real travel, and was the main source of the post-resume
-    // slide/bounce (previously this only got zeroed by luck, via the dtSec
-    // gate below, when the background stint happened to be long).
-    // For everything else, smoothedVelocity is now an actual EMA against
-    // the previous smoothed value instead of a raw copy of the instant
-    // two-point velocity — a single noisy GPS sample (common right as you
-    // slow down) can no longer spike it and cause DR rubberbanding.
     var prevSmoothed = window.smoothedVelocity || { lat: 0, lng: 0 };
     window.lastVelocity = { lat: 0, lng: 0 };
     window.smoothedVelocity = { lat: 0, lng: 0 };
@@ -5320,11 +5270,9 @@ function _cleanupProximityZoomState() {
     }
 }
 
-/* ──────────────────────────────────────────────
-   beforeunload cleanup — destroys sensor fusion,
+/* beforeunload cleanup — destroys sensor fusion,
    stops dead reckoning, and closes audio context.
-   Mobile fallback lives in pagehide handlers.
-   ────────────────────────────────────────────── */
+   Mobile fallback lives in pagehide handlers. */
 if (typeof window !== 'undefined') {
     var _doCleanup = function() {
         try {
@@ -5499,11 +5447,6 @@ function updateDistanceBox(forceUpdate = false, precalcUserPos = null, precalcCl
                             lastDisplayedText = arrivedText;
                         }
                         window.currentlyArrived = true;
-
-                        // Don't call handleProximityAndAutoOpen here — it's already called
-                        // at the top of this function every GPS tick. Double-calling it
-                        // causes debounce stamp confusion and potential double-open.
-
                         _stopCountdown();
 
                         if (window._cooldownExpiryTimeout) {
@@ -5609,9 +5552,6 @@ function updateDistanceBox(forceUpdate = false, precalcUserPos = null, precalcCl
         
 /* ──────────────────────────────────────────────
    calculateDistance — haversine formula.
-   Supports two signatures:
-     calculateDistance(lat1, lng1, lat2, lng2)
-     calculateDistance({lat, lng}, {lat, lng})
    Returns meters, or Infinity on invalid input.
    ────────────────────────────────────────────── */
 function calculateDistance(pos1OrLat, pos2OrLng, lat2, lng2) {
@@ -5855,9 +5795,7 @@ function recenterMap() {
         // _snapViewport on the very next frame.
         dr.forceUpdate();
     } else {
-        // DR is not running — snap directly.  noMoveStart prevents
-        // the synchronous movestart from flipping followUser back
-        // to false.
+        // DR is not running — snap directly.  
         window._programmaticFlyInProgress = true;
         map.panTo(ll, {
             animate:     false,
@@ -7493,8 +7431,7 @@ function initAudioPlayer() {
         }
     });
 
-    // Added touch scrubbing support. The setProgress function 
-    // already handled e.touches, but the events were never bound!
+    // Added touch scrubbing support. 
     if (progressContainer) {
         progressContainer.addEventListener('click', setProgress);
         
@@ -8308,28 +8245,32 @@ function showNavigationTips() {
 
     const svg = inner => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${inner}</svg>`;
     const ICONS = {
-        close:    '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>',
-        more:     '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>',
-        recenter: svg('<circle cx="12" cy="12" r="7"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/>'),
-        distance: svg('<circle cx="5" cy="19" r="2.2"/><circle cx="19" cy="5" r="2.2"/><path d="M8 16l8-8"/>'),
-        proximity:svg('<circle cx="12" cy="12" r="10" stroke-dasharray="3 4" opacity=".5"/><path d="M12 17.5s-4.2-3.7-4.2-7a4.2 4.2 0 1 1 8.4 0c0 3.3-4.2 7-4.2 7z"/><circle cx="12" cy="10.4" r="1.5"/>'),
-        signal:   svg('<path d="M4 20a16 16 0 0 1 16-16M4 20a10.5 10.5 0 0 1 10.5-10.5M4 20A5 5 0 0 1 9 15"/><circle cx="4.6" cy="19.4" r="1.7" fill="currentColor" stroke="none"/>'),
-        audio:    svg('<circle cx="12" cy="12" r="9"/><path d="M10 8.8l5.6 3.2-5.6 3.2z" fill="currentColor" stroke="none"/>'),
-        privacy:  svg('<path d="M12 3l7 3v5.2c0 4.4-2.9 7.9-7 9.8-4.1-1.9-7-5.4-7-9.8V6z"/><path d="M9 12.2l2.1 2.1 4-4.2"/>')
+        close:     '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>',
+        more:      '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>',
+        check:     '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 13l4 4L19 7"/></svg>',
+        recenter:  svg('<circle cx="12" cy="12" r="7"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/>'),
+        distance:  svg('<circle cx="5" cy="19" r="2.2"/><circle cx="19" cy="5" r="2.2"/><path d="M8 16l8-8"/>'),
+        proximity: svg('<circle cx="12" cy="12" r="10" stroke-dasharray="3 4" opacity=".5"/><path d="M12 17.5s-4.2-3.7-4.2-7a4.2 4.2 0 1 1 8.4 0c0 3.3-4.2 7-4.2 7z"/><circle cx="12" cy="10.4" r="1.5"/>'),
+        signal:    svg('<path d="M4 20a16 16 0 0 1 16-16M4 20a10.5 10.5 0 0 1 10.5-10.5M4 20A5 5 0 0 1 9 15"/><circle cx="4.6" cy="19.4" r="1.7" fill="currentColor" stroke="none"/>'),
+        audio:     svg('<circle cx="12" cy="12" r="9"/><path d="M10 8.8l5.6 3.2-5.6 3.2z" fill="currentColor" stroke="none"/>'),
+        privacy:   svg('<path d="M12 3l7 3v5.2c0 4.4-2.9 7.9-7 9.8-4.1-1.9-7-5.4-7-9.8V6z"/><path d="M9 12.2l2.1 2.1 4-4.2"/>')
     };
 
     const TIPS = [
-        [ICONS.recenter,  "Tap the recenter button to focus on your current position."],
-        [ICONS.distance,  "The distance box shows how far you are from the nearest location."],
-        [ICONS.proximity, "Get within 20 feet of a location to interact with it."],
-        [ICONS.signal,    "GPS can drift under tree cover or near buildings — step into the open if a location doesn't appear."],
-        [ICONS.audio,     "Tap play to hear the location's audio guide."],
-        [ICONS.privacy,   "Your location stays on your device — nothing is uploaded."]
+        [ICONS.recenter,  "Recenter the map",     "Tap the recenter button to focus on your current position."],
+        [ICONS.distance,  "Watch the distance",    "The distance box shows how far you are from the nearest location."],
+        [ICONS.proximity, "Get in range",          "Get within 20 feet of a location to interact with it."],
+        [ICONS.signal,    "Mind the GPS drift",    "Signal can drift under tree cover or near buildings — step into the open if a location doesn't appear."],
+        [ICONS.audio,     "Listen along",          "Tap play to hear the location's audio guide."],
+        [ICONS.privacy,   "Stay private",          "Your location stays on your device — nothing is uploaded."]
     ];
-    const tipsHtml = TIPS.map(([icon, text], i) => `
-        <li class="nt-tip nt-reveal" style="--d:${(0.3 + i * 0.07).toFixed(2)}s">
+    const tipsHtml = TIPS.map(([icon, title, text], i) => `
+        <li class="nt-tip nt-reveal" style="--d:${(0.28 + i * 0.06).toFixed(2)}s">
             <span class="nt-tip-icon">${icon}</span>
-            <span class="nt-tip-text">${text}</span>
+            <span class="nt-tip-copy">
+                <span class="nt-tip-title">${title}</span>
+                <span class="nt-tip-text">${text}</span>
+            </span>
         </li>`).join('');
 
     // ---- Fonts (shared) + stylesheet injected once ----
@@ -8361,8 +8302,8 @@ function showNavigationTips() {
             #navTipsModal * { box-sizing:border-box; }
 
             .nt-card {
-                width:100%; max-width:500px; margin:auto;
-                max-height:min(88vh,760px); max-height:min(88dvh,760px);
+                width:100%; max-width:460px; margin:auto;
+                max-height:min(88vh,720px); max-height:min(88dvh,720px);
                 display:flex; flex-direction:column; overflow:hidden;
                 background:#fbfcfe; border-radius:20px; color:#33445c;
                 box-shadow:0 24px 60px -20px rgba(3,10,30,.5), 0 4px 14px -6px rgba(3,10,30,.28);
@@ -8372,7 +8313,7 @@ function showNavigationTips() {
             #navTipsModal.is-open .nt-card { transform:none; }
 
             /* ---- header ---- */
-            .nt-header { position:relative; min-height:132px; padding:26px 24px 36px; color:#fff;
+            .nt-header { position:relative; min-height:128px; padding:26px 24px 34px; color:#fff;
                 background:linear-gradient(155deg,#0d2560 0%,#1a3a8a 55%,#2550ad 100%); }
             .nt-topo { position:absolute; inset:0; overflow:hidden; pointer-events:none; z-index:0; }
             .nt-topo::before { content:''; position:absolute; inset:-28px;
@@ -8385,7 +8326,7 @@ function showNavigationTips() {
             @keyframes ntDrift { to { transform:translate(-18px,-12px); } }
 
             /* quiet compass watermark — one smooth settle, nothing else */
-            .nt-compass { position:absolute; right:22px; bottom:14px; z-index:2; width:58px; height:58px;
+            .nt-compass { position:absolute; right:22px; bottom:12px; z-index:2; width:54px; height:54px;
                 filter:drop-shadow(0 4px 6px rgba(0,0,0,.2)); }
             .nt-needle { transform-box:fill-box; transform-origin:center;
                 animation:ntSettle 1.2s .6s cubic-bezier(.22,1,.36,1) both; }
@@ -8409,39 +8350,42 @@ function showNavigationTips() {
             /* ---- body ---- */
             .nt-scrollwrap { position:relative; flex:1; min-height:0; display:flex; flex-direction:column; }
             .nt-body { flex:1; min-height:0; overflow-y:auto; overscroll-behavior:contain;
-                padding:24px 0 22px; -webkit-overflow-scrolling:touch; }
+                padding:22px 0 20px; -webkit-overflow-scrolling:touch; }
             .nt-body::-webkit-scrollbar { width:7px; }
             .nt-body::-webkit-scrollbar-track { background:transparent; }
             .nt-body::-webkit-scrollbar-thumb { background:#d7dfea; border-radius:8px; }
             .nt-body::-webkit-scrollbar-thumb:hover { background:#c3cee0; }
 
-            .nt-fade { position:absolute; left:0; right:0; bottom:0; height:48px; pointer-events:none;
+            .nt-fade { position:absolute; left:0; right:0; bottom:0; height:44px; pointer-events:none;
                 background:linear-gradient(180deg, rgba(251,252,254,0), #fbfcfe 78%);
-                display:flex; align-items:flex-end; justify-content:center; padding-bottom:6px;
+                display:flex; align-items:flex-end; justify-content:center; padding-bottom:4px;
                 opacity:0; transition:opacity .3s ease; }
             .nt-fade.is-visible { opacity:1; }
             .nt-fade svg { color:#95a3b6; animation:ntBob 1.6s ease-in-out infinite; }
             @keyframes ntBob { 0%,100% { transform:translateY(0); } 50% { transform:translateY(3px); } }
 
-            .nt-lead { margin:0 24px 16px; font-size:.94rem; line-height:1.55; color:#69788d; }
+            .nt-lead { margin:0 24px 14px; font-size:.94rem; line-height:1.55; color:#69788d; }
 
-            .nt-tips { list-style:none; margin:0; padding:0 18px; display:flex; flex-direction:column; gap:4px; }
-            .nt-tip { display:flex; align-items:flex-start; gap:14px; padding:11px 12px; border-radius:12px;
+            .nt-tips { list-style:none; margin:0; padding:0 16px; display:flex; flex-direction:column; gap:2px; }
+            .nt-tip { display:flex; align-items:flex-start; gap:14px; padding:11px 10px; border-radius:12px;
                 transition:background .2s ease, transform .2s cubic-bezier(.16,1,.3,1); }
+            .nt-tip:not(:last-child) { border-bottom:1px solid #eef1f6; }
             .nt-tip:hover { background:rgba(26,58,138,.05); transform:translateX(2px); }
-            .nt-tip-icon { flex-shrink:0; width:38px; height:38px; border-radius:10px; display:grid; place-items:center;
+            .nt-tip-icon { flex-shrink:0; width:38px; height:38px; margin-top:1px; border-radius:11px; display:grid; place-items:center;
                 background:rgba(26,58,138,.08); color:#1a3a8a;
                 transition:background .2s ease, transform .2s cubic-bezier(.16,1,.3,1); }
-            .nt-tip-icon svg { width:20px; height:20px; }
+            .nt-tip-icon svg { width:19px; height:19px; }
             .nt-tip:hover .nt-tip-icon { background:rgba(26,58,138,.15); transform:scale(1.05); }
-            .nt-tip-text { font-size:.96rem; line-height:1.55; color:#3d4c61; padding-top:7px; }
+            .nt-tip-copy { display:flex; flex-direction:column; gap:2px; padding-top:2px; }
+            .nt-tip-title { font-size:.9rem; font-weight:700; color:#243250; line-height:1.4; }
+            .nt-tip-text { font-size:.87rem; line-height:1.5; color:#69788d; }
 
             /* staggered reveal */
             .nt-reveal { opacity:0; transform:translateY(12px);
                 animation:ntUp .55s cubic-bezier(.16,1,.3,1) forwards; animation-delay:var(--d,0s); }
             @keyframes ntUp { to { opacity:1; transform:none; } }
 
-            @media (max-width:380px) { .nt-compass { width:48px; height:48px; } }
+            @media (max-width:380px) { .nt-compass { width:44px; height:44px; } }
             @media (prefers-reduced-motion:reduce) {
                 #navTipsModal, .nt-card, .nt-tip, .nt-tip-icon, .nt-close, .nt-fade { transition:none; }
                 .nt-reveal { animation:none; opacity:1; transform:none; }
@@ -8484,7 +8428,7 @@ function showNavigationTips() {
 
             <div class="nt-scrollwrap">
                 <div class="nt-body">
-                    <p class="nt-lead nt-reveal" style="--d:.22s">Six things worth knowing before you head out.</p>
+                    <p class="nt-lead nt-reveal" style="--d:.2s">Six things worth knowing before you head out.</p>
                     <ul class="nt-tips">${tipsHtml}</ul>
                 </div>
                 <div class="nt-fade" aria-hidden="true">${ICONS.more}</div>
@@ -8611,8 +8555,7 @@ function getMarkerColor(tours) {
         // to the user (animate:false) every frame in centered mode. If DR is
         // already running, an animated panTo here races that snap and
         // rubber-bands the map on return — so nudge DR to sync immediately
-        // instead. Only pan ourselves (original animated behavior) when DR
-        // isn't driving the viewport yet.
+        // instead. 
         const dr = window.deadReckoning;
         if (dr && typeof dr.isActive === 'function' && dr.isActive() &&
             typeof dr.forceUpdate === 'function') {
@@ -8670,7 +8613,7 @@ function createMarkersOnly() {
             bubblingMouseEvents: false
         });
         
-        // 1. Image dimensions are explicitly set to prevent layout reflow jitter
+        // Image dimensions are explicitly set to prevent layout reflow jitter
         const popupContent = `
             <div class="popup-content">
                 <img loading="eager" 
@@ -8692,7 +8635,7 @@ function createMarkersOnly() {
             </div>
         `;
         
-        // 2. Explicitly enable autoPan and give it breathing room from the viewport edge
+        // Explicitly enable autoPan and give it breathing room from the viewport edge
         locationMarker.bindPopup(popupContent, {
             offset: L.point(0, -25),
             className: 'custom-popup',
@@ -8704,7 +8647,7 @@ function createMarkersOnly() {
             autoPanPadding: L.point(20, 20) 
         });
         
-        // 3. Suspend Dead Reckoning when the popup opens to prevent viewport tug-of-war
+        // Suspend Dead Reckoning when the popup opens to prevent viewport tug-of-war
         locationMarker.on('popupopen', function(e) {
             activePopups.add(locationMarker);
             attachPopupEventListeners(e.popup._contentNode, location);
@@ -8881,7 +8824,7 @@ function showNavigationModal(destinationLat, destinationLng) {
        });
    };
    
-   // FIX 1: Added keepOverflowHidden parameter to prevent scroll-lock race condition
+   // Added keepOverflowHidden parameter to prevent scroll-lock race condition
    const closeModal = (keepOverflowHidden = false) => {
        if (!keepOverflowHidden) {
            document.body.style.overflow = '';
@@ -8952,7 +8895,7 @@ function showNavigationModal(destinationLat, destinationLng) {
            reminderModal.querySelector(".reminder-content").style.transform = "translateY(20px)";
            setTimeout(() => {
                reminderModal.remove();
-               // FIX 2: Use window.location.href instead of window.open for reliable mobile deep-linking
+               // Use window.location.href instead of window.open for reliable mobile deep-linking
                window.location.href = navigationUrl;
                document.body.focus();
            }, 300);
@@ -8999,7 +8942,7 @@ function showNavigationModal(destinationLat, destinationLng) {
            }
        }
        
-       // FIX 1 Applied: Pass true to keep overflow hidden while the reminder modal opens
+       // Pass true to keep overflow hidden while the reminder modal opens
        closeModal(true);
        showReminderModal(navigationUrl);
    };
@@ -9206,17 +9149,18 @@ function returnToIndex() {
             .ex-body { padding:24px 26px 26px; text-align:center; overflow-y:auto; }
             .ex-message { margin:0 0 24px; color:#5c6c7c; line-height:1.6; font-size:1rem; }
             .ex-actions { display:flex; gap:12px; }
-            .ex-btn { flex:1; padding:14px 18px; border-radius:12px; cursor:pointer;
-                font:600 1rem/1 'Public Sans',system-ui,sans-serif;
-                transition:background .2s ease, transform .15s ease, box-shadow .2s ease, border-color .2s ease;
+            .ex-btn { flex:1; padding:13px 18px; border-radius:12px; cursor:pointer;
+                font:700 .96rem/1 'Public Sans',system-ui,sans-serif;
+                transition:background .2s ease, transform .15s ease, box-shadow .2s ease, border-color .2s ease, filter .2s ease;
                 touch-action:manipulation; user-select:none; -webkit-tap-highlight-color:transparent; }
             .ex-btn:active { transform:scale(.97); }
             .ex-btn:focus-visible { outline:2px solid #86a5ff; outline-offset:2px; }
-            .ex-primary { background:#1a3a8a; color:#fff; border:1px solid #1a3a8a;
-                box-shadow:0 10px 22px -10px rgba(26,58,138,.6); }
-            .ex-primary:hover { background:#0d2c6e; border-color:#0d2c6e; transform:translateY(-1px);
-                box-shadow:0 14px 26px -10px rgba(13,44,110,.65); }
-            .ex-secondary { background:transparent; color:#1a3a8a; border:1.5px solid rgba(26,58,138,.4); }
+            .ex-primary { color:#fff; border:none;
+                background:linear-gradient(135deg,#1a3a8a,#2550ad);
+                box-shadow:0 10px 22px -10px rgba(26,58,138,.55); }
+            .ex-primary:hover { transform:translateY(-1px); filter:brightness(1.06);
+                box-shadow:0 14px 26px -10px rgba(26,58,138,.6); }
+            .ex-secondary { background:transparent; color:#1a3a8a; border:1.5px solid rgba(26,58,138,.35); }
             .ex-secondary:hover { background:rgba(26,58,138,.06); border-color:#1a3a8a; transform:translateY(-1px); }
             .ex-credits { display:inline-flex; align-items:center; margin-top:20px; padding:8px 18px;
                 border-radius:999px; border:1px solid rgba(100,116,139,.22); background:rgba(100,116,139,.05);
@@ -9251,29 +9195,33 @@ function returnToIndex() {
             .cr-body::-webkit-scrollbar-track { background:transparent; }
             .cr-body::-webkit-scrollbar-thumb { background:#d7dfea; border-radius:8px; }
             .cr-body::-webkit-scrollbar-thumb:hover { background:#c3cee0; }
-            .cr-fade { position:absolute; left:0; right:0; bottom:0; height:48px; pointer-events:none;
+            .cr-fade { position:absolute; left:0; right:0; bottom:0; height:44px; pointer-events:none;
                 background:linear-gradient(180deg, rgba(251,252,254,0), #fbfcfe 78%);
-                display:flex; align-items:flex-end; justify-content:center; padding-bottom:6px;
+                display:flex; align-items:flex-end; justify-content:center; padding-bottom:4px;
                 opacity:0; transition:opacity .3s ease; }
             .cr-fade.is-visible { opacity:1; }
             .cr-fade svg { color:#95a3b6; animation:crBob 1.6s ease-in-out infinite; }
             @keyframes crBob { 0%,100% { transform:translateY(0); } 50% { transform:translateY(3px); } }
 
-            .cr-list { list-style:none; margin:0; padding:0 18px; display:flex; flex-direction:column; gap:6px; }
-            .cr-item { display:flex; align-items:flex-start; gap:14px; padding:13px 12px; border-radius:12px;
-                transition:background .2s ease; }
-            .cr-item:hover { background:rgba(26,58,138,.05); }
-            .cr-badge { flex-shrink:0; width:44px; height:44px; border-radius:11px; display:grid; place-items:center;
+            .cr-list { list-style:none; margin:0; padding:0 16px; display:flex; flex-direction:column; gap:2px; }
+            .cr-item { display:flex; align-items:flex-start; gap:14px; padding:13px 10px; border-radius:12px;
+                transition:background .2s ease, transform .2s cubic-bezier(.16,1,.3,1); }
+            .cr-item:not(:last-child) { border-bottom:1px solid #eef1f6; }
+            .cr-item:hover { background:rgba(26,58,138,.05); transform:translateX(2px); }
+            .cr-badge { flex-shrink:0; width:42px; height:42px; margin-top:1px; border-radius:11px; display:grid; place-items:center;
                 background:rgba(26,58,138,.08); color:#1a3a8a;
-                font-family:'Fraunces',Georgia,serif; font-weight:700; font-size:.8rem; letter-spacing:.02em; }
+                font-family:'Fraunces',Georgia,serif; font-weight:700; font-size:.78rem; letter-spacing:.02em;
+                transition:background .2s ease, transform .2s cubic-bezier(.16,1,.3,1); }
+            .cr-item:hover .cr-badge { background:rgba(26,58,138,.15); transform:scale(1.05); }
+            .cr-meta { padding-top:1px; }
             .cr-link { display:inline-flex; align-items:center; gap:5px; color:#1a3a8a; font-weight:700;
-                font-size:1rem; text-decoration:none; }
+                font-size:.96rem; text-decoration:none; }
             .cr-link:hover { text-decoration:underline; }
             .cr-link:focus-visible { outline:2px solid #86a5ff; outline-offset:2px; border-radius:4px; }
             .cr-link svg { color:#8593a8; flex-shrink:0; transition:transform .2s ease, color .2s ease; }
             .cr-item:hover .cr-link svg { transform:translate(2px,-2px); color:#1a3a8a; }
-            .cr-plainname { color:#1f2d40; font-weight:700; font-size:1rem; }
-            .cr-desc { margin:4px 0 0; color:#69788d; font-size:.88rem; line-height:1.5; }
+            .cr-plainname { color:#1f2d40; font-weight:700; font-size:.96rem; }
+            .cr-desc { margin:3px 0 0; color:#69788d; font-size:.87rem; line-height:1.5; }
 
             /* staggered reveal (shared) */
             .ex-reveal, .cr-reveal { opacity:0; transform:translateY(12px);
@@ -9283,7 +9231,7 @@ function returnToIndex() {
             @media (max-width:380px) { .cr-medal { width:44px; height:44px; } }
             @media (prefers-reduced-motion:reduce) {
                 #exitModal, #creditsModal, .ex-card, .cr-card, .ex-btn, .ex-credits,
-                .cr-close, .cr-item, .cr-link svg, .cr-fade { transition:none; }
+                .cr-close, .cr-item, .cr-badge, .cr-link svg, .cr-fade { transition:none; }
                 .ex-reveal, .cr-reveal { animation:none; opacity:1; transform:none; }
                 .ex-topo::before, .cr-topo::before { animation:none; }
                 .cr-fade svg { animation:none; }
@@ -9379,7 +9327,6 @@ function returnToIndex() {
     popupDiv.classList.add('is-open');
     setTimeout(() => cancelBtn.focus({ preventScroll: true }), 400); // safe default
 
-    // ================= ACKNOWLEDGEMENTS =================
     function openCredits() {
         if (document.getElementById('creditsModal')) return;
 
@@ -9461,25 +9408,45 @@ function returnToIndex() {
 }
     
 function isSignificantMovement(newPosition) {
+    const now = Date.now();
+    const track = isSignificantMovement._track || (isSignificantMovement._track = {});
+
+    // First fix: seed the anchor and the tracker, treat as significant.
     if (!lastPositionForJitter) {
         lastPositionForJitter = newPosition;
-        lastSignificantMovement = Date.now();
+        lastSignificantMovement = now;
+        track.pos = newPosition;
+        track.time = now;
         return true;
     }
 
     const distance = calculateDistance(lastPositionForJitter, newPosition);
-    
-    // Prevent invalid GPS spikes from poisoning the baseline position
-    if (!isFinite(distance) || distance < 0) {
+
+    // Haversine is never negative, so the old `distance < 0` test was dead code.
+    if (!isFinite(distance)) {
         return false;
     }
 
-    const now = Date.now();
+    // ── Spike guard (opt-in) ──
+    const maxSpeed = CONFIG.MAX_PLAUSIBLE_SPEED;
+    if (track.pos && maxSpeed != null) {
+        const fixDelta = Math.max(now - track.time, 1) / 1000;   // seconds since previous fix
+        const step = calculateDistance(track.pos, newPosition);
+        const impliedSpeed = step / fixDelta;                    // m/s
+        if (isFinite(impliedSpeed) && impliedSpeed > maxSpeed) {
+            return false;   // impossible speed → bad fix; don't advance the tracker
+        }
+    }
+    track.pos = newPosition;
+    track.time = now;
+
     const timeSince = now - lastSignificantMovement;
+    // Falls back to your original JITTER_THRESHOLD * 5 if SPIKE_THRESHOLD isn't set.
+    const spikeThreshold = CONFIG.SPIKE_THRESHOLD ?? (CONFIG.JITTER_THRESHOLD * 5);
 
     if (
         (distance >= CONFIG.JITTER_THRESHOLD && timeSince >= CONFIG.SIGNIFICANT_MOVEMENT_COOLDOWN) ||
-        distance >= CONFIG.JITTER_THRESHOLD * 5
+        distance >= spikeThreshold
     ) {
         lastPositionForJitter = newPosition;
         lastSignificantMovement = now;
@@ -9533,8 +9500,7 @@ function optimizeImages(root = document) {
     return;
   }
 
-  // Shared by both the "already known broken at process-time" and
-  // "failed to load later" paths. These used to diverge (visibility:hidden
+  // These used to diverge (visibility:hidden
   // vs opacity:0.5) purely based on *when* the browser happened to notice
   // the failure, not on any real difference in the two cases — unified here
   // on visibility:hidden. The distinct data-optimized values ('error-broken'
@@ -9665,7 +9631,6 @@ function setupImageOptimizationObserver() {
         rafId = null;
         pendingRoots.forEach(root => {
           // Defense-in-depth: skip if the root itself is a Leaflet container
-          // (shouldn't happen given the callback guards, but cheap insurance).
           if (root.closest && root.closest('.leaflet-container')) return;
           optimizeImages(root);
         });
@@ -9679,16 +9644,8 @@ function setupImageOptimizationObserver() {
           for (const node of mutation.addedNodes) {
             if (node.nodeType !== Node.ELEMENT_NODE) continue;
     
-            // ── SKIP LEAFLET INTERNALS ──────────────────────────────────
             // Leaflet creates/destroys hundreds of <img> tiles during
-            // pan/zoom. Processing them causes:
-            //   1. CPU waste: querySelectorAll on the tile pane every frame
-            //   2. Layout breakage: optimizeImages sets width/height/
-            //      aspectRatio/loading="lazy" on tiles, conflicting with
-            //      Leaflet's own positioning (transform-based, not
-            //      attribute-based).
-            // Leaflet tiles carry the class "leaflet-tile"; all map
-            // internals live under ".leaflet-pane" or ".leaflet-container".
+            // pan/zoom.
             if (node.classList && node.classList.contains('leaflet-tile')) continue;
             if (node.closest && node.closest('.leaflet-pane')) continue;
     
@@ -9733,9 +9690,8 @@ function setupImageOptimizationObserver() {
     }
 
 /* EVENT LISTENER SETUP */
-
 function handleInteractionStart() {
-    // CRITICAL: The map is moving programmatically. 
+    // The map is moving programmatically. 
     // Ignore this to keep followUser = true and isMapInteracting = false.
     if (window._programmaticFlyInProgress) {
         return;
@@ -9773,8 +9729,6 @@ function setupMapEvents() {
 
     try {
         // We only listen for drag/zoom events. 
-        // By relying on these specific events, we ignore internal 'move' 
-        // events generated by setView/panTo during programmatic updates.
         map.on('dragstart zoomstart', handleInteractionStart);
         map.on('dragend zoomend', handleInteractionEnd);
     } catch (error) {
