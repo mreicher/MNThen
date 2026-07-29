@@ -2250,158 +2250,193 @@ const trackedTimeouts = new Set();
 /* ──────────────────────────────────────────────
    MAP INITIALIZATION
    ────────────────────────────────────────────── */
-    function initMap() {
-        // ── Guard: full teardown if re-initializing ──
-        // disposeMapLoop() only clears window-scoped RAF/timeout/interval handles
-        // (see its rafHandles/timeoutHandles/intervalHandles lists) — it does NOT
-        // stop dead reckoning, whose animation-frame id is a closure-private
-        // variable inside deadReckoning and is never exposed on window. Without
-        // this explicit stop, DR keeps extrapolating and writing to `userMarker`
-        // and `map` straight through the teardown/recreate below.
-        if (typeof disposeMapLoop === 'function') disposeMapLoop();
-        if (window.deadReckoning && typeof window.deadReckoning.stop === 'function') {
-            window.deadReckoning.stop();   // also clears _drOwnsMarker / _drLastOwnsTime
-        }
+   function initMap() {
+    // ── Guard: full teardown if re-initializing ──
+    // disposeMapLoop() only clears window-scoped RAF/timeout/interval handles
+    // (see its rafHandles/timeoutHandles/intervalHandles lists) — it does NOT
+    // stop dead reckoning, whose animation-frame id is a closure-private
+    // variable inside deadReckoning and is never exposed on window. Without
+    // this explicit stop, DR keeps extrapolating and writing to `userMarker`
+    // and `map` straight through the teardown/recreate below.
+    if (typeof disposeMapLoop === 'function') disposeMapLoop();
+    if (window.deadReckoning && typeof window.deadReckoning.stop === 'function') {
+        window.deadReckoning.stop();   // also clears _drOwnsMarker / _drLastOwnsTime
+    }
+
+    if (map) {
+        try { map.remove(); } catch (e) { console.warn('[Map] Remove failed:', e.message); }
+        map = null;
+    }
+    if (markerClusterGroup) {
+        try { markerClusterGroup.clearLayers(); } catch (e) {}
+        markerClusterGroup = null;
+    }
+    // userMarker wasn't being torn down like the layers above — it was left
+    // pointing at the old (now-detached) marker instance until reassigned
+    // further down. Every marker-write path (dead reckoning's
+    // _setMarkerPosition, scheduleMarkerUpdate) gates on
+    // `typeof userMarker !== 'undefined' && userMarker` being truthy, so a
+    // stale-but-truthy reference here means those gates pass when they
+    // shouldn't, during the window before the new marker exists.
+    if (userMarker) {
+        try { userMarker.remove(); } catch (e) {}
+        userMarker = null;
+    }
+
+    // ── Reset interaction-handler registration flag ──
+    // setupMapInteractionHandlers() bails early when this flag is true.
+    // The old handlers were bound to the now-removed map instance, so the
+    // flag MUST be cleared here — otherwise drag/zoom interaction detection
+    // is silently dead after every re-init (followUser never toggles off on
+    // user pan, inactivity timer never clears/starts, etc.).
+    window._interactionHandlersSetup = false;
+
+    // ── Reset marker/popup bookkeeping ──
+    // markersCreated gates nothing in createMarkersOnly() today, but leaving
+    // it true across a re-init is a latent bug if any future code checks it.
+    // activePopups holds references to old (removed) marker instances — stale
+    // entries that would confuse closeAllPopups() if called before
+    // createMarkersOnly() repopulates the set.
+    markersCreated = false;
+    if (activePopups) activePopups.clear();
+
+    // ── Reset animation flags that disposeMapLoop doesn't cover ──
+    // _mapAnimating is checked by DR's _snapViewport every frame. If a
+    // re-init lands mid-animation (e.g. visibility return racing a
+    // proximity zoom), this flag stays true and permanently blocks
+    // viewport sync until something else clears it.
+    window._mapAnimating = false;
+
+    // Render-state globals consumed by the GPS render scheduler
+    // (_scheduleMapUpdate / _executeRender). disposeMapLoop cancels the
+    // pending RAF but leaves this state pointing at the old map/position —
+    // clear it so nothing can act on stale state if it's read before the
+    // next real GPS update arrives.
+    window._currentMapState    = null;
+    window._currentRenderState = null;
+    window._currentSpeedTier   = null;
+
+    // ── Storage cleanup ──
+    ['lastKnownPos', 'routeHistory'].forEach(k => {
+        // Separate try/catch per call so a quota/security error on one
+        // storage backend can't prevent cleanup of the other.
+        try { localStorage.removeItem(k); } catch (_) {}
+        try { sessionStorage.removeItem(k); } catch (_) {}
+    });
     
-        if (map) {
-            try { map.remove(); } catch (e) { console.warn('[Map] Remove failed:', e.message); }
-            map = null;
-        }
-        if (markerClusterGroup) {
-            try { markerClusterGroup.clearLayers(); } catch (e) {}
-            markerClusterGroup = null;
-        }
-        // userMarker wasn't being torn down like the layers above — it was left
-        // pointing at the old (now-detached) marker instance until reassigned
-        // further down. Every marker-write path (dead reckoning's
-        // _setMarkerPosition, scheduleMarkerUpdate) gates on
-        // `typeof userMarker !== 'undefined' && userMarker` being truthy, so a
-        // stale-but-truthy reference here means those gates pass when they
-        // shouldn't, during the window before the new marker exists.
-        if (userMarker) {
-            try { userMarker.remove(); } catch (e) {}
-            userMarker = null;
-        }
+    // ── Map creation ──    
+    map = L.map('map', {
+        zoomControl: false,
+        doubleClickZoom: false,
+        zoomSnap: 0.1,
+        zoomDelta: 0.5,
+        wheelDebounceTime: 100,
+        tapTolerance: 15,
+        bounceAtZoomLimits: false,
+        renderer: L.canvas(),
+        fadeAnimation: false,
+        zoomAnimationThreshold: 4,
+        markerZoomAnimation: false,
+        attributionControl: false   
+    }).setView([46.392410, -94.636230], 9);
     
-        // Render-state globals consumed by the GPS render scheduler
-        // (_scheduleMapUpdate / _executeRender). disposeMapLoop cancels the
-        // pending RAF but leaves this state pointing at the old map/position —
-        // clear it so nothing can act on stale state if it's read before the
-        // next real GPS update arrives.
-        window._currentMapState    = null;
-        window._currentRenderState = null;
-        window._currentSpeedTier   = null;
+    L.control.attribution({ prefix: false }).addTo(map); 
+
+    // ── Tile layer with required OSM attribution ──
+    const tiles = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        minZoom: 7,
+        maxZoom: 19,
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+        updateWhenIdle: true,
+        updateWhenZooming: false,
+        keepBuffer: 2,
+        className: 'map-tiles'
+    }).addTo(map);
+
+    // Expose the tile layer so _prefetchMapTiles() can read its URL
+    // template instead of falling back to a hardcoded string. Without
+    // this, window.currentTileLayer is always undefined and every
+    // prefetch call silently uses the fallback — fragile if the tile
+    // source ever changes.
+    window.currentTileLayer = tiles;
+
+    // Retry the occasional dropped tile (up to 3x, with backoff).
+    // Uses createTrackedTimeout instead of raw setTimeout so
+    // disposeMapLoop → clearAllTrackedTimeouts() sweeps pending
+    // retries on teardown. A raw setTimeout here survives map
+    // destruction and fires tile.src = ... against a removed layer.
+    tiles.on('tileerror', function (e) {
+        const tile = e.tile;
+        tile._retries = tile._retries || 0;
+        if (tile._retries >= 3) return;
+        tile._retries++;
+        const src = tile._origSrc || (tile._origSrc = tile.src);
+        createTrackedTimeout(() => { tile.src = src; }, 300 * tile._retries);
+    });
     
-        // ── Storage cleanup ──
-        ['lastKnownPos', 'routeHistory'].forEach(k => {
-            // Separate try/catch per call so a quota/security error on one
-            // storage backend can't prevent cleanup of the other.
-            try { localStorage.removeItem(k); } catch (_) {}
-            try { sessionStorage.removeItem(k); } catch (_) {}
-        });
+    // ── Marker cluster ──
+    markerClusterGroup = L.markerClusterGroup({
+        showCoverageOnHover: false,
+        zoomToBoundsOnClick: true,
+        spiderfyOnMaxZoom: true,
+        animate: false,
+        chunkedLoading: true,
+        chunkProgress: updateLoadingStatus,
+        maxClusterRadius: z => z > 16 ? 40 : 80,
+        iconCreateFunction: c => L.divIcon({
+            html: `<div><span>${c.getChildCount()}</span></div>`,
+            className: 'marker-cluster-custom',
+            iconSize: [40, 40]
+        })
+    }).addTo(map);
+
+    // ── User marker ──
+    userMarker = L.marker([0, 0], {
+        icon: L.divIcon({
+            className: 'user-marker',
+            html: '<div class="user-marker-icon"></div>',
+            iconSize: [20, 20],
+            iconAnchor: [10, 10]
+        }),
+        zIndexOffset: 1000
+    }).addTo(map);
+
+    showLoadingMessage();
+
+    // ── Geolocation with escalated fallback ──
+    if ('geolocation' in navigator) {
+        const opts = { enableHighAccuracy: true, timeout: 45000, maximumAge: 5000 };
         
-        // ── Map creation ──    
-        map = L.map('map', {
-            zoomControl: false,
-            doubleClickZoom: false,
-            zoomSnap: 0.1,
-            zoomDelta: 0.5,
-            wheelDebounceTime: 100,
-            tapTolerance: 15,
-            bounceAtZoomLimits: false,
-            renderer: L.canvas(),
-            fadeAnimation: false,
-            zoomAnimationThreshold: 4,
-            markerZoomAnimation: false,
-            attributionControl: false   
-        }).setView([46.392410, -94.636230], 9);
-        
-        L.control.attribution({ prefix: false }).addTo(map); 
-    
-        // ── Tile layer with required OSM attribution ──
-        const tiles = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-            minZoom: 7,
-            maxZoom: 19,
-            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
-            updateWhenIdle: true,
-            updateWhenZooming: false,
-            keepBuffer: 2,
-            className: 'map-tiles'
-        }).addTo(map);
-    
-        // Retry the occasional dropped tile (up to 3x, with backoff)
-        tiles.on('tileerror', function (e) {
-            const tile = e.tile;
-            tile._retries = tile._retries || 0;
-            if (tile._retries >= 3) return;
-            tile._retries++;
-            const src = tile._origSrc || (tile._origSrc = tile.src);
-            setTimeout(() => { tile.src = src; }, 300 * tile._retries);
-        });
-        
-        // ── Marker cluster ──
-        markerClusterGroup = L.markerClusterGroup({
-            showCoverageOnHover: false,
-            zoomToBoundsOnClick: true,
-            spiderfyOnMaxZoom: true,
-            animate: false,
-            chunkedLoading: true,
-            chunkProgress: updateLoadingStatus,
-            maxClusterRadius: z => z > 16 ? 40 : 80,
-            iconCreateFunction: c => L.divIcon({
-                html: `<div><span>${c.getChildCount()}</span></div>`,
-                className: 'marker-cluster-custom',
-                iconSize: [40, 40]
-            })
-        }).addTo(map);
-    
-        // ── User marker ──
-        userMarker = L.marker([0, 0], {
-            icon: L.divIcon({
-                className: 'user-marker',
-                html: '<div class="user-marker-icon"></div>',
-                iconSize: [20, 20],
-                iconAnchor: [10, 10]
-            }),
-            zIndexOffset: 1000
-        }).addTo(map);
-    
-        showLoadingMessage();
-    
-        // ── Geolocation with escalated fallback ──
-        if ('geolocation' in navigator) {
-            const opts = { enableHighAccuracy: true, timeout: 45000, maximumAge: 5000 };
+        const onFirstError = (err) => {
+            // iOS often denies first prompt due to timing; retry with relaxed constraints.
+            // Only retry on timeout (code 3) — retrying PERMISSION_DENIED (1) or
+            // POSITION_UNAVAILABLE (2) with the exact same options can't produce a
+            // different outcome, it just delays the user seeing the real error.
+            const isTimeout = err?.code === 3;
+            if (!isTimeout) {
+                handleLocationError(err);
+                return;
+            }
+            const retryOpts = { enableHighAccuracy: true, timeout: 60000, maximumAge: 10000 };
             
-            const onFirstError = (err) => {
-                // iOS often denies first prompt due to timing; retry with relaxed constraints.
-                // Only retry on timeout (code 3) — retrying PERMISSION_DENIED (1) or
-                // POSITION_UNAVAILABLE (2) with the exact same options can't produce a
-                // different outcome, it just delays the user seeing the real error.
-                const isTimeout = err?.code === 3;
-                if (!isTimeout) {
-                    handleLocationError(err);
-                    return;
-                }
-                const retryOpts = { enableHighAccuracy: true, timeout: 60000, maximumAge: 10000 };
-                
-                navigator.geolocation.getCurrentPosition(
-                    initializeUserLocation,
-                    handleLocationError,
-                    retryOpts
-                );
-            };
-    
             navigator.geolocation.getCurrentPosition(
                 initializeUserLocation,
-                onFirstError,
-                opts
+                handleLocationError,
+                retryOpts
             );
-        } else {
-            showPopup('Geolocation Error', 'Geolocation is not supported');
-            map.setView([44.9778, -93.2650], 17, { animate: false });
-            hideLoadingMessage();
-        }
+        };
+
+        navigator.geolocation.getCurrentPosition(
+            initializeUserLocation,
+            onFirstError,
+            opts
+        );
+    } else {
+        showPopup('Geolocation Error', 'Geolocation is not supported');
+        map.setView([44.9778, -93.2650], 17, { animate: false });
+        hideLoadingMessage();
     }
+}
 
 /* ──────────────────────────────────────────────
    GPS SEARCHING STATE — CSS-driven
