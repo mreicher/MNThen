@@ -3362,7 +3362,7 @@ function handlePositionUpdate(position) {
 /* ──────────────────────────────────────────────
    VISIBILITY CHANGE HANDLER
    ────────────────────────────────────────────── */
- function handleVisibilityChange() {
+function handleVisibilityChange() {
     if (document.hidden) {
         window.lastHiddenTime = Date.now();
         lastKnownPosition = userMarker?.getLatLng() ?? null;
@@ -3384,6 +3384,7 @@ function handlePositionUpdate(position) {
     } else {
         const awayMs    = Date.now() - (window.lastHiddenTime || 0);
         const threshold = CONFIG?.BACKGROUND_THRESHOLD ?? 30_000;
+
         if (window.visibilityDebounceTimer) {
             clearTimeout(window.visibilityDebounceTimer);
             window.visibilityDebounceTimer = null;
@@ -3391,7 +3392,63 @@ function handlePositionUpdate(position) {
         if (typeof startIdleProximityCheck === 'function') {
             startIdleProximityCheck();
         }
+
+        // ── Immediate camera snap ────────────────────────────────────────
+        // Runs unconditionally, before we know whether we'll also fetch a
+        // fresh GPS fix. Previously the short-absence branch only moved the
+        // marker (userMarker.setLatLng) and called map.invalidateSize — it
+        // never touched the camera or followUser/isMapInteracting. If the
+        // map wasn't centered on the user when the tab was backgrounded
+        // (a drag was in progress, a popup was open, etc.), nothing here
+        // ever recentered it, and dead reckoning's frame() loop only snaps
+        // the viewport when window.followUser is true — so the marker could
+        // sit off-center indefinitely after returning. Using the shared
+        // wake-reset path guarantees an instant, forced recenter + a reset
+        // followUser/isMapInteracting every single time, regardless of how
+        // long the app was away or what state the map was left in.
+        const cachedPos = window.lastPosition
+            ? {
+                  lat: window.lastPosition.lat,
+                  lng: window.lastPosition.lng,
+                  accuracy: window.lastPosition.accuracy || 20,
+                  heading: window.lastPosition.heading ?? null,
+                  speedMPS: 0,
+                  timestamp: Date.now()
+              }
+            : (lastKnownPosition
+                ? {
+                      lat: lastKnownPosition.lat,
+                      lng: lastKnownPosition.lng,
+                      accuracy: 20,
+                      heading: null,
+                      speedMPS: 0,
+                      timestamp: Date.now()
+                  }
+                : null);
+
+        if (map && userMarker && cachedPos && typeof _resetMapToPosition === 'function') {
+            try {
+                _resetMapToPosition(cachedPos, {
+                    resetType: 'wake',
+                    currentTime: Date.now(),
+                    forceUpdate: true,
+                    clearStationary: true
+                });
+            } catch (err) {
+                console.warn('[Visibility] Immediate wake snap failed:', err);
+            }
+        }
+
+        if (map) {
+            map.invalidateSize({ pan: false });
+        }
+
         if (awayMs > threshold) {
+            // Long absence: the snap above is a best-effort placeholder using
+            // possibly-stale cached coordinates. Keep the reacquiring visual
+            // and go get a real fix — updateLocationAfterBackground() will
+            // call _resetMapToPosition again (also resetType 'wake') once a
+            // fresh position lands, forcing a second, accurate recenter.
             window.visibilityDebounceTimer = createTrackedTimeout(() => {
                 window.visibilityDebounceTimer = null;
                 const currentAwayMs = Date.now() - (window.lastHiddenTime || 0);
@@ -3423,17 +3480,19 @@ function handlePositionUpdate(position) {
                 createTrackedTimeout(() => { window.isReWaking = false; }, 2000);
             }, 500);
         } else {
+            // Short absence: the immediate snap above already recentered the
+            // camera and reset followUser/isMapInteracting, so there's
+            // nothing stale to correct — just clear the reacquiring visual
+            // and hand tracking back to dead reckoning.
             window._isWakingFromBackground = false;
             const markerEl = userMarker?.getElement?.();
             if (markerEl) markerEl.classList.remove('gps-reacquiring');
-            if (map && lastKnownPosition) {
-                map.invalidateSize({ pan: false });
-                userMarker?.setLatLng(lastKnownPosition);
-            }
+
             if (window.deadReckoning && typeof window.deadReckoning.start === 'function') {
                 window.deadReckoning.start();
             }
         }
+
         if (markerClusterGroup &&
             typeof markerClusterGroup.getLayers === 'function' &&
             markerClusterGroup.getLayers().length === 0) {
@@ -3446,19 +3505,48 @@ function handlePositionUpdate(position) {
 /* ──────────────────────────────────────────────
    BACKGROUND LOCATION UPDATE
    ────────────────────────────────────────────── */
-    let geolocationRequestPending = false;
-    let warmupWatchId = null;
-    let _backgroundUpdateTimeout = null;
+let geolocationRequestPending = false;
+let warmupWatchId = null;
+let _backgroundUpdateTimeout = null;
 
 function updateLocationAfterBackground() {
     window.lastHiddenTime = window.lastHiddenTime || Date.now();
 
     const timeSinceLastBg = Date.now() - (window._lastBackgroundUpdate || 0);
     if (timeSinceLastBg < 30_000 && window.lastPosition) {
-        if (map) {
+        // Rapid background/foreground cycling — we already refreshed
+        // recently, so skip re-acquiring GPS. This used to only call
+        // map.invalidateSize + userMarker.setLatLng, which moves the marker
+        // but never touches the camera or followUser/isMapInteracting. If
+        // the map wasn't already centered on the user (a drag was mid-flight,
+        // a popup had shifted the view, etc.), that left the marker sitting
+        // off-center indefinitely — the same floating behavior the wake path
+        // is supposed to prevent. Route through the shared wake-reset instead
+        // so this bail-out gets the same forced recenter as every other wake.
+        if (map && userMarker && typeof _resetMapToPosition === 'function') {
+            try {
+                _resetMapToPosition(window.lastPosition, {
+                    resetType: 'wake',
+                    currentTime: Date.now(),
+                    forceUpdate: true,
+                    clearStationary: true
+                });
+            } catch (err) {
+                console.warn('[Background] Recent-update recenter failed:', err);
+                map.invalidateSize({ pan: false });
+                userMarker?.setLatLng([window.lastPosition.lat, window.lastPosition.lng]);
+            }
+        } else if (map) {
             map.invalidateSize({ pan: false });
             userMarker?.setLatLng([window.lastPosition.lat, window.lastPosition.lng]);
         }
+
+        // We're not going to fetch a fresh fix on this call, so nothing else
+        // will clear the reacquiring state — do it here.
+        window._isWakingFromBackground = false;
+        const markerEl = userMarker?.getElement?.();
+        if (markerEl) markerEl.classList.remove('gps-reacquiring');
+
         return;
     }
 
@@ -3483,7 +3571,7 @@ function updateLocationAfterBackground() {
             warmupWatchId = null;
         }
         document.getElementById('geolocation-retry-modal')?.remove();
-        
+
         // Safety fallback so DR isn't permanently blocked if GPS fails or times out
         window._isWakingFromBackground = false;
         const markerEl = userMarker?.getElement?.();
@@ -3603,6 +3691,14 @@ function updateLocationAfterBackground() {
 
             if (Date.now() - position.timestamp > 30000) return;
 
+            // Ignore stale/out-of-order fixes. This check used to live only
+            // inside the "significant movement" branch below, which meant a
+            // stale fix could still slip through and move the marker when
+            // the device hadn't moved much. Checking it up front closes that gap.
+            if (window.lastUpdateTime && position.timestamp <= window.lastUpdateTime) {
+                return;
+            }
+
             // Fresh fix arrived! Allow DR to resume with accurate data and remove visual feedback
             window._isWakingFromBackground = false;
             const markerEl = userMarker?.getElement?.();
@@ -3614,32 +3710,24 @@ function updateLocationAfterBackground() {
 
             if (!map) return;
 
-            const { latitude, longitude } = coords;
+            updateUserLocation(position, true);
+            if (typeof updateDistanceBox === 'function') updateDistanceBox();
 
-            const currentCenter = map.getCenter();
-            const distanceMoved = currentCenter.distanceTo([latitude, longitude]);
-
-            const moveNoiseFloorM = Math.min(Math.max((coords.accuracy || 20) * 2, 5), 100);
-
-            if (distanceMoved < moveNoiseFloorM) {
-                updateUserLocation(position, true);
-                if (typeof updateDistanceBox === 'function') updateDistanceBox();
-                if (typeof isSignificantMovement === 'function' &&
-                    isSignificantMovement({ lat: latitude, lng: longitude })) {
-                    if (typeof resetInactivityTimer === 'function') resetInactivityTimer(false);
-                }
-                return;
-            }
-
+            // Always snap the camera onto the reacquired fix.
+            //
+            // Previously this was gated behind a "did the device move more
+            // than a noise floor" check measured against the map's current
+            // center. That check is useful for suppressing camera jitter
+            // during *live* tracking updates, but it doesn't belong here:
+            // this function only runs once, right after coming back from
+            // background, and its entire job is to force the camera onto
+            // wherever the device actually is now. Since the map is very
+            // often still centered near the last known position when the
+            // app gets backgrounded, that distance check was almost always
+            // false on wake-up, so the snap silently never happened even
+            // though the marker itself updated correctly.
             requestAnimationFrame(() => {
                 try {
-                    if (window.lastUpdateTime && position.timestamp <= window.lastUpdateTime) {
-                        if (typeof updateDistanceBox === 'function') updateDistanceBox();
-                        return;
-                    }
-
-                    updateUserLocation(position, true);
-
                     if (typeof _resetMapToPosition === 'function' && window.lastPosition) {
                         _resetMapToPosition(window.lastPosition, {
                             resetType: 'wake',
@@ -3647,12 +3735,15 @@ function updateLocationAfterBackground() {
                             forceUpdate: true
                         });
                     }
-
-                    if (typeof updateDistanceBox === 'function') updateDistanceBox();
                 } catch (error) {
                     console.error("Error applying location:", error);
                 }
             });
+
+            // Note: no isSignificantMovement/resetInactivityTimer check here —
+            // _resetMapToPosition already does that internally for every
+            // non-init resetType (including 'wake'). Duplicating it here
+            // would fire resetInactivityTimer(false) twice per wake.
         };
 
         const onPositionError = (error) => {
