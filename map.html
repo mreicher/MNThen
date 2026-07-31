@@ -3512,17 +3512,13 @@ let _backgroundUpdateTimeout = null;
 function updateLocationAfterBackground() {
     window.lastHiddenTime = window.lastHiddenTime || Date.now();
 
+    // ── Rapid-cycle bail-out ──────────────────────────────────────────────
+    // We refreshed < 30 s ago and still have a valid cached position.
+    // Skip GPS re-acquisition entirely, but still force a camera recenter
+    // through the shared wake-reset path so the map can't be left
+    // off-center (drag in progress, popup shifted the view, etc.).
     const timeSinceLastBg = Date.now() - (window._lastBackgroundUpdate || 0);
     if (timeSinceLastBg < 30_000 && window.lastPosition) {
-        // Rapid background/foreground cycling — we already refreshed
-        // recently, so skip re-acquiring GPS. This used to only call
-        // map.invalidateSize + userMarker.setLatLng, which moves the marker
-        // but never touches the camera or followUser/isMapInteracting. If
-        // the map wasn't already centered on the user (a drag was mid-flight,
-        // a popup had shifted the view, etc.), that left the marker sitting
-        // off-center indefinitely — the same floating behavior the wake path
-        // is supposed to prevent. Route through the shared wake-reset instead
-        // so this bail-out gets the same forced recenter as every other wake.
         if (map && userMarker && typeof _resetMapToPosition === 'function') {
             try {
                 _resetMapToPosition(window.lastPosition, {
@@ -3541,54 +3537,78 @@ function updateLocationAfterBackground() {
             userMarker?.setLatLng([window.lastPosition.lat, window.lastPosition.lng]);
         }
 
-        // We're not going to fetch a fresh fix on this call, so nothing else
-        // will clear the reacquiring state — do it here.
+        // No fresh fix will arrive on this path — clear the reacquiring
+        // visual and unblock dead reckoning here, since nothing else will.
         window._isWakingFromBackground = false;
         const markerEl = userMarker?.getElement?.();
         if (markerEl) markerEl.classList.remove('gps-reacquiring');
-
+        if (window.deadReckoning && typeof window.deadReckoning.start === 'function') {
+            window.deadReckoning.start();
+        }
         return;
     }
 
+    // ── Re-entrancy guard ─────────────────────────────────────────────────
     if (window._isLocationUpdateInProgress) return;
-    if (!("geolocation" in navigator)) return;
+    if (!('geolocation' in navigator)) return;
 
     window._isLocationUpdateInProgress = true;
 
+    // ── Internal helpers ──────────────────────────────────────────────────
+
+    // Tears down the timeout + pending flag but leaves the warmup watch
+    // alive (the main watch from startPositionUpdates is the long-lived
+    // one; the warmup watch is short-lived and owned by cleanup()).
     const stopTimerKeepWatch = () => {
         geolocationRequestPending = false;
-        if (_backgroundUpdateTimeout) {
-            clearTimeout(_backgroundUpdateTimeout);
+        if (_backgroundUpdateTimeout != null) {
+            clearTrackedTimeout(_backgroundUpdateTimeout);
             _backgroundUpdateTimeout = null;
         }
         window._isLocationUpdateInProgress = false;
     };
 
+    // Full teardown: timer, warmup watch, retry modal, visual state, DR.
     const cleanup = () => {
         stopTimerKeepWatch();
+
         if (warmupWatchId !== null) {
-            navigator.geolocation.clearWatch(warmupWatchId);
+            try { navigator.geolocation.clearWatch(warmupWatchId); } catch (_) {}
             warmupWatchId = null;
         }
+
         document.getElementById('geolocation-retry-modal')?.remove();
 
-        // Safety fallback so DR isn't permanently blocked if GPS fails or times out
+        // Unblock dead reckoning and clear the reacquiring visual.
+        // Every exit path (success, error, timeout, exception) funnels
+        // through here, so DR can never be left permanently blocked.
         window._isWakingFromBackground = false;
         const markerEl = userMarker?.getElement?.();
         if (markerEl) markerEl.classList.remove('gps-reacquiring');
+
+        if (window.deadReckoning && typeof window.deadReckoning.start === 'function') {
+            window.deadReckoning.start();
+        }
     };
 
+    // ── Main body ─────────────────────────────────────────────────────────
     try {
         const awayMs = Date.now() - (window.lastHiddenTime || 0);
 
-        if (awayMs > 30000 && typeof disposeMapLoop === 'function') {
+        // Long absence: tear down all pending timers/RAF/intervals so
+        // nothing fires against stale state while we re-acquire.
+        if (awayMs > 30_000 && typeof disposeMapLoop === 'function') {
             disposeMapLoop();
         }
 
-        if (awayMs > 10000) {
-            window._modeSpeedEMA = undefined;
+        // Medium-to-long absence: the Kalman filter's state is stale.
+        // Reset it so the first fresh fix isn't blended toward a
+        // position from minutes ago.
+        if (awayMs > 10_000) {
+            window._modeSpeedEMA  = undefined;
             window._visualSpeedEMA = undefined;
-            window._proxSpeedEMA = null;
+            window._proxSpeedEMA  = null;
+
             if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
                 try {
                     window.sensorFusion._kalmanFilter.reset();
@@ -3596,32 +3616,41 @@ function updateLocationAfterBackground() {
                         window.sensorFusion.resetState();
                     }
                 } catch (e) {
-                    console.warn('[Background] Kalman/sensorFusion reset failed', e);
+                    console.warn('[Background] Kalman/sensorFusion reset failed:', e);
                 }
             }
         }
 
+        // ── Clear any leftover warmup watch / timeout from a prior call ──
         if (warmupWatchId !== null) {
-            navigator.geolocation.clearWatch(warmupWatchId);
+            try { navigator.geolocation.clearWatch(warmupWatchId); } catch (_) {}
             warmupWatchId = null;
         }
-        if (_backgroundUpdateTimeout) {
-            clearTimeout(_backgroundUpdateTimeout);
+        if (_backgroundUpdateTimeout != null) {
+            clearTrackedTimeout(_backgroundUpdateTimeout);
             _backgroundUpdateTimeout = null;
         }
 
-        if (window.positionWatchId != null) {
-            navigator.geolocation.clearWatch(window.positionWatchId);
-            window.positionWatchId = null;
-        }
+        // ── Gap-free watch swap ───────────────────────────────────────────
+        // Start the new main watch BEFORE clearing the old one so there's
+        // no dead window where neither watch is delivering fixes.
+        const prevWatchId = window.positionWatchId;
         if (typeof startPositionUpdates === 'function') {
             startPositionUpdates();
+        }
+        if (prevWatchId != null) {
+            try { navigator.geolocation.clearWatch(prevWatchId); } catch (_) {}
         }
 
         geolocationRequestPending = true;
 
-        const MAX_DURATION = 10000;
+        // Indoor cold-reacquisition routinely needs 15–25 s. The old 10 s
+        // ceiling showed the retry modal right when the chip was about to
+        // deliver. 25 s covers deep-indoor scenarios while still bounding
+        // the wait for a genuinely broken GPS.
+        const MAX_DURATION = 25_000;
 
+        // ── Retry modal ───────────────────────────────────────────────────
         const showRetryModal = () => {
             if (document.getElementById('geolocation-retry-modal')) return;
 
@@ -3641,7 +3670,9 @@ function updateLocationAfterBackground() {
 
             const text = document.createElement('p');
             text.className = 'geo-retry-text';
-            text.innerHTML = 'We\'re still locating your device.<br>Please ensure location services are enabled, and try again.';
+            text.innerHTML =
+                'We\'re still locating your device.<br>' +
+                'Please ensure location services are enabled, and try again.';
 
             const retryBtn = document.createElement('button');
             retryBtn.className = 'geo-retry-btn';
@@ -3671,35 +3702,49 @@ function updateLocationAfterBackground() {
             document.body.appendChild(overlay);
         };
 
+        // Only bother the user with the modal when they're roughly
+        // stationary — a driver can't act on it and shouldn't be
+        // interrupted.
         const safeToShowModal = () => {
             const rawSpeedMPS = window.lastPosition?.speedMPS;
             const speedMPH = (Number.isFinite(rawSpeedMPS) ? rawSpeedMPS : 0) * 2.23694;
             return speedMPH < 5;
         };
 
+        // ── Warmup watch success ──────────────────────────────────────────
+        let fixApplied = false;   // dedup: only the first valid fix counts
+
         const onPositionSuccess = (position) => {
+            // Only the first valid fix matters — subsequent callbacks
+            // from the same watch are redundant after cleanup().
+            if (fixApplied) return;
+
             const coords = position?.coords;
             if (!coords ||
-                isNaN(coords.latitude) ||
-                isNaN(coords.longitude) ||
-                Math.abs(coords.latitude) > 90 ||
-                Math.abs(coords.longitude) > 180 ||
-                coords.accuracy == null ||
+                !Number.isFinite(coords.latitude)  ||
+                !Number.isFinite(coords.longitude) ||
+                Math.abs(coords.latitude)  > 90    ||
+                Math.abs(coords.longitude) > 180   ||
+                coords.accuracy == null             ||
                 coords.accuracy <= 0) {
                 return;
             }
 
-            if (Date.now() - position.timestamp > 30000) return;
+            const fixTimestamp = Number.isFinite(position.timestamp)
+                ? position.timestamp
+                : Date.now();
 
-            // Ignore stale/out-of-order fixes. This check used to live only
-            // inside the "significant movement" branch below, which meant a
-            // stale fix could still slip through and move the marker when
-            // the device hadn't moved much. Checking it up front closes that gap.
-            if (window.lastUpdateTime && position.timestamp <= window.lastUpdateTime) {
-                return;
-            }
+            // Reject stale fixes (> 30 s old).
+            if (Date.now() - fixTimestamp > 30_000) return;
 
-            // Fresh fix arrived! Allow DR to resume with accurate data and remove visual feedback
+            // Reject out-of-order fixes that the main watch already
+            // processed (or that predate our last known position).
+            if (window.lastUpdateTime && fixTimestamp <= window.lastUpdateTime) return;
+
+            fixApplied = true;
+
+            // Unblock DR and clear the visual immediately — don't wait
+            // for cleanup() so the marker starts tracking right away.
             window._isWakingFromBackground = false;
             const markerEl = userMarker?.getElement?.();
             if (markerEl) markerEl.classList.remove('gps-reacquiring');
@@ -3710,22 +3755,15 @@ function updateLocationAfterBackground() {
 
             if (!map) return;
 
+            // Feed the fix through the normal pipeline so Kalman,
+            // sensor fusion, and render state all stay consistent.
             updateUserLocation(position, true);
             if (typeof updateDistanceBox === 'function') updateDistanceBox();
 
-            // Always snap the camera onto the reacquired fix.
-            //
-            // Previously this was gated behind a "did the device move more
-            // than a noise floor" check measured against the map's current
-            // center. That check is useful for suppressing camera jitter
-            // during *live* tracking updates, but it doesn't belong here:
-            // this function only runs once, right after coming back from
-            // background, and its entire job is to force the camera onto
-            // wherever the device actually is now. Since the map is very
-            // often still centered near the last known position when the
-            // app gets backgrounded, that distance check was almost always
-            // false on wake-up, so the snap silently never happened even
-            // though the marker itself updated correctly.
+            // Force the camera onto the reacquired position. This
+            // function runs exactly once per wake, so the "suppress
+            // jitter during live tracking" distance gate that used to
+            // live here doesn't apply — we always want the snap.
             requestAnimationFrame(() => {
                 try {
                     if (typeof _resetMapToPosition === 'function' && window.lastPosition) {
@@ -3736,48 +3774,60 @@ function updateLocationAfterBackground() {
                         });
                     }
                 } catch (error) {
-                    console.error("Error applying location:", error);
+                    console.error('[Background] Error applying location:', error);
                 }
             });
-
-            // Note: no isSignificantMovement/resetInactivityTimer check here —
-            // _resetMapToPosition already does that internally for every
-            // non-init resetType (including 'wake'). Duplicating it here
-            // would fire resetInactivityTimer(false) twice per wake.
         };
 
+        // ── Warmup watch error ────────────────────────────────────────────
         const onPositionError = (error) => {
-            console.warn("Geolocation error:", error.message, "Code:", error.code);
+            console.warn('[Background] Geolocation error:', error?.message, 'Code:', error?.code);
 
-            if (error.code === error.PERMISSION_DENIED && geolocationRequestPending) {
+            if (!geolocationRequestPending) return;
+
+            // PERMISSION_DENIED (1): the user explicitly blocked us.
+            // Stop waiting and offer the retry modal (if stationary).
+            if (error?.code === 1) {
                 stopTimerKeepWatch();
-                if (safeToShowModal()) {
-                    showRetryModal();
-                }
+                if (safeToShowModal()) showRetryModal();
+                return;
             }
+
+            // POSITION_UNAVAILABLE (2) or TIMEOUT (3): the hardware
+            // couldn't get a fix in time. Let the MAX_DURATION timer
+            // handle the final fallback — it will fire shortly and
+            // show the modal if appropriate. Don't stop the watch
+            // here; the chip may still deliver on a subsequent attempt.
         };
 
+        // ── Arm the warmup watch ──────────────────────────────────────────
+        // maximumAge: 0 forces a fresh fix (not a cached one from before
+        // the app was backgrounded). The watch's own timeout (15 s) is
+        // shorter than MAX_DURATION (25 s) so the chip gets a full
+        // attempt before we declare failure.
         warmupWatchId = navigator.geolocation.watchPosition(
             onPositionSuccess,
             onPositionError,
-            {
-                enableHighAccuracy: true,
-                timeout: 8000,
-                maximumAge: 0
-            }
+            { enableHighAccuracy: true, timeout: 15_000, maximumAge: 0 }
         );
 
+        // ── Hard ceiling ──────────────────────────────────────────────────
+        // If neither success nor a handled error fires within
+        // MAX_DURATION, tear down and optionally show the modal.
         _backgroundUpdateTimeout = createTrackedTimeout(() => {
-            if (geolocationRequestPending) {
-                stopTimerKeepWatch();
-                if (safeToShowModal()) {
-                    showRetryModal();
-                }
+            if (!geolocationRequestPending) return;
+            stopTimerKeepWatch();
+            if (safeToShowModal()) {
+                showRetryModal();
+            } else {
+                // Driving — no modal, but still unblock DR and clear
+                // the visual so the app isn't stuck in reacquiring state.
+                cleanup();
             }
         }, MAX_DURATION);
 
     } catch (err) {
-        console.error('updateLocationAfterBackground setup failed:', err);
+        console.error('[Background] updateLocationAfterBackground setup failed:', err);
         cleanup();
     }
 }
