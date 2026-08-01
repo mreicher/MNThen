@@ -153,11 +153,11 @@ const locations = [
         additionalInfo: "In 1976, Swede Hollow was transformed into a nature sanctuary with trails and signs commemorating the communities that once lived there.",
         difficulty: 2
     },
-/*
+
     {
         id: "1018",
-        lat: 44.95656826495145,
-        lng:  -93.10346918072817,
+        lat: 45.14320597555909, 
+        lng:  -93.00475719775126,
         name: "William R. Merriam Mansion (1882 - 1896)",
         title: "William R. Merriam Mansion",
         image: "https://mnthen.com/images/merriam_house.jpg",
@@ -172,7 +172,7 @@ const locations = [
         additionalInfo: "After serving as Minnesota's governor, Merriam was appointed by President McKinley to direct the U.S. Census Bureau in 1899.",
         difficulty: 1
     },
-*/
+
     {
         id: "1019",
         lat: 45.08421675605315,
