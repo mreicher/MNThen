@@ -1,5 +1,5 @@
 // sw.js – Minnesota Then Service Worker
-// Version: 4.6.50 
+// Version: 4.6.51
 
 const CACHE_NAME    = 'mnthen-v4-ios-6';
 const SHELL_CACHE   = 'mnthen-shell-v6';
@@ -19,7 +19,6 @@ const CORS_AUDIO_DOMAINS = [
   'cloudfront.net'
 ];
 
-// FIXED: Added locations_main.js to shell resources with cache-busting query param
 const SHELL_RESOURCES = [
   '/',
   '/index.html',
@@ -28,10 +27,17 @@ const SHELL_RESOURCES = [
   '/css/map-styles.css',
   '/manifest.json',
   '/locations_main.js',
-  '/locations_main.js?v=1.0.9',  // Cache the versioned URL too
+  '/locations_main.js?v=1.0.97',  // Cache the versioned URL too
   '/images/logo.webp',
   '/images/header/index_header.jpg'
 ];
+
+const CRITICAL_RESOURCES = [
+  '/locations_main.js',
+  '/locations_main.js?v=1.0.97'
+];
+const CRITICAL_RETRY_ATTEMPTS = 3;
+const CRITICAL_RETRY_DELAY_MS = 1000;
 
 const AUDIO_EXTS = /\.(mp3|wav|ogg|m4a|aac|flac|weba)$/i;
 const VIDEO_EXTS = /\.(mp4|webm|mov|avi|mpeg|mkv)$/i;
@@ -79,28 +85,66 @@ function safeJsonParse(text) {
   }
 }
 
-// Cache each resource individually — failures don't block others
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Fetch-and-cache a single resource, with optional retries for critical files.
+async function cacheOneResource(cache, path, { retries = 0, delayMs = 0 } = {}) {
+  const req = new Request(path, { cache: 'reload' });
+  let lastError = null;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(req);
+      if (res.ok && res.status === 200) {
+        await cache.put(req, res.clone());
+        return { path, ok: true, attempts: attempt + 1 };
+      }
+      lastError = new Error('HTTP ' + res.status);
+    } catch (err) {
+      lastError = err;
+    }
+
+    if (attempt < retries) {
+      console.warn(
+        '[SW] Retrying critical resource', path,
+        `(attempt ${attempt + 2}/${retries + 1})`, lastError?.message
+      );
+      await sleep(delayMs);
+    }
+  }
+
+  console.warn('[SW] Resource failed after retries:', path, lastError?.message);
+  return { path, ok: false, error: lastError?.message };
+}
+
+// Cache each resource individually — failures don't block others.
+// Critical resources (e.g. locations_main.js) get retried before being
+// counted as failed; non-critical resources are still best-effort/single-try,
+// exactly as before.
 async function cacheShellResources(cache) {
   const results = await Promise.all(
-    SHELL_RESOURCES.map(async (path) => {
-      const req = new Request(path, { cache: 'reload' });
-      try {
-        const res = await fetch(req);
-        if (res.ok && res.status === 200) {
-          await cache.put(req, res.clone());
-          return { path, ok: true };
-        }
-        throw new Error('HTTP ' + res.status);
-      } catch (err) {
-        console.warn('[SW] Shell resource failed:', path, err.message);
-        return { path, ok: false, error: err.message };
+    SHELL_RESOURCES.map(path => {
+      if (CRITICAL_RESOURCES.includes(path)) {
+        return cacheOneResource(cache, path, {
+          retries: CRITICAL_RETRY_ATTEMPTS,
+          delayMs: CRITICAL_RETRY_DELAY_MS
+        });
       }
+      return cacheOneResource(cache, path);
     })
   );
+
   const ok = results.filter(r => r.ok).length;
   const failed = results.filter(r => !r.ok).map(r => r.path);
   console.log('[SW] Cached', ok, '/', SHELL_RESOURCES.length, 'shell resources');
   if (failed.length) console.warn('[SW] Failed:', failed.join(', '));
+
+  const criticalFailed = failed.filter(p => CRITICAL_RESOURCES.includes(p));
+  if (criticalFailed.length) {
+    console.error('[SW] Critical resources still uncached after retries:', criticalFailed.join(', '));
+  }
 }
 
 // ---------- strategies ----------
@@ -148,15 +192,12 @@ async function networkFirst(req) {
   }
 }
 
-// FIXED: Proper stale-while-revalidate with network fallback.
-// When cache is empty and network fails, try cache with ignoreSearch,
-// then return a synthetic response instead of 503 for critical JS files.
-async function staleWhileRevalidate(req, options = {}) {
+async function staleWhileRevalidate(req) {
   const cache = await caches.open(SHELL_CACHE);
-  
+
   // Try exact match first
   let cached = await cache.match(req);
-  
+
   // If no exact match, try ignoring query params (for ?v=1.0.9)
   if (!cached) {
     cached = await cache.match(req, { ignoreSearch: true });
@@ -172,31 +213,15 @@ async function staleWhileRevalidate(req, options = {}) {
     })
     .catch(() => null);
 
-  // If we have cached, return it immediately
+  // If we have cached, return it immediately (network update happens in background)
   if (cached) return cached;
 
   // No cache — must wait for network
   const networkRes = await networkPromise;
-  
   if (networkRes) return networkRes;
-  
-  // FIXED: For JS/CSS files, return a synthetic "try again" instead of 503
-  // This prevents the browser from caching the 503 error
-  const url = new URL(req.url);
-  if (/\.(js|css)$/i.test(url.pathname)) {
-    return new Response(
-      `// Service Worker: ${url.pathname} temporarily unavailable. Will retry on next load.\n`,
-      { 
-        status: 200,  // Return 200 so browser doesn't cache as error
-        statusText: 'OK (SW fallback)',
-        headers: { 
-          'Content-Type': 'application/javascript',
-          'X-SW-Fallback': 'true'
-        }
-      }
-    );
-  }
-  
+
+  // Neither cache nor network worked — return a real failure so callers
+  // (script onerror, app-level fetch handling) can react correctly.
   return new Response('Offline', { status: 503 });
 }
 
@@ -281,7 +306,7 @@ async function handleGeolocationRequest(data, port) {
 
     // Guard 3: data.locations must exist and be an array
     let locations = data.locations;
-    
+
     if (locations === undefined || locations === null) {
       port?.postMessage({ success: false, error: 'Missing locations field' });
       return;
@@ -290,13 +315,13 @@ async function handleGeolocationRequest(data, port) {
     // Guard 4: If it's a string, it must be valid JSON array syntax
     if (typeof locations === 'string') {
       const trimmed = locations.trim();
-      
+
       // Reject obvious non-JSON content
       if (trimmed.length === 0) {
         port?.postMessage({ success: false, error: 'Empty locations string' });
         return;
       }
-      
+
       // Must start with [ for JSON array
       if (!trimmed.startsWith('[')) {
         console.warn('[SW] GEOLOCATION: locations string is not a JSON array — ignoring');
@@ -349,8 +374,7 @@ self.addEventListener('fetch', e => {
     return;
   }
 
-  // FIXED: locations_main.js with query params — use staleWhileRevalidate
-  // but also try cacheFirst as fallback for the versioned URL
+  // locations_main.js (with or without query params) — stale-while-revalidate
   if (url.includes('/locations_main.js')) {
     e.respondWith(staleWhileRevalidate(req));
     return;
@@ -372,7 +396,7 @@ self.addEventListener('fetch', e => {
 // ---------- lifecycle ----------
 
 self.addEventListener('install', e => {
-  console.log('[SW] 4.6.5 installing');
+  console.log('[SW] 4.6.51 installing');
   e.waitUntil(
     caches.open(SHELL_CACHE)
       .then(cache => cacheShellResources(cache))
@@ -385,7 +409,7 @@ self.addEventListener('install', e => {
 });
 
 self.addEventListener('activate', e => {
-  console.log('[SW] 4.6.5 activating');
+  console.log('[SW] 4.6.51 activating');
   e.waitUntil(
     caches.keys().then(names =>
       Promise.all(
@@ -454,4 +478,5 @@ self.addEventListener('unhandledrejection', e => {
   console.error('[SW] rejection:', e.reason);
   e.preventDefault();
 });
-console.log('[SW] 4.6.5 ready (resilient install)');
+
+console.log('[SW] 4.6.51 ready (resilient install)');
