@@ -98,8 +98,8 @@ const locations = [
 
     {
         id: "1015",
-        lat: 44.95463990008291,
-        lng: -93.10223181529494,
+        lat: 44.954572818613514,
+        lng: -93.102247696294,
         name: "Minnesota’s Third State Capitol",
         title: "Minnesota’s Third State Capitol",
         image: "https://mnthen.com/images/exhibit/capitol3.jpg",
