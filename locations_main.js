@@ -175,8 +175,8 @@ const locations = [
 */
     {
         id: "1019",
-        lat: 45.08421675605315,
-        lng: -92.78683662323817,
+        lat: 45.08428364556119, 
+        lng: -92.78677754635814,
         name: "St. Croix Boom Site (1856 - 1914)",
         title: "St. Croix Boom Site",
         image: "https://mnthen.com/images/boom1.jpg",
@@ -184,8 +184,8 @@ const locations = [
         city: "Stillwater",
         audio: "/audio/exhibit/boomsite.mp3",
         tours: "place",
-        summary: "The St. Croix Boom Site marked Minnesota’s lumber peak, processing 15B feet of logs before closing in 1914 due to deforestation and change.",
-        today: "Three miles north of downtown Stillwater on 95.",
+        summary: "The St. Croix Boom Site sorted an estimated 15 billion board feet of pine before its final log passed through in 1914.",
+        today: "Three miles north of downtown Stillwater along Minnesota State Highway 95.",
         link: "https://mnthen.com/blog/place/boomsite.html",
         imageSource: "Men working the boom via the Forest Lake Times",
         additionalInfo: "Recent efforts to clean up and preserve the St. Croix Boom Site have helped highlight its natural beauty and historical significance.",
