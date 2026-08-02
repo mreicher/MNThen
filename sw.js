@@ -1,5 +1,5 @@
 // sw.js – Minnesota Then Service Worker
-// Version: 4.6.51
+// Version: 4.6.511
 
 const CACHE_NAME    = 'mnthen-v4-ios-6';
 const SHELL_CACHE   = 'mnthen-shell-v6';
@@ -479,4 +479,4 @@ self.addEventListener('unhandledrejection', e => {
   e.preventDefault();
 });
 
-console.log('[SW] 4.6.51 ready (resilient install)');
+console.log('[SW] 4.6.511 ready (resilient install)');
