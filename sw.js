@@ -1,11 +1,11 @@
 // sw.js – Minnesota Then Service Worker
-// Version: 4.6.511
+// Version: 4.6.512
 
-const CACHE_NAME    = 'mnthen-v4-ios-6';
-const SHELL_CACHE   = 'mnthen-shell-v6';
-const RUNTIME_CACHE = 'mnthen-runtime-v6';
-const AUDIO_CACHE   = 'mnthen-audio-v6';
-const TILE_CACHE    = 'mnthen-tiles-v6';
+const CACHE_NAME    = 'mnthen-v4-ios-7';
+const SHELL_CACHE   = 'mnthen-shell-v7';
+const RUNTIME_CACHE = 'mnthen-runtime-v7';
+const AUDIO_CACHE   = 'mnthen-audio-v7';
+const TILE_CACHE    = 'mnthen-tiles-v7';
 
 const MAX_RUNTIME = 100;
 const MAX_AUDIO   = 100;
@@ -71,7 +71,9 @@ async function trimCache(cacheName, maxEntries) {
 function normalizeRequest(req) {
   const url = new URL(req.url);
   if (url.pathname === '/' || url.pathname === '') {
-    return new Request(url.origin + '/index.html');
+    // FIX: Preserve original request properties (headers, credentials, referrer, mode, etc.)
+    // so the normalized request doesn't lose browser-set metadata.
+    return new Request('/index.html', req);
   }
   return req;
 }
@@ -183,9 +185,14 @@ async function networkFirst(req) {
     }
     return res;
   } catch (e) {
-    const cache = await caches.open(RUNTIME_CACHE);
-    const cached = await cache.match(req);
+    // FIX: Fallback chain — runtime cache (fresher), then shell precache, then offline page.
+    const runtimeCache = await caches.open(RUNTIME_CACHE);
+    const cached = await runtimeCache.match(req);
     if (cached) return cached;
+
+    const shellCache = await caches.open(SHELL_CACHE);
+    const shellCached = await shellCache.match(req);
+    if (shellCached) return shellCached;
 
     const offline = await caches.match('/offline.html');
     return offline || new Response('Offline', { status: 503 });
@@ -287,7 +294,7 @@ async function handlePrefetchAudio(data, port) {
   });
 }
 
-// FIXED: Completely hardened. Never tries to parse anything that isn't
+// Completely hardened. Never tries to parse anything that isn't
 // explicitly a valid object with a locations array.
 async function handleGeolocationRequest(data, port) {
   try {
@@ -357,9 +364,12 @@ self.addEventListener('fetch', e => {
 
   if (rawReq.method !== 'GET') return;
 
+  // FIX: Detect document/navigate requests from the ORIGINAL request before
+  // normalizeRequest() strips the browser-set destination/mode properties.
+  const isDocument = rawReq.destination === 'document' || rawReq.mode === 'navigate';
   const req = normalizeRequest(rawReq);
 
-  if (req.destination === 'document') {
+  if (isDocument) {
     e.respondWith(networkFirst(req));
     return;
   }
@@ -396,7 +406,7 @@ self.addEventListener('fetch', e => {
 // ---------- lifecycle ----------
 
 self.addEventListener('install', e => {
-  console.log('[SW] 4.6.51 installing');
+  console.log('[SW] 4.6.512 installing');
   e.waitUntil(
     caches.open(SHELL_CACHE)
       .then(cache => cacheShellResources(cache))
@@ -409,7 +419,7 @@ self.addEventListener('install', e => {
 });
 
 self.addEventListener('activate', e => {
-  console.log('[SW] 4.6.51 activating');
+  console.log('[SW] 4.6.512 activating');
   e.waitUntil(
     caches.keys().then(names =>
       Promise.all(
@@ -479,4 +489,4 @@ self.addEventListener('unhandledrejection', e => {
   e.preventDefault();
 });
 
-console.log('[SW] 4.6.511 ready (resilient install)');
+console.log('[SW] 4.6.512 ready (resilient install)');
