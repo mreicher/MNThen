@@ -1,5 +1,5 @@
 const locations = [
-
+/*
         {
         id: "1010",
         lat: 45.05702204168715,
@@ -18,7 +18,7 @@ const locations = [
         additionalInfo: "Visitors didn’t just arrive by streetcar — some came by steamboat across White Bear Lake to spend the day swimming, dancing, and riding Wildwood’s coaster.",
         difficulty: 2
     },
-    
+    */
     {
         id: "1011",
         lat: 44.922167523742054,
@@ -191,7 +191,7 @@ const locations = [
         additionalInfo: "Recent efforts to clean up and preserve the St. Croix Boom Site have helped highlight its natural beauty and historical significance.",
         difficulty: 1
     },
-
+/*
     {
         id: "1022",
         lat: 44.7695002003817,
@@ -229,7 +229,7 @@ const locations = [
         additionalInfo: "In 1928, Washburn-Crosby Company merged with several other regional milling companies to form General Mills, which remains a major food corporation today.",
         difficulty: 1
     },
-
+*/
     {
         id: "1024",
         lat: 44.45572863141056,
@@ -286,7 +286,7 @@ const locations = [
         additionalInfo: "Legend claimed secret tunnels connected Clifford's brothel to the exclusive Minnesota Club, though this was later debunked.",
         difficulty: 1
     },
-
+/*
     {
         id: "1028",
         lat: 44.95354376638059,
@@ -305,7 +305,7 @@ const locations = [
         additionalInfo: "Hall of Famer Andrew \"Rube\" Foster threw a no-hitter for the St. Paul Colored Gophers at the Pillbox in 1908.",
         difficulty: 1
     },
-
+*/
     {
         id: "1029",
         lat: 44.9621358458752,
@@ -362,7 +362,7 @@ const locations = [
         additionalInfo: "Some streets carry not just one name, but several from the same family—like Werring and Nelson Avenues—honoring brothers and cousins who died in war.",
         difficulty: 1
     },
-
+/*
     {
         id: "1032",
         lat: 45.12128930601264,
@@ -381,7 +381,7 @@ const locations = [
         additionalInfo: "The Willmar 8 helped shift the conversation toward comparable worth, contributing to Minnesota passing some of the strongest pay equity laws in the country.",
         difficulty: 1
     },
-
+*/
     {
         id: "1033",
         lat: 44.94648432105931,
