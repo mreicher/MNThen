@@ -1,7 +1,7 @@
 const blogArticles = [
   {
   "headline": "Bicycle Scorchers of 1890s St. Paul",
-  "blurb": "The 'safety' bicycle craze of the 1890s sent reckless young 'scorchers' careening down the hills of St. Paul at dangerous speeds, sparking sidewalk ordinances, police speed traps, bicycle squads, and the city's first dedicated bike paths.",
+"blurb": "The \"safety\" bicycle craze of the 1890s sent reckless young \"scorchers\" careening down the hills of St. Paul at dangerous speeds, sparking sidewalk ordinances, police speed traps, bicycle squads, and the city's first dedicated bike paths.",
   "icon": "fa-box",
   "author": "Matt Reicher",
   "date": "August 12, 2026",
