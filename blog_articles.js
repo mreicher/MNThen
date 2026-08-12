@@ -5,7 +5,7 @@ const blogArticles = [
   "icon": "fa-box",
   "author": "Matt Reicher",
   "date": "August 12, 2026",
-  "image": "https://www.mnthen.com/images/scorcher.jpg",
+  "image": "https://www.mnthen.com/images/exhibit/scorcher.jpg",
   "url": "https://mnthen.com/blog/thing/st_paul_scorcher.html",
   "keywords": ["bicycle scorchers", "st. paul", "wheelmen", "safety bicycle", "1890s", "bicycle craze", "bike paths", "bicycle squads", "ramsey street", "hill neighborhood", "st. paul daily globe", "thing", "all"]
 },
