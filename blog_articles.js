@@ -1,5 +1,15 @@
 const blogArticles = [
   {
+  "headline": "Bicycle Scorchers of 1890s St. Paul",
+  "blurb": "The "safety" bicycle craze of the 1890s sent reckless young "scorchers" careening down St. Paul's hills at dangerous speeds, sparking sidewalk ordinances, police speed traps, bicycle squads, and the city's first dedicated bike paths.",
+  "icon": "fa-box",
+  "author": "Matt Reicher",
+  "date": "August 12, 2026",
+  "image": "https://www.mnthen.com/images/bicycle_scorchers.jpg",
+  "url": "https://www.mnthen.com/blog/thing/bicycle_scorchers.html",
+  "keywords": ["bicycle scorchers", "st. paul", "wheelmen", "safety bicycle", "1890s", "bicycle craze", "bike paths", "bicycle squads", "ramsey street", "hill neighborhood", "st. paul daily globe", "thing", "all"]
+},
+  {
   "headline": "Lexington Park (1897-1956)",
   "blurb": "Edward Smith built Lexington Park in 1897 so Charles Comiskey's Saints could finally play legal Sunday baseball; two grandstand fires and a steel rebuild later, it anchored the team for six decades before demolition in 1956 made way for a Red Owl grocery store.",
   "icon": "fa-building",
