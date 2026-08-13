@@ -417,6 +417,24 @@ const locations = [
     "imageSource": "Lexington Park, home of the St. Paul Saints from 1897 to 1956. via Twin Cities Music Highlights",
     "additionalInfo": "In June 1926 the St. Paul Pioneer Press reported that only nine home runs had cleared the park's right field fence in the decade after its 1916 rebuild.",
     "difficulty": 1
+},
+{
+  "id": "1035",
+  "lat": 44.94125103900514,
+  "lng": -93.11390854250764,
+  "name": "Bicycle Scorchers of 1890s St. Paul",
+  "title": "Bicycle Scorchers of 1890s St. Paul",
+  "image": "https://mnthen.com/images/exhibit/scorcher.jpg",
+  "creator": "Matt Reicher",
+  "city": "St. Paul",
+  "audio": "/audio/exhibit/scorcher.mp3",
+  "tours": "thing",
+  "summary": "In the 1890s, reckless bicyclists known as 'scorchers' turned Ramsey Hill's steep grade into one of St. Paul's most dangerous stretches, forcing the city to police riders and eventually build separate bike paths.",
+  "today": "Near the foot of Ramsey Hill, St. Paul",
+  "link": "https://mnthen.com/blog/thing/st_paul_scorcher.html",
+  "imageSource": "Man with bicycle. via Minnesota Historical Society",
+  "additionalInfo": "St. Paul's first bicycling ordinance was signed into law on December 12, 1892, requiring riders to stay off sidewalks and to carry a bell or whistle to warn pedestrians.",
+  "difficulty": 1
 }
 
     // Add more locations here
