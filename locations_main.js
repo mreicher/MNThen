@@ -429,7 +429,7 @@ const locations = [
   "city": "St. Paul",
   "audio": "/audio/exhibit/scorcher.mp3",
   "tours": "thing",
-  "summary": "In the 1890s, reckless bicyclists known as 'scorchers' turned Ramsey Hill's steep grade into one of St. Paul's most dangerous stretches, forcing the city to police riders and eventually build separate bike paths.",
+  "summary": "In the 1890s, reckless bicyclists known as 'scorchers' turned St. Paul's steep grades into its most dangerous stretches.",
   "today": "Near the foot of Ramsey Hill, St. Paul",
   "link": "https://mnthen.com/blog/thing/st_paul_scorcher.html",
   "imageSource": "Man with bicycle. via Minnesota Historical Society",
