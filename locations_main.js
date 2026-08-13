@@ -425,6 +425,7 @@ const locations = [
   "name": "Bicycle Scorchers of 1890s St. Paul",
   "title": "Bicycle Scorchers of 1890s St. Paul",
   "image": "https://mnthen.com/images/exhibit/scorcher.jpg",
+  "sumimage": "https://mnthen.com/images/summary/ramsey_hill.jpg",
   "creator": "Matt Reicher",
   "city": "St. Paul",
   "audio": "/audio/exhibit/scorcher.mp3",
