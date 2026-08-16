@@ -2947,42 +2947,64 @@ function hideLoadingMessage() {
     _initUserLocationAttempt(position);
 }
 
-// Shared recovery/backoff for any init failure. Every failure path
-// (exceptions, marker exhaustion, etc.) gets the same retry treatment.
-// The terminal popup only shows once recovery is genuinely exhausted.
+// Sole retry/backoff system for init failures. 
 function _scheduleLocationInitRecovery(err) {
     console.error('Location initialization error:', err);
     window._initializationInProgress = false;
 
-    // Roll back feature flags only if init never completed.
     if (!window._initializationComplete) {
         window._huntStarted           = false;
         window._proximityCheckStarted = false;
     }
 
-    handleLocationError(err);
+    // Permission denied can't be fixed by retrying — go straight to
+    // the terminal popup, same as handleLocationError does.
+    if (err?.code === 1) {
+        window._initRecoveryAttempts = 0;
+        if (typeof hideLoadingMessage === 'function') hideLoadingMessage();
+        if (typeof showPopup === 'function') {
+            showPopup('Location Error', 'Please allow access to your location to use this feature.');
+        }
+        return;
+    }
 
     window._initRecoveryAttempts = (window._initRecoveryAttempts || 0) + 1;
 
     if (window._initRecoveryAttempts <= 3) {
         const backoffMs = Math.min(15000, Math.pow(2, window._initRecoveryAttempts) * 1000);
+        console.log(`[Init] Retrying location init (attempt ${window._initRecoveryAttempts} of 3 in ${backoffMs}ms)`);
         createTrackedTimeout(() => {
             if (navigator.geolocation && !window._initializationComplete) {
                 navigator.geolocation.getCurrentPosition(
                     initializeUserLocation,
-                    handleLocationError,
+                    // Stay within this same recovery loop — do not
+                    // hand off to handleLocationError.
+                    (e) => _scheduleLocationInitRecovery(e),
                     { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
                 );
             }
         }, backoffMs);
-    } else {
-        if (typeof showPopup === 'function') {
-            showPopup(
-                'Location Error',
-                'Unable to get your location after multiple attempts. Please check your GPS settings and refresh the page.',
-                'error'
-            );
+        return;
+    }
+
+    // Max attempts reached — single terminal popup, message tailored
+    // to the underlying error code when we have one.
+    window._initRecoveryAttempts = 0;
+    if (typeof hideLoadingMessage === 'function') hideLoadingMessage();
+
+    let errorMessage = 'Unable to get your location after multiple attempts. Please check your GPS settings and refresh the page.';
+    if (err?.code !== undefined) {
+        switch (err.code) {
+            case 2:
+                errorMessage = 'Your location is currently unavailable. Please check your GPS settings and refresh the page.';
+                break;
+            case 3:
+                errorMessage = 'Getting your location took too long. Please check your GPS settings and refresh the page.';
+                break;
         }
+    }
+    if (typeof showPopup === 'function') {
+        showPopup('Location Error', errorMessage, 'error');
     }
 }
 
@@ -2990,7 +3012,7 @@ function _initUserLocationAttempt(position) {
     // Self-contained validation in case this is ever called directly.
     if (!position?.coords) {
         window._initializationInProgress = false;
-        handleLocationError(new Error('Invalid initial position'));
+        _scheduleLocationInitRecovery(new Error('Invalid initial position'));
         return;
     }
 
@@ -2999,7 +3021,7 @@ function _initUserLocationAttempt(position) {
     if (!Number.isFinite(lat) || !Number.isFinite(lng) ||
         Math.abs(lat) > 90 || Math.abs(lng) > 180) {
         window._initializationInProgress = false;
-        handleLocationError(new Error('Invalid coordinates'));
+        _scheduleLocationInitRecovery(new Error('Invalid coordinates'));
         return;
     }
 
@@ -3113,12 +3135,16 @@ function _initUserLocationAttempt(position) {
         window._lastSuccessfulInit       = Date.now();
         window._initRecoveryAttempts     = 0;
 
+        // Guard against a duplicate watch if this path is ever
+        // re-entered after a watch is already running.
         try {
-            const watchId = startPositionUpdates();
-            if (watchId === null) {
-                createTrackedTimeout(() => {
-                    if (!window.positionWatchId) startPositionUpdates();
-                }, 3000);
+            if (!window.positionWatchId) {
+                const watchId = startPositionUpdates();
+                if (watchId === null) {
+                    createTrackedTimeout(() => {
+                        if (!window.positionWatchId) startPositionUpdates();
+                    }, 3000);
+                }
             }
         } catch (watchErr) {
             console.error('[Init] startPositionUpdates failed:', watchErr);
@@ -5621,23 +5647,19 @@ function calculateDistance(pos1OrLat, pos2OrLng, lat2, lng2) {
 }
 
 /* ──────────────────────────────────────────────
-   handleLocationError — retry with exponential
-   backoff, fast-fail on permission denied.
+   handleLocationError — Handler for geolocation errors from calls OUTSIDE the init-recovery
+   system (e.g. a standalone "locate me" action, watch errors). 
    ────────────────────────────────────────────── */
 function handleLocationError(error) {
     console.warn("Error getting user location:", error);
-
     const localRetryCount = error?._retryCount || 0;
 
-    // Permission denied — no retry can fix this.
     if (error?.code === 1) {
         if (typeof hideLoadingMessage === 'function') hideLoadingMessage();
         showPopup("Location Error", "Please allow access to your location to use this feature.");
         return;
     }
 
-    // Watch timeout with an active watch: let the watch recover on its own.
-    // Parallel getCurrentPosition calls compete for the GPS chip.
     if (error?.code === 3 && window.positionWatchId != null) {
         console.log('[GPS] Watch timeout — suppressing one-shot retry (watch still active)');
         return;
@@ -5645,27 +5667,20 @@ function handleLocationError(error) {
 
     const maxRetries = CONFIG?.MAX_RETRIES ?? 3;
     const retryDelay = CONFIG?.RETRY_DELAY ?? 1000;
-
     if (localRetryCount < maxRetries) {
         const nextRetryCount = localRetryCount + 1;
         const backoffMs = Math.min(10000, retryDelay * Math.pow(2, nextRetryCount - 1));
-
         console.log(`Retrying to get location (Attempt ${nextRetryCount} of ${maxRetries} in ${backoffMs}ms)`);
-
         createTrackedTimeout(() => {
             if (!navigator.geolocation) {
                 console.warn('Geolocation API not available');
                 return;
             }
-
-            // Recovery options: generous timeout because the chip already
-            // struggled, but don't accept a stale cached fix.
             const recoveryOpts = {
                 enableHighAccuracy: true,
                 timeout: 30000,
                 maximumAge: 10000
             };
-
             navigator.geolocation.getCurrentPosition(
                 (position) => {
                     console.log("Location retrieved successfully after retry");
@@ -5685,9 +5700,7 @@ function handleLocationError(error) {
         return;
     }
 
-    // Max retries reached
     if (typeof hideLoadingMessage === 'function') hideLoadingMessage();
-
     let errorMessage = "An error occurred while getting your location.";
     if (error?.code !== undefined) {
         switch (error.code) {
@@ -5705,7 +5718,6 @@ function handleLocationError(error) {
                 break;
         }
     }
-
     showPopup("Location Error", errorMessage);
 }
 
