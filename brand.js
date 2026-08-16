@@ -1,12 +1,5 @@
 /* ============================================================
    BRAND CONFIG  —  THE ONLY FILE YOU CHANGE PER ORGANIZATION.
-   ------------------------------------------------------------
-   The app's index.html is IDENTICAL for every org. To launch a
-   new white-label instance you deploy the same app and swap in
-   this one file (plus that org's own /images and /css assets).
-
-   No build step. This is a plain script that runs first and sets
-   window.BRAND; the app reads every brand value from it.
    ============================================================ */
 window.BRAND = {
   /* ---- Identity ---- */
@@ -30,7 +23,7 @@ window.BRAND = {
   themeColor: "#2c5282",
 
   /* ---- Loading screen ---- */
-  loadingTitle: "The White Label Test",
+  loadingTitle: "The Museum Without Walls",
   loadingSubtitle: "Where Every Step Tells a Story",
 
   /* ---- Media session (lock-screen audio metadata) ---- */
