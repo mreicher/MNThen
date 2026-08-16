@@ -30,7 +30,7 @@ window.BRAND = {
   themeColor: "#2c5282",
 
   /* ---- Loading screen ---- */
-  loadingTitle: "The Museum Without Walls",
+  loadingTitle: "The White Label Test",
   loadingSubtitle: "Where Every Step Tells a Story",
 
   /* ---- Media session (lock-screen audio metadata) ---- */
