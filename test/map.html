@@ -3509,7 +3509,6 @@ function updateLocationAfterBackground() {
     if (!('geolocation' in navigator)) return;
     window._isLocationUpdateInProgress = true;
 
-    // Full teardown: timer, warmup watch, retry modal, visual state, DR.
     const cleanup = () => {
         if (window._backgroundUpdateTimeout != null) {
             clearTrackedTimeout(window._backgroundUpdateTimeout);
@@ -3523,19 +3522,18 @@ function updateLocationAfterBackground() {
         window._isWakingFromBackground = false;
         userMarker?.getElement?.()?.classList.remove('gps-reacquiring');
         window.deadReckoning?.start?.();
+        // Resume normal tiered watching now that acquisition is over
+        // (success, giveup, or cancel) — this is the only place a
+        // non-warmup watch gets (re)started in this function.
+        if (typeof startPositionUpdates === 'function') {
+            startPositionUpdates();
+        }
         window._isLocationUpdateInProgress = false;
     };
 
     try {
         const awayMs = now - (window.lastHiddenTime || 0);
 
-        // True cold start = either coming back after a long stint in the
-        // background, OR this device has never successfully acquired a fix
-        // at all (e.g. first boot). Background duration alone misses the
-        // first-boot case: lastHiddenTime hasn't been set yet at that point,
-        // so awayMs comes out near 0 and a genuinely cold GPS chip would
-        // incorrectly get the short (15s/25s) timeout budget instead of the
-        // long (60s/70s) one it actually needs.
         const isColdStart = awayMs > 5 * 60 * 1000 || !window._hasEverAcquiredFix;
 
         if (awayMs > 30_000 && typeof disposeMapLoop === 'function') {
@@ -3561,13 +3559,9 @@ function updateLocationAfterBackground() {
             window._backgroundUpdateTimeout = null;
         }
 
-        // ── Gap-free watch swap ─────────────────────────────────────────────
-        const prevWatchId = window.positionWatchId;
-        if (typeof startPositionUpdates === 'function') {
-            startPositionUpdates();
-        }
-        if (prevWatchId != null) {
-            try { navigator.geolocation.clearWatch(prevWatchId); } catch (_) {}
+        if (window.positionWatchId != null) {
+            try { navigator.geolocation.clearWatch(window.positionWatchId); } catch (_) {}
+            window.positionWatchId = null;
         }
 
         const isStationary = () => {
@@ -3647,9 +3641,6 @@ function updateLocationAfterBackground() {
 
             const fixTs = Number.isFinite(position.timestamp) ? position.timestamp : Date.now();
 
-            // Relax staleness check for cold starts. After 30 mins, the OS might
-            // return a cached fix that is slightly older than 30s. Allow up to 2 mins
-            // so it isn't incorrectly rejected, fixing the "not resetting" freeze.
             const maxAge = isColdStart ? 120_000 : 30_000;
             if (Date.now() - fixTs > maxAge) return;
 
@@ -3688,10 +3679,6 @@ function updateLocationAfterBackground() {
             }
         };
 
-        // Cold starts (long background stints, or a device that has never
-        // acquired a fix at all) get a much longer budget: cold GPS hardware
-        // can easily take 30-45+ seconds to get its first fix, especially
-        // indoors. Warm resumes keep the tighter, original timeouts.
         warmupWatchId = navigator.geolocation.watchPosition(
             onSuccess,
             onError,
@@ -5702,12 +5689,16 @@ function handleLocationError(error) {
         return;
     }
 
-    // Watch is already running and will deliver a fix on its own.
-    // Spawning a parallel getCurrentPosition call competes for the
-    // same GPS chip and can slow acquisition on some devices.
-    // The one-shot retry path below still handles the pre-watch case.
-    if (error?.code === 3 && window.positionWatchId != null) {
-        console.log('[GPS] Watch timeout — suppressing one-shot retry (watch still active)');
+    // FIX: previously only suppressed the one-shot retry for error code 3.
+    // A live watch will keep trying on its own regardless of *which* error
+    // it just reported — code 2 (unavailable) is just as likely to be
+    // transient as code 3 (timeout). Spawning a parallel getCurrentPosition
+    // for any error while a watch is active creates a second GPS source
+    // racing the watch's own fixes into updateUserLocation, both able to
+    // force-write position and skip jump validation. Suppress whenever a
+    // watch is active, not just on timeout.
+    if (window.positionWatchId != null) {
+        console.log('[GPS] Watch active — suppressing one-shot retry (error code ' + error?.code + ')');
         return;
     }
 
@@ -5725,10 +5716,6 @@ function handleLocationError(error) {
                 return;
             }
 
-            // Use a per-retry options function if the app defines one
-            // (e.g. to relax accuracy/timeout on later attempts),
-            // otherwise fall back to a sane default so this stays
-            // backwards compatible with callers that never defined it.
             const recoveryOpts = typeof getGeolocationOptions === 'function'
                 ? getGeolocationOptions(nextRetryCount)
                 : { enableHighAccuracy: true, timeout: 30000, maximumAge: 10000 };
@@ -5752,7 +5739,6 @@ function handleLocationError(error) {
         return;
     }
 
-    // Max retries reached — give up and surface the error.
     if (typeof hideLoadingMessage === 'function') hideLoadingMessage();
     let errorMessage = "An error occurred while getting your location.";
     if (error?.code !== undefined) {
