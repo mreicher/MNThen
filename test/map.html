@@ -1772,7 +1772,8 @@ window.sensorFusion = new SensorFusionManager().init();
         DRIFT_THRESHOLD_HIGH: 10.0,
         PAN_DURATION_BASE:    0.22,
         PAN_DURATION_FAST:    0.10,
-        FREE_MIN_PAN_M:       4.0
+        FREE_MIN_PAN_M:       4.0,
+        EXTENDED_DECAY_TAU_S: 1.2
     };
 
     let _rafId             = null;
@@ -1788,17 +1789,8 @@ window.sensorFusion = new SensorFusionManager().init();
     let _markerTransSet    = false;
     let _lastPredictedPos  = null;
 
-    let _panPending = false;
-    let _panTarget  = null;
-
-    let _panAnimStart      = 0;
-    let _panAnimDuration   = 0;
-    let _panAnimTargetLat  = null;
-    let _panAnimTargetLng  = null;
-
     let _centeredLat = null;
     let _centeredLng = null;
-    let _panRemainder = { x: 0, y: 0 };
     let _lastSnapZoom = null;
     let _wasMoving = false;
 
@@ -1806,7 +1798,7 @@ window.sensorFusion = new SensorFusionManager().init();
 
     const _getSpeedMPS  = () => window.sensorFusion?.getFilteredSpeedMPS()          ?? (window.lastPosition?.speedMPS || 0);
     const _getVelocity  = () => window.sensorFusion?.getSmoothedVelocityDegPerSec() ?? (window.smoothedVelocity || { lat: 0, lng: 0 });
-    const _getHeading   = () => window.sensorFusion?.getFilteredHeading()            ?? (window.lastPosition?.headingDeg || null);
+    const _getHeading   = () => window.sensorFusion?.getFilteredHeading()            ?? (window.lastPosition?.heading ?? null);
     const _getKalmanPos = () => window.sensorFusion?.getLastKalmanPosition()         ?? null;
     const _getRawPos    = () => window.sensorFusion?.getLastRawPosition()            ?? (window.lastPosition || null);
     const _isStationary = () => window.sensorFusion?._lastStationaryState            ?? window.isStationary;
@@ -1815,7 +1807,6 @@ window.sensorFusion = new SensorFusionManager().init();
         return !!window.followUser;
     }
 
-    // Plateaus + gentle startup curve for prediction horizon.
     const HORIZON_CURVE = [
         { speed: 0.0,  h: 0.0 },
         { speed: 0.5,  h: 0.0 },
@@ -1848,8 +1839,6 @@ window.sensorFusion = new SensorFusionManager().init();
             }
         }
 
-        // Reduce horizon during turns. Noise gate prevents jitter from
-        // tiny heading wobble when walking straight.
         const TURN_NOISE_FLOOR = 2.0;
         const TURN_PENALTY = 0.55;
         const maxTurn = CFG.HEADING_CHANGE_CAP - TURN_NOISE_FLOOR;
@@ -1918,10 +1907,6 @@ window.sensorFusion = new SensorFusionManager().init();
             return;
         }
 
-        // dx/dy are measured fresh every frame, so rounding them directly
-        // keeps sub-pixel residual error bounded at 0.5px. No accumulator
-        // needed — an accumulator would double-count the leftover and
-        // produce a self-sustaining ±1px shake.
         const px = Math.round(dx);
         const py = Math.round(dy);
         if (px === 0 && py === 0) return;
@@ -1939,7 +1924,6 @@ window.sensorFusion = new SensorFusionManager().init();
         kf.seedVelocity(_lastGoodSpeedMPS * Math.cos(rad), _lastGoodSpeedMPS * Math.sin(rad), 2.0);
     }
 
-    // Prefer Kalman > raw > lastPosition for the authoritative fix.
     function _resolveBestKnownPosition() {
         const kp = _getKalmanPos(), rp = _getRawPos();
         if (kp && typeof kp.lat === 'number' && typeof kp.lng === 'number') return { lat: kp.lat, lng: kp.lng };
@@ -1949,9 +1933,6 @@ window.sensorFusion = new SensorFusionManager().init();
         return null;
     }
 
-    // One-shot marker/viewport sync for when the predictive loop is not
-    // running (stationary, first fix, non-centered + below speed threshold).
-    // Keeps DR as the single writer of marker state — no competing updates.
     function _immediateSync() {
         if (window.isLocationHuntVisible) return;
         const pos = _resolveBestKnownPosition();
@@ -1980,8 +1961,6 @@ window.sensorFusion = new SensorFusionManager().init();
         const stationary = _isStationary();
         const centered   = _isCenteredMode();
 
-        // Prime the filter with last known speed/heading when motion resumes,
-        // so it doesn't ramp up from zero during stop-and-go.
         const movingNow = speedMPS >= CFG.MIN_SPEED_MPS;
         if (movingNow && !_wasMoving) _seedVelocityOnResume();
         _wasMoving = movingNow;
@@ -1990,8 +1969,6 @@ window.sensorFusion = new SensorFusionManager().init();
 
         const isInteracting = window.isMapInteracting || window._isProximityZoomAnimating || window._gpsCenteredPanJustOccurred;
         if (isInteracting) {
-            _panRemainder.x = 0;
-            _panRemainder.y = 0;
             _interactionEndTime = now + CFG.INTERACTION_FADE_MS;
             _lastFrameTime = now;
             _rafId = requestAnimationFrame(frame);
@@ -2021,20 +1998,22 @@ window.sensorFusion = new SensorFusionManager().init();
         if (hdg != null) _lastHeadingDeg = hdg;
 
         const vel = _getVelocity();
-        // Cache velocity only when speed is physically plausible (>0.3 m/s),
-        // matching the floor _seedVelocityOnResume() uses.
         if (speedMPS > 0.3) { _lastGoodVelocity = { lat: vel.lat, lng: vel.lng }; _lastGoodSpeedMPS = speedMPS; }
 
         let pLat, pLng;
         const rawAge = Math.max(0, (now - oTs) / 1000);
         const hor    = _getPredictHorizon(speedMPS, _headingChangeRate);
-        const pDt    = Math.min(rawAge, hor);
 
-        if (pDt <= 0 || speedMPS < CFG.LOW_SPEED_CUTOFF_MPS || stationary) {
+        if (rawAge <= 0 || speedMPS < CFG.LOW_SPEED_CUTOFF_MPS || stationary) {
             pLat = oLat; pLng = oLng;
         } else {
-            pLat = oLat + vel.lat * pDt;
-            pLng = oLng + vel.lng * pDt;
+            const t1 = Math.min(rawAge, hor);
+            const over = Math.max(0, rawAge - hor);
+            const tau = CFG.EXTENDED_DECAY_TAU_S;
+            const decayDt = t1 + (over > 0 ? tau * (1 - Math.exp(-over / tau)) : 0);
+
+            pLat = oLat + vel.lat * decayDt;
+            pLng = oLng + vel.lng * decayDt;
             const jN = Math.abs(pLat - oLat) * 111111;
             const jE = Math.abs(pLng - oLng) * 111111 * Math.cos(oLat * Math.PI / 180);
             if (jN > 150 || jE > 150) { pLat = oLat; pLng = oLng; }
@@ -2042,10 +2021,6 @@ window.sensorFusion = new SensorFusionManager().init();
 
         _lastPredictedPos = { lat: pLat, lng: pLng };
 
-        // Adaptive hold-still: widen speed and distance thresholds while the
-        // Kalman filter is still converging or accuracy is poor, then tighten
-        // back to baseline once settled. Prevents GPS noise from causing
-        // visible drift during the brief settle-in window.
         const isConverged   = window._isKalmanConverged === true;
         const rawAccuracyM  = Number.isFinite(lastPos?.accuracy) ? lastPos.accuracy : 20;
         const goodAccuracy  = rawAccuracyM <= 12;
@@ -2096,11 +2071,7 @@ window.sensorFusion = new SensorFusionManager().init();
     function _start() {
         if (_active) return true;
 
-        // Block starts during background wake; forceUpdate() falls back to
-        // _immediateSync() (one-time snap, no extrapolation) until a fresh
-        // fix clears the flag.
         if (window._isWakingFromBackground) return false;
-
         if (window.isLocationHuntVisible) return false;
 
         const speedMPS = _getSpeedMPS(), centered = _isCenteredMode();
@@ -2121,9 +2092,8 @@ window.sensorFusion = new SensorFusionManager().init();
 
         stop() {
             if (_rafId != null) { cancelAnimationFrame(_rafId); _rafId = null; }
-            _active = false; _panPending = false; _panTarget = null;
+            _active = false;
             _centeredLat = null; _centeredLng = null;
-            _panRemainder.x = 0; _panRemainder.y = 0;
             _lastSnapZoom = null;
             window.__drHeld = null;
             _wasMoving = false;
@@ -2135,9 +2105,6 @@ window.sensorFusion = new SensorFusionManager().init();
 
         onMovementResumed: _start,
 
-        // If the continuous loop isn't running (stationary, first fix,
-        // below speed threshold, non-centered), do a one-shot sync so the
-        // marker never stalls. DR remains the single writer either way.
         forceUpdate() {
             if (_active) {
                 _lastFrameTime = 0;
