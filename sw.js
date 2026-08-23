@@ -335,25 +335,9 @@ self.addEventListener('fetch', e => {
     return;
   }
 
-  // Intercept PMTiles requests via Service Worker to bypass cross-origin browser CORS restrictions
+  // Pass PMTiles range requests straight through to network without cache byte-range collision
   if (url.includes('.pmtiles')) {
-    e.respondWith(
-      caches.open(TILE_CACHE).then(async (cache) => {
-        const cached = await cache.match(rawReq);
-        if (cached) return cached;
-        
-        try {
-          const res = await fetch(rawReq);
-          if (res.ok || res.status === 206) {
-            cache.put(rawReq, res.clone()).catch(() => {});
-            trimCache(TILE_CACHE, MAX_TILES);
-          }
-          return res;
-        } catch (err) {
-          return new Response('PMTiles fetch failed', { status: 503 });
-        }
-      })
-    );
+    e.respondWith(fetch(rawReq));
     return;
   }
 
