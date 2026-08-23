@@ -3466,11 +3466,20 @@ function handleVisibilityChange() {
    ────────────────────────────────────────────── */
 let warmupWatchId = null;
 
+/**
+ * Reacquires GPS after the app returns from background long enough that
+ * the OS may have suspended location updates. This function's only job is
+ * acquisition and timeout/retry bookkeeping — the actual position,
+ * viewport, and dead-reckoning snap are owned entirely by
+ * updateUserLocation's forceUpdate path once a usable fix comes in.
+ */
 function updateLocationAfterBackground() {
     const now = Date.now();
     window.lastHiddenTime = window.lastHiddenTime || now;
+    const awayMs = now - window.lastHiddenTime;
 
-    // ── Rapid-cycle bail-out ──────────────────────────────────────────────
+    // ── Trivial absence: position is still fresh, just resync the view ────
+    // No new fix needed — the last one is recent enough to trust as-is.
     if (now - (window._lastBackgroundUpdate || 0) < 30_000 && window.lastPosition) {
         if (map && userMarker && typeof _resetMapToPosition === 'function') {
             try {
@@ -3489,19 +3498,40 @@ function updateLocationAfterBackground() {
             map.invalidateSize({ pan: false });
             userMarker?.setLatLng?.([window.lastPosition.lat, window.lastPosition.lng]);
         }
-
         window._isWakingFromBackground = false;
         userMarker?.getElement?.()?.classList.remove('gps-reacquiring');
         window.deadReckoning?.start?.();
         return;
     }
 
-    // ── Re-entrancy guard ─────────────────────────────────────────────────
+    // ── Re-entrancy guard: one acquisition cycle at a time ─────────────────
     if (window._isLocationUpdateInProgress) return;
     if (!('geolocation' in navigator)) return;
     window._isLocationUpdateInProgress = true;
 
-    const cleanup = () => {
+    // True cold start = a long absence, OR a device that has never
+    // successfully acquired a fix at all. Duration alone misses the
+    // first-boot case: lastHiddenTime hasn't been set yet then, so awayMs
+    // reads near-zero even though the GPS chip genuinely needs the longer
+    // cold-start budget.
+    const isColdStart = awayMs > 5 * 60 * 1000 || !window._hasEverAcquiredFix;
+
+    if (awayMs > 30_000 && typeof disposeMapLoop === 'function') {
+        disposeMapLoop();
+    }
+    if (awayMs > 10_000 && window.sensorFusion?._kalmanFilter) {
+        try {
+            window.sensorFusion._kalmanFilter.reset();
+            window.sensorFusion.resetState?.();
+        } catch (e) {
+            console.warn('[Background] Kalman reset failed:', e);
+        }
+    }
+
+    // Was written out twice, identically, in the previous version (once
+    // as pre-setup cleanup, once inside the exit-path cleanup). One
+    // definition used in both places now, so the two can't drift apart.
+    const clearPendingAcquisition = () => {
         if (window._backgroundUpdateTimeout != null) {
             clearTrackedTimeout(window._backgroundUpdateTimeout);
             window._backgroundUpdateTimeout = null;
@@ -3510,183 +3540,166 @@ function updateLocationAfterBackground() {
             try { navigator.geolocation.clearWatch(warmupWatchId); } catch (_) {}
             warmupWatchId = null;
         }
+    };
+
+    // Clear any leftovers from a prior call, then stop any live watch so
+    // exactly one geolocation source is active during acquisition.
+    clearPendingAcquisition();
+    if (window.positionWatchId != null) {
+        try { navigator.geolocation.clearWatch(window.positionWatchId); } catch (_) {}
+        window.positionWatchId = null;
+    }
+
+    let fixApplied = false;
+
+    // Runs on every exit path: success, permission denial, or timeout.
+    // Resumes normal tiered watching — the only place a non-warmup watch
+    // gets (re)started in this function.
+    const finishAcquisition = () => {
+        clearPendingAcquisition();
         document.getElementById('geolocation-retry-modal')?.remove();
         window._isWakingFromBackground = false;
         userMarker?.getElement?.()?.classList.remove('gps-reacquiring');
         window.deadReckoning?.start?.();
-        // Resume normal tiered watching now that acquisition is over
-        // (success, giveup, or cancel) — this is the only place a
-        // non-warmup watch gets (re)started in this function.
-        if (typeof startPositionUpdates === 'function') {
-            startPositionUpdates();
-        }
+        if (typeof startPositionUpdates === 'function') startPositionUpdates();
         window._isLocationUpdateInProgress = false;
     };
 
+    const isLikelyStationary = () => {
+        const mps = window.lastPosition?.speedMPS;
+        return (Number.isFinite(mps) ? mps : 0) * 2.23694 < 5;
+    };
+
+    const showRetryModal = () => {
+        if (document.getElementById('geolocation-retry-modal')) return;
+
+        const overlay = document.createElement('div');
+        overlay.id = 'geolocation-retry-modal';
+        overlay.className = 'geo-retry-overlay';
+        overlay.setAttribute('role', 'dialog');
+        overlay.setAttribute('aria-modal', 'true');
+        overlay.setAttribute('aria-label', 'Location retry');
+
+        const card = document.createElement('div');
+        card.className = 'geo-retry-card';
+
+        const title = document.createElement('div');
+        title.className = 'geo-retry-title';
+        title.textContent = 'Location Needed';
+
+        const text = document.createElement('p');
+        text.className = 'geo-retry-text';
+        text.innerHTML =
+            'We\'re still locating your device.<br>' +
+            'Please ensure location services are enabled, and try again.';
+
+        const retryBtn = document.createElement('button');
+        retryBtn.className = 'geo-retry-btn';
+        retryBtn.textContent = '↻ Try Again';
+        retryBtn.addEventListener('click', () => {
+            overlay.remove();
+            updateLocationAfterBackground();
+        });
+
+        const closeBtn = document.createElement('button');
+        closeBtn.className = 'geo-retry-cancel';
+        closeBtn.textContent = 'Cancel';
+        closeBtn.addEventListener('click', () => {
+            overlay.remove();
+            finishAcquisition();
+        });
+
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) {
+                overlay.remove();
+                finishAcquisition();
+            }
+        });
+
+        card.appendChild(title);
+        card.appendChild(text);
+        card.appendChild(retryBtn);
+        card.appendChild(closeBtn);
+        overlay.appendChild(card);
+        document.body.appendChild(overlay);
+    };
+
+    const isUsableFix = (position) => {
+        const coords = position?.coords;
+        if (!coords ||
+            !Number.isFinite(coords.latitude) ||
+            !Number.isFinite(coords.longitude) ||
+            Math.abs(coords.latitude) > 90 ||
+            Math.abs(coords.longitude) > 180 ||
+            coords.accuracy == null ||
+            coords.accuracy <= 0) {
+            return false;
+        }
+
+        const fixTs = Number.isFinite(position.timestamp) ? position.timestamp : Date.now();
+
+        // Cold starts get a more relaxed staleness allowance: after 5+
+        // minutes away, even a technically-cached fix from the OS is
+        // still meaningfully better than nothing.
+        const maxAge = isColdStart ? 120_000 : 30_000;
+        if (Date.now() - fixTs > maxAge) return false;
+
+        if (window.lastUpdateTime && fixTs <= window.lastUpdateTime) return false;
+
+        return true;
+    };
+
+    const onFixAcquired = (position) => {
+        if (fixApplied || !isUsableFix(position)) return;
+
+        fixApplied = true;
+        finishAcquisition();
+
+        const fixTs = Number.isFinite(position.timestamp) ? position.timestamp : Date.now();
+        window._hasEverAcquiredFix = true;
+        window._needsWakeSnap = false;
+        window._lastFusionFixTimestamp = fixTs;
+        window._lastBackgroundUpdate = Date.now();
+
+        updateUserLocation(position, true);
+        if (typeof updateDistanceBox === 'function') updateDistanceBox();
+    };
+
+    const onAcquisitionError = (error) => {
+        // Only permission denial is terminal here — for every other error
+        // code the live watch keeps retrying on its own, so there's
+        // nothing else for this handler to do but wait for it.
+        if (error?.code !== 1) return;
+        finishAcquisition();
+        if (isLikelyStationary()) showRetryModal();
+    };
+
     try {
-        const awayMs = now - (window.lastHiddenTime || 0);
-
-        const isColdStart = awayMs > 5 * 60 * 1000 || !window._hasEverAcquiredFix;
-
-        if (awayMs > 30_000 && typeof disposeMapLoop === 'function') {
-            disposeMapLoop();
-        }
-
-        if (awayMs > 10_000 && window.sensorFusion?._kalmanFilter) {
-            try {
-                window.sensorFusion._kalmanFilter.reset();
-                window.sensorFusion.resetState?.();
-            } catch (e) {
-                console.warn('[Background] Kalman reset failed:', e);
-            }
-        }
-
-        // ── Clear leftovers from a prior call ───────────────────────────────
-        if (warmupWatchId != null) {
-            try { navigator.geolocation.clearWatch(warmupWatchId); } catch (_) {}
-            warmupWatchId = null;
-        }
-        if (window._backgroundUpdateTimeout != null) {
-            clearTrackedTimeout(window._backgroundUpdateTimeout);
-            window._backgroundUpdateTimeout = null;
-        }
-
-        // acquisition: the warmup watch.
-        if (window.positionWatchId != null) {
-            try { navigator.geolocation.clearWatch(window.positionWatchId); } catch (_) {}
-            window.positionWatchId = null;
-        }
-
-        const isStationary = () => {
-            const mps = window.lastPosition?.speedMPS;
-            return (Number.isFinite(mps) ? mps : 0) * 2.23694 < 5;
-        };
-
-        const showRetryModal = () => {
-            if (document.getElementById('geolocation-retry-modal')) return;
-
-            const overlay = document.createElement('div');
-            overlay.id = 'geolocation-retry-modal';
-            overlay.className = 'geo-retry-overlay';
-            overlay.setAttribute('role', 'dialog');
-            overlay.setAttribute('aria-modal', 'true');
-            overlay.setAttribute('aria-label', 'Location retry');
-
-            const card = document.createElement('div');
-            card.className = 'geo-retry-card';
-
-            const title = document.createElement('div');
-            title.className = 'geo-retry-title';
-            title.textContent = 'Location Needed';
-
-            const text = document.createElement('p');
-            text.className = 'geo-retry-text';
-            text.innerHTML =
-                'We\'re still locating your device.<br>' +
-                'Please ensure location services are enabled, and try again.';
-
-            const retryBtn = document.createElement('button');
-            retryBtn.className = 'geo-retry-btn';
-            retryBtn.textContent = '↻ Try Again';
-            retryBtn.addEventListener('click', () => {
-                overlay.remove();
-                updateLocationAfterBackground();
-            });
-
-            const closeBtn = document.createElement('button');
-            closeBtn.className = 'geo-retry-cancel';
-            closeBtn.textContent = 'Cancel';
-            closeBtn.addEventListener('click', () => {
-                overlay.remove();
-                cleanup();
-            });
-
-            overlay.addEventListener('click', (e) => {
-                if (e.target === overlay) {
-                    overlay.remove();
-                    cleanup();
-                }
-            });
-
-            card.appendChild(title);
-            card.appendChild(text);
-            card.appendChild(retryBtn);
-            card.appendChild(closeBtn);
-            overlay.appendChild(card);
-            document.body.appendChild(overlay);
-        };
-
-        let fixApplied = false;
-
-        const onSuccess = (position) => {
-            if (fixApplied) return;
-
-            const coords = position?.coords;
-            if (!coords ||
-                !Number.isFinite(coords.latitude) ||
-                !Number.isFinite(coords.longitude) ||
-                Math.abs(coords.latitude) > 90 ||
-                Math.abs(coords.longitude) > 180 ||
-                coords.accuracy == null ||
-                coords.accuracy <= 0) {
-                return;
-            }
-
-            const fixTs = Number.isFinite(position.timestamp) ? position.timestamp : Date.now();
-
-            const maxAge = isColdStart ? 120_000 : 30_000;
-            if (Date.now() - fixTs > maxAge) return;
-
-            if (window.lastUpdateTime && fixTs <= window.lastUpdateTime) return;
-
-            fixApplied = true;
-            cleanup();
-
-            window._hasEverAcquiredFix = true;
-            window._needsWakeSnap = false;
-            window._lastFusionFixTimestamp = fixTs;
-            window._lastBackgroundUpdate = Date.now();
-
-            updateUserLocation(position, true);
-            if (typeof updateDistanceBox === 'function') updateDistanceBox();
-
-            requestAnimationFrame(() => {
-                try {
-                    if (typeof _resetMapToPosition === 'function' && window.lastPosition) {
-                        _resetMapToPosition(window.lastPosition, {
-                            resetType: 'wake',
-                            currentTime: Date.now(),
-                            forceUpdate: true
-                        });
-                    }
-                } catch (err) {
-                    console.error('[Background] Wake snap failed:', err);
-                }
-            });
-        };
-
-        const onError = (error) => {
-            if (error?.code === 1) {
-                cleanup();
-                if (isStationary()) showRetryModal();
-            }
-        };
-
+        // "Find faster": warm resumes may accept a fix the OS already has
+        // cached — fast, no new hardware acquisition needed — since the
+        // device hasn't had time to drift meaningfully in a few seconds.
+        // Cold starts still require maximumAge:0, since anything cached
+        // after 5+ minutes away (or on a device with no prior fix) would
+        // be stale enough to actively mislead rather than help.
         warmupWatchId = navigator.geolocation.watchPosition(
-            onSuccess,
-            onError,
-            { enableHighAccuracy: true, timeout: isColdStart ? 60_000 : 15_000, maximumAge: 0 }
+            onFixAcquired,
+            onAcquisitionError,
+            {
+                enableHighAccuracy: true,
+                timeout: isColdStart ? 60_000 : 15_000,
+                maximumAge: isColdStart ? 0 : 3000
+            }
         );
 
         window._backgroundUpdateTimeout = createTrackedTimeout(() => {
             if (fixApplied) return;
-            cleanup();
-            if (isStationary()) showRetryModal();
+            finishAcquisition();
+            if (isLikelyStationary()) showRetryModal();
         }, isColdStart ? 70_000 : 25_000);
 
     } catch (err) {
         console.error('[Background] Setup failed:', err);
-        cleanup();
+        finishAcquisition();
     }
 }
       
@@ -4224,108 +4237,15 @@ function _handleTriggerZone(location, distanceFeet, now, isOnCooldown) {
     }
     
 function _prefetchMapTiles(location, now) {
-    if (!location || location.id == null) return;
-    if (now < window._tileBackoffUntil) return; // in cooldown, skip silently
-
-    const prefetchKey = `_didPrefetch19_${location.id}`;
-    const timeKey = `_time${prefetchKey}`;
-    const lastPrefetchTime = window[timeKey];
-
-    // Respect TTL and OSM usage constraints (avoid hammering servers on repeated triggers)
-    const OSM_TILE_TTL_MS = Math.max(TILE_PREFETCH_TTL_MS, 60000); // Minimum 1-minute floor per location to comply with polite usage
-    if (window[prefetchKey] && lastPrefetchTime && (now - lastPrefetchTime) < OSM_TILE_TTL_MS) {
+    // Explicit tile prefetching is prohibited by OSM policy.
+    // Map libraries handle reactive, user-driven tile loading automatically.
+    if (!location || !Number.isFinite(location.lat) || !Number.isFinite(location.lng)) {
+        console.warn('[Map] Invalid location coordinates provided');
         return;
     }
-
-    if (!map || typeof map.getCenter !== 'function' || typeof map.getZoom !== 'function') {
-        console.warn('[Prefetch] Map not available for tile prefetch');
-        return;
-    }
-
-    try {
-        const currentZoom = map.getZoom();
-
-        if (currentZoom >= PROXIMITY_ZOOM_LEVEL) {
-            window[prefetchKey] = true;
-            window[timeKey] = now;
-            return;
-        }
-
-        const center = map.getCenter();
-        if (!center || !Number.isFinite(center.lat) || !Number.isFinite(center.lng)) {
-            console.warn('[Prefetch] Invalid map center, skipping');
-            return;
-        }
-
-        const targetLat = Number.isFinite(location.lat) ? location.lat : center.lat;
-        const targetLng = Number.isFinite(location.lng) ? location.lng : center.lng;
-        if (!Number.isFinite(targetLat) || !Number.isFinite(targetLng)) {
-            console.warn('[Prefetch] No valid target coordinates, skipping');
-            return;
-        }
-
-        const targetZoom = PROXIMITY_ZOOM_LEVEL;
-        const tileUrlTemplate = window.currentTileLayer?._url
-            || 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
-
-        const { n, x: xtile, y: ytile } = _latLngToTile(targetLat, targetLng, targetZoom);
-
-        // Strict OSM compliance: Center tile only + absolute minimum crucial neighbors 
-        // to minimize load on public tile infrastructure.
-        const offsets = [[0, 0], [1, 0], [-1, 0]]; 
-        const tilesToPrefetch = [];
-        const subdomains = ['a', 'b', 'c'];
-
-        for (const [dx, dy] of offsets) {
-            const x = xtile + dx;
-            const y = ytile + dy;
-            if (!(x >= 0 && x < n && y >= 0 && y < n)) continue;
-
-            const subdomain = subdomains[(x + y) % subdomains.length];
-            const url = tileUrlTemplate
-                .replace('{z}', targetZoom)
-                .replace('{x}', x)
-                .replace('{y}', y)
-                .replace('{s}', subdomain);
-
-            tilesToPrefetch.push(url);
-        }
-
-        if (tilesToPrefetch.length === 0) {
-            console.warn('[Prefetch] No valid tiles to prefetch for', location.name || location.id);
-            return;
-        }
-
-        window._tilePrefetchBatchId = (window._tilePrefetchBatchId ?? 0) + 1;
-        const batchId = window._tilePrefetchBatchId;
-
-        let errorCount = 0;
-        const onErrorTracker = () => {
-            errorCount++;
-            if (errorCount > (TILE_PREFETCH_MAX_FAILURES || 2)) {
-                window[prefetchKey] = false;
-                window[timeKey] = 0;
-                // Implement backoff to prevent hammering after errors
-                window._tileBackoffUntil = now + 30000; 
-            }
-        };
-
-        // Ensure queue processor respects polite spacing if it exists
-        tilesToPrefetch.forEach((url) => {
-            window._tilePrefetchQueue.push({ url, batchId, onErrorTracker });
-        });
-        
-        if (typeof _pumpTilePrefetchQueue === 'function') {
-            _pumpTilePrefetchQueue();
-        }
-
-        window[prefetchKey] = true;
-        window[timeKey] = now;
-        console.log(`[Prefetch] Queued ${tilesToPrefetch.length} polite tiles at zoom ${targetZoom} for`, location.name || location.id);
-
-    } catch (err) {
-        console.warn('[Prefetch] Failed to prefetch tiles:', err);
-    }
+    
+    // If you need to center the map on interaction, do it through standard view methods:
+    // map.setView([location.lat, location.lng], targetZoom);
 }
 
 /* ──────────────────────────────────────────────
