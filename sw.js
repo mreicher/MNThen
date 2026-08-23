@@ -1,5 +1,5 @@
 // sw.js – Minnesota Then Service Worker
-// Version: 4.6.512
+// Version: 4.6.513
 
 const CACHE_NAME    = 'mnthen-v4-ios-7';
 const SHELL_CACHE   = 'mnthen-shell-v7';
@@ -27,7 +27,7 @@ const SHELL_RESOURCES = [
   '/css/map-styles.css',
   '/manifest.json',
   '/locations_main.js',
-  '/locations_main.js?v=1.0.97',  // Cache the versioned URL too
+  '/locations_main.js?v=1.0.97',
   '/images/logo.webp',
   '/images/header/index_header.jpg'
 ];
@@ -71,14 +71,11 @@ async function trimCache(cacheName, maxEntries) {
 function normalizeRequest(req) {
   const url = new URL(req.url);
   if (url.pathname === '/' || url.pathname === '') {
-    // FIX: Preserve original request properties (headers, credentials, referrer, mode, etc.)
-    // so the normalized request doesn't lose browser-set metadata.
     return new Request('/index.html', req);
   }
   return req;
 }
 
-// Safe JSON parse — returns null instead of throwing on invalid JSON
 function safeJsonParse(text) {
   try {
     return JSON.parse(text);
@@ -91,7 +88,6 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Fetch-and-cache a single resource, with optional retries for critical files.
 async function cacheOneResource(cache, path, { retries = 0, delayMs = 0 } = {}) {
   const req = new Request(path, { cache: 'reload' });
   let lastError = null;
@@ -121,10 +117,6 @@ async function cacheOneResource(cache, path, { retries = 0, delayMs = 0 } = {}) 
   return { path, ok: false, error: lastError?.message };
 }
 
-// Cache each resource individually — failures don't block others.
-// Critical resources (e.g. locations_main.js) get retried before being
-// counted as failed; non-critical resources are still best-effort/single-try,
-// exactly as before.
 async function cacheShellResources(cache) {
   const results = await Promise.all(
     SHELL_RESOURCES.map(path => {
@@ -185,7 +177,6 @@ async function networkFirst(req) {
     }
     return res;
   } catch (e) {
-    // FIX: Fallback chain — runtime cache (fresher), then shell precache, then offline page.
     const runtimeCache = await caches.open(RUNTIME_CACHE);
     const cached = await runtimeCache.match(req);
     if (cached) return cached;
@@ -201,16 +192,12 @@ async function networkFirst(req) {
 
 async function staleWhileRevalidate(req) {
   const cache = await caches.open(SHELL_CACHE);
-
-  // Try exact match first
   let cached = await cache.match(req);
 
-  // If no exact match, try ignoring query params (for ?v=1.0.9)
   if (!cached) {
     cached = await cache.match(req, { ignoreSearch: true });
   }
 
-  // Always try network in background
   const networkPromise = fetch(req)
     .then(res => {
       if (res.ok && res.status === 200) {
@@ -220,15 +207,11 @@ async function staleWhileRevalidate(req) {
     })
     .catch(() => null);
 
-  // If we have cached, return it immediately (network update happens in background)
   if (cached) return cached;
 
-  // No cache — must wait for network
   const networkRes = await networkPromise;
   if (networkRes) return networkRes;
 
-  // Neither cache nor network worked — return a real failure so callers
-  // (script onerror, app-level fetch handling) can react correctly.
   return new Response('Offline', { status: 503 });
 }
 
@@ -294,64 +277,44 @@ async function handlePrefetchAudio(data, port) {
   });
 }
 
-// Completely hardened. Never tries to parse anything that isn't
-// explicitly a valid object with a locations array.
 async function handleGeolocationRequest(data, port) {
   try {
-    // Guard 1: data must be a plain object
     if (!data || typeof data !== 'object' || data === null) {
       port?.postMessage({ success: false, error: 'Invalid request: not an object' });
       return;
     }
 
-    // Guard 2: data must not be a string (raw JS content)
     if (typeof data === 'string') {
-      console.warn('[SW] GEOLOCATION: received string instead of object — ignoring');
       port?.postMessage({ success: false, error: 'Expected object, received string' });
       return;
     }
 
-    // Guard 3: data.locations must exist and be an array
     let locations = data.locations;
-
     if (locations === undefined || locations === null) {
       port?.postMessage({ success: false, error: 'Missing locations field' });
       return;
     }
 
-    // Guard 4: If it's a string, it must be valid JSON array syntax
     if (typeof locations === 'string') {
       const trimmed = locations.trim();
-
-      // Reject obvious non-JSON content
-      if (trimmed.length === 0) {
-        port?.postMessage({ success: false, error: 'Empty locations string' });
+      if (trimmed.length === 0 || !trimmed.startsWith('[')) {
+        port?.postMessage({ success: false, error: 'locations is not a valid JSON array' });
         return;
       }
-
-      // Must start with [ for JSON array
-      if (!trimmed.startsWith('[')) {
-        console.warn('[SW] GEOLOCATION: locations string is not a JSON array — ignoring');
-        port?.postMessage({ success: false, error: 'locations is not a JSON array' });
-        return;
-      }
-
       locations = safeJsonParse(locations);
       if (locations === null) {
-        console.warn('[SW] GEOLOCATION: locations string was not valid JSON');
         port?.postMessage({ success: false, error: 'locations is not valid JSON' });
         return;
       }
     }
 
     if (!Array.isArray(locations)) {
-      port?.postMessage({ success: false, error: 'Invalid locations: expected array, got ' + typeof locations });
+      port?.postMessage({ success: false, error: 'Invalid locations: expected array' });
       return;
     }
 
     port?.postMessage({ success: true, locationsCount: locations.length });
   } catch (err) {
-    console.error('[SW] handleGeolocationRequest error:', err);
     port?.postMessage({ success: false, error: err.message });
   }
 }
@@ -364,13 +327,33 @@ self.addEventListener('fetch', e => {
 
   if (rawReq.method !== 'GET') return;
 
-  // FIX: Detect document/navigate requests from the ORIGINAL request before
-  // normalizeRequest() strips the browser-set destination/mode properties.
   const isDocument = rawReq.destination === 'document' || rawReq.mode === 'navigate';
   const req = normalizeRequest(rawReq);
 
   if (isDocument) {
     e.respondWith(networkFirst(req));
+    return;
+  }
+
+  // Intercept PMTiles requests via Service Worker to bypass cross-origin browser CORS restrictions
+  if (url.includes('.pmtiles')) {
+    e.respondWith(
+      caches.open(TILE_CACHE).then(async (cache) => {
+        const cached = await cache.match(rawReq);
+        if (cached) return cached;
+        
+        try {
+          const res = await fetch(rawReq);
+          if (res.ok || res.status === 206) {
+            cache.put(rawReq, res.clone()).catch(() => {});
+            trimCache(TILE_CACHE, MAX_TILES);
+          }
+          return res;
+        } catch (err) {
+          return new Response('PMTiles fetch failed', { status: 503 });
+        }
+      })
+    );
     return;
   }
 
@@ -384,7 +367,6 @@ self.addEventListener('fetch', e => {
     return;
   }
 
-  // locations_main.js (with or without query params) — stale-while-revalidate
   if (url.includes('/locations_main.js')) {
     e.respondWith(staleWhileRevalidate(req));
     return;
@@ -395,18 +377,13 @@ self.addEventListener('fetch', e => {
     return;
   }
 
-  if (/\.(css|js|png|jpg|jpeg|gif|svg|webp|ico|woff|woff2)$/i.test(url)) {
-    e.respondWith(cacheFirst(req, CACHE_NAME));
-    return;
-  }
-
   e.respondWith(cacheFirst(req, CACHE_NAME));
 });
 
 // ---------- lifecycle ----------
 
 self.addEventListener('install', e => {
-  console.log('[SW] 4.6.512 installing');
+  console.log('[SW] 4.6.513 installing');
   e.waitUntil(
     caches.open(SHELL_CACHE)
       .then(cache => cacheShellResources(cache))
@@ -419,7 +396,7 @@ self.addEventListener('install', e => {
 });
 
 self.addEventListener('activate', e => {
-  console.log('[SW] 4.6.512 activating');
+  console.log('[SW] 4.6.513 activating');
   e.waitUntil(
     caches.keys().then(names =>
       Promise.all(
@@ -480,13 +457,11 @@ self.addEventListener('message', e => {
 // ---------- error shields ----------
 
 self.addEventListener('error', e => {
-  console.error('[SW] error:', e.error);
   e.preventDefault();
 });
 
 self.addEventListener('unhandledrejection', e => {
-  console.error('[SW] rejection:', e.reason);
   e.preventDefault();
 });
 
-console.log('[SW] 4.6.512 ready (resilient install)');
+console.log('[SW] 4.6.513 ready (resilient install)');
