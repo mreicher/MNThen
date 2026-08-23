@@ -5,11 +5,9 @@ const CACHE_NAME    = 'mnthen-v4-ios-7';
 const SHELL_CACHE   = 'mnthen-shell-v7';
 const RUNTIME_CACHE = 'mnthen-runtime-v7';
 const AUDIO_CACHE   = 'mnthen-audio-v7';
-const TILE_CACHE    = 'mnthen-tiles-v7';
 
 const MAX_RUNTIME = 100;
 const MAX_AUDIO   = 100;
-const MAX_TILES   = 1500;
 const MAX_SHELL   = 50;
 
 const CORS_AUDIO_DOMAINS = [
@@ -41,7 +39,6 @@ const CRITICAL_RETRY_DELAY_MS = 1000;
 
 const AUDIO_EXTS = /\.(mp3|wav|ogg|m4a|aac|flac|weba)$/i;
 const VIDEO_EXTS = /\.(mp4|webm|mov|avi|mpeg|mkv)$/i;
-const TILE_REGEX = /tile\.openstreetmap\.org\/\d+\/\d+\/\d+\.(png|jpg|jpeg|webp)/i;
 
 // ---------- helpers ----------
 
@@ -335,17 +332,6 @@ self.addEventListener('fetch', e => {
     return;
   }
 
-  // Pass PMTiles range requests straight through to network without cache byte-range collision
-  if (url.includes('.pmtiles')) {
-    e.respondWith(fetch(rawReq));
-    return;
-  }
-
-  if (TILE_REGEX.test(url)) {
-    e.respondWith(cacheFirst(req, TILE_CACHE));
-    return;
-  }
-
   if (url.includes('/api/')) {
     e.respondWith(networkFirst(req));
     return;
@@ -385,7 +371,7 @@ self.addEventListener('activate', e => {
     caches.keys().then(names =>
       Promise.all(
         names.map(n => {
-          if (![CACHE_NAME, SHELL_CACHE, RUNTIME_CACHE, AUDIO_CACHE, TILE_CACHE].includes(n)) {
+          if (![CACHE_NAME, SHELL_CACHE, RUNTIME_CACHE, AUDIO_CACHE].includes(n)) {
             console.log('[SW] Deleting old cache:', n);
             return caches.delete(n);
           }
@@ -411,8 +397,7 @@ self.addEventListener('message', e => {
         caches.delete(CACHE_NAME),
         caches.delete(SHELL_CACHE),
         caches.delete(RUNTIME_CACHE),
-        caches.delete(AUDIO_CACHE),
-        caches.delete(TILE_CACHE)
+        caches.delete(AUDIO_CACHE)
       ]).then(
         () => e.ports[0]?.postMessage({ success: true }),
         err => e.ports[0]?.postMessage({ success: false, error: err.message })
