@@ -2934,10 +2934,7 @@ function _scheduleLocationInitRecovery(err) {
     
     window._initRecoveryAttempts = (window._initRecoveryAttempts || 0) + 1;
     
-    // FIX: Increased max retries from 3 to 5, and timeout from 15s to 30s.
-    // Cold GPS starts often need 30+ seconds. This prevents premature error popups.
     if (window._initRecoveryAttempts <= 5) {
-        // FIX: Increased backoff delay to give the OS time to wake up the GPS hardware.
         const backoffMs = Math.min(30000, Math.pow(2, window._initRecoveryAttempts) * 2000);
         console.log(`[Init] Retrying location init (attempt ${window._initRecoveryAttempts} of 5 in ${backoffMs}ms)`);
         
@@ -3152,8 +3149,7 @@ function _initUserLocationAttempt(position) {
     /* ──────────────────────────────────────────────
        GPS POWER MODE 
        ────────────────────────────────────────────── */
-      function getWatchOptions() {
-
+     function getWatchOptions() {
             const rawSpeedMPS = window.lastPosition?.speedMPS;
             const sanitizedRawSpeedMPS = Number.isFinite(rawSpeedMPS) ? Math.max(0, rawSpeedMPS) : 0;
             const filteredSpeedMPS = window.sensorFusion?.getFilteredSpeedMPS?.() ?? 0;
@@ -3161,8 +3157,30 @@ function _initUserLocationAttempt(position) {
             const isStationaryFlag = window.sensorFusion?._lastStationaryState ?? window.isStationary;
             const STATIONARY_OVERRIDE_MPH = 5;
             const stationary = speedMPH < 0.3 || (isStationaryFlag && speedMPH < STATIONARY_OVERRIDE_MPH);
-            const driving    = speedMPH >= 5 || (!isStationaryFlag && speedMPH >= 4);
-            const highSpeed  = speedMPH >= 45;
+            const prevTier = window._activeSpeedWatchTier || null;
+        
+            let driving;
+            if (stationary) {
+                driving = false;
+            } else if (prevTier === 'driving' || prevTier === 'highSpeed') {
+                driving = speedMPH >= 3.5; // already driving — stay unless clearly slowed
+            } else {
+                driving = speedMPH >= 5 || (!isStationaryFlag && speedMPH >= 4);
+            }
+        
+            let highSpeed;
+            if (!driving) {
+                highSpeed = false;
+            } else if (prevTier === 'highSpeed') {
+                highSpeed = speedMPH >= 40; // already cruising fast — stay unless clearly slowed
+            } else {
+                highSpeed = speedMPH >= 45;
+            }
+        
+            window._activeSpeedWatchTier = stationary ? 'stationary'
+                                          : highSpeed  ? 'highSpeed'
+                                          : driving    ? 'driving'
+                                          :              'walking';
         
             const maximumAge = stationary ? 5000
                               : highSpeed  ? 0
@@ -3175,6 +3193,7 @@ function _initUserLocationAttempt(position) {
                 timeout: stationary ? 20000 : driving ? 10000 : 15000,
             };
         }
+        
 /* ──────────────────────────────────────────────
    POSITION UPDATES — GPS watch + power manager
    ────────────────────────────────────────────── */
@@ -3676,29 +3695,6 @@ function updateLocationAfterBackground() {
 
         fixApplied = true;
 
-        // FIX: seed the Kalman filter's velocity from real displacement
-        // over the background gap, before finishAcquisition()/
-        // updateUserLocation() run. This must happen here, reading the
-        // dedicated _prewakeLastPosition/_prewakeLastUpdateTime snapshot
-        // (captured in handleVisibilityChange at the moment the app was
-        // hidden) rather than window.lastPosition/lastUpdateTime, because
-        // the wake-snap's _resetMapToPosition call already overwrote
-        // window.lastUpdateTime to the wake moment — using that would
-        // divide real distance by a too-short elapsed time and produce a
-        // wildly overstated velocity.
-        //
-        // Without this, a background gap long enough to trigger the
-        // Kalman reset above (awayMs > 10s) wipes kf.x to null, which
-        // silently disables every displacement/last-velocity fallback
-        // inside smoothPosition()'s own re-seeding logic (they all
-        // require kf.x or other now-cleared state to be non-null). The
-        // filter then reinitializes assuming near-zero velocity and has
-        // to wait for the device's own coords.speed/heading to catch up
-        // over several fixes — the "resumes but not as smooth" gap after
-        // background+travel. scheduleVelocitySeed() only sets a *pending*
-        // hint; smoothPosition() still prefers this fix's own GPS
-        // speed/heading when they're usable, so this purely fills the
-        // gap when they aren't.
         try {
             const kf = window.sensorFusion?._kalmanFilter;
             const prevPos = window._prewakeLastPosition;
@@ -5192,23 +5188,6 @@ function _neutralizeMarkerTransition() {
     
         if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
             var kf = window.sensorFusion._kalmanFilter;
-
-            // FIX: wake resets used to unconditionally wipe the Kalman
-            // filter's velocity/covariance on EVERY visibility change,
-            // including trivial sub-3s app switches where the GPS watch
-            // never even stopped. Wiping velocity forces a multi-fix
-            // reconvergence window on every quick glance away from the
-            // app. Previously the marker's CSS transition glide masked
-            // that stall-then-catch-up; once the transition was removed
-            // (see _neutralizeMarkerTransition), the same reconvergence
-            // artifact became visible as a "rubber band" snap.
-            //
-            // Callers can now pass resetSensorState explicitly. If they
-            // don't, this falls back to the original isInit||isWake
-            // behavior, so any caller that doesn't opt in keeps the old
-            // (safe) default. A genuine large gap or position jump,
-            // detected just below, still forces a reset regardless of
-            // what the caller requested — this can't mask real staleness.
             var shouldResetKalman = (options.resetSensorState != null)
                 ? !!options.resetSensorState
                 : (isInit || isWake);
@@ -5653,14 +5632,6 @@ function handleLocationError(error) {
         return;
     }
 
-    // FIX: previously only suppressed the one-shot retry for error code 3.
-    // A live watch will keep trying on its own regardless of *which* error
-    // it just reported — code 2 (unavailable) is just as likely to be
-    // transient as code 3 (timeout). Spawning a parallel getCurrentPosition
-    // for any error while a watch is active creates a second GPS source
-    // racing the watch's own fixes into updateUserLocation, both able to
-    // force-write position and skip jump validation. Suppress whenever a
-    // watch is active, not just on timeout.
     if (window.positionWatchId != null) {
         console.log('[GPS] Watch active — suppressing one-shot retry (error code ' + error?.code + ')');
         return;
