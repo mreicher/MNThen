@@ -1796,7 +1796,8 @@ window.sensorFusion = new SensorFusionManager().init();
         PAN_DURATION_FAST:    0.10,
         FREE_MIN_PAN_M:       4.0,
         EXTENDED_DECAY_TAU_S: 1.2,
-        WAKEUP_GRACE_MS:      3000
+        WAKEUP_GRACE_MS:      3000,
+        WAKE_SETTLE_MS:       2500 
     };
 
     let _rafId             = null;
@@ -1817,6 +1818,8 @@ window.sensorFusion = new SensorFusionManager().init();
     let _centeredLng = null;
     let _lastSnapZoom = null;
     let _wasMoving = false;
+    let _wakeSettling = false;
+    let _wakeSettleStart = 0;
 
     const _now = () => performance.now();
 
@@ -2012,41 +2015,50 @@ window.sensorFusion = new SensorFusionManager().init();
         }
     }
 
-      function frame(now) {
+          function frame(now) {
         _rafId = null;
-        
+
         if (window.isLocationHuntVisible) { _active = false; return; }
-        
+
         const lastPos = window.lastPosition;
-        
-        // Track how long the loop has been running to allow a grace period on wake-up
         const loopAge = now - _loopStartTime;
-        
-        // Don't kill the loop immediately if lastPos is null.
-        // GPS may take 1-2 seconds to deliver a fix after wake-up.
-        if (!lastPos) { 
+
+        if (!lastPos) {
             if (loopAge < CFG.WAKEUP_GRACE_MS) {
                 _rafId = requestAnimationFrame(frame);
                 return;
             }
-            _active = false; 
-            return; 
+            _active = false;
+            return;
+        }
+
+        // NEW: check whether we've settled out of the post-wake window.
+        // Exits early (before the noisy vector could get another chance
+        // to seed) as soon as the Kalman filter reports converged —
+        // meaning several real fixes have already corrected whatever the
+        // first post-wake fix got wrong — or after WAKE_SETTLE_MS as a
+        // hard ceiling so a slow-to-converge signal doesn't hold forever.
+        if (_wakeSettling) {
+            if (window._isKalmanConverged === true || (now - _wakeSettleStart) > CFG.WAKE_SETTLE_MS) {
+                _wakeSettling = false;
+            }
         }
 
         const speedMPS   = _getSpeedMPS();
         const stationary = _isStationary();
         const centered   = _isCenteredMode();
 
+        // Suppress resume-seeding while still settling — seeding here
+        // would inject the same noisy first-fix velocity into the Kalman
+        // filter's internal state that we're trying to avoid trusting.
         const movingNow = speedMPS >= CFG.MIN_SPEED_MPS;
-        if (movingNow && !_wasMoving) _seedVelocityOnResume();
+        if (movingNow && !_wasMoving && !_wakeSettling) _seedVelocityOnResume();
         _wasMoving = movingNow;
 
-        // Don't kill the loop immediately if sensors report stationary.
-        // Sensors often report 0 speed/stationary for the first 1-2 seconds after wake-up.
-        if (!centered && stationary && speedMPS < CFG.MIN_SPEED_MPS) { 
+        if (!centered && stationary && speedMPS < CFG.MIN_SPEED_MPS) {
             if (loopAge > CFG.WAKEUP_GRACE_MS) {
-                _active = false; 
-                return; 
+                _active = false;
+                return;
             }
         }
 
@@ -2087,7 +2099,12 @@ window.sensorFusion = new SensorFusionManager().init();
         const rawAge = Math.max(0, (now - oTs) / 1000);
         const hor    = _getPredictHorizon(speedMPS, _headingChangeRate);
 
-        if (rawAge <= 0 || speedMPS < CFG.LOW_SPEED_CUTOFF_MPS || stationary) {
+        // NEW: while settling, never extrapolate — hold at the measured
+        // origin every frame. The marker will still move smoothly as new
+        // real fixes arrive (oLat/oLng updates each frame from live
+        // Kalman/raw position), it just won't project ahead using a
+        // velocity vector we don't trust yet.
+        if (_wakeSettling || rawAge <= 0 || speedMPS < CFG.LOW_SPEED_CUTOFF_MPS || stationary) {
             pLat = oLat; pLng = oLng;
         } else {
             const t1 = Math.min(rawAge, hor);
@@ -2150,8 +2167,8 @@ window.sensorFusion = new SensorFusionManager().init();
 
         _rafId = requestAnimationFrame(frame);
     }
-
-     function _start(options) {
+    
+         function _start(options) {
         options = options || {};
         if (_active) return true;
 
@@ -2162,10 +2179,17 @@ window.sensorFusion = new SensorFusionManager().init();
         if (!options.ignoreSpeed && !centered && speedMPS < CFG.MIN_SPEED_MPS) return false;
         if (!options.ignoreSpeed && !centered && window.isStationary && speedMPS < 0.8) return false;
 
-        if (speedMPS >= CFG.MIN_SPEED_MPS || options.ignoreSpeed) _seedVelocityOnResume();
+        const isWakeResume = !!(options.ignoreWake && options.ignoreSpeed);
+
+        if (isWakeResume) {
+            _wakeSettling    = true;
+            _wakeSettleStart = _now();
+        } else if (speedMPS >= CFG.MIN_SPEED_MPS) {
+            _seedVelocityOnResume();
+        }
 
         _active = true;
-        _loopStartTime = _now(); 
+        _loopStartTime = _now();
         _lastFrameTime = _now();
         _interactionEndTime = 0;
         _rafId = requestAnimationFrame(frame);
@@ -2175,13 +2199,14 @@ window.sensorFusion = new SensorFusionManager().init();
     window.deadReckoning = {
         start(options) { return _start(options); },
      
-        stop(clearMotionCache = false) {
+               stop(clearMotionCache = false) {
             if (_rafId != null) { cancelAnimationFrame(_rafId); _rafId = null; }
             _active = false;
             _centeredLat = null; _centeredLng = null;
             _lastSnapZoom = null;
             window.__drHeld = null;
             _wasMoving = false;
+            _wakeSettling = false;   
             if (clearMotionCache) {
                 _lastGoodVelocity = { lat: 0, lng: 0 };
                 _lastGoodSpeedMPS = 0;
