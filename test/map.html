@@ -1795,7 +1795,8 @@ window.sensorFusion = new SensorFusionManager().init();
         PAN_DURATION_BASE:    0.22,
         PAN_DURATION_FAST:    0.10,
         FREE_MIN_PAN_M:       4.0,
-        EXTENDED_DECAY_TAU_S: 1.2
+        EXTENDED_DECAY_TAU_S: 1.2,
+        WAKEUP_GRACE_MS:      3000
     };
 
     let _rafId             = null;
@@ -1938,25 +1939,47 @@ window.sensorFusion = new SensorFusionManager().init();
         map.panBy([px, py], { animate: false, noMoveStart: true });
     }
 
-function _seedVelocityOnResume() {
+    function _seedVelocityOnResume() {
         if (!window.sensorFusion) return;
         const kf = window.sensorFusion._kalmanFilter;
         if (!kf || kf.x === null) return;
 
-        // If we have a cached velocity vector and sufficient speed, use it directly (heading-independent)
-        if (_lastGoodSpeedMPS > 0.3 && _lastGoodVelocity && (Math.abs(_lastGoodVelocity.lat) > 0 || Math.abs(_lastGoodVelocity.lng) > 0)) {
+        let speedToSeed = _lastGoodSpeedMPS;
+        let velToSeed = _lastGoodVelocity;
+        let headingToSeed = _lastHeadingDeg;
+
+        // ✅ FIX: If cache was wiped (e.g., stop(true) on backgrounding), 
+        // fall back to live sensors to give the Kalman filter a head start.
+        if (speedToSeed < 0.3) {
+            const liveSpeed = window.sensorFusion.getFilteredSpeedMPS?.() ?? 0;
+            const liveHeading = window.sensorFusion.getFilteredHeading?.() ?? null;
+            const liveVel = window.sensorFusion.getSmoothedVelocityDegPerSec?.() ?? null;
+            
+            if (liveSpeed >= 0.3) {
+                speedToSeed = liveSpeed;
+                if (liveVel && (Math.abs(liveVel.lat) > 0 || Math.abs(liveVel.lng) > 0)) {
+                    velToSeed = liveVel;
+                }
+                if (liveHeading != null) {
+                    headingToSeed = liveHeading;
+                }
+            }
+        }
+
+        // If we have a cached/live velocity vector and sufficient speed, use it directly (heading-independent)
+        if (speedToSeed > 0.3 && velToSeed && (Math.abs(velToSeed.lat) > 0 || Math.abs(velToSeed.lng) > 0)) {
             kf.seedVelocity(
-                _lastGoodVelocity.lat * 111111,
-                _lastGoodVelocity.lng * 111111,
+                velToSeed.lat * 111111,
+                velToSeed.lng * 111111,
                 2.0
             );
             return;
         }
 
         // Fallback to heading-based seeding if velocity vector is missing but speed/heading exist
-        if (_lastGoodSpeedMPS >= 0.3 && _lastHeadingDeg != null) {
-            const rad = _lastHeadingDeg * Math.PI / 180;
-            kf.seedVelocity(_lastGoodSpeedMPS * Math.cos(rad), _lastGoodSpeedMPS * Math.sin(rad), 2.0);
+        if (speedToSeed >= 0.3 && headingToSeed != null) {
+            const rad = headingToSeed * Math.PI / 180;
+            kf.seedVelocity(speedToSeed * Math.cos(rad), speedToSeed * Math.sin(rad), 2.0);
         }
     }
 
@@ -1988,10 +2011,26 @@ function _seedVelocityOnResume() {
         }
     }
 
-    function frame(now) {
+      function frame(now) {
         _rafId = null;
+        
+        if (window.isLocationHuntVisible) { _active = false; return; }
+        
         const lastPos = window.lastPosition;
-        if (!lastPos || window.isLocationHuntVisible) { _active = false; return; }
+        
+        // ✅ FIX: Track how long the loop has been running to allow a grace period on wake-up
+        const loopAge = now - _loopStartTime;
+        
+        // ✅ FIX: Don't kill the loop immediately if lastPos is null.
+        // GPS may take 1-2 seconds to deliver a fix after wake-up.
+        if (!lastPos) { 
+            if (loopAge < CFG.WAKEUP_GRACE_MS) {
+                _rafId = requestAnimationFrame(frame);
+                return;
+            }
+            _active = false; 
+            return; 
+        }
 
         const speedMPS   = _getSpeedMPS();
         const stationary = _isStationary();
@@ -2001,7 +2040,14 @@ function _seedVelocityOnResume() {
         if (movingNow && !_wasMoving) _seedVelocityOnResume();
         _wasMoving = movingNow;
 
-        if (!centered && stationary && speedMPS < CFG.MIN_SPEED_MPS) { _active = false; return; }
+        // ✅ FIX: Don't kill the loop immediately if sensors report stationary.
+        // Sensors often report 0 speed/stationary for the first 1-2 seconds after wake-up.
+        if (!centered && stationary && speedMPS < CFG.MIN_SPEED_MPS) { 
+            if (loopAge > CFG.WAKEUP_GRACE_MS) {
+                _active = false; 
+                return; 
+            }
+        }
 
         const isInteracting = window.isMapInteracting || window._isProximityZoomAnimating || window._gpsCenteredPanJustOccurred;
         if (isInteracting) {
@@ -2104,7 +2150,7 @@ function _seedVelocityOnResume() {
         _rafId = requestAnimationFrame(frame);
     }
 
-  function _start(options) {
+     function _start(options) {
         options = options || {};
         if (_active) return true;
 
@@ -2118,6 +2164,7 @@ function _seedVelocityOnResume() {
         if (speedMPS >= CFG.MIN_SPEED_MPS || options.ignoreSpeed) _seedVelocityOnResume();
 
         _active = true;
+        _loopStartTime = _now(); // ✅ ADDED: Track when the loop starts for the wake-up grace period
         _lastFrameTime = _now();
         _interactionEndTime = 0;
         _rafId = requestAnimationFrame(frame);
@@ -3400,7 +3447,7 @@ function handlePositionUpdate(position) {
 /* ──────────────────────────────────────────────
    VISIBILITY CHANGE HANDLER
    ────────────────────────────────────────────── */
-    function handleVisibilityChange() {
+  function handleVisibilityChange() {
     if (document.hidden) {
         window.lastHiddenTime = Date.now();
         lastKnownPosition = userMarker?.getLatLng() ?? null;
@@ -3438,6 +3485,11 @@ function handlePositionUpdate(position) {
     if (typeof startIdleProximityCheck === 'function') {
         startIdleProximityCheck();
     }
+
+    // ✅ FIX 1: Clear the wake flag BEFORE calling _resetMapToPosition.
+    // _resetMapToPosition internally calls window.deadReckoning.start().
+    // If the wake flag is still true, that internal call fails silently.
+    window._isWakingFromBackground = false;
 
     // ── Immediate camera snap to best-known position ────────────────
     const cachedPos = window.lastPosition
@@ -3477,10 +3529,15 @@ function handlePositionUpdate(position) {
 
     if (map) map.invalidateSize({ pan: false });
 
-    window._isWakingFromBackground = false;
+    // ✅ FIX 2: Pass options to bypass the speed/wake gates.
+    // Sensors often report 0 speed for the first 1-2 seconds after wake-up.
+    // By passing { ignoreSpeed: true }, we force the DR animation loop to start
+    // immediately. Once _active is true, any subsequent internal start() calls
+    // (like those inside updateLocationAfterBackground) will safely no-op.
+    const drOptions = { ignoreWake: true, ignoreSpeed: true };
 
     if (window.deadReckoning && typeof window.deadReckoning.forceUpdate === 'function') {
-        window.deadReckoning.forceUpdate();
+        window.deadReckoning.forceUpdate(drOptions);
     }
 
     if (awayMs < 3000) {
@@ -3491,7 +3548,7 @@ function handlePositionUpdate(position) {
             const markerEl = userMarker?.getElement?.();
             if (markerEl) markerEl.classList.remove('gps-reacquiring');
             if (window.deadReckoning?.forceUpdate) {
-                window.deadReckoning.forceUpdate();
+                window.deadReckoning.forceUpdate(drOptions);
             }
         }, 50);
     } else {
@@ -3509,7 +3566,7 @@ function handlePositionUpdate(position) {
                 const el = userMarker?.getElement?.();
                 if (el) el.classList.remove('gps-reacquiring');
                 if (window.deadReckoning?.forceUpdate) {
-                    window.deadReckoning.forceUpdate();
+                    window.deadReckoning.forceUpdate(drOptions);
                 }
             }, 100);
         }
@@ -3519,7 +3576,7 @@ function handlePositionUpdate(position) {
             const el = userMarker?.getElement?.();
             if (el) el.classList.remove('gps-reacquiring');
             if (window.deadReckoning?.forceUpdate) {
-                window.deadReckoning.forceUpdate();
+                window.deadReckoning.forceUpdate(drOptions);
             }
         }, 26000);
     }
@@ -3564,7 +3621,9 @@ function updateLocationAfterBackground() {
         }
         window._isWakingFromBackground = false;
         userMarker?.getElement?.()?.classList.remove('gps-reacquiring');
-        window.deadReckoning?.start?.();
+        
+        // ✅ FIX: Pass options to bypass the speed gate on wake-up.
+        window.deadReckoning?.start?.({ ignoreWake: true, ignoreSpeed: true });
         return;
     }
 
@@ -3627,7 +3686,10 @@ function updateLocationAfterBackground() {
         document.getElementById('geolocation-retry-modal')?.remove();
         window._isWakingFromBackground = false;
         userMarker?.getElement?.()?.classList.remove('gps-reacquiring');
-        window.deadReckoning?.start?.();
+        
+        // ✅ FIX: Pass options to bypass the speed gate on wake-up.
+        window.deadReckoning?.start?.({ ignoreWake: true, ignoreSpeed: true });
+        
         if (typeof startPositionUpdates === 'function') startPositionUpdates();
         window._isLocationUpdateInProgress = false;
     };
@@ -5115,189 +5177,195 @@ function _neutralizeMarkerTransition() {
    and velocity, starts DR loop.
    ────────────────────────────────────────────── */
 function _resetMapToPosition(newPosition, options) {
-        options = options || {};
-        if (!map || !userMarker || !newPosition) return;
-    
-        if (typeof newPosition.lat !== 'number' || typeof newPosition.lng !== 'number' ||
-            isNaN(newPosition.lat) || isNaN(newPosition.lng)) {
-            console.warn('[Reset] Invalid position, aborting');
-            return;
-        }
-    
-        var currentTime = options.currentTime != null ? options.currentTime : Date.now();
-        var resetType = options.resetType || 'jump';
-        var forceUpdate = !!options.forceUpdate;
-        var clearStationary = options.clearStationary !== false;
-        var prevPos = window.lastPosition || null;
-        var prevTime = window.lastUpdateTime || null;
-        var isInit = resetType === 'init';
-        var isWake = resetType === 'wake';
-        var shouldRecenterMap = isInit || isWake || options.forceRecenter === true;
-    
-        function makeBufferEntry() {
-            return {
-                lat: newPosition.lat,
-                lng: newPosition.lng,
-                accuracy: newPosition.accuracy || 20,
-                timestamp: currentTime,
-                heading: newPosition.heading || null,
-                speedMPS: (typeof newPosition.speedMPS === 'number' && !isNaN(newPosition.speedMPS))
-                    ? Math.max(0, newPosition.speedMPS)
-                    : 0
-            };
-        }
-    
-        if (isInit) {
-            if (typeof setupMapInteractionHandlers === 'function') setupMapInteractionHandlers();
-            if (typeof seedPositionBuffer === 'function') {
-                seedPositionBuffer(newPosition, 1);
-            } else {
-                window.positionBuffer = [makeBufferEntry()];
-            }
-            window.stationaryStartTime = currentTime;
-            window.isMapInteracting = false;
-            window.lastInteractionTime = currentTime;
-            window.blockSpeedZoom = false;
-            window.zoomedInState = false;
-            window.followUser = true;
+    options = options || {};
+    if (!map || !userMarker || !newPosition) return;
+
+    if (typeof newPosition.lat !== 'number' || typeof newPosition.lng !== 'number' ||
+        isNaN(newPosition.lat) || isNaN(newPosition.lng)) {
+        console.warn('[Reset] Invalid position, aborting');
+        return;
+    }
+
+    var currentTime = options.currentTime != null ? options.currentTime : Date.now();
+    var resetType = options.resetType || 'jump';
+    var forceUpdate = !!options.forceUpdate;
+    var clearStationary = options.clearStationary !== false;
+    var prevPos = window.lastPosition || null;
+    var prevTime = window.lastUpdateTime || null;
+    var isInit = resetType === 'init';
+    var isWake = resetType === 'wake';
+    var shouldRecenterMap = isInit || isWake || options.forceRecenter === true;
+
+    function makeBufferEntry() {
+        return {
+            lat: newPosition.lat,
+            lng: newPosition.lng,
+            accuracy: newPosition.accuracy || 20,
+            timestamp: currentTime,
+            heading: newPosition.heading || null,
+            speedMPS: (typeof newPosition.speedMPS === 'number' && !isNaN(newPosition.speedMPS))
+                ? Math.max(0, newPosition.speedMPS)
+                : 0
+        };
+    }
+
+    if (isInit) {
+        if (typeof setupMapInteractionHandlers === 'function') setupMapInteractionHandlers();
+        if (typeof seedPositionBuffer === 'function') {
+            seedPositionBuffer(newPosition, 1);
         } else {
-            if (clearStationary && window.stationaryCheckTimeout != null) {
-                clearTimeout(window.stationaryCheckTimeout);
-                window.stationaryCheckTimeout = null;
-            }
             window.positionBuffer = [makeBufferEntry()];
-            window.stationaryStartTime = isWake ? currentTime : null;
         }
-    
-        if (!isWake) {
-            window.lastPosition = newPosition;
-            window.lastUpdateTime = currentTime;
-            window.lastUpdateTimestamp = currentTime;
+        window.stationaryStartTime = currentTime;
+        window.isMapInteracting = false;
+        window.lastInteractionTime = currentTime;
+        window.blockSpeedZoom = false;
+        window.zoomedInState = false;
+        window.followUser = true;
+    } else {
+        if (clearStationary && window.stationaryCheckTimeout != null) {
+            clearTimeout(window.stationaryCheckTimeout);
+            window.stationaryCheckTimeout = null;
         }
-    
-        var prevSmoothed = window.smoothedVelocity || { lat: 0, lng: 0 };
-        window.lastVelocity = { lat: 0, lng: 0 };
-        window.smoothedVelocity = { lat: 0, lng: 0 };
-        if (!isWake && prevPos && prevTime && currentTime) {
-            var dtSec = (currentTime - prevTime) / 1000;
-            if (dtSec > 0 && dtSec < 120) {
-                var latVel = (newPosition.lat - prevPos.lat) / dtSec;
-                var lngVel = (newPosition.lng - prevPos.lng) / dtSec;
-                var cosLat = Math.cos(newPosition.lat * Math.PI / 180);
-                var latMPS = latVel * 111111;
-                var lngMPS = lngVel * 111111 * cosLat;
-                var speedMPS = Math.sqrt(latMPS * latMPS + lngMPS * lngMPS);
-                if (speedMPS < 100) {
-                    window.lastVelocity = { lat: latVel, lng: lngVel };
-                    var alpha = 0.35;
-                    window.smoothedVelocity = {
-                        lat: alpha * latVel + (1 - alpha) * prevSmoothed.lat,
-                        lng: alpha * lngVel + (1 - alpha) * prevSmoothed.lng
-                    };
-                }
-            }
-        }
-    
-        if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
-            var kf = window.sensorFusion._kalmanFilter;
-            var shouldResetKalman = (options.resetSensorState != null)
-                ? !!options.resetSensorState
-                : (isInit || isWake);
-    
-            // Only apply time/distance overrides if caller didn't explicitly set resetSensorState
-            if (!shouldResetKalman && prevTime && currentTime && options.resetSensorState == null) {
-                var gapSec = (currentTime - prevTime) / 1000;
-                if (gapSec > 30) shouldResetKalman = true;
-    
-                if (!shouldResetKalman && prevPos) {
-                    var jumpLat = Math.abs(newPosition.lat - prevPos.lat) * 111111;
-                    var jumpLng = Math.abs(newPosition.lng - prevPos.lng) * 111111 *
-                        Math.cos(newPosition.lat * Math.PI / 180);
-                    if (Math.sqrt(jumpLat * jumpLat + jumpLng * jumpLng) > 500) {
-                        shouldResetKalman = true;
-                    }
-                }
-            }
-    
-            if (shouldResetKalman) {
-                try {
-                    kf.reset();
-                    if (typeof window.sensorFusion.resetState === 'function') {
-                        window.sensorFusion.resetState();
-                    }
-                } catch (e) {
-                    console.warn('[Reset] Kalman/sensorFusion reset failed', e);
-                }
-            }
-        }
-    
-        window.isStationary = false;
-        window.stationaryLockPosition = null;
-    
-        var targetZoom = map.getZoom();
-        if (isInit) {
-            targetZoom = 17;
-        }
-    
-        if (window.zoomController && typeof window.zoomController.getState === 'function') {
-            var zcState = window.zoomController.getState();
-            if (zcState && zcState.lockedUntil > currentTime) {
-                targetZoom = zcState.level;
-            }
-        }
-    
-        _neutralizeMarkerTransition();
-        userMarker.setLatLng([newPosition.lat, newPosition.lng]);
-    
-        if (shouldRecenterMap) {
-            if (typeof _clearInactivityTimer === 'function') {
-                _clearInactivityTimer();
-            }
-            window._programmaticFlyInProgress = true;
-            try {
-                map.setView([newPosition.lat, newPosition.lng], targetZoom, {
-                    animate: false,
-                    pan: { noMoveStart: true }
-                });
-            } catch (e) {
-                console.warn('[Reset] map.setView failed, retrying without pan options', e);
-                try {
-                    map.setView([newPosition.lat, newPosition.lng], targetZoom, { animate: false });
-                } catch (e2) {
-                    console.warn('[Reset] map.setView fallback also failed', e2);
-                }
-            }
-            window._programmaticFlyInProgress = false;
-        }
-    
-        if (window.deadReckoning) {
-            if (typeof window.deadReckoning.invalidateMarkerCache === 'function') {
-                window.deadReckoning.invalidateMarkerCache();
-            }
-            if (typeof window.deadReckoning.start === 'function') {
-                window.deadReckoning.start();
-            }
-            if (!isInit && typeof window.deadReckoning.forceUpdate === 'function') {
-                window.deadReckoning.forceUpdate();
-            }
-        }
-    
-        if (shouldRecenterMap) {
-            window.followUser = true;
-            window.isMapInteracting = false;
-        }
-    
-        if (isInit) {
-            if (typeof updateDistanceBox === 'function') updateDistanceBox(forceUpdate);
-            if (typeof updateAccuracyIndicator === 'function') updateAccuracyIndicator(newPosition.accuracy);
-        } else {
-            if (typeof isSignificantMovement === 'function' &&
-                isSignificantMovement(newPosition) &&
-                typeof resetInactivityTimer === 'function') {
-                resetInactivityTimer(false);
+        window.positionBuffer = [makeBufferEntry()];
+        window.stationaryStartTime = isWake ? currentTime : null;
+    }
+
+    if (!isWake) {
+        window.lastPosition = newPosition;
+        window.lastUpdateTime = currentTime;
+        window.lastUpdateTimestamp = currentTime;
+    }
+
+    var prevSmoothed = window.smoothedVelocity || { lat: 0, lng: 0 };
+    window.lastVelocity = { lat: 0, lng: 0 };
+    window.smoothedVelocity = { lat: 0, lng: 0 };
+    if (!isWake && prevPos && prevTime && currentTime) {
+        var dtSec = (currentTime - prevTime) / 1000;
+        if (dtSec > 0 && dtSec < 120) {
+            var latVel = (newPosition.lat - prevPos.lat) / dtSec;
+            var lngVel = (newPosition.lng - prevPos.lng) / dtSec;
+            var cosLat = Math.cos(newPosition.lat * Math.PI / 180);
+            var latMPS = latVel * 111111;
+            var lngMPS = lngVel * 111111 * cosLat;
+            var speedMPS = Math.sqrt(latMPS * latMPS + lngMPS * lngMPS);
+            if (speedMPS < 100) {
+                window.lastVelocity = { lat: latVel, lng: lngVel };
+                var alpha = 0.35;
+                window.smoothedVelocity = {
+                    lat: alpha * latVel + (1 - alpha) * prevSmoothed.lat,
+                    lng: alpha * lngVel + (1 - alpha) * prevSmoothed.lng
+                };
             }
         }
     }
+
+    if (window.sensorFusion && window.sensorFusion._kalmanFilter) {
+        var kf = window.sensorFusion._kalmanFilter;
+        var shouldResetKalman = (options.resetSensorState != null)
+            ? !!options.resetSensorState
+            : (isInit || isWake);
+
+        // Only apply time/distance overrides if caller didn't explicitly set resetSensorState
+        if (!shouldResetKalman && prevTime && currentTime && options.resetSensorState == null) {
+            var gapSec = (currentTime - prevTime) / 1000;
+            if (gapSec > 30) shouldResetKalman = true;
+
+            if (!shouldResetKalman && prevPos) {
+                var jumpLat = Math.abs(newPosition.lat - prevPos.lat) * 111111;
+                var jumpLng = Math.abs(newPosition.lng - prevPos.lng) * 111111 *
+                    Math.cos(newPosition.lat * Math.PI / 180);
+                if (Math.sqrt(jumpLat * jumpLat + jumpLng * jumpLng) > 500) {
+                    shouldResetKalman = true;
+                }
+            }
+        }
+
+        if (shouldResetKalman) {
+            try {
+                kf.reset();
+                if (typeof window.sensorFusion.resetState === 'function') {
+                    window.sensorFusion.resetState();
+                }
+            } catch (e) {
+                console.warn('[Reset] Kalman/sensorFusion reset failed', e);
+            }
+        }
+    }
+
+    window.isStationary = false;
+    window.stationaryLockPosition = null;
+
+    var targetZoom = map.getZoom();
+    if (isInit) {
+        targetZoom = 17;
+    }
+
+    if (window.zoomController && typeof window.zoomController.getState === 'function') {
+        var zcState = window.zoomController.getState();
+        if (zcState && zcState.lockedUntil > currentTime) {
+            targetZoom = zcState.level;
+        }
+    }
+
+    _neutralizeMarkerTransition();
+    userMarker.setLatLng([newPosition.lat, newPosition.lng]);
+
+    if (shouldRecenterMap) {
+        if (typeof _clearInactivityTimer === 'function') {
+            _clearInactivityTimer();
+        }
+        window._programmaticFlyInProgress = true;
+        try {
+            map.setView([newPosition.lat, newPosition.lng], targetZoom, {
+                animate: false,
+                pan: { noMoveStart: true }
+            });
+        } catch (e) {
+            console.warn('[Reset] map.setView failed, retrying without pan options', e);
+            try {
+                map.setView([newPosition.lat, newPosition.lng], targetZoom, { animate: false });
+            } catch (e2) {
+                console.warn('[Reset] map.setView fallback also failed', e2);
+            }
+        }
+        window._programmaticFlyInProgress = false;
+    }
+
+    if (window.deadReckoning) {
+        if (typeof window.deadReckoning.invalidateMarkerCache === 'function') {
+            window.deadReckoning.invalidateMarkerCache();
+        }
+        
+        // ✅ FIX: Pass options to bypass the speed/wake gates on wake-up.
+        // Because handleVisibilityChange calls this function BEFORE clearing
+        // window._isWakingFromBackground, a normal start() call would fail silently.
+        const drOptions = isWake ? { ignoreWake: true, ignoreSpeed: true } : undefined;
+
+        if (typeof window.deadReckoning.start === 'function') {
+            window.deadReckoning.start(drOptions);
+        }
+        if (!isInit && typeof window.deadReckoning.forceUpdate === 'function') {
+            window.deadReckoning.forceUpdate(drOptions);
+        }
+    }
+
+    if (shouldRecenterMap) {
+        window.followUser = true;
+        window.isMapInteracting = false;
+    }
+
+    if (isInit) {
+        if (typeof updateDistanceBox === 'function') updateDistanceBox(forceUpdate);
+        if (typeof updateAccuracyIndicator === 'function') updateAccuracyIndicator(newPosition.accuracy);
+    } else {
+        if (typeof isSignificantMovement === 'function' &&
+            isSignificantMovement(newPosition) &&
+            typeof resetInactivityTimer === 'function') {
+            resetInactivityTimer(false);
+        }
+    }
+}
             
 /* ──────────────────────────────────────────────
    _initializeUserLocationState — delegates to the
