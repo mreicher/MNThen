@@ -1938,12 +1938,26 @@ window.sensorFusion = new SensorFusionManager().init();
         map.panBy([px, py], { animate: false, noMoveStart: true });
     }
 
-    function _seedVelocityOnResume() {
-        if (!window.sensorFusion || !_lastGoodSpeedMPS || _lastHeadingDeg == null) return;
+function _seedVelocityOnResume() {
+        if (!window.sensorFusion) return;
         const kf = window.sensorFusion._kalmanFilter;
-        if (!kf || kf.x === null || _lastGoodSpeedMPS < 0.3) return;
-        const rad = _lastHeadingDeg * Math.PI / 180;
-        kf.seedVelocity(_lastGoodSpeedMPS * Math.cos(rad), _lastGoodSpeedMPS * Math.sin(rad), 2.0);
+        if (!kf || kf.x === null) return;
+
+        // If we have a cached velocity vector and sufficient speed, use it directly (heading-independent)
+        if (_lastGoodSpeedMPS > 0.3 && _lastGoodVelocity && (Math.abs(_lastGoodVelocity.lat) > 0 || Math.abs(_lastGoodVelocity.lng) > 0)) {
+            kf.seedVelocity(
+                _lastGoodVelocity.lat * 111111,
+                _lastGoodVelocity.lng * 111111,
+                2.0
+            );
+            return;
+        }
+
+        // Fallback to heading-based seeding if velocity vector is missing but speed/heading exist
+        if (_lastGoodSpeedMPS >= 0.3 && _lastHeadingDeg != null) {
+            const rad = _lastHeadingDeg * Math.PI / 180;
+            kf.seedVelocity(_lastGoodSpeedMPS * Math.cos(rad), _lastGoodSpeedMPS * Math.sin(rad), 2.0);
+        }
     }
 
     function _resolveBestKnownPosition() {
@@ -2090,17 +2104,18 @@ window.sensorFusion = new SensorFusionManager().init();
         _rafId = requestAnimationFrame(frame);
     }
 
-    function _start() {
+  function _start(options) {
+        options = options || {};
         if (_active) return true;
 
-        if (window._isWakingFromBackground) return false;
+        if (!options.ignoreWake && window._isWakingFromBackground) return false;
         if (window.isLocationHuntVisible) return false;
 
         const speedMPS = _getSpeedMPS(), centered = _isCenteredMode();
-        if (!centered && speedMPS < CFG.MIN_SPEED_MPS) return false;
-        if (!centered && window.isStationary && speedMPS < 0.8) return false;
+        if (!options.ignoreSpeed && !centered && speedMPS < CFG.MIN_SPEED_MPS) return false;
+        if (!options.ignoreSpeed && !centered && window.isStationary && speedMPS < 0.8) return false;
 
-        if (speedMPS >= CFG.MIN_SPEED_MPS) _seedVelocityOnResume();
+        if (speedMPS >= CFG.MIN_SPEED_MPS || options.ignoreSpeed) _seedVelocityOnResume();
 
         _active = true;
         _lastFrameTime = _now();
@@ -2109,43 +2124,37 @@ window.sensorFusion = new SensorFusionManager().init();
         return true;
     }
 
- window.deadReckoning = {
-    start() { _start(); },
+    window.deadReckoning = {
+        start(options) { return _start(options); },
      
-    stop(clearMotionCache = false) {
-        if (_rafId != null) { cancelAnimationFrame(_rafId); _rafId = null; }
-        _active = false;
-        _centeredLat = null; _centeredLng = null;
-        _lastSnapZoom = null;
-        window.__drHeld = null;
-        _wasMoving = false;
-        if (clearMotionCache) {
-            // Only the backgrounding path opts into this. A normal stop
-            // (stationary, hunt overlay) should keep the last known
-            // velocity/heading around so _seedVelocityOnResume can give
-            // motion a head start when it picks back up — that cache is
-            // only wrong after a real gap where speed/heading may have
-            // changed while we weren't watching.
-            _lastGoodVelocity = { lat: 0, lng: 0 };
-            _lastGoodSpeedMPS = 0;
-            _lastHeadingDeg = null;
-            _headingChangeRate = 0;
-        }
-        const el = _getMarkerEl();
-        if (el) { el.style.willChange = ''; el.style.transition = ''; _markerTransSet = false; _markerPrepped = false; }
-    },
+        stop(clearMotionCache = false) {
+            if (_rafId != null) { cancelAnimationFrame(_rafId); _rafId = null; }
+            _active = false;
+            _centeredLat = null; _centeredLng = null;
+            _lastSnapZoom = null;
+            window.__drHeld = null;
+            _wasMoving = false;
+            if (clearMotionCache) {
+                _lastGoodVelocity = { lat: 0, lng: 0 };
+                _lastGoodSpeedMPS = 0;
+                _lastHeadingDeg = null;
+                _headingChangeRate = 0;
+            }
+            const el = _getMarkerEl();
+            if (el) { el.style.willChange = ''; el.style.transition = ''; _markerTransSet = false; _markerPrepped = false; }
+        },
      
-    isActive() { return _active; },
-    onMovementResumed: _start,
+        isActive() { return _active; },
+        onMovementResumed(options) { return _start(options); },
 
-        forceUpdate() {
+        forceUpdate(options) {
             if (_active) {
                 _lastFrameTime = 0;
                 if (_rafId != null) { cancelAnimationFrame(_rafId); }
                 _rafId = requestAnimationFrame(frame);
                 return;
             }
-            const started = _start();
+            const started = _start(options);
             if (!started) {
                 _immediateSync();
             }
@@ -4579,10 +4588,11 @@ function _prefetchMapTiles(location, now) {
 /* ──────────────────────────────────────────────
    Gap Handling & Velocity Seeding 
    ────────────────────────────────────────────── */
-function _handleGPSGap(fix, lastPos, timeDelta) {
+function _handleGPSGap(fix, lastPos, timeDelta, forceUpdate) {
     if (!lastPos) return;
     var kf = window.sensorFusion && window.sensorFusion._kalmanFilter;
     if (!kf) return;
+    
     // Medium gap (10–300s): seed velocity from displacement if movement
     // exceeds the accuracy-aware noise floor.
     if (timeDelta > 10 && timeDelta < 300) {
@@ -4620,12 +4630,15 @@ function _handleGPSGap(fix, lastPos, timeDelta) {
         var impliedSpeedLong = distLong / timeDelta;
         var MAX_PLAUSIBLE_MPS = 45; // ~100 mph safety ceiling, matches onFixAcquired
 
-        kf.reset();
-        if (window.sensorFusion && typeof window.sensorFusion.resetState === 'function') {
-            try {
-                window.sensorFusion.resetState();
-            } catch (e) {
-                console.warn('[GPSGap] sensorFusion.resetState failed', e);
+        // Only reset if not explicitly forced to bypass or preserved on wake
+        if (!forceUpdate && !window._preserveKalmanOnWake) {
+            kf.reset();
+            if (window.sensorFusion && typeof window.sensorFusion.resetState === 'function') {
+                try {
+                    window.sensorFusion.resetState();
+                } catch (e) {
+                    console.warn('[GPSGap] sensorFusion.resetState failed', e);
+                }
             }
         }
 
@@ -5101,7 +5114,7 @@ function _neutralizeMarkerTransition() {
    init and jump recovery. Seeds DR with position
    and velocity, starts DR loop.
    ────────────────────────────────────────────── */
-  function _resetMapToPosition(newPosition, options) {
+function _resetMapToPosition(newPosition, options) {
         options = options || {};
         if (!map || !userMarker || !newPosition) return;
     
@@ -5191,7 +5204,8 @@ function _neutralizeMarkerTransition() {
                 ? !!options.resetSensorState
                 : (isInit || isWake);
     
-            if (!shouldResetKalman && prevTime && currentTime) {
+            // Only apply time/distance overrides if caller didn't explicitly set resetSensorState
+            if (!shouldResetKalman && prevTime && currentTime && options.resetSensorState == null) {
                 var gapSec = (currentTime - prevTime) / 1000;
                 if (gapSec > 30) shouldResetKalman = true;
     
@@ -5224,7 +5238,6 @@ function _neutralizeMarkerTransition() {
         if (isInit) {
             targetZoom = 17;
         }
-        // Wake skips speed-based rezoom — only correct the center.
     
         if (window.zoomController && typeof window.zoomController.getState === 'function') {
             var zcState = window.zoomController.getState();
