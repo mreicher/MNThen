@@ -1482,7 +1482,7 @@ class SensorFusionManager {
         return { vNorth: kalmanSpeed * Math.cos(headingRad), vEast: kalmanSpeed * Math.sin(headingRad) };
     }
 
-       smoothPosition(rawLat, rawLng, accuracyMeters, timestampMs, gpsSpeedMPS, gpsHeadingDeg, forceSnap) {
+        smoothPosition(rawLat, rawLng, accuracyMeters, timestampMs, gpsSpeedMPS, gpsHeadingDeg, forceSnap) {
         if (!isFinite(rawLat) || !isFinite(rawLng) || !this._kalmanFilter) {
             return { lat: rawLat || 0, lng: rawLng || 0, vNorth: 0, vEast: 0, speedMPS: 0 };
         }
@@ -1520,16 +1520,22 @@ class SensorFusionManager {
 
         if (kf._justInitialized) {
             let seeded = false;
-            if (gpsSpeedMPS != null && gpsSpeedMPS > 0.3 && gpsHeadingDeg != null && isFinite(gpsHeadingDeg)) {
+
+            if (kf._pendingSeedVelocity) {
+                const { vNorth, vEast } = kf._pendingSeedVelocity;
+                if (isFinite(vNorth) && isFinite(vEast)) {
+                    kf.seedVelocity(vNorth, vEast, 2.25);
+                    seeded = true;
+                }
+                kf._pendingSeedVelocity = null;
+            }
+
+            if (!seeded && gpsSpeedMPS != null && gpsSpeedMPS > 0.3 && gpsHeadingDeg != null && isFinite(gpsHeadingDeg)) {
                 const hr = gpsHeadingDeg * Math.PI / 180;
                 kf.seedVelocity(gpsSpeedMPS * Math.cos(hr), gpsSpeedMPS * Math.sin(hr), 0.5);
                 seeded = true;
             }
-            if (!seeded && kf._pendingSeedVelocity) {
-                const { vNorth, vEast } = kf._pendingSeedVelocity;
-                if (isFinite(vNorth) && isFinite(vEast)) { kf.seedVelocity(vNorth, vEast, 2.25); seeded = true; }
-                kf._pendingSeedVelocity = null;
-            }
+
             if (!seeded && prevRawLat != null && prevRawTimestamp != null) {
                 const dtSec2 = (timestampMs - prevRawTimestamp) / 1000;
                 if (dtSec2 > 0) {
@@ -1558,7 +1564,7 @@ class SensorFusionManager {
         let holdStill = false;
 
         if (forceSnap) {
-  
+
             resultLat = rawLat; resultLng = rawLng;
             if (kf.x) {
                 resultVNorth = kf.x[2];
@@ -3401,10 +3407,17 @@ function handlePositionUpdate(position) {
 /* ──────────────────────────────────────────────
    VISIBILITY CHANGE HANDLER
    ────────────────────────────────────────────── */
-    function handleVisibilityChange() {
+  function handleVisibilityChange() {
     if (document.hidden) {
         window.lastHiddenTime = Date.now();
         lastKnownPosition = userMarker?.getLatLng() ?? null;
+
+        // Invalidate any in-flight background acquisition from a previous
+        // foreground period before it can deliver a stale result while
+        // we're hidden again.
+        if (typeof cancelPendingBackgroundAcquisition === 'function') {
+            cancelPendingBackgroundAcquisition();
+        }
 
         // True pre-background position/time, snapshotted before the wake
         window._prewakeLastPosition = window.lastPosition
@@ -3439,6 +3452,21 @@ function handlePositionUpdate(position) {
     if (typeof startIdleProximityCheck === 'function') {
         startIdleProximityCheck();
     }
+
+    window._isWakingFromBackground = false;
+
+    // Wake-settling window: suppresses DR's forward extrapolation until
+    // either the Kalman filter reconverges (checked every frame inside
+    // deadReckoning's frame() loop) or this time ceiling is hit — whichever
+    // comes first. Only meaningful for real absences where the Kalman
+    // filter actually got reset; harmless to set unconditionally otherwise
+    // since a fresh/short gap will reconverge almost immediately anyway.
+    window._wakeSettleUntil = Date.now() + 8000;
+
+    // Options passed to every DR call below so it bypasses the normal
+    // "am I moving / was I just backgrounded" gates that would otherwise
+    // block it from (re)starting immediately on resume.
+    const drOptions = { ignoreWake: true, ignoreSpeed: true };
 
     // ── Immediate camera snap to best-known position ────────────────
     const cachedPos = window.lastPosition
@@ -3478,10 +3506,8 @@ function handlePositionUpdate(position) {
 
     if (map) map.invalidateSize({ pan: false });
 
-    window._isWakingFromBackground = false;
-
     if (window.deadReckoning && typeof window.deadReckoning.forceUpdate === 'function') {
-        window.deadReckoning.forceUpdate();
+        window.deadReckoning.forceUpdate(drOptions);
     }
 
     if (awayMs < 3000) {
@@ -3492,7 +3518,7 @@ function handlePositionUpdate(position) {
             const markerEl = userMarker?.getElement?.();
             if (markerEl) markerEl.classList.remove('gps-reacquiring');
             if (window.deadReckoning?.forceUpdate) {
-                window.deadReckoning.forceUpdate();
+                window.deadReckoning.forceUpdate(drOptions);
             }
         }, 50);
     } else {
@@ -3510,7 +3536,7 @@ function handlePositionUpdate(position) {
                 const el = userMarker?.getElement?.();
                 if (el) el.classList.remove('gps-reacquiring');
                 if (window.deadReckoning?.forceUpdate) {
-                    window.deadReckoning.forceUpdate();
+                    window.deadReckoning.forceUpdate(drOptions);
                 }
             }, 100);
         }
@@ -3520,7 +3546,7 @@ function handlePositionUpdate(position) {
             const el = userMarker?.getElement?.();
             if (el) el.classList.remove('gps-reacquiring');
             if (window.deadReckoning?.forceUpdate) {
-                window.deadReckoning.forceUpdate();
+                window.deadReckoning.forceUpdate(drOptions);
             }
         }, 26000);
     }
@@ -3537,11 +3563,34 @@ function handlePositionUpdate(position) {
    BACKGROUND LOCATION UPDATE
    ────────────────────────────────────────────── */
 let warmupWatchId = null;
+let _bgAcquisitionGeneration = 0;
+
+// Invalidates any in-flight updateLocationAfterBackground() acquisition.
+// Call this whenever the app re-backgrounds. Without it, a watchPosition
+// (or its paired timeout) left over from a PREVIOUS foreground period can
+// still deliver a result later while the app is hidden again, and
+// finishAcquisition() would incorrectly clear window._isWakingFromBackground
+// and start DR's rAF loop while backgrounded.
+function cancelPendingBackgroundAcquisition() {
+    _bgAcquisitionGeneration++;
+    if (window._backgroundUpdateTimeout != null) {
+        clearTrackedTimeout(window._backgroundUpdateTimeout);
+        window._backgroundUpdateTimeout = null;
+    }
+    if (warmupWatchId != null) {
+        try { navigator.geolocation.clearWatch(warmupWatchId); } catch (_) {}
+        warmupWatchId = null;
+    }
+    window._isLocationUpdateInProgress = false;
+}
 
 function updateLocationAfterBackground() {
+    const myGen = ++_bgAcquisitionGeneration;
     const now = Date.now();
     window.lastHiddenTime = window.lastHiddenTime || now;
     const awayMs = now - window.lastHiddenTime;
+
+    const drOptions = { ignoreWake: true, ignoreSpeed: true };
 
     // ── Trivial absence: position is still fresh, just resync the view ────
     if (now - (window._lastBackgroundUpdate || 0) < 30_000 && window.lastPosition) {
@@ -3563,9 +3612,10 @@ function updateLocationAfterBackground() {
             map.invalidateSize({ pan: false });
             userMarker?.setLatLng?.([window.lastPosition.lat, window.lastPosition.lng]);
         }
+        if (myGen !== _bgAcquisitionGeneration) return; // superseded (re-hidden) mid-sync
         window._isWakingFromBackground = false;
         userMarker?.getElement?.()?.classList.remove('gps-reacquiring');
-        window.deadReckoning?.start?.();
+        window.deadReckoning?.start?.(drOptions);
         return;
     }
 
@@ -3599,7 +3649,7 @@ function updateLocationAfterBackground() {
         try {
             window.sensorFusion._kalmanFilter.reset();
             window.sensorFusion.resetState?.();
-            window._isKalmanConverged = false; 
+            window._isKalmanConverged = false;
         } catch (e) {
             console.warn('[Background] Kalman reset failed:', e);
         }
@@ -3627,9 +3677,16 @@ function updateLocationAfterBackground() {
     const finishAcquisition = () => {
         clearPendingAcquisition();
         document.getElementById('geolocation-retry-modal')?.remove();
+        // Stale cycle — a newer acquisition or a re-backgrounding event has
+        // already taken over. Do NOT touch _isWakingFromBackground or start
+        // DR; that state belongs to whichever cycle is current now.
+        if (myGen !== _bgAcquisitionGeneration) {
+            window._isLocationUpdateInProgress = false;
+            return;
+        }
         window._isWakingFromBackground = false;
         userMarker?.getElement?.()?.classList.remove('gps-reacquiring');
-        window.deadReckoning?.start?.();
+        window.deadReckoning?.start?.(drOptions);
         if (typeof startPositionUpdates === 'function') startPositionUpdates();
         window._isLocationUpdateInProgress = false;
     };
@@ -3640,6 +3697,7 @@ function updateLocationAfterBackground() {
     };
 
     const showRetryModal = () => {
+        if (myGen !== _bgAcquisitionGeneration) return; // don't surface UI for a dead cycle
         if (document.getElementById('geolocation-retry-modal')) return;
 
         const overlay = document.createElement('div');
@@ -3715,6 +3773,7 @@ function updateLocationAfterBackground() {
     };
 
     const onFixAcquired = (position) => {
+        if (myGen !== _bgAcquisitionGeneration) return; // stale watch — should already be cleared, guard anyway
         if (fixApplied || !isUsableFix(position)) return;
 
         fixApplied = true;
@@ -3748,6 +3807,8 @@ function updateLocationAfterBackground() {
 
         finishAcquisition();
 
+        if (myGen !== _bgAcquisitionGeneration) return; // re-hidden during finishAcquisition — don't touch live tracking state
+
         const fixTs = Number.isFinite(position.timestamp) ? position.timestamp : Date.now();
         window._hasEverAcquiredFix = true;
         window._needsWakeSnap = false;
@@ -3759,6 +3820,7 @@ function updateLocationAfterBackground() {
     };
 
     const onAcquisitionError = (error) => {
+        if (myGen !== _bgAcquisitionGeneration) return;
         if (error?.code !== 1) return;
         finishAcquisition();
         if (isLikelyStationary()) showRetryModal();
@@ -3778,6 +3840,7 @@ function updateLocationAfterBackground() {
         );
 
         window._backgroundUpdateTimeout = createTrackedTimeout(() => {
+            if (myGen !== _bgAcquisitionGeneration) return;
             if (fixApplied) return;
             finishAcquisition();
             if (isLikelyStationary()) showRetryModal();
