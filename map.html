@@ -976,8 +976,16 @@ class PositionKalmanFilter {
     unfreeze()       { this._isFrozen = false; this._frozenPosition = null; }
     isFrozen()       { return this._isFrozen; }
 
-    seedVelocity(vNorth, vEast, variance) {
-        if (!this.x) return;
+      seedVelocity(vNorth, vEast, variance) {
+        if (!this.x) {
+            // Filter isn't initialized yet (cold start, or reset coming out
+            // of background). Stash it so the next _initialize() call picks
+            // it up instead of silently dropping it — this was the reason
+            // DR had zero velocity to work with right after reacquiring GPS.
+            this._pendingSeedVelocity = { vNorth, vEast };
+            this._lastSeedVelocity = { vNorth, vEast };
+            return;
+        }
         this.x[2] = vNorth; this.x[3] = vEast;
         if (this.P) {
             const v = variance || 10.0;
@@ -1941,7 +1949,7 @@ window.sensorFusion = new SensorFusionManager().init();
 function _seedVelocityOnResume() {
         if (!window.sensorFusion) return;
         const kf = window.sensorFusion._kalmanFilter;
-        if (!kf || kf.x === null) return;
+        if (!kf) return;
 
         // If we have a cached velocity vector and sufficient speed, use it directly (heading-independent)
         if (_lastGoodSpeedMPS > 0.3 && _lastGoodVelocity && (Math.abs(_lastGoodVelocity.lat) > 0 || Math.abs(_lastGoodVelocity.lng) > 0)) {
@@ -3400,12 +3408,11 @@ function handlePositionUpdate(position) {
 /* ──────────────────────────────────────────────
    VISIBILITY CHANGE HANDLER
    ────────────────────────────────────────────── */
-    function handleVisibilityChange() {
+   function handleVisibilityChange() {
     if (document.hidden) {
         window.lastHiddenTime = Date.now();
         lastKnownPosition = userMarker?.getLatLng() ?? null;
 
-        // True pre-background position/time, snapshotted before the wake
         window._prewakeLastPosition = window.lastPosition
             ? { lat: window.lastPosition.lat, lng: window.lastPosition.lng }
             : null;
@@ -3439,7 +3446,6 @@ function handlePositionUpdate(position) {
         startIdleProximityCheck();
     }
 
-    // ── Immediate camera snap to best-known position ────────────────
     const cachedPos = window.lastPosition
         ? {
               lat: window.lastPosition.lat,
@@ -3447,7 +3453,7 @@ function handlePositionUpdate(position) {
               accuracy: window.lastPosition.accuracy || 20,
               heading: window.lastPosition.heading ?? null,
               speedMPS: 0,
-              timestamp: Date.now() // Note: clamped safely by DR Math.max(0, ...)
+              timestamp: Date.now()
           }
         : (lastKnownPosition
             ? {
@@ -3480,25 +3486,18 @@ function handlePositionUpdate(position) {
     window._isWakingFromBackground = false;
 
     if (window.deadReckoning && typeof window.deadReckoning.forceUpdate === 'function') {
-        window.deadReckoning.forceUpdate();
+        window.deadReckoning.forceUpdate({ ignoreWake: true, ignoreSpeed: true });
     }
 
     if (awayMs < 3000) {
-        // Trivial absence: just clear the reacquiring indicator shortly after.
-        // DR is already running as of the call above — this no longer gates
-        // DR startup, it only cleans up the UI class.
         setTimeout(() => {
             const markerEl = userMarker?.getElement?.();
             if (markerEl) markerEl.classList.remove('gps-reacquiring');
             if (window.deadReckoning?.forceUpdate) {
-                window.deadReckoning.forceUpdate();
+                window.deadReckoning.forceUpdate({ ignoreWake: true, ignoreSpeed: true });
             }
         }, 50);
     } else {
-        // Real absence: still want a genuinely fresh fix rather than trusting
-        // extrapolation from a position that may now be meters away from
-        // reality. DR is already active/holding from the call above, so the
-        // marker won't be frozen/idle while we wait for that fresh fix.
         window._needsWakeSnap = true;
 
         try {
@@ -3509,17 +3508,16 @@ function handlePositionUpdate(position) {
                 const el = userMarker?.getElement?.();
                 if (el) el.classList.remove('gps-reacquiring');
                 if (window.deadReckoning?.forceUpdate) {
-                    window.deadReckoning.forceUpdate();
+                    window.deadReckoning.forceUpdate({ ignoreWake: true, ignoreSpeed: true });
                 }
             }, 100);
         }
 
-        // Safety net in case location updates stall out
         createTrackedTimeout(() => {
             const el = userMarker?.getElement?.();
             if (el) el.classList.remove('gps-reacquiring');
             if (window.deadReckoning?.forceUpdate) {
-                window.deadReckoning.forceUpdate();
+                window.deadReckoning.forceUpdate({ ignoreWake: true, ignoreSpeed: true });
             }
         }, 26000);
     }
@@ -3535,14 +3533,11 @@ function handlePositionUpdate(position) {
 /* ──────────────────────────────────────────────
    BACKGROUND LOCATION UPDATE
    ────────────────────────────────────────────── */
-let warmupWatchId = null;
-
 function updateLocationAfterBackground() {
     const now = Date.now();
     window.lastHiddenTime = window.lastHiddenTime || now;
     const awayMs = now - window.lastHiddenTime;
 
-    // ── Trivial absence: position is still fresh, just resync the view ────
     if (now - (window._lastBackgroundUpdate || 0) < 30_000 && window.lastPosition) {
         if (map && userMarker && typeof _resetMapToPosition === 'function') {
             try {
@@ -3564,19 +3559,16 @@ function updateLocationAfterBackground() {
         }
         window._isWakingFromBackground = false;
         userMarker?.getElement?.()?.classList.remove('gps-reacquiring');
-        window.deadReckoning?.start?.();
+        window.deadReckoning?.start?.({ ignoreWake: true, ignoreSpeed: true });
         return;
     }
 
-    // ── Re-entrancy guard: one acquisition cycle at a time ─────────────────
     if (window._isLocationUpdateInProgress) return;
     if (!('geolocation' in navigator)) return;
     window._isLocationUpdateInProgress = true;
 
     const isColdStart = awayMs > 5 * 60 * 1000 || !window._hasEverAcquiredFix;
 
-    // ── Immediate warm fallback: instantly paint last known position ────────
-    // Prevents the visual "shuffle" or gap during hardware spin-up on cold wakes.
     if (isColdStart && window.lastPosition && map && userMarker) {
         try {
             _resetMapToPosition?.(window.lastPosition, {
@@ -3593,6 +3585,13 @@ function updateLocationAfterBackground() {
 
     if (awayMs > 30_000 && typeof disposeMapLoop === 'function') {
         disposeMapLoop();
+        // disposeMapLoop() stops the DR loop as part of its full teardown.
+        // Bring it right back up so the marker is primed to glide the
+        // instant real data resumes, instead of sitting fully inert while
+        // we wait (sometimes tens of seconds) for a fresh GPS fix.
+        if (window.deadReckoning && typeof window.deadReckoning.start === 'function') {
+            window.deadReckoning.start({ ignoreWake: true, ignoreSpeed: true });
+        }
     }
     if (awayMs > 10_000 && window.sensorFusion?._kalmanFilter) {
         try {
@@ -3627,7 +3626,7 @@ function updateLocationAfterBackground() {
         document.getElementById('geolocation-retry-modal')?.remove();
         window._isWakingFromBackground = false;
         userMarker?.getElement?.()?.classList.remove('gps-reacquiring');
-        window.deadReckoning?.start?.();
+        window.deadReckoning?.start?.({ ignoreWake: true, ignoreSpeed: true });
         if (typeof startPositionUpdates === 'function') startPositionUpdates();
         window._isLocationUpdateInProgress = false;
     };
@@ -3769,8 +3768,6 @@ function updateLocationAfterBackground() {
             {
                 enableHighAccuracy: true,
                 timeout: isColdStart ? 60_000 : 15_000,
-                // Allowed cached positions up to 3000ms even on cold starts
-                // to bridge the GPS spin-up hardware gap immediately.
                 maximumAge: 3000
             }
         );
@@ -5204,7 +5201,6 @@ function _resetMapToPosition(newPosition, options) {
                 ? !!options.resetSensorState
                 : (isInit || isWake);
     
-            // Only apply time/distance overrides if caller didn't explicitly set resetSensorState
             if (!shouldResetKalman && prevTime && currentTime && options.resetSensorState == null) {
                 var gapSec = (currentTime - prevTime) / 1000;
                 if (gapSec > 30) shouldResetKalman = true;
@@ -5275,10 +5271,15 @@ function _resetMapToPosition(newPosition, options) {
                 window.deadReckoning.invalidateMarkerCache();
             }
             if (typeof window.deadReckoning.start === 'function') {
-                window.deadReckoning.start();
+                // ignoreWake/ignoreSpeed: this function is the single place
+                // that repositions after a known discontinuity (init/wake/
+                // jump), so it should always be able to bring DR up, even if
+                // _isWakingFromBackground hasn't flipped false yet or the
+                // instant speed reads zero right after a Kalman reset.
+                window.deadReckoning.start({ ignoreWake: true, ignoreSpeed: true });
             }
             if (!isInit && typeof window.deadReckoning.forceUpdate === 'function') {
-                window.deadReckoning.forceUpdate();
+                window.deadReckoning.forceUpdate({ ignoreWake: true, ignoreSpeed: true });
             }
         }
     
