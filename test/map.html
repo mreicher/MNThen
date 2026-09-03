@@ -1813,6 +1813,7 @@ window.sensorFusion = new SensorFusionManager().init();
     let _lastGoodSpeedMPS  = 0;
     let _lastHeadingDeg    = null;
     let _headingChangeRate = 0;
+    let _headingChangeRateSigned = 0; 
     let _interactionEndTime = 0;
     let _markerEl          = null;
     let _markerPrepped     = false;
@@ -1852,7 +1853,47 @@ window.sensorFusion = new SensorFusionManager().init();
         { speed: 40.0, h: 2.8 },
     ];
 
-    function _getPredictHorizon(speedMPS, headingChangeDegPerSec) {
+        function _predictArcPosition(oLat, oLng, vel, decayDt, turnRateDegPerSec) {
+        const cosOLat   = Math.cos(oLat * Math.PI / 180);
+        const vNorthMPS = vel.lat * 111111;
+        const vEastMPS  = vel.lng * 111111 * cosOLat;
+        const speed     = Math.hypot(vNorthMPS, vEastMPS);
+
+        if (speed < 0.05 || decayDt <= 0) {
+            return { lat: oLat, lng: oLng };
+        }
+
+        // Clamp the turn rate to the same ceiling used to shrink the
+        // prediction horizon, so one noisy heading sample can't send the
+        // arc spinning off unrealistically.
+        const maxOmegaRad = CFG.HEADING_CHANGE_CAP * Math.PI / 180;
+        let omega = (turnRateDegPerSec || 0) * Math.PI / 180;
+        if (omega >  maxOmegaRad) omega =  maxOmegaRad;
+        if (omega < -maxOmegaRad) omega = -maxOmegaRad;
+
+        const heading0 = Math.atan2(vEastMPS, vNorthMPS);
+
+        let deltaNorth, deltaEast;
+        if (Math.abs(omega) < 1e-4) {
+            // No meaningful turn rate — identical to the old straight-line math.
+            deltaNorth = speed * decayDt * Math.cos(heading0);
+            deltaEast  = speed * decayDt * Math.sin(heading0);
+        } else {
+            // Closed-form integral of constant speed + constant turn rate:
+            // the predicted point follows an arc instead of a tangent line,
+            // so it bends through the corner instead of shooting past it.
+            const heading1 = heading0 + omega * decayDt;
+            deltaNorth = (speed / omega) * (Math.sin(heading1) - Math.sin(heading0));
+            deltaEast  = (speed / omega) * (Math.cos(heading0) - Math.cos(heading1));
+        }
+
+        return {
+            lat: oLat + deltaNorth / 111111,
+            lng: oLng + deltaEast / (111111 * cosOLat)
+        };
+    }
+    
+       function _getPredictHorizon(speedMPS, headingChangeDegPerSec) {
         let h;
         if (speedMPS <= HORIZON_CURVE[0].speed) {
             h = HORIZON_CURVE[0].h;
@@ -1869,12 +1910,17 @@ window.sensorFusion = new SensorFusionManager().init();
             }
         }
 
-        const TURN_NOISE_FLOOR = 2.0;
-        const TURN_PENALTY = 0.55;
+        // Reacts a bit earlier (lower noise floor) and cuts harder at the
+        // top end (higher penalty) than before. The arc prediction below
+        // still assumes the current turn rate holds steady for the whole
+        // horizon — the shorter that horizon is during a hard turn, the
+        // less room that assumption has to drift from reality.
+        const TURN_NOISE_FLOOR = 1.5;
+        const TURN_PENALTY = 0.75;
         const maxTurn = CFG.HEADING_CHANGE_CAP - TURN_NOISE_FLOOR;
 
         if (maxTurn > 0) {
-            const effectiveHeadingChange = Math.max(0, headingChangeDegPerSec - TURN_NOISE_FLOOR);
+            const effectiveHeadingChange = Math.max(0, Math.abs(headingChangeDegPerSec) - TURN_NOISE_FLOOR);
             const t = Math.min(1.0, effectiveHeadingChange / maxTurn);
             const turnFactor = t * t * (3 - 2 * t);
             h *= (1.0 - turnFactor * TURN_PENALTY);
@@ -1882,7 +1928,7 @@ window.sensorFusion = new SensorFusionManager().init();
 
         return Math.max(0, Math.min(h, CFG.MAX_PREDICT_HORIZON));
     }
-
+    
     function _getMarkerEl() {
         if (_markerEl) return _markerEl;
         if (typeof userMarker !== 'undefined' && userMarker) {
@@ -1996,7 +2042,7 @@ function _seedVelocityOnResume() {
         }
     }
 
-    function frame(now) {
+      function frame(now) {
         _rafId = null;
         const lastPos = window.lastPosition;
         if (!lastPos || window.isLocationHuntVisible) { _active = false; return; }
@@ -2037,7 +2083,9 @@ function _seedVelocityOnResume() {
             let d = hdg - _lastHeadingDeg;
             if (d >  180) d -= 360;
             if (d < -180) d += 360;
-            _headingChangeRate = _headingChangeRate * 0.7 + (Math.abs(d) / (Math.max(dtMs, 16) / 1000)) * 0.3;
+            const instRate = d / (Math.max(dtMs, 16) / 1000);
+            _headingChangeRate       = _headingChangeRate       * 0.7 + Math.abs(instRate) * 0.3;
+            _headingChangeRateSigned = _headingChangeRateSigned * 0.7 + instRate           * 0.3;
         }
         if (hdg != null) _lastHeadingDeg = hdg;
 
@@ -2056,8 +2104,9 @@ function _seedVelocityOnResume() {
             const tau = CFG.EXTENDED_DECAY_TAU_S;
             const decayDt = t1 + (over > 0 ? tau * (1 - Math.exp(-over / tau)) : 0);
 
-            pLat = oLat + vel.lat * decayDt;
-            pLng = oLng + vel.lng * decayDt;
+            const arc = _predictArcPosition(oLat, oLng, vel, decayDt, _headingChangeRateSigned);
+            pLat = arc.lat; pLng = arc.lng;
+
             const jN = Math.abs(pLat - oLat) * 111111;
             const jE = Math.abs(pLng - oLng) * 111111 * Math.cos(oLat * Math.PI / 180);
             if (jN > 150 || jE > 150) { pLat = oLat; pLng = oLng; }
@@ -2147,6 +2196,7 @@ function _seedVelocityOnResume() {
                 _lastGoodSpeedMPS = 0;
                 _lastHeadingDeg = null;
                 _headingChangeRate = 0;
+                _headingChangeRateSigned = 0;
             }
             const el = _getMarkerEl();
             if (el) { el.style.willChange = ''; el.style.transition = ''; _markerTransSet = false; _markerPrepped = false; }
@@ -2154,7 +2204,7 @@ function _seedVelocityOnResume() {
      
         isActive() { return _active; },
         onMovementResumed(options) { return _start(options); },
-
+        
         forceUpdate(options) {
             if (_active) {
                 _lastFrameTime = 0;
