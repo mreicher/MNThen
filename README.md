@@ -18,7 +18,9 @@
 
 ## Overview
 
-No app store. No signup to explore. Your location stays on your device. Just a browser, doing things browsers aren't supposed to be able to do.
+No app store. Your location stays on your device. Just a browser, doing things browsers aren't supposed to be able to do.
+
+The map and online stories are free and need no account. The history trivia game can be played as a guest, with an optional account for people 13 and older who want to save scores and join the leaderboard.
 
 Minnesota Then is a public history and publishing project. Its centerpiece is a walking map that unlocks photographs, narration, and stories as you reach historical sites. The map runs on a custom real-time sensor fusion pipeline built with the W3C Geolocation API, the device compass, and the accelerometer, with no native code and no Mapbox or Google Maps SDKs.
 
@@ -144,12 +146,20 @@ The positioning pipeline runs at 60fps with sub-16ms frame budgets. Adding a vir
 
 The [trivia game](https://mnthen.com/trivia.html) is a single page backed by Firebase Authentication and Realtime Database.
 
-- Guest play with no account; guest scores are not saved
-- Optional accounts with email verification and self-service deletion
-- A neutral age screen before signup; accounts are for people 13 and older
-- A public leaderboard showing first name, last initial, optional display name, scores, and games played
-- Labeled sponsor breaks between rounds
+**The game**
+- Three rounds of five questions, with 30 seconds per question
+- Up to 100 points per question, with faster answers earning more
+- One wrong option drops away about every 8 seconds
+- Two short sponsor breaks between rounds
 - Score sharing to social networks and email
+
+**Accounts**
+- Guest play needs no account, and guest scores are not saved
+- A neutral age screen asks for birth month and year before signup. The answer is not saved or sent, and accounts are for people 13 and older.
+- Email verification is required before scores are saved
+- The newsletter checkbox is optional and unchecked by default
+- A public leaderboard shows first name, last initial, optional display name, scores, and games played
+- Players can delete their account from inside the game
 
 ---
 
@@ -157,12 +167,16 @@ The [trivia game](https://mnthen.com/trivia.html) is a single page backed by Fir
 
 | Area | What happens |
 |------|--------------|
-| **Map** | No account. Location, compass, and motion data are processed on your device and not sent to us. Anonymous visit, view, and like totals may be recorded. |
-| **Trivia** | Accounts are optional. Account holders appear on the public leaderboard. |
-| **Website** | Many pages use Google Analytics, which is not loaded when your browser sends a Do Not Track signal. |
-| **Sponsors** | No ad networks and no sale of personal information. |
+| **Map and stories** | No account. Location, compass, and motion data are processed on your device and not sent to us. Anonymous visit, view, and like totals may be recorded. |
+| **Trivia as a guest** | No account, and scores are not saved. |
+| **Trivia accounts** | We collect your name, optional display name, email address, scores and play history, and newsletter choice. Passwords are handled by Firebase Authentication and are not visible to us. |
+| **Contact and sponsor inquiries** | Form messages are delivered by email through FormSubmit. |
+| **Newsletter and support** | Handled by Substack and Buy Me a Coffee under their own privacy policies. |
+| **Browser storage** | Used for things like audio position, install preferences, recently seen trivia questions, sign-in, and the age screen marker. |
+| **Analytics** | Many pages use Google Analytics, which is not loaded when your browser sends a Do Not Track signal. |
+| **Sponsors** | No ad networks, no sale of personal information, and no information about individual visitors or players given to sponsors. |
 
-Read the full [Privacy Policy and Terms of Service](https://www.mnthen.com/privacy_terms.html).
+This is a summary. Read the full [Privacy Policy and Terms of Service](https://www.mnthen.com/privacy_terms.html).
 
 ---
 
@@ -185,7 +199,7 @@ Then open `http://localhost:8000`.
 - Location permission
 
 > [!NOTE]
-> **Running your own copy?** Use your own Firebase project and security rules, replace or remove the Google Analytics ID, and swap out Minnesota Then branding, sponsor content, and contact details.
+> **Running your own copy?** Use your own Firebase project and security rules, replace or remove the Google Analytics ID, publish your own privacy policy and terms, and swap out Minnesota Then branding, sponsor content, and contact details.
 
 ---
 
@@ -213,7 +227,7 @@ MNThen/
 
 ## Supporting the Project
 
-- **Sponsor:** Support a location, story, community project, or trivia break on the [sponsors page](https://www.mnthen.com/sponsors.html). Sponsors do not control research, conclusions, or wording.
+- **Sponsor:** Back a location, story, community project, trivia break, or a full year of the work on the [sponsors page](https://www.mnthen.com/sponsors.html). Sponsors do not control research, conclusions, or wording.
 - **Contribute:** Make a one-time or recurring gift through [Buy Me a Coffee](https://buymeacoffee.com/minnesotathen).
 - **Follow:** Subscribe to the [newsletter](https://mnthen.substack.com).
 - **Correct us:** Found a historical error or a bug? Open an issue or send an email.
@@ -262,4 +276,3 @@ This project uses a dual-license structure. Please make sure you understand the 
 ## Contact
 
 [mattreicher@protonmail.com](mailto:mattreicher@protonmail.com)
-
