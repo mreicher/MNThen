@@ -69,6 +69,7 @@ const blogArticles = [
   "url": "https://www.mnthen.com/blog/event/sackett.html",
   "keywords": ["james sackett", "st. paul police", "officer down", "1970 ambush", "cold case", "ronald reed", "larry clark", "connie trimble", "black panther", "hague avenue", "event", "all"]
 },
+  /*
   {
   "headline": "Minnesota's Second State Capitol (1883 - 1938)",
   "blurb": "After the 1881 fire, Minnesota's second capitol opened in 1883. Criticized for design flaws and space issues, it served until 1905 and was razed in 1938.",
@@ -79,6 +80,7 @@ const blogArticles = [
   "url": "https://www.mnthen.com/blog/place/secondcap.html",
   "keywords": ["Minnesota second state capitol", "Leroy S. Buffington", "St. Paul history", "Minnesota government", "Works Progress Administration", "Fitzgerald Park", "place", "all"]
 },
+*/
   {
   "headline": "John’s Bar and Funhouse Prostitution Scandal (1952–1956)",
   "blurb": "A sensational 1952 police raid exposed John’s Bar and Funhouse at 2500 Marshall St NE as the Minneapolis hub of an interstate prostitution ring—triggering Mann Act prosecutions, prison sentences for the Gawron brothers, and the bar’s abrupt closure. Its legacy lives on in the beloved dive bar that replaced it: Tony Jaros’ River Garden.",
